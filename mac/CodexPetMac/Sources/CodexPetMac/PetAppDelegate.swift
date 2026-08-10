@@ -158,6 +158,11 @@ private struct MP4ImportFailure {
     let reason: String
 }
 
+private struct MP4ImportNotice {
+    let name: String
+    let messages: [String]
+}
+
 private struct ActiveOneShotPreview {
     let playback: OneShotPlayback
     let libraryState: PetState
@@ -1175,6 +1180,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             toolchain: toolchain,
             imported: 0,
             failures: [],
+            notices: [],
             batchID: batchID
         )
     }
@@ -1186,6 +1192,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         toolchain: AlphaToolchain,
         imported: Int,
         failures: [MP4ImportFailure],
+        notices: [MP4ImportNotice],
         batchID: UUID
     ) {
         guard activeMP4BatchID == batchID else { return }
@@ -1195,6 +1202,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 total: sourceURLs.count,
                 imported: imported,
                 failures: failures,
+                notices: notices,
                 cancelled: true,
                 batchID: batchID
             )
@@ -1206,6 +1214,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 total: sourceURLs.count,
                 imported: imported,
                 failures: failures,
+                notices: notices,
                 cancelled: false,
                 batchID: batchID
             )
@@ -1229,8 +1238,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             sourceURL: sourceURL,
             outputURL: outputURL,
             reportURL: reportURL,
-            width: Int(mediaMap.window.width.rounded()),
-            height: Int(mediaMap.window.height.rounded()),
+            width: AlphaAuthoringCanvas.width,
+            height: AlphaAuthoringCanvas.height,
             toolchain: toolchain,
             phase: { [weak self] phase in
                 guard let self else { return }
@@ -1274,6 +1283,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                             total: sourceURLs.count,
                             imported: imported,
                             failures: failures,
+                            notices: notices,
                             cancelled: true,
                             batchID: batchID
                         )
@@ -1290,6 +1300,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                             toolchain: toolchain,
                             imported: imported,
                             failures: failures + [failure],
+                            notices: notices,
                             batchID: batchID
                         )
                     }
@@ -1325,6 +1336,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                                     total: sourceURLs.count,
                                     imported: imported,
                                     failures: failures,
+                                    notices: notices,
                                     cancelled: true,
                                     batchID: batchID
                                 )
@@ -1332,6 +1344,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                             }
                             var nextImported = imported
                             var nextFailures = failures
+                            var nextNotices = notices
                             switch validation {
                             case let .failure(error):
                                 try? FileManager.default.removeItem(at: conversion.outputURL)
@@ -1361,6 +1374,14 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                                         path: conversion.outputURL.lastPathComponent
                                     )
                                     nextImported += 1
+                                    if !report.notices.isEmpty {
+                                        nextNotices.append(
+                                            MP4ImportNotice(
+                                                name: self.safeMediaDisplayName(sourceURL),
+                                                messages: report.notices.map(\.message)
+                                            )
+                                        )
+                                    }
                                     self.logger.info("event=animation_imported state=\(state.rawValue, privacy: .public) frames=\(report.frames, privacy: .public) batch_index=\(position, privacy: .public) batch_count=\(sourceURLs.count, privacy: .public)")
                                 } catch {
                                     try? FileManager.default.removeItem(at: conversion.outputURL)
@@ -1381,6 +1402,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                                 toolchain: toolchain,
                                 imported: nextImported,
                                 failures: nextFailures,
+                                notices: nextNotices,
                                 batchID: batchID
                             )
                         }
@@ -1395,6 +1417,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         total: Int,
         imported: Int,
         failures: [MP4ImportFailure],
+        notices: [MP4ImportNotice],
         cancelled: Bool,
         batchID: UUID
     ) {
@@ -1402,6 +1425,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         activeMP4BatchID = nil
         mp4BatchCancellationRequested = false
         mediaMutationInProgress = false
+        let noticeSummary = summarizedImportNotices(notices)
         if cancelled {
             let priorFailures = summarizedImportFailures(failures)
             settingsController?.update(
@@ -1409,11 +1433,16 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                     state,
                     "Import cancelled · \(imported) of \(total) clips were added"
                         + (priorFailures.map { " · Earlier failures: \($0)" } ?? "")
+                        + (noticeSummary.map { " · Notices: \($0)" } ?? "")
                 )
             )
         } else if failures.isEmpty {
             settingsController?.update(
-                activity: .succeeded(state, "Imported \(imported) clip\(imported == 1 ? "" : "s")")
+                activity: .succeeded(
+                    state,
+                    "Imported \(imported) clip\(imported == 1 ? "" : "s")"
+                        + (noticeSummary.map { " · \($0)" } ?? "")
+                )
             )
         } else {
             settingsController?.update(
@@ -1421,6 +1450,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                     state,
                     "Imported \(imported) of \(total) · "
                         + (summarizedImportFailures(failures) ?? "Conversion failed")
+                        + (noticeSummary.map { " · Notices: \($0)" } ?? "")
                 )
             )
         }
@@ -1433,6 +1463,15 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             .map { "\($0.name): \($0.reason)" }
             .joined(separator: " · ")
         let suffix = failures.count > 2 ? " · and \(failures.count - 2) more" : ""
+        return visible + suffix
+    }
+
+    private func summarizedImportNotices(_ notices: [MP4ImportNotice]) -> String? {
+        guard !notices.isEmpty else { return nil }
+        let visible = notices.prefix(2)
+            .map { "\($0.name): \($0.messages.joined(separator: ", "))" }
+            .joined(separator: " · ")
+        let suffix = notices.count > 2 ? " · and \(notices.count - 2) more" : ""
         return visible + suffix
     }
 

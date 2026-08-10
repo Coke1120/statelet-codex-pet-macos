@@ -196,7 +196,7 @@ The exact uniform `#00FF00` recommendation is the authoring target. Because a
 generator may still return imperfect or varying green, the maintained converter
 estimates the border background on every frame, preserves
 source proportions with aspect-fill scaling and a centered crop to the
-configured pet canvas, produces a continuous alpha matte, applies controlled
+stable 320×480 authoring canvas, produces a continuous alpha matte, applies controlled
 green despill, records source foreground edge contact, clears only the
 pre-codec output border, writes a ProRes 4444 intermediate, and uses Apple's
 `avconvert` for HEVC with alpha. It allows character motion and effects to
@@ -217,6 +217,9 @@ converter has no release verification bypass.
 Its report binds the source both before decoding and immediately before
 publication, plus the delivery and retained intermediate, by SHA-256. The
 artifact/report set is rolled back together if publication fails.
+The probe rejects explicit non-square sample aspect ratios. Source audio is
+stripped and reported, while first/last post-matte differences are recorded as
+an informational loop-seam notice; neither notice relaxes a delivery gate.
 
 The converter needs `ffmpeg`, `ffprobe`, Apple's `avconvert`, NumPy, and Pillow.
 Probe the planned pipeline first:
@@ -448,6 +451,8 @@ Drag the body to move the panel. Drag any border or corner to resize it while
 preserving the current aspect ratio, down to a minimum width of 160 points. The
 app persists the final width and height in the `window` object of
 `media-map.json`; General settings and the next launch use the saved size.
+Window dimensions are display points only and do not change the 320×480 pixel
+canvas used for newly converted animation media.
 
 The **Appearance** pane controls:
 

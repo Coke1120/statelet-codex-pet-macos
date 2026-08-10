@@ -127,19 +127,23 @@ source FPS, not measured rendered frames.
 MP4 is authoring input, not the delivered runtime format. The maintained
 converter:
 
-1. probes a constant-frame-rate source;
-2. estimates the observed green background per frame;
-3. creates continuous alpha and controlled despill;
-4. records source edge contact and clears the pre-codec output border;
-5. writes a ProRes 4444 intermediate;
-6. creates Apple HEVC with alpha;
-7. decodes the delivery through Apple's media pipeline; and
-8. checks alpha loss, corruption, retained green, and white/black/checkerboard
+1. probes a constant-frame-rate, square-pixel source and records audio tracks;
+2. aspect-fills a stable 320×480 authoring canvas, independent of window points;
+3. estimates the observed green background per frame;
+4. creates continuous alpha and controlled despill;
+5. records source edge contact, informational loop-seam metrics, and clears the
+   pre-codec output border;
+6. writes a silent ProRes 4444 intermediate;
+7. creates Apple HEVC with alpha;
+8. decodes the delivery through Apple's media pipeline; and
+9. checks alpha loss, corruption, retained green, and white/black/checkerboard
    composites on every frame.
 
 Accepted output is a `.mov` beside its converter-generated `.report.json`.
 Statelet copies and revalidates both before atomically updating the media map.
-The running app never chroma-keys green video.
+The running app never chroma-keys green video. Import results surface audio
+removal, non-identical loop endpoints, and automatic even-geometry alignment as
+notices; none of them bypasses a delivery acceptance gate.
 
 ## Managed media safety
 

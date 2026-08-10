@@ -3,6 +3,24 @@
 All notable changes to Statelet are documented here. Versions follow semantic
 versioning for the public source release.
 
+## Unreleased
+
+### Changed
+
+- MP4 authoring now uses a stable even 320×480 pixel canvas independent of the
+  resizable AppKit window.
+- Conversion reports and import results identify stripped audio, non-identical
+  loop endpoints, and automatic codec-canvas alignment as informational notices.
+- Explicit non-square sample-aspect-ratio input is rejected before decoding.
+- macOS CI discovers every Python test module and fails if any test is skipped.
+
+### Fixed
+
+- Odd requested HEVC-alpha dimensions are aligned before matting so Apple
+  `avconvert` cannot silently crop a row or column after reference generation.
+- The Animations pane keeps its per-state clip list visible at minimum window
+  size and uses a compact MP4 import strip.
+
 ## [1.6.0] - 2026-08-10
 
 First public release of **Statelet**, the local-first Codex lifecycle companion

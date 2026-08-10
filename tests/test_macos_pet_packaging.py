@@ -247,6 +247,20 @@ esac
         self.assertIn("summarizedImportFailures(failures)", cancelled_branch)
         self.assertIn("Earlier failures:", cancelled_branch)
 
+    def test_mp4_import_uses_stable_authoring_canvas(self) -> None:
+        source = PET_APP_DELEGATE.read_text(encoding="utf-8")
+        conversion_call = source.split("conversionCoordinator.convert(", 1)[1].split(
+            "toolchain: toolchain", 1
+        )[0]
+        self.assertIn("width: AlphaAuthoringCanvas.width", conversion_call)
+        self.assertIn("height: AlphaAuthoringCanvas.height", conversion_call)
+        self.assertNotIn("mediaMap.window", conversion_call)
+
+    def test_mp4_import_surfaces_informational_report_notices(self) -> None:
+        source = PET_APP_DELEGATE.read_text(encoding="utf-8")
+        self.assertIn("messages: report.notices.map(\\.message)", source)
+        self.assertIn("summarizedImportNotices(notices)", source)
+
     def test_bundle_builder_rejects_embedded_private_path(self) -> None:
         executable = self.base / "leaky-executable"
         executable.write_text(

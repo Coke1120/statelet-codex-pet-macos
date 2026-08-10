@@ -34,28 +34,21 @@ jobs:
       - name: Install FFmpeg
         run: brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
 
-      - name: Run alpha conversion tests without skips
+      - name: Run complete Python test suite without skips
         run: |
           python - <<'PY'
           import unittest
 
-          suite = unittest.defaultTestLoader.loadTestsFromName(
-              "tests.test_macos_alpha_video"
+          suite = unittest.defaultTestLoader.discover(
+              "tests",
+              pattern="test_*.py",
           )
           result = unittest.TextTestRunner(verbosity=2).run(suite)
           if result.skipped:
-              raise SystemExit(f"alpha tests skipped: {result.skipped}")
+              raise SystemExit(f"Python tests skipped: {result.skipped}")
           if not result.wasSuccessful():
               raise SystemExit(1)
           PY
-
-      - name: Run lifecycle and packaging tests
-        run: |
-          python -m unittest \
-            tests.test_codex_hook \
-            tests.test_codex_pet_state \
-            tests.test_macos_pet_packaging \
-            tests.test_macos_pet_startup -v
 
       - name: Reject excluded public-release content
         run: |

@@ -142,6 +142,8 @@ class VideoInfo:
     codec_name: str
     pixel_format: str
     codec_profile: str = "unknown"
+    sample_aspect_ratio: str = "1:1"
+    audio_codecs: tuple[str, ...] = ()
 
     @property
     def fps_text(self) -> str:
@@ -272,7 +274,7 @@ def build_ffprobe_command(
         "-show_entries",
         (
             "stream=index,codec_type,codec_name,profile,width,height,avg_frame_rate,"
-            "r_frame_rate,nb_frames,nb_read_frames,duration,pix_fmt:"
+            "r_frame_rate,nb_frames,nb_read_frames,duration,pix_fmt,sample_aspect_ratio:"
             "stream_tags=rotate:stream_side_data=rotation:"
             "stream_disposition=attached_pic:format=duration"
         ),
@@ -290,6 +292,33 @@ def _probe_failure(result: subprocess.CompletedProcess[str]) -> ProbeError:
         "ffprobe could not inspect the input video"
         + (f" (exit {result.returncode})" if result.returncode else "")
     )
+
+
+def _normalized_sample_aspect_ratio(value: Any) -> str:
+    """Return the square-pixel contract or reject explicit anamorphic input.
+
+    ffprobe reports an omitted sample-aspect-ratio as ``N/A`` or ``0:1`` for
+    ordinary square-pixel files.  Those unspecified values follow FFmpeg's
+    square-pixel default.  Any explicit non-square value is rejected before
+    decoding so ``setsar=1`` cannot silently change the displayed geometry.
+    """
+
+    if value in (None, "", "N/A", "0:1", "0/1"):
+        return "1:1"
+    text = str(value).strip()
+    separator = ":" if ":" in text else "/" if "/" in text else None
+    if separator is None:
+        raise ProbeError("video sample aspect ratio is invalid")
+    try:
+        numerator_text, denominator_text = text.split(separator, 1)
+        ratio = Fraction(int(numerator_text), int(denominator_text))
+    except (ValueError, ZeroDivisionError) as exc:
+        raise ProbeError("video sample aspect ratio is invalid") from exc
+    if ratio != 1:
+        raise ProbeError(
+            "input video must use square pixels (sample aspect ratio 1:1)"
+        )
+    return "1:1"
 
 
 def probe_video(
@@ -338,6 +367,14 @@ def probe_video(
             f"(found {len(video_streams)})"
         )
     stream = video_streams[0]
+    sample_aspect_ratio = _normalized_sample_aspect_ratio(
+        stream.get("sample_aspect_ratio")
+    )
+    audio_codecs = tuple(
+        str(item.get("codec_name") or "unknown")
+        for item in streams
+        if item.get("codec_type") == "audio"
+    )
     width = stream.get("width")
     height = stream.get("height")
     try:
@@ -415,6 +452,8 @@ def probe_video(
         codec_name=str(stream.get("codec_name") or "unknown"),
         pixel_format=str(stream.get("pix_fmt") or "unknown"),
         codec_profile=str(stream.get("profile") or "unknown"),
+        sample_aspect_ratio=sample_aspect_ratio,
+        audio_codecs=audio_codecs,
     )
 
 

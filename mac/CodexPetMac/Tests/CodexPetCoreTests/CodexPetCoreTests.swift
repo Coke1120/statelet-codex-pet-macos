@@ -1,4 +1,5 @@
 import CoreGraphics
+import Foundation
 import XCTest
 @testable import CodexPetCore
 
@@ -9,7 +10,10 @@ private func validAlphaReportJSON() -> String {
     """
     {
       "status":"converted",
+      "source":{"audio":{"stream_count":1,"codecs":["aac"],"policy":"stripped"}},
       "geometry":{"width":320,"height":486,"pixel_format":"straight-rgba"},
+      "geometry_alignment":{"requested_width":321,"requested_height":487,"policy":"floor_to_even","adjusted":true},
+      "quality":{"loop_seam":{"performed":true,"exact_match":false,"differing_pixels":120,"mean_absolute_error":0.5,"maximum_absolute_error":12,"policy":"informational"}},
       "codec":{"delivery":"HEVC with alpha"},
       "verification":{
         "performed":true,"unsafe":false,"frames_verified":241,"maximum_outer_edge_alpha":1,
@@ -358,6 +362,56 @@ final class CodexPetCoreTests: XCTestCase {
         XCTAssertEqual(validated.height, 486)
         XCTAssertEqual(validated.frames, 241)
         XCTAssertEqual(validated.fps, "24/1")
+        XCTAssertEqual(
+            validated.notices,
+            [
+                .audioStripped(streamCount: 1),
+                .loopMayJump(differingPixels: 120),
+                .canvasAdjusted(
+                    requestedWidth: 321,
+                    requestedHeight: 487,
+                    outputWidth: 320,
+                    outputHeight: 486
+                ),
+            ]
+        )
+    }
+
+    func testInformationalConversionNoticesDoNotOverrideVerificationGates() {
+        assertReportError(
+            validAlphaReportJSON().replacingOccurrences(
+                of: "\"lost_alpha_pixels_total\":0",
+                with: "\"lost_alpha_pixels_total\":1"
+            ),
+            actualOutputSHA256: reportOutputHash,
+            equals: .alphaGateFailed
+        )
+        assertReportError(
+            validAlphaReportJSON().replacingOccurrences(
+                of: "\"quality_passed\":true,\"limits\"",
+                with: "\"quality_passed\":false,\"limits\""
+            ),
+            actualOutputSHA256: reportOutputHash,
+            equals: .compositeGateFailed
+        )
+    }
+
+    func testLegacyAlphaReportWithoutInformationalSectionsRemainsAccepted() throws {
+        var legacy = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(validAlphaReportJSON().utf8))
+                as? [String: Any]
+        )
+        legacy.removeValue(forKey: "source")
+        legacy.removeValue(forKey: "geometry_alignment")
+        legacy.removeValue(forKey: "quality")
+
+        let validated = try AlphaConversionReportValidator.validate(
+            data: try JSONSerialization.data(withJSONObject: legacy),
+            expectedOutputBasename: "idle.mov",
+            actualOutputSHA256: reportOutputHash
+        )
+
+        XCTAssertTrue(validated.notices.isEmpty)
     }
 
     func testAlphaConversionReportRejectsIdentityAndSourceFailures() {
@@ -971,6 +1025,17 @@ final class CodexPetCoreTests: XCTestCase {
         let restored = WindowFramePolicy.applyingConfiguredSize(configured, to: stored)
         XCTAssertEqual(restored.origin, stored.origin)
         XCTAssertEqual(restored.size, configured)
+    }
+
+    func testAlphaAuthoringCanvasDoesNotFollowResizableWindow() throws {
+        let resizedWindow = try WindowConfiguration(width: 341, height: 511)
+
+        XCTAssertEqual(resizedWindow.width, 341)
+        XCTAssertEqual(resizedWindow.height, 511)
+        XCTAssertEqual(AlphaAuthoringCanvas.width, 320)
+        XCTAssertEqual(AlphaAuthoringCanvas.height, 480)
+        XCTAssertEqual(AlphaAuthoringCanvas.width % 2, 0)
+        XCTAssertEqual(AlphaAuthoringCanvas.height % 2, 0)
     }
 
     func testWindowFrameClampingHandlesNegativeVerticalAndRemovedDisplays() {

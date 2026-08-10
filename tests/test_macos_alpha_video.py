@@ -148,6 +148,7 @@ class MacOSAlphaCommandTests(unittest.TestCase):
         self.assertIn("avg_frame_rate", entries)
         self.assertIn("r_frame_rate", entries)
         self.assertIn("nb_read_frames", entries)
+        self.assertIn("sample_aspect_ratio", entries)
         self.assertIn("stream_disposition=attached_pic", entries)
 
     def test_ffmpeg_and_avconvert_commands_use_alpha_contract(self):
@@ -325,6 +326,76 @@ class MacOSAlphaCommandTests(unittest.TestCase):
                 ],
                 alpha.SOURCE_RESIZE_MODE,
             )
+
+    def test_dry_run_report_declares_source_audio_is_stripped(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source-with-audio.mp4"
+            output = root / "review.mov"
+            report_path = root / "review.report.json"
+            source.write_bytes(b"source")
+            args = converter.build_parser().parse_args(
+                [
+                    str(source),
+                    str(output),
+                    "--report",
+                    str(report_path),
+                    "--width",
+                    "320",
+                    "--height",
+                    "480",
+                    "--dry-run",
+                ]
+            )
+            info = alpha.VideoInfo(
+                width=720,
+                height=1280,
+                frame_count=240,
+                fps=Fraction(24, 1),
+                duration_seconds=10.0,
+                codec_name="h264",
+                pixel_format="yuv420p",
+                codec_profile="High",
+                audio_codecs=("aac",),
+            )
+            with mock.patch.object(
+                converter, "require_image_dependencies"
+            ), mock.patch.object(
+                converter, "require_tool", side_effect=lambda _name, requested: requested
+            ), mock.patch.object(converter, "probe_video", return_value=info):
+                report = converter.convert_video(args)
+
+            self.assertEqual(
+                report["source"]["audio"],
+                {
+                    "stream_count": 1,
+                    "codecs": ["aac"],
+                    "policy": "stripped",
+                },
+            )
+            self.assertIn("-an", report["commands"]["decode"])
+
+    @unittest.skipUnless(alpha.np is not None, "NumPy is required")
+    def test_loop_seam_diagnostics_are_informational(self):
+        np = alpha.np
+        assert np is not None
+        first = np.zeros((2, 3, 4), dtype=np.uint8)
+        last = first.copy()
+        last[1, 2, 0] = 12
+
+        diagnostics = converter._loop_seam_diagnostics(first, last)
+
+        self.assertEqual(
+            diagnostics,
+            {
+                "performed": True,
+                "exact_match": False,
+                "differing_pixels": 1,
+                "mean_absolute_error": 0.5,
+                "maximum_absolute_error": 12,
+                "policy": "informational",
+            },
+        )
 
     def test_odd_requested_geometry_is_aligned_before_encoding(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1315,6 +1386,66 @@ class MacOSAlphaCommandTests(unittest.TestCase):
                     runner=lambda *args, **kwargs: result,
                 )
 
+    def test_probe_records_audio_and_accepts_square_pixels(self):
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as source:
+            payload = {
+                "streams": [
+                    {
+                        "codec_type": "video",
+                        "codec_name": "h264",
+                        "profile": "High",
+                        "width": 16,
+                        "height": 16,
+                        "sample_aspect_ratio": "1:1",
+                        "avg_frame_rate": "24/1",
+                        "r_frame_rate": "24/1",
+                        "nb_read_frames": "2",
+                        "duration": "0.083333",
+                    },
+                    {"codec_type": "audio", "codec_name": "aac"},
+                ]
+            }
+            result = subprocess.CompletedProcess(
+                ["ffprobe"], 0, json.dumps(payload), ""
+            )
+
+            info = alpha.probe_video(
+                source.name,
+                ffprobe="/opt/homebrew/bin/ffprobe",
+                runner=lambda *args, **kwargs: result,
+            )
+
+            self.assertEqual(info.sample_aspect_ratio, "1:1")
+            self.assertEqual(info.audio_codecs, ("aac",))
+
+    def test_probe_rejects_non_square_sample_aspect_ratio_before_decode(self):
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as source:
+            payload = {
+                "streams": [
+                    {
+                        "codec_type": "video",
+                        "codec_name": "h264",
+                        "width": 16,
+                        "height": 16,
+                        "sample_aspect_ratio": "4:3",
+                        "avg_frame_rate": "24/1",
+                        "r_frame_rate": "24/1",
+                        "nb_read_frames": "2",
+                        "duration": "0.083333",
+                    }
+                ]
+            }
+            result = subprocess.CompletedProcess(
+                ["ffprobe"], 0, json.dumps(payload), ""
+            )
+
+            with self.assertRaisesRegex(alpha.ProbeError, "square pixels"):
+                alpha.probe_video(
+                    source.name,
+                    ffprobe="/opt/homebrew/bin/ffprobe",
+                    runner=lambda *args, **kwargs: result,
+                )
+
     def test_probe_ignores_attached_cover_art_but_rejects_two_playable_videos(self):
         with tempfile.NamedTemporaryFile(suffix=".mp4") as source:
             stream = {
@@ -1523,6 +1654,15 @@ class MacOSAlphaIntegrationTests(unittest.TestCase):
             self.assertEqual(converted.returncode, 0, converted.stderr)
             payload = json.loads(report.read_text(encoding="utf-8"))
             self.assertEqual(payload["status"], "converted")
+            self.assertEqual(
+                payload["source"]["audio"],
+                {"stream_count": 0, "codecs": [], "policy": "none"},
+            )
+            self.assertTrue(payload["quality"]["loop_seam"]["performed"])
+            self.assertEqual(
+                payload["quality"]["loop_seam"]["policy"], "informational"
+            )
+            self.assertFalse(payload["quality"]["loop_seam"]["exact_match"])
             self.assertEqual(
                 payload["geometry"],
                 {"width": 64, "height": 48, "pixel_format": "straight-rgba"},

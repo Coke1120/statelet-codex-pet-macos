@@ -39,7 +39,10 @@ private func validAlphaReportJSON() -> String {
     """
     {
       "status":"converted",
+      "source":{"audio":{"stream_count":1,"codecs":["aac"],"policy":"stripped"}},
       "geometry":{"width":320,"height":486,"pixel_format":"straight-rgba"},
+      "geometry_alignment":{"requested_width":321,"requested_height":487,"policy":"floor_to_even","adjusted":true},
+      "quality":{"loop_seam":{"performed":true,"exact_match":false,"differing_pixels":120,"mean_absolute_error":0.5,"maximum_absolute_error":12,"policy":"informational"}},
       "codec":{"delivery":"HEVC with alpha"},
       "verification":{
         "performed":true,
@@ -284,6 +287,36 @@ private func runSelfTest() throws {
     try require(validated.sourceSHA256 == sourceHash, "validated source hash changed")
     try require(validated.frames == 241, "validated frame count changed")
     try require(validated.width == 320 && validated.height == 486, "validated geometry changed")
+    try require(
+        validated.notices == [
+            .audioStripped(streamCount: 1),
+            .loopMayJump(differingPixels: 120),
+            .canvasAdjusted(
+                requestedWidth: 321,
+                requestedHeight: 487,
+                outputWidth: 320,
+                outputHeight: 486
+            ),
+        ],
+        "validated conversion notices changed"
+    )
+    guard var legacyReport = try JSONSerialization.jsonObject(
+        with: Data(validAlphaReportJSON().utf8)
+    ) as? [String: Any] else {
+        throw SelfTestFailure.assertion("valid report fixture is not a JSON object")
+    }
+    legacyReport.removeValue(forKey: "source")
+    legacyReport.removeValue(forKey: "geometry_alignment")
+    legacyReport.removeValue(forKey: "quality")
+    let legacyValidated = try AlphaConversionReportValidator.validate(
+        data: try JSONSerialization.data(withJSONObject: legacyReport),
+        expectedOutputBasename: "idle.mov",
+        actualOutputSHA256: outputHash
+    )
+    try require(
+        legacyValidated.notices.isEmpty,
+        "legacy report gained informational notices"
+    )
     try requiresError("unsafe conversion report was accepted") {
         let report = validAlphaReportJSON().replacingOccurrences(of: "\"unsafe\":false", with: "\"unsafe\":true")
         _ = try AlphaConversionReportValidator.validate(

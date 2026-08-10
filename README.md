@@ -223,11 +223,17 @@ Application Support data to Trash.
 ## Development
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
-  tests.test_codex_hook \
-  tests.test_codex_pet_state \
-  tests.test_macos_pet_packaging \
-  tests.test_macos_pet_startup -v
+PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY'
+import unittest
+
+suite = unittest.defaultTestLoader.discover(
+    "tests", pattern="test_*.py"
+)
+result = unittest.TextTestRunner(verbosity=2).run(suite)
+if result.skipped:
+    raise SystemExit(f"Python tests skipped: {result.skipped}")
+raise SystemExit(0 if result.wasSuccessful() else 1)
+PY
 
 swift run -c release --package-path mac/CodexPetMac codex-pet-core-self-test
 swift test -c release --package-path mac/CodexPetMac
@@ -236,10 +242,11 @@ codesign --verify --deep --strict mac/CodexPetMac/dist/Statelet.app
 python3 -m json.tool mac/CodexPetMac/Examples/media-map.json >/dev/null
 ```
 
-Run `tests.test_macos_alpha_video` after installing the optional alpha authoring
-toolchain. See [Deployment](docs/DEPLOYMENT.md#release-verification) for the
-complete release gate and [the lifecycle and media reference](docs/MACOS_COMPANION.md)
-for implementation contracts.
+Install the optional alpha authoring toolchain before running the complete
+Python suite; release verification treats every skipped test as a failure. See
+[Deployment](docs/DEPLOYMENT.md#release-verification) for the complete release
+gate and [the lifecycle and media reference](docs/MACOS_COMPANION.md) for
+implementation contracts.
 
 ## License and project status
 

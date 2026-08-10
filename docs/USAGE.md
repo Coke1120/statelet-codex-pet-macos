@@ -147,6 +147,7 @@ source videos outside the repository.
 The recommended source is:
 
 - a constant-frame-rate MP4 with one stable video stream;
+- square pixels with no rotation metadata;
 - a full-body character with clean margin on every side;
 - a locked camera and stable framing, exposure, scale, and focus;
 - a completely uniform RGB `#00FF00` background;
@@ -157,13 +158,20 @@ The recommended source is:
 
 The margin is a quality recommendation, not a rejection rule. Statelet accepts
 subjects and effects that touch or exceed the source canvas; anything outside
-the selected output canvas is cropped because those pixels do not exist in the
-delivered frame.
+the stable 320×480 authoring canvas is cropped because those pixels do not exist
+in the delivered frame. Resizing the on-screen pet changes AppKit display points,
+not the pixel geometry used for future conversions.
 
 Select **Add Clip… → Import MP4s…**, or drag local `.mp4` files from Finder onto
 the selected state's drop zone. A drop preserves Finder order, removes exact
 duplicate paths, and is rejected before conversion if any item is missing,
 unreadable, a directory, remote, or not an MP4.
+
+Explicit non-square sample-aspect-ratio media is rejected before decoding.
+Audio tracks are removed because Statelet animations are silent; the completed
+import reports that removal instead of ignoring it. A non-identical first/last
+frame remains importable but produces a **loop endpoints differ** notice so a
+visible seam can be reauthored without weakening alpha or composite checks.
 
 Accepted files run sequentially through:
 

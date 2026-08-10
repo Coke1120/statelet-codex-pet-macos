@@ -8,6 +8,29 @@ public struct ValidatedAlphaConversionReport: Equatable, Sendable {
     public let height: Int
     public let frames: Int
     public let fps: String
+    public let notices: [AlphaConversionNotice]
+}
+
+public enum AlphaConversionNotice: Equatable, Sendable {
+    case audioStripped(streamCount: Int)
+    case loopMayJump(differingPixels: Int)
+    case canvasAdjusted(
+        requestedWidth: Int,
+        requestedHeight: Int,
+        outputWidth: Int,
+        outputHeight: Int
+    )
+
+    public var message: String {
+        switch self {
+        case let .audioStripped(streamCount):
+            return streamCount == 1 ? "audio removed" : "\(streamCount) audio tracks removed"
+        case .loopMayJump:
+            return "loop endpoints differ"
+        case let .canvasAdjusted(requestedWidth, requestedHeight, outputWidth, outputHeight):
+            return "canvas \(requestedWidth)×\(requestedHeight) → \(outputWidth)×\(outputHeight)"
+        }
+    }
 }
 
 public enum AlphaConversionReportValidationError: Error, Equatable, LocalizedError {
@@ -148,6 +171,34 @@ public enum AlphaConversionReportValidator {
             throw AlphaConversionReportValidationError.compositeGateFailed
         }
 
+        var notices: [AlphaConversionNotice] = []
+        if let audio = report.source?.audio,
+           audio.policy == "stripped",
+           audio.streamCount > 0 {
+            notices.append(.audioStripped(streamCount: audio.streamCount))
+        }
+        if let seam = report.quality?.loopSeam,
+           seam.performed,
+           seam.policy == "informational",
+           !seam.exactMatch,
+           seam.differingPixels > 0 {
+            notices.append(.loopMayJump(differingPixels: seam.differingPixels))
+        }
+        if let alignment = report.geometryAlignment,
+           alignment.adjusted,
+           alignment.policy == "floor_to_even",
+           alignment.requestedWidth > 0,
+           alignment.requestedHeight > 0 {
+            notices.append(
+                .canvasAdjusted(
+                    requestedWidth: alignment.requestedWidth,
+                    requestedHeight: alignment.requestedHeight,
+                    outputWidth: delivery.width,
+                    outputHeight: delivery.height
+                )
+            )
+        }
+
         return ValidatedAlphaConversionReport(
             outputBasename: report.artifacts.outputName,
             outputSHA256: reportedOutputHash,
@@ -155,7 +206,8 @@ public enum AlphaConversionReportValidator {
             width: delivery.width,
             height: delivery.height,
             frames: delivery.frames,
-            fps: delivery.fps
+            fps: delivery.fps,
+            notices: notices
         )
     }
 
@@ -186,10 +238,74 @@ public enum AlphaConversionReportValidator {
 
 private struct AlphaConversionReport: Decodable {
     let status: String
+    let source: Source?
     let geometry: Geometry
+    let geometryAlignment: GeometryAlignment?
+    let quality: Quality?
     let codec: Codec
     let verification: Verification
     let artifacts: Artifacts
+
+    enum CodingKeys: String, CodingKey {
+        case status
+        case source
+        case geometry
+        case geometryAlignment = "geometry_alignment"
+        case quality
+        case codec
+        case verification
+        case artifacts
+    }
+
+    struct Source: Decodable {
+        let audio: Audio?
+    }
+
+    struct Audio: Decodable {
+        let streamCount: Int
+        let policy: String
+
+        enum CodingKeys: String, CodingKey {
+            case streamCount = "stream_count"
+            case policy
+        }
+    }
+
+    struct GeometryAlignment: Decodable {
+        let requestedWidth: Int
+        let requestedHeight: Int
+        let policy: String
+        let adjusted: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case requestedWidth = "requested_width"
+            case requestedHeight = "requested_height"
+            case policy
+            case adjusted
+        }
+    }
+
+    struct Quality: Decodable {
+        let loopSeam: LoopSeam?
+
+        enum CodingKeys: String, CodingKey {
+            case loopSeam = "loop_seam"
+        }
+    }
+
+    struct LoopSeam: Decodable {
+        let performed: Bool
+        let exactMatch: Bool
+        let differingPixels: Int
+        let policy: String
+
+        enum CodingKeys: String, CodingKey {
+            case performed
+            case exactMatch = "exact_match"
+            case differingPixels = "differing_pixels"
+            case policy
+        }
+    }
 
     struct Geometry: Decodable {
         let width: Int

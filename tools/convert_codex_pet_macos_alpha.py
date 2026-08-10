@@ -147,6 +147,48 @@ def _align_hevc_alpha_geometry(width: int, height: int) -> tuple[int, int]:
     return width - (width % 2), height - (height % 2)
 
 
+def _source_audio_report(info: VideoInfo) -> dict[str, Any]:
+    """Describe the intentional silent-delivery policy without rejecting input."""
+
+    return {
+        "stream_count": len(info.audio_codecs),
+        "codecs": list(info.audio_codecs),
+        "policy": "stripped" if info.audio_codecs else "none",
+    }
+
+
+def _loop_seam_diagnostics(first_rgba: Any, last_rgba: Any) -> dict[str, Any]:
+    """Measure the authored loop seam without turning it into a codec gate."""
+
+    numpy = _numpy_for_loop_seam()
+    if first_rgba.shape != last_rgba.shape:
+        raise AlphaConversionError("loop seam frames have different geometry")
+    difference = numpy.abs(
+        first_rgba.astype(numpy.int16) - last_rgba.astype(numpy.int16)
+    )
+    differing_pixels = int(numpy.count_nonzero(numpy.any(difference != 0, axis=2)))
+    return {
+        "performed": True,
+        "exact_match": differing_pixels == 0,
+        "differing_pixels": differing_pixels,
+        "mean_absolute_error": float(difference.mean()),
+        "maximum_absolute_error": int(difference.max()),
+        "policy": "informational",
+    }
+
+
+def _numpy_for_loop_seam() -> Any:
+    """Return NumPy after the normal dependency guard has run."""
+
+    require_image_dependencies()
+    # Keep NumPy optional at module import time so error-path tests still run on
+    # minimal hosts.  The normal dependency guard above makes this lazy import
+    # safe for both package imports and direct ``python tools/...`` execution.
+    import numpy as numpy
+
+    return numpy
+
+
 def _positive_int(value: str) -> int:
     try:
         result = int(value)
@@ -896,6 +938,8 @@ def _stream_matte_to_prores(
     foreground_total = 0
     max_preclean_edge_alpha = 0
     preclean_edge_contact_total = 0
+    first_rgba: Any | None = None
+    last_rgba: Any | None = None
     try:
         if encoder.stdin is None:
             raise AlphaConversionError("ffmpeg ProRes encoder did not expose stdin")
@@ -941,6 +985,9 @@ def _stream_matte_to_prores(
                         raise AlphaConversionError(
                             "ffmpeg ProRes encoder closed its input"
                         ) from exc
+                    if first_rgba is None:
+                        first_rgba = rgba.copy()
+                    last_rgba = rgba
                     frames_checked += 1
                     if progress is not None:
                         progress.emit(
@@ -1004,6 +1051,8 @@ def _stream_matte_to_prores(
         raise AlphaConversionError("unable to inspect matte alpha reference") from exc
     if reference_size != expected_size:
         raise AlphaConversionError("matte alpha reference has an unexpected size")
+    if first_rgba is None or last_rgba is None:
+        raise AlphaConversionError("source produced no frames for loop seam analysis")
     return {
         "frames_checked": frames_checked,
         "expected_frames": info.frame_count,
@@ -1023,6 +1072,7 @@ def _stream_matte_to_prores(
         },
         "semitransparent_edge_pixels": semitransparent_total,
         "foreground_pixels": foreground_total,
+        "loop_seam": _loop_seam_diagnostics(first_rgba, last_rgba),
         "quality_passed": True,
     }
 
@@ -1517,6 +1567,8 @@ def convert_video(
                 "frames": info.frame_count,
                 "fps": info.fps_text,
                 "duration_seconds": info.duration_seconds,
+                "sample_aspect_ratio": info.sample_aspect_ratio,
+                "audio": _source_audio_report(info),
             },
             "geometry": {"width": width, "height": height},
             "geometry_alignment": geometry_alignment,
@@ -1662,6 +1714,8 @@ def convert_video(
                 "frames": info.frame_count,
                 "fps": info.fps_text,
                 "duration_seconds": info.duration_seconds,
+                "sample_aspect_ratio": info.sample_aspect_ratio,
+                "audio": _source_audio_report(info),
             },
             "geometry": {"width": width, "height": height, "pixel_format": "straight-rgba"},
             "geometry_alignment": geometry_alignment,

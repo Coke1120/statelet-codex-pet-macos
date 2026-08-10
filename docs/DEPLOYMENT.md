@@ -267,11 +267,17 @@ not an ad-hoc-signed app.
 Run the affected checks from the repository root:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
-  tests.test_codex_hook \
-  tests.test_codex_pet_state \
-  tests.test_macos_pet_packaging \
-  tests.test_macos_pet_startup -v
+PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY'
+import unittest
+
+suite = unittest.defaultTestLoader.discover(
+    "tests", pattern="test_*.py"
+)
+result = unittest.TextTestRunner(verbosity=2).run(suite)
+if result.skipped:
+    raise SystemExit(f"Python tests skipped: {result.skipped}")
+raise SystemExit(0 if result.wasSuccessful() else 1)
+PY
 
 swift run -c release --package-path mac/CodexPetMac codex-pet-core-self-test
 swift test -c release --package-path mac/CodexPetMac
@@ -281,11 +287,9 @@ python3 -m json.tool mac/CodexPetMac/Examples/media-map.json >/dev/null
 git diff --check
 ```
 
-After preparing the alpha toolchain, also run:
-
-```bash
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_macos_alpha_video -v
-```
+Prepare the alpha toolchain before running this gate. Test discovery includes
+every `tests/test_*.py` module, including the alpha and native AppKit layout
+suites, and the release gate fails if any test is skipped.
 
 Full `swift test` requires Xcode with XCTest. Command Line Tools alone can build
 the app and run `codex-pet-core-self-test`, but may not provide XCTest.
