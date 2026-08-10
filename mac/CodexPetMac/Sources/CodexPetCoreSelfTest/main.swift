@@ -67,7 +67,100 @@ private func validAlphaReportJSON() -> String {
     """
 }
 
+private func runDialogueVoiceSelfTest() throws {
+    let profileID = UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!
+    let lineID = UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
+    let profile = try GPTSoVITSVoiceProfile(
+        id: profileID,
+        revision: 1,
+        name: "Self-test voice",
+        apiBaseURL: URL(string: "http://127.0.0.1:9880")!,
+        gptWeightRelativePath: "voice/assets/gpt/model.ckpt",
+        sovitsWeightRelativePath: "voice/assets/sovits/model.pth",
+        referenceAudioRelativePath: "voice/assets/reference/reference.wav",
+        referenceText: "Reference",
+        promptLanguage: "en",
+        defaultTextLanguage: "en",
+        inputFingerprint: String(repeating: "a", count: 64)
+    )
+    var library = try DialogueVoiceLibrary(profile: profile)
+    _ = try library.addLine(text: "Hello", id: lineID)
+    let staleTicket = try library.beginGeneration(for: lineID)
+    _ = try library.editLine(id: lineID, text: "Hello again")
+    try requiresError("late dialogue generation result was accepted") {
+        _ = try library.completeGeneration(ticket: staleTicket, outputPath: "voice/generated/late.wav")
+    }
+    let currentTicket = try library.beginGeneration(for: lineID)
+    _ = try library.completeGeneration(
+        ticket: currentTicket,
+        outputPath: "voice/generated/current.wav"
+    )
+    try require(library.lines.first?.status == .ready, "dialogue output did not become ready")
+    let resolvedOutput = try library.outputURL(
+        for: lineID,
+        relativeTo: URL(fileURLWithPath: "/managed/root")
+    )
+    try require(
+        resolvedOutput.path == "/managed/root/voice/generated/current.wav",
+        "ready dialogue output did not resolve inside the managed root"
+    )
+    try requiresError("cleanup accepted the active GPT weight") {
+        try library.enqueueCleanup(paths: [profile.gptWeightRelativePath])
+    }
+    try requiresError("cleanup accepted the current dialogue output") {
+        try library.enqueueCleanup(paths: ["voice/generated/current.wav"])
+    }
+    try requiresError("library accepted an overlapping cleanup tombstone") {
+        _ = try DialogueVoiceLibrary(
+            profile: profile,
+            lines: library.lines,
+            pendingCleanupPaths: ["voice/generated/current.wav"]
+        )
+    }
+
+    var collidingOutputLibrary = try DialogueVoiceLibrary(profile: profile)
+    _ = try collidingOutputLibrary.addLine(text: "Collision", id: UUID())
+    try collidingOutputLibrary.enqueueCleanup(paths: ["voice/generated/collision.wav"])
+    let collidingTicket = try collidingOutputLibrary.beginGeneration(
+        for: collidingOutputLibrary.lines[0].id
+    )
+    try requiresError("generation published an output queued for cleanup") {
+        _ = try collidingOutputLibrary.completeGeneration(
+            ticket: collidingTicket,
+            outputPath: "voice/generated/collision.wav"
+        )
+    }
+    try requiresError("remote voice endpoint was accepted") {
+        _ = try GPTSoVITSVoiceProfile(
+            name: "Remote",
+            apiBaseURL: URL(string: "http://example.com:9880")!,
+            gptWeightRelativePath: "voice/assets/gpt/model.ckpt",
+            sovitsWeightRelativePath: "voice/assets/sovits/model.pth",
+            referenceAudioRelativePath: "voice/assets/reference/reference.wav",
+            referenceText: "Reference",
+            promptLanguage: "en",
+            defaultTextLanguage: "en",
+            inputFingerprint: String(repeating: "a", count: 64)
+        )
+    }
+
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("statelet-dialogue-self-test-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = DialogueVoiceStore(rootURL: root)
+    try store.save(library)
+    let loadedLibrary = try store.load()
+    try require(loadedLibrary == library, "dialogue voice store did not round-trip")
+    let directoryMode = try FileManager.default.attributesOfItem(atPath: root.path)[.posixPermissions]
+        as? NSNumber
+    let fileMode = try FileManager.default.attributesOfItem(atPath: store.fileURL.path)[.posixPermissions]
+        as? NSNumber
+    try require(((directoryMode?.intValue ?? 0) & 0o777) == 0o700, "dialogue store directory is not private")
+    try require(((fileMode?.intValue ?? 0) & 0o777) == 0o600, "dialogue store file is not private")
+}
+
 private func runSelfTest() throws {
+    try runDialogueVoiceSelfTest()
     var progressParser = AlphaConversionProgressParser()
     let noiseProgress = try progressParser.parseLine("converter startup noise")
     try require(noiseProgress == nil, "progress parser accepted noise")

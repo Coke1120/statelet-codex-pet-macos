@@ -32,5 +32,10 @@ let package = Package(
             dependencies: ["CodexPetCore"],
             path: "Tests/CodexPetCoreTests"
         ),
+        .testTarget(
+            name: "CodexPetMacTests",
+            dependencies: ["CodexPetMac", "CodexPetCore"],
+            path: "Tests/CodexPetMacTests"
+        ),
     ]
 )
