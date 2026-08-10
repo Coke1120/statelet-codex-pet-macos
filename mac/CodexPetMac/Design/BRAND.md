@@ -4,7 +4,7 @@
 
 **Statelet**
 
-Descriptor: **A living Codex Pet state companion for macOS**
+Descriptor: **A living Codex lifecycle companion for macOS**
 
 Traditional Chinese positioning: **把 Codex 的工作狀態變成桌面上有生命感的小夥伴。**
 

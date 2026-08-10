@@ -1,14 +1,14 @@
 import Foundation
 
-/// Manages only Codex Pet's marked macOS player LaunchAgent.
+/// Manages only Statelet's marked macOS player LaunchAgent.
 ///
 /// This type deliberately does not inspect or change lifecycle hooks, the state
 /// aggregator, or the hardware/Serial service. Callers should present
 /// `LaunchAtLoginStatus.summary` directly; it never contains an absolute path.
 struct LaunchAtLoginManager {
-    static let playerLabel = "com.coke1120.codex-pet.mac-player"
-    static let bundleIdentifier = "com.coke1120.CodexPetMac"
-    static let managedMarker = "mac-widget-v1"
+    static let playerLabel = StateletIdentity.playerLaunchAgentLabel
+    static let bundleIdentifier = StateletIdentity.bundleIdentifier
+    static let managedMarker = StateletIdentity.managedMarker
 
     enum State: Equatable {
         case missing
@@ -72,7 +72,7 @@ struct LaunchAtLoginManager {
         var errorDescription: String? {
             switch self {
             case .invalidInstalledApp:
-                return "The installed Statelet.app could not be verified."
+                return "The installed \(StateletIdentity.appBundleName) could not be verified."
             case .unmanagedPlist:
                 return "The startup item is not managed by Statelet and was not changed."
             case .malformedPlist:
@@ -178,7 +178,10 @@ struct LaunchAtLoginManager {
     }
 
     private var supportURL: URL {
-        homeURL.appendingPathComponent("Library/Application Support/CodexPet", isDirectory: true)
+        homeURL.appendingPathComponent(
+            StateletIdentity.applicationSupportRelativePath,
+            isDirectory: true
+        )
     }
 
     private var launchAgentsURL: URL {
@@ -190,11 +193,16 @@ struct LaunchAtLoginManager {
     }
 
     private var installedAppURL: URL {
-        homeURL.appendingPathComponent("Applications/Statelet.app", isDirectory: true)
+        homeURL.appendingPathComponent(
+            "Applications/\(StateletIdentity.appBundleName)",
+            isDirectory: true
+        )
     }
 
     private var executableURL: URL {
-        installedAppURL.appendingPathComponent("Contents/MacOS/CodexPetMac")
+        installedAppURL.appendingPathComponent(
+            "Contents/MacOS/\(StateletIdentity.executableName)"
+        )
     }
 
     private struct PlistInspection {
@@ -224,7 +232,10 @@ struct LaunchAtLoginManager {
         else {
             return PlistInspection(state: .malformed, payload: nil)
         }
-        guard payload["CodexPetMacManaged"] as? String == Self.managedMarker else {
+        guard
+            let marker = payload[StateletIdentity.launchAgentManagedPlistKey] as? String,
+            marker == Self.managedMarker
+        else {
             return PlistInspection(state: .unmanaged, payload: payload)
         }
         guard plistMatchesInstallerSchema(payload) else {
@@ -270,7 +281,7 @@ struct LaunchAtLoginManager {
 
     private func installerPayload(enabled: Bool) -> [String: Any] {
         [
-            "CodexPetMacManaged": Self.managedMarker,
+            StateletIdentity.launchAgentManagedPlistKey: Self.managedMarker,
             "ProcessType": "Interactive",
             "RunAtLoad": enabled,
             "ThrottleInterval": 10,
@@ -284,7 +295,10 @@ struct LaunchAtLoginManager {
     }
 
     private func installedAppIsValid() -> Bool {
-        let expected = homeURL.appendingPathComponent("Applications/Statelet.app", isDirectory: true)
+        let expected = homeURL.appendingPathComponent(
+            "Applications/\(StateletIdentity.appBundleName)",
+            isDirectory: true
+        )
             .standardizedFileURL
         guard installedAppURL.standardizedFileURL == expected else { return false }
         let infoURL = installedAppURL.appendingPathComponent("Contents/Info.plist")
@@ -293,7 +307,7 @@ struct LaunchAtLoginManager {
             let object = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
             let info = object as? [String: Any],
             info["CFBundleIdentifier"] as? String == Self.bundleIdentifier,
-            info["CodexPetManaged"] as? String == Self.managedMarker,
+            info[StateletIdentity.appManagedPlistKey] as? String == Self.managedMarker,
             fileManager.isExecutableFile(atPath: executableURL.path)
         else { return false }
         return true
@@ -382,7 +396,10 @@ struct LaunchAtLoginManager {
                 ),
                 let payload = object as? [String: Any]
             else { throw ManagerError.snapshotFailed }
-            guard payload["CodexPetMacManaged"] as? String == Self.managedMarker else {
+            guard
+                let marker = payload[StateletIdentity.launchAgentManagedPlistKey] as? String,
+                marker == Self.managedMarker
+            else {
                 throw ManagerError.unmanagedPlist
             }
             let attributes = try fileManager.attributesOfItem(atPath: playerPlistURL.path)

@@ -1,4 +1,4 @@
-# Use Statelet, the Codex Pet for macOS
+# Use Statelet on macOS
 
 Statelet presents Codex lifecycle activity as a transparent animated companion.
 This guide covers first run, animation libraries, conversion, controls,

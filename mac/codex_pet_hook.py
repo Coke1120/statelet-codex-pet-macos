@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Translate Codex lifecycle hooks into small, privacy-safe Codex Pet state files.
+"""Translate Codex lifecycle hooks into small, privacy-safe Statelet state files.
 
 Codex sends one JSON object on stdin. This hook deliberately stores only a
 hashed session key, the mapped pet state, event name, and timestamp. It never
@@ -116,7 +116,7 @@ def main() -> int:
         write_event(payload, default_state_dir())
     except Exception as exc:
         # Lifecycle display failures must never block or alter a Codex turn.
-        print("Codex Pet hook warning: {}".format(exc), file=sys.stderr)
+        print("Statelet hook warning: {}".format(exc), file=sys.stderr)
     # Stop and UserPromptSubmit require valid JSON output when stdout is used.
     print("{}")
     return 0

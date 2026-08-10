@@ -131,6 +131,22 @@ DEFAULT_PRESET = "PresetHEVCHighestQualityWithAlpha"
 ROUNDTRIP_PRESET = "PresetAppleProRes4444LPCM"
 
 
+def _align_hevc_alpha_geometry(width: int, height: int) -> tuple[int, int]:
+    """Floor each canvas dimension to the even geometry Apple preserves.
+
+    ``avconvert`` silently removes the final row or column from odd-sized
+    ProRes inputs when producing HEVC with alpha.  Aligning before matting
+    keeps the reference alpha, intermediate, delivery, and report bound to
+    one exact geometry instead of weakening the post-encode verification.
+    """
+
+    if width < 4 or height < 4:
+        raise AlphaConversionError(
+            "HEVC alpha output dimensions must be at least 4 pixels"
+        )
+    return width - (width % 2), height - (height % 2)
+
+
 def _positive_int(value: str) -> int:
     try:
         result = int(value)
@@ -1025,7 +1041,10 @@ def _verify_basic_info(
             f"{label} codec is {actual.codec_name}, expected {expected_codec}"
         )
     if actual.width != expected.width or actual.height != expected.height:
-        raise FrameQualityError(f"{label} geometry does not match the source")
+        raise FrameQualityError(
+            f"{label} geometry is {actual.width}x{actual.height}; "
+            f"expected {expected.width}x{expected.height}"
+        )
     if actual.frame_count != expected.frame_count:
         raise FrameQualityError(
             f"{label} contains {actual.frame_count} frames; expected {expected.frame_count}"
@@ -1456,8 +1475,18 @@ def convert_video(
     progress.emit(5, stage="probe", message="Probing source video")
     info = probe_video(source, ffprobe=ffprobe)
     progress.emit(10, stage="probe", message="Source video probe complete")
-    width = args.width or info.width
-    height = args.height or info.height
+    requested_width = args.width or info.width
+    requested_height = args.height or info.height
+    width, height = _align_hevc_alpha_geometry(
+        requested_width,
+        requested_height,
+    )
+    geometry_alignment = {
+        "requested_width": requested_width,
+        "requested_height": requested_height,
+        "policy": "floor_to_even",
+        "adjusted": width != requested_width or height != requested_height,
+    }
 
     if args.dry_run:
         decode_command = build_ffmpeg_decode_command(
@@ -1490,6 +1519,7 @@ def convert_video(
                 "duration_seconds": info.duration_seconds,
             },
             "geometry": {"width": width, "height": height},
+            "geometry_alignment": geometry_alignment,
             "source_framing": {
                 "resize_mode": SOURCE_RESIZE_MODE,
                 "strict": bool(args.strict_source_framing),
@@ -1634,6 +1664,7 @@ def convert_video(
                 "duration_seconds": info.duration_seconds,
             },
             "geometry": {"width": width, "height": height, "pixel_format": "straight-rgba"},
+            "geometry_alignment": geometry_alignment,
             "source_framing": {
                 "resize_mode": SOURCE_RESIZE_MODE,
                 "strict": bool(args.strict_source_framing),

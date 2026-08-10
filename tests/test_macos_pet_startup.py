@@ -36,11 +36,30 @@ class MacPetStartupTests(unittest.TestCase):
                     @main
                     struct StartupHarness {
                         static func main() throws {
+                            guard StateletIdentity.appBundleName == "Statelet.app",
+                                  StateletIdentity.executableName == "CodexPetMac",
+                                  StateletIdentity.bundleIdentifier == "com.coke1120.CodexPetMac",
+                                  StateletIdentity.applicationSupportRelativePath
+                                      == "Library/Application Support/CodexPet",
+                                  StateletIdentity.playerLaunchAgentLabel
+                                      == "com.coke1120.codex-pet.mac-player",
+                                  StateletIdentity.aggregatorLaunchAgentLabel
+                                      == "com.coke1120.codex-pet.state-aggregator",
+                                  StateletIdentity.appManagedPlistKey == "CodexPetManaged",
+                                  StateletIdentity.launchAgentManagedPlistKey == "CodexPetMacManaged",
+                                  StateletIdentity.managedMarker == "mac-widget-v1" else {
+                                throw HarnessFailure.failed("compatibility identifiers")
+                            }
                             let home = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
                             let fm = FileManager.default
-                            let app = home.appendingPathComponent("Applications/Statelet.app", isDirectory: true)
+                            let app = home.appendingPathComponent(
+                                "Applications/\(StateletIdentity.appBundleName)",
+                                isDirectory: true
+                            )
                             let contents = app.appendingPathComponent("Contents", isDirectory: true)
-                            let executable = contents.appendingPathComponent("MacOS/CodexPetMac")
+                            let executable = contents.appendingPathComponent(
+                                "MacOS/\(StateletIdentity.executableName)"
+                            )
                             try fm.createDirectory(
                                 at: executable.deletingLastPathComponent(),
                                 withIntermediateDirectories: true
@@ -51,7 +70,7 @@ class MacPetStartupTests(unittest.TestCase):
                             }
                             let info: [String: Any] = [
                                 "CFBundleIdentifier": LaunchAtLoginManager.bundleIdentifier,
-                                "CodexPetManaged": LaunchAtLoginManager.managedMarker,
+                                StateletIdentity.appManagedPlistKey: LaunchAtLoginManager.managedMarker,
                             ]
                             let infoData = try PropertyListSerialization.data(
                                 fromPropertyList: info,
@@ -66,7 +85,7 @@ class MacPetStartupTests(unittest.TestCase):
                                 "\(LaunchAtLoginManager.playerLabel).plist"
                             )
                             let stale: [String: Any] = [
-                                "CodexPetMacManaged": LaunchAtLoginManager.managedMarker,
+                                StateletIdentity.launchAgentManagedPlistKey: LaunchAtLoginManager.managedMarker,
                                 "Label": LaunchAtLoginManager.playerLabel,
                                 "RunAtLoad": false,
                             ]
@@ -173,6 +192,7 @@ class MacPetStartupTests(unittest.TestCase):
             compiled = subprocess.run(
                 [
                     swiftc,
+                    str(SOURCES / "StateletIdentity.swift"),
                     str(SOURCES / "LaunchAtLoginManager.swift"),
                     str(SOURCES / "PetDiagnostics.swift"),
                     str(harness),

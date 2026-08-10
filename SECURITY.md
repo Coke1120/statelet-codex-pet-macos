@@ -1,7 +1,7 @@
 # Security policy
 
-Statelet is a local macOS companion for Codex Pet. Security reports are welcome
-for the current `main` branch and the latest published release.
+Statelet is a local macOS lifecycle companion for Codex. Security reports are
+welcome for the current `main` branch and the latest published release.
 
 ## Reporting a vulnerability
 

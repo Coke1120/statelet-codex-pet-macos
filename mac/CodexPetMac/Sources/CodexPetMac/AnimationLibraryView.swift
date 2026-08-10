@@ -2,6 +2,11 @@ import AppKit
 import CodexPetCore
 import Darwin
 
+private enum AnimationLibraryLayout {
+    static let importStripHeight: CGFloat = 48
+    static let minimumClipListHeight: CGFloat = 160
+}
+
 enum MP4ImportURLValidation {
     case accepted([URL])
     case rejected(String)
@@ -240,6 +245,7 @@ private final class LibraryActionCell: NSTableCellView {
 private final class MP4DropZoneView: NSView {
     var onImport: (([URL]) -> Void)?
 
+    private let iconView = NSImageView()
     private let titleLabel = NSTextField(labelWithString: "")
     private let detailLabel = NSTextField(wrappingLabelWithString: "")
     private var selectedState: PetState = .idle
@@ -253,24 +259,42 @@ private final class MP4DropZoneView: NSView {
         super.init(frame: frameRect)
         translatesAutoresizingMaskIntoConstraints = false
         registerForDraggedTypes([.fileURL, .URL])
+        iconView.image = NSImage(
+            systemSymbolName: "square.and.arrow.down",
+            accessibilityDescription: nil
+        )
+        iconView.contentTintColor = .secondaryLabelColor
+        iconView.setAccessibilityElement(false)
         titleLabel.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
-        titleLabel.alignment = .center
+        titleLabel.alignment = .left
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.maximumNumberOfLines = 1
         detailLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         detailLabel.textColor = .secondaryLabelColor
-        detailLabel.alignment = .center
-        detailLabel.maximumNumberOfLines = 2
-        let stack = NSStackView(views: [titleLabel, detailLabel])
-        stack.orientation = .vertical
-        stack.alignment = .centerX
-        stack.spacing = 2
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(stack)
+        detailLabel.alignment = .left
+        detailLabel.lineBreakMode = .byTruncatingTail
+        detailLabel.maximumNumberOfLines = 1
+        detailLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let textStack = NSStackView(views: [titleLabel, detailLabel])
+        textStack.orientation = .vertical
+        textStack.alignment = .leading
+        textStack.spacing = 1
+        let contentStack = NSStackView(views: [iconView, textStack])
+        contentStack.orientation = .horizontal
+        contentStack.alignment = .centerY
+        contentStack.spacing = 10
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(contentStack)
         NSLayoutConstraint.activate([
-            heightAnchor.constraint(greaterThanOrEqualToConstant: 64),
-            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
-            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
-            stack.centerYAnchor.constraint(equalTo: centerYAnchor),
+            heightAnchor.constraint(equalToConstant: AnimationLibraryLayout.importStripHeight),
+            iconView.widthAnchor.constraint(equalToConstant: 18),
+            iconView.heightAnchor.constraint(equalToConstant: 18),
+            contentStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            contentStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            contentStack.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
+        setContentHuggingPriority(.required, for: .vertical)
+        setContentCompressionResistancePriority(.required, for: .vertical)
         setAccessibilityElement(true)
         setAccessibilityRole(.group)
         updatePresentation(resetMessage: true)
@@ -304,24 +328,29 @@ private final class MP4DropZoneView: NSView {
     }
 
     private func updatePresentation(resetMessage: Bool) {
-        titleLabel.stringValue = "Drop MP4s for \(selectedState.displayName)"
+        titleLabel.stringValue = "Drop MP4s into \(selectedState.displayName)"
         if resetMessage {
             if busy {
-                detailLabel.stringValue = "Import is disabled while the current media operation finishes."
+                setDetailMessage("Import is disabled while the current media operation finishes.")
             } else if !importEnabled {
-                detailLabel.stringValue = "Conversion tools must be ready before MP4s can be dropped."
+                setDetailMessage("Conversion tools must be ready before MP4s can be dropped.")
             } else {
-                detailLabel.stringValue = "Drop one or more local .mp4 files, or use Add Clip."
+                setDetailMessage(
+                    "or choose Add Clip…",
+                    accessibilityHelp: "Drop local MP4 files from Finder. Files are imported in their dropped order."
+                )
             }
         }
         setAccessibilityLabel("Drop MP4s for \(selectedState.displayName) animations")
-        setAccessibilityHelp(
-            busy
-                ? "Wait for the current media operation to finish."
-                : "Drop local MP4 files from Finder. Files are imported in their dropped order."
-        )
         alphaValue = importEnabled && !busy ? 1 : 0.65
         needsDisplay = true
+    }
+
+    private func setDetailMessage(_ message: String, accessibilityHelp: String? = nil) {
+        detailLabel.stringValue = message
+        detailLabel.toolTip = message
+        toolTip = message
+        setAccessibilityHelp(accessibilityHelp ?? message)
     }
 
     private func draggedURLs(from pasteboard: NSPasteboard) -> [URL]? {
@@ -333,22 +362,24 @@ private final class MP4DropZoneView: NSView {
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         guard importEnabled, !busy else {
-            detailLabel.stringValue = busy
-                ? "Wait for the current media operation to finish."
-                : "Conversion tools are not ready."
+            setDetailMessage(
+                busy
+                    ? "Wait for the current media operation to finish."
+                    : "Conversion tools are not ready."
+            )
             return []
         }
         guard let urls = draggedURLs(from: sender.draggingPasteboard) else {
-            detailLabel.stringValue = "Nothing imported: drop local MP4 files from Finder."
+            setDetailMessage("Nothing imported: drop local MP4 files from Finder.")
             return []
         }
         isDragHighlighted = true
         switch MP4ImportURLValidator.validate(urls) {
         case let .accepted(accepted):
-            detailLabel.stringValue = "Release to import \(accepted.count) MP4\(accepted.count == 1 ? "" : "s") into \(selectedState.displayName)."
+            setDetailMessage("Release to import \(accepted.count) MP4\(accepted.count == 1 ? "" : "s") into \(selectedState.displayName).")
             return .copy
         case let .rejected(reason):
-            detailLabel.stringValue = "Nothing will be imported: \(reason)"
+            setDetailMessage("Nothing will be imported: \(reason)")
             return []
         }
     }
@@ -365,16 +396,16 @@ private final class MP4DropZoneView: NSView {
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         isDragHighlighted = false
         guard importEnabled, !busy, let urls = draggedURLs(from: sender.draggingPasteboard) else {
-            detailLabel.stringValue = "Nothing imported: drop local MP4 files from Finder."
+            setDetailMessage("Nothing imported: drop local MP4 files from Finder.")
             return false
         }
         switch MP4ImportURLValidator.validate(urls) {
         case let .accepted(accepted):
-            detailLabel.stringValue = "Starting import of \(accepted.count) MP4\(accepted.count == 1 ? "" : "s") into \(selectedState.displayName)…"
+            setDetailMessage("Starting import of \(accepted.count) MP4\(accepted.count == 1 ? "" : "s") into \(selectedState.displayName)…")
             onImport?(accepted)
             return true
         case let .rejected(reason):
-            detailLabel.stringValue = "Nothing imported: \(reason)"
+            setDetailMessage("Nothing imported: \(reason)")
             return false
         }
     }
@@ -403,6 +434,8 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
     )
     private let addClip = NSPopUpButton()
     private let dropZone = MP4DropZoneView()
+    private let clipsSectionTitle = NSTextField(labelWithString: "CLIPS")
+    private let clipsCountLabel = NSTextField(labelWithString: "0 clips")
     private let tableView = NSTableView()
     private let clipsScrollView = NSScrollView()
     private let emptyLabel = NSTextField(wrappingLabelWithString: "No clips for this state. Add an MP4 to convert, or add a verified transparent MOV.")
@@ -443,6 +476,9 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
         modeControl.setAccessibilityLabel("Playback mode")
         modeHelp.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         modeHelp.textColor = .secondaryLabelColor
+        modeHelp.maximumNumberOfLines = 1
+        modeHelp.lineBreakMode = .byTruncatingTail
+        modeHelp.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         addClip.addItem(withTitle: "Add Clip…")
         addClip.menu?.addItem(.separator())
@@ -468,6 +504,21 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
         header.alignment = .centerY
         header.distribution = .fill
 
+        clipsSectionTitle.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
+        clipsSectionTitle.textColor = .secondaryLabelColor
+        clipsSectionTitle.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        clipsCountLabel.font = .monospacedDigitSystemFont(
+            ofSize: NSFont.smallSystemFontSize,
+            weight: .regular
+        )
+        clipsCountLabel.textColor = .secondaryLabelColor
+        clipsCountLabel.alignment = .right
+        clipsCountLabel.setContentHuggingPriority(.required, for: .horizontal)
+        let clipsHeader = NSStackView(views: [clipsSectionTitle, clipsCountLabel])
+        clipsHeader.orientation = .horizontal
+        clipsHeader.alignment = .centerY
+        clipsHeader.distribution = .fill
+
         configureTable()
 
         emptyLabel.alignment = .center
@@ -482,7 +533,11 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
 
         let detail = NSView()
         detail.translatesAutoresizingMaskIntoConstraints = false
-        for view in [header, stateDescription, modeHelp, continuousRotationCheckbox, dropZone, clipsScrollView, emptyStack] { view.translatesAutoresizingMaskIntoConstraints = false; detail.addSubview(view) }
+        for view in [header, stateDescription, modeHelp, continuousRotationCheckbox, dropZone, clipsHeader, clipsScrollView, emptyStack] { view.translatesAutoresizingMaskIntoConstraints = false; detail.addSubview(view) }
+        let minimumClipListHeight = clipsScrollView.heightAnchor.constraint(
+            greaterThanOrEqualToConstant: AnimationLibraryLayout.minimumClipListHeight
+        )
+        minimumClipListHeight.priority = NSLayoutConstraint.Priority(999)
         NSLayoutConstraint.activate([
             header.topAnchor.constraint(equalTo: detail.topAnchor),
             header.leadingAnchor.constraint(equalTo: detail.leadingAnchor),
@@ -499,10 +554,14 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
             dropZone.topAnchor.constraint(equalTo: continuousRotationCheckbox.bottomAnchor, constant: 8),
             dropZone.leadingAnchor.constraint(equalTo: detail.leadingAnchor),
             dropZone.trailingAnchor.constraint(equalTo: detail.trailingAnchor),
-            clipsScrollView.topAnchor.constraint(equalTo: dropZone.bottomAnchor, constant: 8),
+            clipsHeader.topAnchor.constraint(equalTo: dropZone.bottomAnchor, constant: 8),
+            clipsHeader.leadingAnchor.constraint(equalTo: detail.leadingAnchor),
+            clipsHeader.trailingAnchor.constraint(equalTo: detail.trailingAnchor),
+            clipsScrollView.topAnchor.constraint(equalTo: clipsHeader.bottomAnchor, constant: 4),
             clipsScrollView.leadingAnchor.constraint(equalTo: detail.leadingAnchor),
             clipsScrollView.trailingAnchor.constraint(equalTo: detail.trailingAnchor),
             clipsScrollView.bottomAnchor.constraint(equalTo: detail.bottomAnchor),
+            minimumClipListHeight,
             emptyStack.centerXAnchor.constraint(equalTo: clipsScrollView.centerXAnchor),
             emptyStack.centerYAnchor.constraint(equalTo: clipsScrollView.centerYAnchor),
             emptyStack.widthAnchor.constraint(lessThanOrEqualTo: clipsScrollView.widthAnchor, constant: -60),
@@ -552,6 +611,11 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
         clipsScrollView.backgroundColor = .controlBackgroundColor
         clipsScrollView.documentView = tableView
         clipsScrollView.translatesAutoresizingMaskIntoConstraints = false
+        clipsScrollView.setContentHuggingPriority(.defaultLow, for: .vertical)
+        clipsScrollView.setContentCompressionResistancePriority(
+            NSLayoutConstraint.Priority(999),
+            for: .vertical
+        )
     }
 
     private func addColumn(
@@ -618,6 +682,8 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
                 ? "Use clips in their listed order, continuing to the next clip whenever one ends."
                 : "Use clips in their listed order each time this state begins."
         }
+        modeHelp.toolTip = modeHelp.stringValue
+        modeHelp.setAccessibilityHelp(modeHelp.stringValue)
         continuousRotationCheckbox.state = playlist?.advanceOn == .clipEnd ? .on : .off
         let canContinuouslyRotate = playlist?.mode != .fixed && (playlist?.entries.count ?? 0) > 1
         continuousRotationCheckbox.isEnabled = canContinuouslyRotate && !busy
@@ -648,6 +714,10 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
                 busy: busy
             )
         }
+        let clipNoun = clipRows.count == 1 ? "clip" : "clips"
+        clipsCountLabel.stringValue = "\(clipRows.count) \(clipNoun)"
+        clipsCountLabel.setAccessibilityLabel("\(clipRows.count) \(clipNoun) for \(selectedState.displayName)")
+        tableView.setAccessibilityLabel("\(selectedState.displayName) animation clips")
         tableView.reloadData()
         if let selectedPath, let selectedIndex = clipRows.firstIndex(where: { $0.entry.path == selectedPath }) {
             tableView.selectRowIndexes(IndexSet(integer: selectedIndex), byExtendingSelection: false)

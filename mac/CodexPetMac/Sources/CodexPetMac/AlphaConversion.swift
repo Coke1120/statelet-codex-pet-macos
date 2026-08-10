@@ -144,7 +144,9 @@ final class AlphaToolchainDiscovery {
         let home = fileManager.homeDirectoryForCurrentUser
         candidates.append(
             home
-                .appendingPathComponent("Library/Application Support/CodexPet/alpha-runtime/bin/python3")
+                .appendingPathComponent(
+                    "\(StateletIdentity.applicationSupportRelativePath)/alpha-runtime/bin/python3"
+                )
         )
         candidates.append(
             home
@@ -266,7 +268,10 @@ private final class LockedProgressProtocolState: @unchecked Sendable {
 }
 
 final class AlphaConversionCoordinator {
-    private let queue = DispatchQueue(label: "com.coke1120.CodexPetMac.alpha-conversion", qos: .userInitiated)
+    private let queue = DispatchQueue(
+        label: "\(StateletIdentity.bundleIdentifier).alpha-conversion",
+        qos: .userInitiated
+    )
     private let lock = NSLock()
     private var activeProcess: Process?
     private var activeProcessGroupPID: pid_t?

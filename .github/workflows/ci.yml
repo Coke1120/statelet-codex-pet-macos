@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: Check out Codex Pet companion
+      - name: Check out Statelet
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up Python 3.9

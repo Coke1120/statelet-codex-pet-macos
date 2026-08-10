@@ -53,6 +53,7 @@ media-map.json
 *.log
 
 # Private or generated animation media
+/prompts/
 private-assets/
 private-media/
 media/

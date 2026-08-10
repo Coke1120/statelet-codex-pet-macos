@@ -167,7 +167,10 @@ esac
         self.assertEqual(info["CFBundleIdentifier"], "com.coke1120.CodexPetMac")
         self.assertEqual(info["CFBundleDisplayName"], "Statelet")
         self.assertEqual(info["CFBundleIconFile"], "Statelet.icns")
-        self.assertIn("Codex Pet", info["CFBundleGetInfoString"])
+        self.assertEqual(
+            info["CFBundleGetInfoString"],
+            "Statelet — a local-first Codex lifecycle companion for macOS",
+        )
         self.assertEqual(
             info["NSHumanReadableCopyright"],
             "Copyright © 2026 Statelet contributors. MIT licensed.",
@@ -222,6 +225,14 @@ esac
         install_source = INSTALL_SCRIPT.read_text(encoding="utf-8")
         self.assertIn('app_bundle="$package_dir/dist/Statelet.app"', install_source)
         self.assertIn('app_dest="$applications_dir/Statelet.app"', install_source)
+
+    def test_readmes_use_statelet_as_the_product_name(self) -> None:
+        for readme in (ROOT / "README.md", PACKAGE / "README.md"):
+            with self.subTest(readme=readme.relative_to(ROOT)):
+                source = readme.read_text(encoding="utf-8")
+                self.assertTrue(source.startswith("# Statelet"))
+                self.assertNotIn("Codex Pet for macOS", source)
+                self.assertNotIn("Codex Pet Mac", source)
 
     def test_runtime_converter_cannot_mutate_signed_bundle_with_python_bytecode(self) -> None:
         source = ALPHA_COORDINATOR.read_text(encoding="utf-8")

@@ -1,4 +1,4 @@
-# Deploy Statelet, the Codex Pet for macOS
+# Deploy Statelet on macOS
 
 This guide covers building, installing, upgrading, starting automatically, and
 uninstalling Statelet 1.6.0 (build 11) on macOS 13 or newer.

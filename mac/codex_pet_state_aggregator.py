@@ -175,7 +175,7 @@ class InstanceLock:
         except BlockingIOError as exc:
             self.handle.close()
             self.handle = None
-            raise RuntimeError("another Codex Pet state aggregator is running") from exc
+            raise RuntimeError("another Statelet state aggregator is running") from exc
         return self
 
     def __exit__(self, _type, _value, _traceback) -> None:
@@ -313,7 +313,7 @@ def main() -> int:
                 lambda: stopped,
             )
     except (OSError, RuntimeError) as exc:
-        print("Codex Pet state aggregator error: {}".format(exc), file=sys.stderr)
+        print("Statelet state aggregator error: {}".format(exc), file=sys.stderr)
         return 1
 
 

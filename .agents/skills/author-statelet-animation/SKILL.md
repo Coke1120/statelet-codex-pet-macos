@@ -1,6 +1,6 @@
 ---
 name: author-statelet-animation
-description: Author, convert, and verify local animation media for Statelet, the macOS Codex Pet companion. Use when preparing a Statelet lifecycle MP4, producing HEVC-with-alpha MOV output, validating conversion reports, or importing verified media into the macOS app.
+description: Author, convert, and verify local animation media for Statelet, the macOS lifecycle companion for Codex. Use when preparing a Statelet lifecycle MP4, producing HEVC-with-alpha MOV output, validating conversion reports, or importing verified media into the macOS app.
 ---
 
 # Author Statelet animation
@@ -33,6 +33,6 @@ Use only media the user owns or is authorized to adapt and distribute.
 Use default quality thresholds unless a repository change explicitly updates
 the contract and tests. Never weaken a gate merely to make a candidate pass.
 
-Preserve the stable Codex Pet bundle identifier, executable, Application Support
+Preserve the stable legacy bundle identifier, executable, Application Support
 directory, preference keys, and LaunchAgent labels; they remain intentionally
 unchanged for Statelet upgrade compatibility.

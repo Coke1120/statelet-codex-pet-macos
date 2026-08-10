@@ -29,5 +29,5 @@ icon, or visual identity has not been performed.
 | `statelet-menubar-template.svg` | `272d5df8eec1524e822b63a0b82e258401fed7369a1dcf88f3613029e5815501` |
 | `StateletMenuBarTemplate.pdf` | `e55b70bd0c663419f3e3a86627ade00cc89b22f3cc21f5e33e99cd01c28dd74b` |
 
-The artwork is product identity for Statelet, a macOS Codex Pet companion. It
-does not include third-party animation media.
+The artwork is product identity for Statelet, a macOS lifecycle companion for
+Codex. It does not include third-party animation media.

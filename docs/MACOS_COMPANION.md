@@ -1,8 +1,9 @@
 # Statelet lifecycle and media reference
 
 This reference documents the internal contracts behind Statelet 1.6.0 (build
-11), the native Codex Pet for macOS. Start with [Deployment](DEPLOYMENT.md) for
-installation or [Using Statelet](USAGE.md) for daily operation.
+11), the native Codex lifecycle companion for macOS. Start with
+[Deployment](DEPLOYMENT.md) for installation or [Using Statelet](USAGE.md) for
+daily operation.
 
 ## Product boundary
 

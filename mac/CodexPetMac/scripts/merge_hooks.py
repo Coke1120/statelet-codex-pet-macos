@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage an additive, duplicate-free Codex Pet lifecycle hook configuration."""
+"""Stage an additive, duplicate-free Statelet lifecycle hook configuration."""
 
 from __future__ import annotations
 

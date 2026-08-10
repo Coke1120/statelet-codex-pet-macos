@@ -11,7 +11,7 @@
 	<key>CFBundleIconFile</key>
 	<string>Statelet.icns</string>
 	<key>CFBundleGetInfoString</key>
-	<string>Statelet — a local-first Codex Pet companion for macOS</string>
+	<string>Statelet — a local-first Codex lifecycle companion for macOS</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.coke1120.CodexPetMac</string>
 	<key>CFBundleInfoDictionaryVersion</key>

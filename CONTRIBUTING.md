@@ -1,6 +1,7 @@
 # Contributing to Statelet
 
-Thank you for improving Statelet, the macOS Codex Pet companion.
+Thank you for improving Statelet, the local-first Codex lifecycle companion for
+macOS.
 
 ## Project scope
 
@@ -38,9 +39,9 @@ codesign --verify --deep --strict mac/CodexPetMac/dist/Statelet.app
 ## Compatibility contract
 
 The user-visible product name is Statelet. The existing technical identifiers
-remain intentionally stable so Codex Pet installations upgrade without losing
-preferences, runtime data, or managed services. Do not rename these without an
-explicit migration design and regression coverage:
+remain intentionally stable so Statelet-compatible installations upgrade
+without losing preferences, runtime data, or managed services. Do not rename
+these without an explicit migration design and regression coverage:
 
 - bundle identifier `com.coke1120.CodexPetMac`
 - executable and Swift target `CodexPetMac`

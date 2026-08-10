@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the board-independent Codex Pet lifecycle publisher."""
+"""Tests for the board-independent Statelet lifecycle publisher."""
 
 import json
 import stat

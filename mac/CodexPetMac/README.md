@@ -419,10 +419,10 @@ instead of presenting Idle as live Codex activity.
 
 The installer also merges lifecycle commands additively into
 `~/.codex/hooks.json`. Unrelated hooks and top-level settings are preserved. A
-valid existing Codex Pet hook under Application Support is reused (including a
-board installation) instead of adding duplicate commands; only exact obsolete
-`Documents/.../codex_pet_hook.py` command entries are migrated. Restart Codex
-after first installation so the new hook configuration is loaded.
+valid existing Statelet-compatible hook under Application Support is reused
+(including a board installation) instead of adding duplicate commands; only
+exact obsolete `Documents/.../codex_pet_hook.py` command entries are migrated.
+Restart Codex after first installation so the new hook configuration is loaded.
 
 For a one-state visual check, temporarily stop the aggregator, publish one
 forced record, and restart it when finished:

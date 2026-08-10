@@ -16,7 +16,10 @@ private struct LaunchOptions {
 
     static func parse(arguments: [String], fileManager: FileManager = .default) -> LaunchOptions {
         let support = fileManager.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/CodexPet", isDirectory: true)
+            .appendingPathComponent(
+                StateletIdentity.applicationSupportRelativePath,
+                isDirectory: true
+            )
         let defaultMap = support.appendingPathComponent("media/media-map.json")
         let defaultState = support.appendingPathComponent("runtime/current_state.json")
         var options = LaunchOptions(
@@ -175,7 +178,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private static let healthCheckIntervalSeconds = 30
     private static let positionSaveDebounceMilliseconds = 300
 
-    private let logger = Logger(subsystem: "com.coke1120.CodexPetMac", category: "app")
+    private let logger = Logger(subsystem: StateletIdentity.bundleIdentifier, category: "app")
     private let freshnessPolicy = StateFreshnessPolicy.production
     private var options: LaunchOptions!
     private var mediaMap = try! MediaMap()
@@ -2001,7 +2004,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var canonicalManagedMediaRoot: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(
-                "Library/Application Support/CodexPet/media",
+                "\(StateletIdentity.applicationSupportRelativePath)/media",
                 isDirectory: true
             )
             .standardizedFileURL
@@ -2179,7 +2182,10 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
 
     private func revealLogsFolder() {
         let logs = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/CodexPet/logs", isDirectory: true)
+            .appendingPathComponent(
+                "\(StateletIdentity.applicationSupportRelativePath)/logs",
+                isDirectory: true
+            )
         try? FileManager.default.createDirectory(
             at: logs,
             withIntermediateDirectories: true,

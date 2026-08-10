@@ -1,8 +1,8 @@
 # Third-party notices
 
-Statelet is a macOS Codex Pet companion distributed under the MIT license. The
-repository uses or interoperates with the following third-party software. Each
-component remains subject to its own license.
+Statelet is a macOS lifecycle companion for Codex distributed under the MIT
+license. The repository uses or interoperates with the following third-party
+software. Each component remains subject to its own license.
 
 ## Runtime and build components
 

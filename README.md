@@ -1,13 +1,13 @@
-# Statelet — Codex Pet for macOS
+# Statelet
 
 [![macOS 13+](https://img.shields.io/badge/macOS-13%2B-000000?logo=apple&logoColor=white)](docs/DEPLOYMENT.md)
 [![Swift 5.9+](https://img.shields.io/badge/Swift-5.9%2B-F05138?logo=swift&logoColor=white)](mac/CodexPetMac/Package.swift)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/Coke1120/statelet-codex-pet-macos/actions/workflows/ci.yml/badge.svg)](https://github.com/Coke1120/statelet-codex-pet-macos/actions/workflows/ci.yml)
 
-Statelet is a native, local-first **Codex Pet** for macOS. It turns Codex
+Statelet is a native, local-first macOS companion for Codex. It turns Codex
 lifecycle events—Idle, Running, Waiting, and Review—into an animated,
-transparent desktop companion. It runs without a development board, keeps its
+transparent desktop presence. It runs without a development board, keeps its
 runtime data on the Mac, and uses AppKit and AVFoundation rather than a browser
 runtime.
 

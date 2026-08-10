@@ -754,7 +754,7 @@ final class PetPlayerController {
         var readiness = PresentationReadinessTracker()
     }
 
-    private let logger = Logger(subsystem: "com.coke1120.CodexPetMac", category: "player")
+    private let logger = Logger(subsystem: StateletIdentity.bundleIdentifier, category: "player")
     let view: PetPlayerView
     private let queuePlayer = AVQueuePlayer()
     private var looper: AVPlayerLooper?

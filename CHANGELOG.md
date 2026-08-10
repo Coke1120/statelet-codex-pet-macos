@@ -5,7 +5,8 @@ versioning for the public source release.
 
 ## [1.6.0] - 2026-08-10
 
-First public release of **Statelet — Codex Pet for macOS**.
+First public release of **Statelet**, the local-first Codex lifecycle companion
+for macOS.
 
 ### Added
 
@@ -31,6 +32,6 @@ First public release of **Statelet — Codex Pet for macOS**.
   a public binary still requires Developer ID signing, notarization, stapling,
   and clean-Mac Gatekeeper verification.
 - The internal bundle identifier, executable, LaunchAgent labels, preferences,
-  and Application Support paths retain their Codex Pet compatibility names.
+  and Application Support paths retain their legacy compatibility values.
 
 [1.6.0]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.6.0

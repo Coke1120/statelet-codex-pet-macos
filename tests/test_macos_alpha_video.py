@@ -326,6 +326,108 @@ class MacOSAlphaCommandTests(unittest.TestCase):
                 alpha.SOURCE_RESIZE_MODE,
             )
 
+    def test_odd_requested_geometry_is_aligned_before_encoding(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.mp4"
+            output = root / "review.mov"
+            report_path = root / "review.report.json"
+            source.write_bytes(b"source")
+            args = converter.build_parser().parse_args(
+                [
+                    str(source),
+                    str(output),
+                    "--report",
+                    str(report_path),
+                    "--width",
+                    "341",
+                    "--height",
+                    "511",
+                    "--dry-run",
+                ]
+            )
+            info = alpha.VideoInfo(
+                width=720,
+                height=1280,
+                frame_count=240,
+                fps=Fraction(24, 1),
+                duration_seconds=10.0,
+                codec_name="h264",
+                pixel_format="yuv420p",
+                codec_profile="High",
+            )
+            with mock.patch.object(
+                converter, "require_image_dependencies"
+            ), mock.patch.object(
+                converter, "require_tool", side_effect=lambda _name, requested: requested
+            ), mock.patch.object(converter, "probe_video", return_value=info):
+                report = converter.convert_video(args)
+
+            self.assertEqual(report["geometry"], {"width": 340, "height": 510})
+            self.assertEqual(
+                report["geometry_alignment"],
+                {
+                    "requested_width": 341,
+                    "requested_height": 511,
+                    "policy": "floor_to_even",
+                    "adjusted": True,
+                },
+            )
+            decode = report["commands"]["decode"]
+            self.assertIn("scale=340:510", decode[decode.index("-vf") + 1])
+            persisted = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["geometry"], {"width": 340, "height": 510})
+
+    def test_hevc_geometry_alignment_rejects_subpixel_canvas(self):
+        with self.assertRaisesRegex(
+            alpha.AlphaConversionError,
+            "at least 4 pixels",
+        ):
+            converter._align_hevc_alpha_geometry(3, 511)
+
+    def test_hevc_geometry_alignment_handles_each_axis_independently(self):
+        for requested, expected in (
+            ((340, 510), (340, 510)),
+            ((341, 510), (340, 510)),
+            ((340, 511), (340, 510)),
+            ((341, 511), (340, 510)),
+        ):
+            with self.subTest(requested=requested):
+                self.assertEqual(
+                    converter._align_hevc_alpha_geometry(*requested),
+                    expected,
+                )
+
+    def test_geometry_mismatch_reports_actual_and_expected_dimensions(self):
+        actual = alpha.VideoInfo(
+            width=340,
+            height=510,
+            frame_count=240,
+            fps=Fraction(24, 1),
+            duration_seconds=10.0,
+            codec_name="hevc",
+            pixel_format="yuv420p",
+        )
+        expected = alpha.VideoInfo(
+            width=341,
+            height=511,
+            frame_count=240,
+            fps=Fraction(24, 1),
+            duration_seconds=10.0,
+            codec_name="",
+            pixel_format="",
+        )
+        with self.assertRaisesRegex(
+            alpha.FrameQualityError,
+            "HEVC delivery geometry is 340x510; expected 341x511",
+        ):
+            converter._verify_basic_info(
+                actual,
+                expected,
+                expected_codec="hevc",
+                label="HEVC delivery",
+            )
+
     def test_rgba_decoder_pair_closes_reference_when_delivery_spawn_fails(self):
         first_decoder = mock.Mock()
         with mock.patch.object(
@@ -1400,6 +1502,10 @@ class MacOSAlphaIntegrationTests(unittest.TestCase):
                 str(report),
                 "--intermediate-output",
                 str(intermediate),
+                "--width",
+                "65",
+                "--height",
+                "49",
                 "--ffmpeg",
                 ffmpeg,
                 "--ffprobe",
@@ -1417,6 +1523,19 @@ class MacOSAlphaIntegrationTests(unittest.TestCase):
             self.assertEqual(converted.returncode, 0, converted.stderr)
             payload = json.loads(report.read_text(encoding="utf-8"))
             self.assertEqual(payload["status"], "converted")
+            self.assertEqual(
+                payload["geometry"],
+                {"width": 64, "height": 48, "pixel_format": "straight-rgba"},
+            )
+            self.assertEqual(
+                payload["geometry_alignment"],
+                {
+                    "requested_width": 65,
+                    "requested_height": 49,
+                    "policy": "floor_to_even",
+                    "adjusted": True,
+                },
+            )
             verification = payload["verification"]
             self.assertTrue(verification["performed"])
             self.assertFalse(verification["unsafe"])
@@ -1424,7 +1543,15 @@ class MacOSAlphaIntegrationTests(unittest.TestCase):
             self.assertEqual(verification["delivery"]["codec"], "hevc")
             self.assertEqual(verification["delivery"]["frames"], frame_count)
             self.assertEqual(verification["delivery"]["fps"], "24/1")
+            self.assertEqual(
+                (verification["delivery"]["width"], verification["delivery"]["height"]),
+                (64, 48),
+            )
             self.assertEqual(verification["roundtrip"]["profile"], "4444")
+            self.assertEqual(
+                (verification["roundtrip"]["width"], verification["roundtrip"]["height"]),
+                (64, 48),
+            )
             self.assertEqual(verification["alpha"]["lost_alpha_pixels_total"], 0)
             self.assertLessEqual(
                 verification["maximum_outer_edge_alpha"],

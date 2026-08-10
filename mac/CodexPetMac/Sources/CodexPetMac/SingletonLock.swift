@@ -9,7 +9,10 @@ final class SingletonLock {
 
     init?(fileManager: FileManager = .default) {
         let support = fileManager.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/CodexPet", isDirectory: true)
+            .appendingPathComponent(
+                StateletIdentity.applicationSupportRelativePath,
+                isDirectory: true
+            )
         do {
             try fileManager.createDirectory(at: support, withIntermediateDirectories: true)
             try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: support.path)

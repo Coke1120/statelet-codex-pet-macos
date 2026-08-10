@@ -1146,7 +1146,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                 path: path,
                 canonicalRoot: FileManager.default.homeDirectoryForCurrentUser
                     .appendingPathComponent(
-                        "Library/Application Support/CodexPet/media",
+                        "\(StateletIdentity.applicationSupportRelativePath)/media",
                         isDirectory: true
                     )
             )

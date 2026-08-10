@@ -52,8 +52,6 @@ struct PetDiagnosticsInput {
 
 /// Builds a sanitized, copyable local health report without reading log contents.
 struct PetDiagnostics {
-    private static let aggregatorLabel = "com.coke1120.codex-pet.state-aggregator"
-
     private let fileManager: FileManager
     private let homeURL: URL
     private let launchAtLoginManager: LaunchAtLoginManager
@@ -69,11 +67,16 @@ struct PetDiagnostics {
     /// Absolute home paths and free-form caller text are never emitted.
     func build(input: PetDiagnosticsInput) -> String {
         let startup = launchAtLoginManager.status()
-        let support = homeURL.appendingPathComponent("Library/Application Support/CodexPet", isDirectory: true)
+        let support = homeURL.appendingPathComponent(
+            StateletIdentity.applicationSupportRelativePath,
+            isDirectory: true
+        )
         let app = inspectInstalledApp()
         let aggregator = inspectManagedPlist(
-            at: homeURL.appendingPathComponent("Library/LaunchAgents/\(Self.aggregatorLabel).plist"),
-            label: Self.aggregatorLabel
+            at: homeURL.appendingPathComponent(
+                "Library/LaunchAgents/\(StateletIdentity.aggregatorLaunchAgentLabel).plist"
+            ),
+            label: StateletIdentity.aggregatorLaunchAgentLabel
         )
 
         var lines = [
@@ -122,7 +125,10 @@ struct PetDiagnostics {
     }
 
     private func inspectInstalledApp() -> String {
-        let app = homeURL.appendingPathComponent("Applications/Statelet.app", isDirectory: true)
+        let app = homeURL.appendingPathComponent(
+            "Applications/\(StateletIdentity.appBundleName)",
+            isDirectory: true
+        )
         guard fileManager.fileExists(atPath: app.path) else { return "missing" }
         let infoURL = app.appendingPathComponent("Contents/Info.plist")
         guard
@@ -130,12 +136,16 @@ struct PetDiagnostics {
             let object = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
             let info = object as? [String: Any]
         else { return "malformed" }
-        guard info["CodexPetManaged"] as? String == LaunchAtLoginManager.managedMarker else {
+        guard info[StateletIdentity.appManagedPlistKey] as? String == LaunchAtLoginManager.managedMarker else {
             return "unmanaged"
         }
         guard
             info["CFBundleIdentifier"] as? String == LaunchAtLoginManager.bundleIdentifier,
-            fileManager.isExecutableFile(atPath: app.appendingPathComponent("Contents/MacOS/CodexPetMac").path)
+            fileManager.isExecutableFile(
+                atPath: app.appendingPathComponent(
+                    "Contents/MacOS/\(StateletIdentity.executableName)"
+                ).path
+            )
         else { return "managed-stale" }
         return "managed-valid"
     }
@@ -147,7 +157,10 @@ struct PetDiagnostics {
             let object = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
             let payload = object as? [String: Any]
         else { return "malformed-unverified" }
-        guard payload["CodexPetMacManaged"] as? String == LaunchAtLoginManager.managedMarker else {
+        guard
+            let marker = payload[StateletIdentity.launchAgentManagedPlistKey] as? String,
+            marker == LaunchAtLoginManager.managedMarker
+        else {
             return "unmanaged"
         }
         return payload["Label"] as? String == label ? "managed" : "managed-stale"
