@@ -165,6 +165,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private var selectedAnimationState: PetState = .idle
     private var toolchainState: AlphaToolchainState = .checking
     private var activity: SettingsActivity = .idle
+    private var libraryRevisionTimer: Timer?
     private var aspectRatio = 1.5
     private let stateLabelPositions: [StateLabelPosition] = [.topLeft, .topRight, .bottomLeft, .bottomRight]
     private let stateLabelSizes: [StateLabelSize] = [.small, .regular, .large]
@@ -195,6 +196,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             window.center()
         }
         NSApp.activate(ignoringOtherApps: true)
+        animationLibrary.invalidateRowCache()
+        refreshRows()
+        startLibraryRevisionTimer()
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
     }
@@ -1055,6 +1059,21 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             busy: globallyBusy,
             importEnabled: toolchainState.isReady
         )
+    }
+
+    private func startLibraryRevisionTimer() {
+        guard libraryRevisionTimer == nil else { return }
+        let timer = Timer(timeInterval: 1.5, repeats: true) { [weak self] _ in
+            self?.refreshRows()
+        }
+        timer.tolerance = 0.35
+        RunLoop.main.add(timer, forMode: .common)
+        libraryRevisionTimer = timer
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        libraryRevisionTimer?.invalidate()
+        libraryRevisionTimer = nil
     }
 
     @objc private func changePane() {

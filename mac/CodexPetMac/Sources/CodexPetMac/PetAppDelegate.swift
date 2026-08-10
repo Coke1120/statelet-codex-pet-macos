@@ -276,7 +276,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         panel.delegate = self
         panel.contentView = PetPlayerView(frame: panel.contentRect(forFrameRect: panel.frame))
         player = PetPlayerController(view: panel.contentView as! PetPlayerView)
-        player.view.applyAppearance(configuredWindow.appearance)
+        player.applyAppearance(configuredWindow.appearance)
         player.onPresentationEvent = { [weak self] transitionID, state, event in
             self?.handlePresentationEvent(transitionID: transitionID, state: state, event: event)
         }
@@ -307,6 +307,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         } else {
             panel.orderFront(nil)
         }
+        updateWindowOcclusionSuspension()
 
         installStatusItem()
         NotificationCenter.default.addObserver(
@@ -319,6 +320,18 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             self,
             selector: #selector(accessibilityDisplayOptionsChanged),
             name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(screensDidSleep),
+            name: NSWorkspace.screensDidSleepNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(screensDidWake),
+            name: NSWorkspace.screensDidWakeNotification,
             object: nil
         )
         if let forcedState = options.forcedState {
@@ -356,6 +369,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
 
     func windowDidMove(_ notification: Notification) { schedulePositionSave() }
     func windowDidResize(_ notification: Notification) { schedulePositionSave() }
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        updateWindowOcclusionSuspension()
+    }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         showSettings()
@@ -376,8 +392,35 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             player?.setReduceMotion(reduceMotion)
             apply(state: currentState, forceRefresh: true)
         }
-        player?.view.applyAppearance(mediaMap.window.appearance)
+        player?.applyAppearance(mediaMap.window.appearance)
         refreshSettings()
+    }
+
+    @objc private func screensDidSleep() {
+        player?.setSuspended(true, for: .screenAsleep)
+    }
+
+    @objc private func screensDidWake() {
+        for step in DisplayWakeRecoveryPolicy.steps {
+            switch step {
+            case .clearWindowOcclusion:
+                player?.setSuspended(false, for: .windowOccluded)
+            case .clearScreenSleep:
+                player?.setSuspended(false, for: .screenAsleep)
+            case .recheckWindowOcclusion:
+                DispatchQueue.main.async { [weak self] in
+                    self?.updateWindowOcclusionSuspension()
+                }
+            }
+        }
+    }
+
+    private func updateWindowOcclusionSuspension() {
+        guard let panel else { return }
+        player?.setSuspended(
+            !panel.occlusionState.contains(.visible),
+            for: .windowOccluded
+        )
     }
 
     private func installWatchers() {
@@ -421,6 +464,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
         if result == .playbackChanged {
             apply(state: currentState, forceRefresh: true)
+        } else if result == .windowChanged {
+            updateStatusMenu()
+            refreshSettings()
         }
     }
 
@@ -438,7 +484,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             let impact = MediaMapChangeImpact.decide(previous: mediaMap, incoming: decoded)
             mediaMap = decoded
             mapReadFailureReported = false
-            refreshSettings()
             switch impact {
             case .unchanged: return .unchanged
             case .windowOnly: return .windowChanged
@@ -462,7 +507,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             alwaysOnTop: options.alwaysOnTopOverride ?? mediaMap.window.alwaysOnTop,
             fullScreenAuxiliary: mediaMap.window.fullScreenAuxiliary
         )
-        player?.view.applyAppearance(mediaMap.window.appearance)
+        player?.applyAppearance(mediaMap.window.appearance)
     }
 
     private func readState(from url: URL) {
@@ -514,6 +559,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func apply(state: PetState, forceRefresh: Bool = false) {
+        let previousProducerState = currentState
         let shouldAdvanceSelection = MediaSelectionAdvancePolicy.shouldAdvance(
             previousLifecycleState: lastLifecycleStateForSelection,
             incomingState: state,
@@ -547,9 +593,18 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             forceRefresh: forceRefresh
         )
         currentState = state
-        updateStatusMenu()
-        refreshSettings()
-        guard decision.shouldRefresh else { return }
+        let shouldRefreshUI = LifecycleUIRefreshPolicy.shouldRefresh(
+            previousProducerState: previousProducerState,
+            incomingProducerState: state,
+            presentationWillRefresh: decision.shouldRefresh
+        )
+        guard decision.shouldRefresh else {
+            if shouldRefreshUI {
+                updateStatusMenu()
+                refreshSettings()
+            }
+            return
+        }
 
         startLifecyclePresentation(
             state: presentationState,
@@ -1132,7 +1187,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 repairAvailable: cachedLaunchAtLoginStatus?.canRepair ?? false
             )
         )
-        settingsController.update(toolchainState: toolchainState)
     }
 
     private var publisherSettingsSummary: String {
@@ -2648,8 +2702,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             apply(state: currentState, forceRefresh: true)
         } else {
             updateStatusMenu()
+            refreshSettings()
         }
-        refreshSettings()
     }
 
     private func applyWindowSettings(_ update: WindowSettingsUpdate) {
@@ -2669,7 +2723,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             clickThrough = update.clickThrough
             panel.ignoresMouseEvents = clickThrough
             applyPublishedMediaMap(updated, refreshPlayback: false)
-            updateStatusMenu()
         } catch {
             presentSettingsError("The window setting could not be saved.")
             refreshSettings()

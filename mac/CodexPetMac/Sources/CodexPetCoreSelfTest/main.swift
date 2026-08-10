@@ -872,6 +872,59 @@ private func runSelfTest() throws {
     try require(preview.begin(previewState: .review, baselineRealState: .running) == .review, "repeated begin did not replace manual preview")
     try require(preview.receiveLifecycleState(.running) == .presentingPreview(.review), "repeated begin did not replace the baseline")
 
+    var suspension = PlaybackSuspensionPolicy()
+    try require(suspension.replacePlayback(rate: 0.75) == .resume(rate: 0.75), "initial playback did not resume")
+    try require(suspension.setSuspended(true, for: .windowOccluded) == .pause, "occlusion did not pause")
+    try require(suspension.setSuspended(true, for: .screenAsleep) == .pause, "screen sleep did not remain paused")
+    try require(suspension.setSuspended(false, for: .windowOccluded) == .none, "clearing one reason resumed another")
+    try require(suspension.setSuspended(false, for: .screenAsleep) == .resume(rate: 0.75), "final reason did not restore rate")
+    try require(
+        DisplayWakeRecoveryPolicy.steps == [.clearWindowOcclusion, .clearScreenSleep, .recheckWindowOcclusion],
+        "wake recovery can retain stale occlusion"
+    )
+    var lru = BoundedLRUCache<Int, String>(capacity: 2)
+    lru.insert("one", for: 1)
+    lru.insert("two", for: 2)
+    _ = lru.value(for: 1)
+    lru.insert("three", for: 3)
+    try require(lru.value(for: 2) == nil && lru.count == 2, "FPS cache did not evict least-recently-used entry")
+    try require(
+        !LifecycleUIRefreshPolicy.shouldRefresh(
+            previousProducerState: .running,
+            incomingProducerState: .running,
+            presentationWillRefresh: false
+        ),
+        "unchanged heartbeat refreshed UI"
+    )
+    try require(
+        LifecycleUIRefreshPolicy.shouldRefresh(
+            previousProducerState: .running,
+            incomingProducerState: .waiting,
+            presentationWillRefresh: false
+        ),
+        "producer change behind stable preview did not refresh UI"
+    )
+
+    let runtimeRevisionRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("statelet-runtime-revision-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: runtimeRevisionRoot) }
+    try FileManager.default.createDirectory(at: runtimeRevisionRoot, withIntermediateDirectories: true)
+    let runtimeRevisionFile = runtimeRevisionRoot.appendingPathComponent("clip.mov")
+    try require(LocalFileRevision(url: runtimeRevisionFile) == nil, "missing file had a revision")
+    try Data("first".utf8).write(to: runtimeRevisionFile)
+    let firstRevision = LocalFileRevision(url: runtimeRevisionFile)
+    try FileManager.default.removeItem(at: runtimeRevisionFile)
+    try Data("replacement-longer".utf8).write(to: runtimeRevisionFile)
+    let replacementRevision = LocalFileRevision(url: runtimeRevisionFile)
+    try require(
+        firstRevision != nil && replacementRevision != nil && firstRevision != replacementRevision,
+        "file replacement did not invalidate revision identity"
+    )
+    try require(
+        LibraryRowRefreshPolicy.shouldRefresh(previous: firstRevision, incoming: replacementRevision),
+        "library row policy retained stale file metadata"
+    )
+
     let displays = [
         CGRect(x: -1920, y: -1080, width: 1920, height: 1080),
         CGRect(x: 0, y: 0, width: 1440, height: 900),

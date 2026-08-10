@@ -434,6 +434,15 @@ private final class MP4DropZoneView: NSView {
 }
 
 final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDelegate {
+    private struct RowUpdateKey: Equatable {
+        let selectedState: PetState
+        let playlist: StateMediaPlaylist?
+        let mapURL: URL
+        let selectedPreviewPath: String?
+        let reduceMotion: Bool
+        let busy: Bool
+        let fileRevisions: [LocalFileRevision?]
+    }
     var onStateSelection: ((PetState) -> Void)?
     var onModeChange: ((MediaPlaybackMode) -> Void)?
     var onAdvanceTriggerChange: ((MediaPlaylistAdvancePolicy) -> Void)?
@@ -463,6 +472,7 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
     private let emptyLabel = NSTextField(wrappingLabelWithString: "No clips for this state. Add an MP4 to convert, or add a verified transparent MOV.")
     private let emptyAddButton = NSButton(title: "Add Clip…", target: nil, action: nil)
     private var clipRows: [LibraryClipRowModel] = []
+    private var lastRowUpdateKey: RowUpdateKey?
 
     override init(frame frameRect: NSRect) {
         stateButtons = PetState.allCases.map { LibraryStateButton(state: $0, target: nil, action: #selector(selectState(_:))) }
@@ -477,6 +487,10 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
     override func layout() {
         super.layout()
         resizeFlexibleClipColumn()
+    }
+
+    func invalidateRowCache() {
+        lastRowUpdateKey = nil
     }
 
     private func build() {
@@ -718,10 +732,36 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
         addClip.item(at: 2)?.isEnabled = importEnabled && !busy
         dropZone.update(selectedState: selectedState, importEnabled: importEnabled, busy: busy)
 
+        let resolvedEntries = (playlist?.entries ?? []).map { entry in
+            (
+                entry,
+                mediaMap.resolvedURL(for: entry, relativeTo: mapURL),
+                mediaMap.resolvedPosterURL(for: entry, relativeTo: mapURL)
+            )
+        }
+        let watchedURLs = resolvedEntries.flatMap { _, movieURL, posterURL in
+            [movieURL] + (posterURL.map { [$0] } ?? [])
+        }
+        let fileRevisions = watchedURLs.map(LocalFileRevision.init(url:))
+
+        let rowUpdateKey = RowUpdateKey(
+            selectedState: selectedState,
+            playlist: playlist,
+            mapURL: mapURL.standardizedFileURL,
+            selectedPreviewPath: preview?.state == selectedState ? preview?.path : nil,
+            reduceMotion: reduceMotion,
+            busy: busy,
+            fileRevisions: fileRevisions
+        )
+        guard LibraryRowRefreshPolicy.shouldRefresh(
+            previous: lastRowUpdateKey,
+            incoming: rowUpdateKey
+        ) else { return }
+        lastRowUpdateKey = rowUpdateKey
+
         let selectedPath = selectedRowModel()?.entry.path
-        clipRows = (playlist?.entries ?? []).enumerated().map { index, entry in
-            let resolvedURL = mediaMap.resolvedURL(for: entry, relativeTo: mapURL)
-            let resolvedPosterURL = mediaMap.resolvedPosterURL(for: entry, relativeTo: mapURL)
+        clipRows = resolvedEntries.enumerated().map { index, resolvedEntry in
+            let (entry, resolvedURL, resolvedPosterURL) = resolvedEntry
             let posterExists = resolvedPosterURL.map { FileManager.default.isReadableFile(atPath: $0.path) } ?? false
             return LibraryClipRowModel(
                 position: index + 1,

@@ -56,7 +56,9 @@ identifier. Statelet does not store prompts, tool output, transcript paths, or
 working directories in those records.
 
 See [the lifecycle and media reference](docs/MACOS_COMPANION.md) for freshness,
-heartbeat, playlist, and filesystem contracts.
+heartbeat, playlist, and filesystem contracts. Developers can use the
+[local performance harness](docs/PERFORMANCE.md) for path-free CPU, memory,
+soak, and warm state-switch evidence.
 
 ## Requirements
 
@@ -121,10 +123,14 @@ earlier results.
 | Review | Tests, lint, type checks, or review work are active |
 
 Each session stays eligible for 900 seconds after its latest event. The
-aggregator polls every 250 ms, publishes state changes on the next poll, and
-republishes unchanged state once per minute as a liveness heartbeat. A
-same-state heartbeat refreshes health without restarting playback or advancing
-a playlist.
+aggregator normally uses macOS `kqueue` directory events to publish state
+changes immediately. It wakes on session TTL and temporary force-state
+deadlines, and republishes unchanged state once per minute as a liveness
+heartbeat. If event watching is unsupported or fails, it uses bounded 250 ms
+polling instead. A path-free startup/runtime diagnostic reports
+`mode=event_driven` or `mode=poll_fallback` with a sanitized reason category.
+A same-state heartbeat refreshes health without restarting playback or
+advancing a playlist.
 
 ## Animation libraries
 

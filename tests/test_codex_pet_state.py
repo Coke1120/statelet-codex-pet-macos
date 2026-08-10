@@ -2,10 +2,14 @@
 """Tests for the board-independent Statelet lifecycle publisher."""
 
 import json
+import os
+import select
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -35,6 +39,51 @@ def write_record(path: Path, lifecycle: str, updated_at: float) -> None:
         ),
         encoding="utf-8",
     )
+
+
+class FakeClock:
+    def __init__(self, wall_time: float = 100.0, monotonic_time: float = 10.0):
+        self.wall_time = wall_time
+        self.monotonic_time = monotonic_time
+
+    def wall(self) -> float:
+        return self.wall_time
+
+    def monotonic(self) -> float:
+        return self.monotonic_time
+
+    def advance(self, seconds: float) -> None:
+        self.wall_time += seconds
+        self.monotonic_time += seconds
+
+
+class ScriptedWaiter:
+    def __init__(self, clock: FakeClock, actions=None):
+        self.clock = clock
+        self.actions = list(actions or [])
+        self.timeouts = []
+        self.wait_count = 0
+        self.prepare_count = 0
+
+    def prepare(self) -> bool:
+        self.prepare_count += 1
+        return True
+
+    def wait(self, timeout: float) -> None:
+        self.timeouts.append(timeout)
+        action = (
+            self.actions[self.wait_count]
+            if self.wait_count < len(self.actions)
+            else None
+        )
+        self.wait_count += 1
+        if action is None:
+            self.clock.advance(timeout)
+        else:
+            action(timeout)
+
+    def close(self) -> None:
+        pass
 
 
 class LifecycleStateTests(unittest.TestCase):
@@ -177,6 +226,275 @@ class PublisherTests(unittest.TestCase):
             self.assertEqual(forced, ("waiting", 99.5, 0))
             self.assertEqual(expired, ("running", 99.0, 1))
 
+    def test_event_wake_publishes_state_change_without_poll_delay(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            sessions.mkdir()
+            output = root / "current_state.json"
+            clock = FakeClock()
+
+            def create_session(_timeout: float) -> None:
+                clock.advance(0.05)
+                write_record(record_path(sessions, "a"), "running", clock.wall())
+
+            waiter = ScriptedWaiter(clock, [create_session, lambda _timeout: None])
+            aggregator.run(
+                sessions,
+                output,
+                poll=0.25,
+                heartbeat=60.0,
+                active_ttl=900.0,
+                once=False,
+                print_state=False,
+                forced_state=None,
+                force_seconds=30.0,
+                should_stop=lambda: waiter.wait_count >= 2,
+                waiter=waiter,
+                wall_clock=clock.wall,
+                monotonic_clock=clock.monotonic,
+            )
+
+            self.assertEqual(json.loads(output.read_text())["state"], "running")
+            self.assertEqual(waiter.timeouts[0], 60.0)
+            self.assertEqual(waiter.prepare_count, 2)
+            self.assertLess(clock.wall_time, 101.0)
+
+    def test_deadline_wakes_for_heartbeat_and_session_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            sessions.mkdir()
+            output = root / "current_state.json"
+            clock = FakeClock()
+            write_record(record_path(sessions, "a"), "running", 99.0)
+            waiter = ScriptedWaiter(clock)
+
+            aggregator.run(
+                sessions,
+                output,
+                poll=0.25,
+                heartbeat=60.0,
+                active_ttl=2.0,
+                once=False,
+                print_state=False,
+                forced_state=None,
+                force_seconds=30.0,
+                should_stop=lambda: waiter.wait_count >= 2,
+                waiter=waiter,
+                wall_clock=clock.wall,
+                monotonic_clock=clock.monotonic,
+            )
+
+            self.assertAlmostEqual(waiter.timeouts[0], 1.001, places=6)
+            self.assertEqual(json.loads(output.read_text())["state"], "idle")
+            self.assertFalse(record_path(sessions, "a").exists())
+
+    def test_heartbeat_deadline_wakes_without_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            sessions.mkdir()
+            output = root / "current_state.json"
+            clock = FakeClock()
+            waiter = ScriptedWaiter(clock)
+
+            aggregator.run(
+                sessions,
+                output,
+                poll=0.25,
+                heartbeat=5.0,
+                active_ttl=900.0,
+                once=False,
+                print_state=False,
+                forced_state=None,
+                force_seconds=30.0,
+                should_stop=lambda: waiter.wait_count >= 2,
+                waiter=waiter,
+                wall_clock=clock.wall,
+                monotonic_clock=clock.monotonic,
+            )
+
+            self.assertEqual(waiter.timeouts[0], 5.0)
+            persisted = json.loads(output.read_text())
+            self.assertEqual(persisted["state"], "idle")
+            self.assertEqual(persisted["emitted_at"], 105.0)
+
+    def test_force_deadline_wakes_without_directory_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            sessions.mkdir()
+            output = root / "current_state.json"
+            clock = FakeClock()
+            write_record(record_path(sessions, "a"), "running", 99.0)
+            waiter = ScriptedWaiter(clock)
+
+            aggregator.run(
+                sessions,
+                output,
+                poll=0.25,
+                heartbeat=60.0,
+                active_ttl=900.0,
+                once=False,
+                print_state=False,
+                forced_state="review",
+                force_seconds=2.0,
+                should_stop=lambda: waiter.wait_count >= 2,
+                waiter=waiter,
+                wall_clock=clock.wall,
+                monotonic_clock=clock.monotonic,
+            )
+
+            self.assertEqual(waiter.timeouts[0], 2.0)
+            persisted = json.loads(output.read_text())
+            self.assertEqual(persisted["state"], "running")
+            self.assertFalse(persisted["forced"])
+
+    def test_force_expiry_republishes_when_aggregate_state_is_the_same(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            sessions.mkdir()
+            output = root / "current_state.json"
+            clock = FakeClock()
+            write_record(record_path(sessions, "a"), "review", 99.0)
+            waiter = ScriptedWaiter(clock)
+
+            aggregator.run(
+                sessions,
+                output,
+                poll=0.25,
+                heartbeat=60.0,
+                active_ttl=900.0,
+                once=False,
+                print_state=False,
+                forced_state="review",
+                force_seconds=2.0,
+                should_stop=lambda: waiter.wait_count >= 2,
+                waiter=waiter,
+                wall_clock=clock.wall,
+                monotonic_clock=clock.monotonic,
+            )
+
+            persisted = json.loads(output.read_text())
+            self.assertEqual(persisted["state"], "review")
+            self.assertFalse(persisted["forced"])
+
+    def test_stop_after_wake_does_not_rescan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            sessions.mkdir()
+            output = root / "current_state.json"
+            clock = FakeClock()
+            stopped = [False]
+
+            def stop_after_change(_timeout: float) -> None:
+                write_record(record_path(sessions, "a"), "running", clock.wall())
+                stopped[0] = True
+
+            waiter = ScriptedWaiter(clock, [stop_after_change])
+            aggregator.run(
+                sessions,
+                output,
+                poll=0.25,
+                heartbeat=60.0,
+                active_ttl=900.0,
+                once=False,
+                print_state=False,
+                forced_state=None,
+                force_seconds=30.0,
+                should_stop=lambda: stopped[0],
+                waiter=waiter,
+                wall_clock=clock.wall,
+                monotonic_clock=clock.monotonic,
+            )
+
+            self.assertEqual(json.loads(output.read_text())["state"], "idle")
+
+    def test_waiter_fallback_is_bounded_by_poll_interval(self) -> None:
+        slept = []
+        diagnostics = []
+        waiter = aggregator.DirectoryEventWaiter(
+            Path("/definitely/missing/statelet/session-directory"),
+            poll_interval=0.25,
+            sleep=slept.append,
+            diagnostic=lambda mode, reason: diagnostics.append((mode, reason)),
+        )
+        try:
+            waiter._disable_kqueue()
+            waiter.wait(60.0)
+            waiter.wait(60.0)
+        finally:
+            waiter.close()
+        self.assertEqual(slept, [0.25, 0.25])
+        expected_reason = (
+            "open_failed"
+            if hasattr(select, "kqueue")
+            else "unsupported"
+        )
+        self.assertEqual(
+            diagnostics,
+            [(aggregator.POLL_FALLBACK_MODE, expected_reason)],
+        )
+
+    def test_waiter_does_not_follow_a_symlinked_session_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            real_sessions = root / "real-sessions"
+            real_sessions.mkdir()
+            linked_sessions = root / "sessions"
+            linked_sessions.symlink_to(real_sessions, target_is_directory=True)
+            slept = []
+            waiter = aggregator.DirectoryEventWaiter(
+                linked_sessions,
+                poll_interval=0.25,
+                sleep=slept.append,
+            )
+            try:
+                self.assertFalse(waiter.event_driven)
+                waiter.wait(60.0)
+            finally:
+                waiter.close()
+            self.assertEqual(slept, [0.25])
+
+    def test_mode_diagnostic_is_path_free_and_rejects_unknown_reasons(self) -> None:
+        self.assertEqual(
+            aggregator.FALLBACK_REASONS,
+            frozenset(
+                (
+                    "unsupported",
+                    "open_failed",
+                    "registration_failed",
+                    "wait_failed",
+                )
+            ),
+        )
+        script = """
+import sys
+sys.path.insert(0, {!r})
+from codex_pet_state_aggregator import print_mode_diagnostic
+print_mode_diagnostic('event_driven', None)
+print_mode_diagnostic('poll_fallback', 'wait_failed')
+""".format(str(MAC_DIR))
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stderr.splitlines(),
+            [
+                "Statelet state aggregator mode=event_driven",
+                "Statelet state aggregator mode=poll_fallback reason=wait_failed",
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "invalid"):
+            aggregator.print_mode_diagnostic("poll_fallback", "/private/path")
+
     def test_single_instance_lock_is_non_blocking(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             lock_path = Path(temporary) / "runtime" / ".state-aggregator.lock"
@@ -230,6 +548,18 @@ import codex_pet_state_aggregator
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), "review")
+            expected_reason = (
+                "open_failed"
+                if hasattr(select, "kqueue")
+                else "unsupported"
+            )
+            self.assertEqual(
+                result.stderr.strip(),
+                "Statelet state aggregator mode=poll_fallback reason={}".format(
+                    expected_reason
+                ),
+            )
+            self.assertNotIn(temporary, result.stderr)
             persisted = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(persisted["state"], "review")
             self.assertTrue(persisted["forced"])
@@ -237,6 +567,185 @@ import codex_pet_state_aggregator
                 persisted["source_updated_at"], persisted["emitted_at"]
             )
 
+
+@unittest.skipUnless(
+    hasattr(select, "kqueue") and hasattr(select, "KQ_FILTER_VNODE"),
+    "Darwin kqueue is unavailable",
+)
+class DarwinDirectoryEventWaiterTests(unittest.TestCase):
+    def test_mode_diagnostic_reports_failure_again_after_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            diagnostics = []
+            waiter = aggregator.DirectoryEventWaiter(
+                sessions,
+                poll_interval=0.25,
+                diagnostic=lambda mode, reason: diagnostics.append((mode, reason)),
+            )
+            self.assertFalse(waiter.event_driven)
+
+            sessions.mkdir()
+            self.assertTrue(waiter.prepare())
+            sessions.rename(root / "old-sessions")
+            waiter.wait(2.0)
+            self.assertFalse(waiter.event_driven)
+            self.assertFalse(waiter.prepare())
+            waiter.close()
+
+            self.assertEqual(
+                diagnostics,
+                [
+                    (aggregator.POLL_FALLBACK_MODE, "open_failed"),
+                    (aggregator.EVENT_DRIVEN_MODE, None),
+                    (aggregator.POLL_FALLBACK_MODE, "open_failed"),
+                ],
+            )
+
+    def test_atomic_directory_update_wakes_kqueue(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            sessions = Path(temporary) / "sessions"
+            sessions.mkdir()
+            diagnostics = []
+            waiter = aggregator.DirectoryEventWaiter(
+                sessions,
+                poll_interval=0.25,
+                diagnostic=lambda mode, reason: diagnostics.append((mode, reason)),
+            )
+            self.assertTrue(waiter.event_driven)
+
+            def replace_record() -> None:
+                time.sleep(0.05)
+                temporary_record = sessions / ".record.tmp"
+                temporary_record.write_text("{}", encoding="utf-8")
+                os.replace(temporary_record, record_path(sessions, "c"))
+
+            writer = threading.Thread(target=replace_record)
+            writer.start()
+            started = time.monotonic()
+            try:
+                waiter.wait(2.0)
+            finally:
+                waiter.close()
+                writer.join()
+
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertTrue(record_path(sessions, "c").exists())
+            self.assertEqual(
+                diagnostics,
+                [(aggregator.EVENT_DRIVEN_MODE, None)],
+            )
+
+    def test_directory_rename_then_rewatch_wakes_for_new_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            sessions.mkdir()
+            waiter = aggregator.DirectoryEventWaiter(sessions, poll_interval=0.25)
+            self.assertTrue(waiter.event_driven)
+
+            sessions.rename(root / "old-sessions")
+            waiter.wait(2.0)
+            self.assertFalse(waiter.event_driven)
+            sessions.mkdir()
+
+            # The watch is re-established before the next scan. A write in the
+            # former scan-to-wait gap must therefore queue a vnode event.
+            self.assertTrue(waiter.prepare())
+            temporary_record = sessions / ".record.tmp"
+            temporary_record.write_text("{}", encoding="utf-8")
+            os.replace(temporary_record, record_path(sessions, "d"))
+            started = time.monotonic()
+            try:
+                waiter.wait(2.0)
+            finally:
+                waiter.close()
+
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertTrue(record_path(sessions, "d").exists())
+
+    def test_late_directory_registration_returns_for_immediate_rescan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            sessions = Path(temporary) / "sessions"
+            slept = []
+            waiter = aggregator.DirectoryEventWaiter(
+                sessions,
+                poll_interval=0.25,
+                sleep=slept.append,
+            )
+            self.assertFalse(waiter.prepare())
+
+            # Simulate the directory and its first record appearing after the
+            # scan but before wait(). Newly arming must not block afterward.
+            sessions.mkdir()
+            write_record(record_path(sessions, "e"), "running", time.time())
+            started = time.monotonic()
+            try:
+                waiter.wait(2.0)
+            finally:
+                waiter.close()
+
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual(slept, [])
+            self.assertTrue(record_path(sessions, "e").exists())
+
+    def test_wake_interrupts_kqueue_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            sessions = Path(temporary) / "sessions"
+            sessions.mkdir()
+            waiter = aggregator.DirectoryEventWaiter(sessions, poll_interval=0.25)
+
+            def wake_waiter() -> None:
+                time.sleep(0.05)
+                waiter.wake()
+
+            waker = threading.Thread(target=wake_waiter)
+            waker.start()
+            started = time.monotonic()
+            try:
+                waiter.wait(2.0)
+            finally:
+                waiter.close()
+                waker.join()
+
+            self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_wait_failure_transitions_once_to_bounded_poll_fallback(self) -> None:
+        class FailingKqueue:
+            def control(self, _changes, _max_events, _timeout):
+                raise OSError("synthetic wait failure")
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            sessions = Path(temporary) / "sessions"
+            sessions.mkdir()
+            diagnostics = []
+            slept = []
+            waiter = aggregator.DirectoryEventWaiter(
+                sessions,
+                poll_interval=0.25,
+                sleep=slept.append,
+                diagnostic=lambda mode, reason: diagnostics.append((mode, reason)),
+            )
+            real_kqueue = waiter._kqueue
+            waiter._kqueue = FailingKqueue()
+            try:
+                waiter.wait(60.0)
+                waiter.wait(60.0)
+            finally:
+                waiter.close()
+                real_kqueue.close()
+
+            self.assertEqual(slept, [0.25, 0.25])
+            self.assertEqual(
+                diagnostics,
+                [
+                    (aggregator.EVENT_DRIVEN_MODE, None),
+                    (aggregator.POLL_FALLBACK_MODE, "wait_failed"),
+                ],
+            )
 
 if __name__ == "__main__":
     unittest.main()

@@ -24,6 +24,9 @@ ALPHA_COORDINATOR = PACKAGE / "Sources" / "CodexPetMac" / "AlphaConversion.swift
 STATELET_IDENTITY = PACKAGE / "Sources" / "CodexPetMac" / "StateletIdentity.swift"
 PET_APP_DELEGATE = PACKAGE / "Sources" / "CodexPetMac" / "PetAppDelegate.swift"
 PET_PANEL = PACKAGE / "Sources" / "CodexPetMac" / "PetPanel.swift"
+PET_PLAYER = PACKAGE / "Sources" / "CodexPetMac" / "PetPlayer.swift"
+ANIMATION_LIBRARY = PACKAGE / "Sources" / "CodexPetMac" / "AnimationLibraryView.swift"
+RUNTIME_EFFICIENCY = PACKAGE / "Sources" / "CodexPetCore" / "RuntimeEfficiency.swift"
 SETTINGS_CONTROLLER = PACKAGE / "Sources" / "CodexPetMac" / "SettingsWindowController.swift"
 MAC_MAIN = PACKAGE / "Sources" / "CodexPetMac" / "main.swift"
 MANAGED_MARKER = "mac-widget-v1"
@@ -331,6 +334,55 @@ struct PetPanelHarness {
         self.assertIn("alwaysOnTop: update.alwaysOnTop", delegate)
         self.assertIn("try publishMediaMap(updated)", delegate)
         self.assertIn('checkboxWithTitle: "Keep Statelet on Top"', settings)
+
+    def test_player_suspends_for_occlusion_and_screen_sleep_without_cross_resuming(self) -> None:
+        player = PET_PLAYER.read_text(encoding="utf-8")
+        delegate = PET_APP_DELEGATE.read_text(encoding="utf-8")
+        policy = RUNTIME_EFFICIENCY.read_text(encoding="utf-8")
+
+        self.assertIn("private var suspensionPolicy = PlaybackSuspensionPolicy()", player)
+        self.assertIn("changed = reasons.insert(reason).inserted", policy)
+        self.assertIn("changed = reasons.remove(reason) != nil", policy)
+        self.assertIn("guard reasons.isEmpty else", policy)
+        self.assertIn("queuePlayer.pause()", player)
+        self.assertIn("queuePlayer.playImmediately(atRate: Float(rate))", player)
+        self.assertIn("readinessTimeoutWorkItem?.cancel()", player)
+        self.assertIn("windowDidChangeOcclusionState", delegate)
+        self.assertIn("NSWorkspace.screensDidSleepNotification", delegate)
+        self.assertIn("NSWorkspace.screensDidWakeNotification", delegate)
+        self.assertIn("!panel.occlusionState.contains(.visible)", delegate)
+        self.assertIn("DisplayWakeRecoveryPolicy.steps", delegate)
+        self.assertNotIn("preventUserIdleSystemSleep", delegate)
+
+    def test_fps_metadata_is_badge_gated_reuses_item_asset_and_has_a_bounded_cache(self) -> None:
+        player = PET_PLAYER.read_text(encoding="utf-8")
+        policy = RUNTIME_EFFICIENCY.read_text(encoding="utf-8")
+
+        self.assertIn("guard view.isFPSBadgeEnabled else", player)
+        self.assertIn("asset: queuePlayer.currentItem?.asset ?? item.asset", player)
+        self.assertNotIn("AVURLAsset(url: url)", player)
+        self.assertIn("maximumCachedFrameRates = 32", player)
+        self.assertIn("BoundedLRUCache<LocalFileRevision, Double>", player)
+        self.assertIn("device = UInt64(info.st_dev)", policy)
+        self.assertIn("inode = UInt64(info.st_ino)", policy)
+        self.assertIn("while order.count > capacity", policy)
+
+    def test_unchanged_lifecycle_and_library_updates_skip_expensive_refreshes(self) -> None:
+        delegate = PET_APP_DELEGATE.read_text(encoding="utf-8")
+        settings = SETTINGS_CONTROLLER.read_text(encoding="utf-8")
+        library = ANIMATION_LIBRARY.read_text(encoding="utf-8")
+
+        apply_body = delegate.split("private func apply(state: PetState", 1)[1].split(
+            "private func startLifecyclePresentation", 1
+        )[0]
+        decision_gate = apply_body.index("let shouldRefreshUI = LifecycleUIRefreshPolicy.shouldRefresh")
+        self.assertNotIn("updateStatusMenu()", apply_body[:decision_gate])
+        self.assertNotIn("refreshSettings()", apply_body[:decision_gate])
+        self.assertIn("LibraryRowRefreshPolicy.shouldRefresh", library)
+        self.assertIn("fileRevisions: fileRevisions", library)
+        self.assertIn("startLibraryRevisionTimer()", settings)
+        self.assertIn("timer.tolerance = 0.35", settings)
+        self.assertIn("animationLibrary.invalidateRowCache()", settings)
 
     def test_conversion_process_is_bounded_and_force_terminates_when_stuck(self) -> None:
         source = ALPHA_COORDINATOR.read_text(encoding="utf-8")

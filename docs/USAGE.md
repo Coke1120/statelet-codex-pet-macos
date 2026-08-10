@@ -43,9 +43,14 @@ At equal priority, the newest session event wins. A Stop event changes only its
 own session to Idle; another active session may still keep Statelet in Waiting,
 Review, or Running.
 
-Session records remain eligible for 900 seconds. The aggregator checks them
-every 250 ms and republishes unchanged state once per minute. A heartbeat
-refreshes publisher health but does not restart a movie or advance a playlist.
+Session records remain eligible for 900 seconds. On macOS, `kqueue` directory
+events normally wake the aggregator immediately; explicit TTL, temporary-force,
+and once-per-minute heartbeat deadlines handle changes that do not produce a
+file event. If event watching is unsupported or fails, bounded 250 ms polling
+preserves correctness. The aggregator log reports a path-free
+`mode=event_driven` or `mode=poll_fallback` diagnostic with a sanitized reason
+category. A heartbeat refreshes publisher health but does not restart a movie
+or advance a playlist.
 
 The badge reports:
 

@@ -389,9 +389,12 @@ beats a newer Running session. When that Waiting session emits Stop, only its
 record becomes Idle, so another active Review or Running session can win. With
 no active record, the result is Idle with no `source_updated_at`.
 
-The aggregator polls every 250 ms, publishes a changed result on the next poll,
-and refreshes an unchanged result once per minute so writer liveness remains
-visible without multi-Hz disk writes. `current_state.json` preserves the winning
+The aggregator normally uses macOS `kqueue` directory events to publish a
+changed result immediately. Session TTL, temporary-force, and once-per-minute
+liveness-heartbeat deadlines wake it without file activity. If event watching
+is unsupported or fails, bounded 250 ms polling preserves correctness. A
+path-free log diagnostic reports `mode=event_driven` or `mode=poll_fallback`
+with a sanitized reason category. `current_state.json` preserves the winning
 session clock as `source_updated_at`, writes the publication clock as
 `emitted_at`, and includes the active-session count. The player checks the
 publication clock every 30 seconds. Swift `CurrentState` uses legacy

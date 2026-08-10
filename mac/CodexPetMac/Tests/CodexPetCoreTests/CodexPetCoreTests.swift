@@ -1277,6 +1277,73 @@ final class CodexPetCoreTests: XCTestCase {
         XCTAssertTrue(displays.contains { visibleArea(of: oversizedRepaired, in: $0) })
     }
 
+    func testPlaybackSuspensionComposesReasonsAndPreservesResumeRate() {
+        var policy = PlaybackSuspensionPolicy()
+        XCTAssertEqual(policy.replacePlayback(rate: 0.75), .resume(rate: 0.75))
+        XCTAssertEqual(policy.setSuspended(true, for: .windowOccluded), .pause)
+        XCTAssertEqual(policy.setSuspended(true, for: .screenAsleep), .pause)
+        XCTAssertEqual(policy.setSuspended(false, for: .windowOccluded), .none)
+        XCTAssertFalse(policy.canStartReadinessDeadline)
+        XCTAssertEqual(policy.setSuspended(false, for: .screenAsleep), .resume(rate: 0.75))
+        XCTAssertTrue(policy.canStartReadinessDeadline)
+
+        XCTAssertEqual(policy.setSuspended(true, for: .screenAsleep), .pause)
+        XCTAssertEqual(policy.replacePlayback(rate: 1.25), .pause)
+        XCTAssertEqual(policy.setSuspended(false, for: .screenAsleep), .resume(rate: 1.25))
+        policy.clearPlayback()
+        XCTAssertEqual(policy.setSuspended(true, for: .windowOccluded), .pause)
+        XCTAssertEqual(policy.setSuspended(false, for: .windowOccluded), .none)
+    }
+
+    func testDisplayWakeRecoveryClearsStaleOcclusionBeforeRechecking() {
+        XCTAssertEqual(
+            DisplayWakeRecoveryPolicy.steps,
+            [.clearWindowOcclusion, .clearScreenSleep, .recheckWindowOcclusion]
+        )
+    }
+
+    func testBoundedLRUCacheEvictsLeastRecentlyUsedAndFileRevisionInvalidates() throws {
+        var cache = BoundedLRUCache<Int, String>(capacity: 2)
+        cache.insert("one", for: 1)
+        cache.insert("two", for: 2)
+        XCTAssertEqual(cache.value(for: 1), "one")
+        cache.insert("three", for: 3)
+        XCTAssertNil(cache.value(for: 2))
+        XCTAssertEqual(cache.count, 2)
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("statelet-runtime-policy-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let file = directory.appendingPathComponent("clip.mov")
+        XCTAssertNil(LocalFileRevision(url: file))
+        try Data("first".utf8).write(to: file)
+        let first = try XCTUnwrap(LocalFileRevision(url: file))
+        try FileManager.default.removeItem(at: file)
+        try Data("replacement-longer".utf8).write(to: file)
+        let replacement = try XCTUnwrap(LocalFileRevision(url: file))
+        XCTAssertNotEqual(first, replacement)
+        XCTAssertTrue(LibraryRowRefreshPolicy.shouldRefresh(previous: [first], incoming: [replacement]))
+    }
+
+    func testLifecycleUIRefreshSkipsHeartbeatButTracksProducerBehindPreview() {
+        XCTAssertFalse(LifecycleUIRefreshPolicy.shouldRefresh(
+            previousProducerState: .running,
+            incomingProducerState: .running,
+            presentationWillRefresh: false
+        ))
+        XCTAssertTrue(LifecycleUIRefreshPolicy.shouldRefresh(
+            previousProducerState: .running,
+            incomingProducerState: .waiting,
+            presentationWillRefresh: false
+        ))
+        XCTAssertTrue(LifecycleUIRefreshPolicy.shouldRefresh(
+            previousProducerState: .running,
+            incomingProducerState: .running,
+            presentationWillRefresh: true
+        ))
+    }
+
     private func visibleArea(of frame: CGRect, in display: CGRect) -> Bool {
         let intersection = frame.intersection(display)
         return intersection.width >= 48 && intersection.height >= 48
