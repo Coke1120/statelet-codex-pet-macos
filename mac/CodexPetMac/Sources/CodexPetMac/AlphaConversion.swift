@@ -477,7 +477,7 @@ final class AlphaConversionCoordinator {
     private func sanitizedFailureMessage(from data: Data) -> String {
         let raw = String(data: data.suffix(8_192), encoding: .utf8) ?? ""
         let lastLine = raw
-            .split(whereSeparator: \Character.isNewline)
+            .split(whereSeparator: { $0.isNewline })
             .map(String.init)
             .last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
         guard let lastLine else {

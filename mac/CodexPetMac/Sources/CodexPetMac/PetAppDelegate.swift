@@ -1449,7 +1449,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         let flattened = url.lastPathComponent
             .components(separatedBy: .controlCharacters)
             .joined(separator: " ")
-            .split(whereSeparator: \Character.isWhitespace)
+            .split(whereSeparator: { $0.isWhitespace })
             .joined(separator: " ")
         return String((flattened.isEmpty ? "MP4" : flattened).prefix(100))
     }

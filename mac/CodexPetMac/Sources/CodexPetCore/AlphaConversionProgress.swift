@@ -81,7 +81,7 @@ public struct AlphaConversionProgress: Decodable, Equatable, Sendable {
                 options: .regularExpression
             )
         return flattened
-            .split(whereSeparator: \Character.isWhitespace)
+            .split(whereSeparator: { $0.isWhitespace })
             .joined(separator: " ")
             .prefix(500)
             .description
