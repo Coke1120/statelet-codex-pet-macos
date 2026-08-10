@@ -2591,6 +2591,8 @@ def _verify_alpha_roundtrip(
     delivery_cadence = verify_video_cadence(
         delivery,
         delivery_info,
+        label="HEVC delivery",
+        allow_packet_fallback=True,
         ffprobe=ffprobe,
         timeout_seconds=min(timeout_seconds, 30.0),
     )
@@ -2634,6 +2636,7 @@ def _verify_alpha_roundtrip(
         roundtrip_cadence = verify_video_cadence(
             roundtrip,
             roundtrip_info,
+            label="ProRes alpha round-trip",
             ffprobe=ffprobe,
             timeout_seconds=min(timeout_seconds, 30.0),
         )
@@ -3030,6 +3033,7 @@ def convert_video(
     cadence = verify_video_cadence(
         source,
         info,
+        label="source",
         ffprobe=ffprobe,
         timeout_seconds=min(args.process_timeout_seconds, 30.0),
     )
@@ -3105,6 +3109,7 @@ def convert_video(
         intermediate_report["cadence"] = verify_video_cadence(
             temp_intermediate,
             intermediate_info,
+            label="ProRes intermediate",
             ffprobe=ffprobe,
             timeout_seconds=min(args.process_timeout_seconds, 30.0),
         )

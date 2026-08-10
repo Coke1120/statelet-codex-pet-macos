@@ -2179,6 +2179,16 @@ class MacOSAlphaCommandTests(unittest.TestCase):
 
         self.assertIn("-show_frames", command)
         self.assertEqual(command[command.index("-select_streams") + 1], "2")
+        packet_command = alpha.build_ffprobe_packet_cadence_command(
+            "source.mp4",
+            stream_index=2,
+            ffprobe="ffprobe",
+        )
+        self.assertIn("-show_packets", packet_command)
+        self.assertEqual(
+            packet_command[packet_command.index("-show_entries") + 1],
+            "packet=pts_time",
+        )
 
     def test_compact_cadence_probe_ignores_ffprobe_side_data_columns(self):
         process = mock.Mock()
@@ -2207,8 +2217,114 @@ class MacOSAlphaCommandTests(unittest.TestCase):
                 process_factory=lambda *_args, **_kwargs: process,
             )
 
-        self.assertEqual(report["frames_checked"], 2)
-        self.assertTrue(report["quality_passed"])
+            self.assertEqual(report["frames_checked"], 2)
+            self.assertTrue(report["quality_passed"])
+
+    def test_compact_cadence_count_error_identifies_stage_without_paths(self):
+        info = alpha.VideoInfo(
+            width=64,
+            height=48,
+            frame_count=2,
+            fps=Fraction(24, 1),
+            duration_seconds=2 / 24,
+            codec_name="h264",
+            pixel_format="yuv420p",
+            time_base="1/12288",
+        )
+        process = mock.Mock()
+        process.stdout = io.BytesIO(b"0.000000\n")
+        process.wait.return_value = 0
+        process.poll.return_value = 0
+
+        with mock.patch.object(alpha, "require_tool", return_value="ffprobe"):
+            with self.assertRaisesRegex(
+                alpha.ProbeError,
+                r"source cadence exposed 1 timestamps for 2 decoded frames",
+            ) as raised:
+                alpha.verify_video_cadence(
+                    Path("/private/source.mp4"),
+                    info,
+                    label="source",
+                    process_factory=lambda *_args, **_kwargs: process,
+                )
+        self.assertNotIn("/private/source.mp4", str(raised.exception))
+
+    def test_hevc_cadence_uses_strict_packet_pts_when_frames_expose_no_timestamps(self):
+        info = alpha.VideoInfo(
+            width=64,
+            height=48,
+            frame_count=3,
+            fps=Fraction(24, 1),
+            duration_seconds=3 / 24,
+            codec_name="hevc",
+            pixel_format="yuva420p",
+            time_base="1/600",
+        )
+        frame_process = mock.Mock()
+        frame_process.stdout = io.BytesIO(b"")
+        frame_process.wait.return_value = 0
+        frame_process.poll.return_value = 0
+        packet_process = mock.Mock()
+        # Packet PTS can be emitted in decode rather than presentation order.
+        packet_process.stdout = io.BytesIO(b"0.083333\n0.000000\n0.041667\n")
+        packet_process.wait.return_value = 0
+        packet_process.poll.return_value = 0
+        processes = iter((frame_process, packet_process))
+        commands = []
+
+        def factory(command, **_kwargs):
+            commands.append(command)
+            return next(processes)
+
+        with mock.patch.object(alpha, "require_tool", return_value="ffprobe"):
+            report = alpha.verify_video_cadence(
+                "delivery.mov",
+                info,
+                label="HEVC delivery",
+                allow_packet_fallback=True,
+                process_factory=factory,
+            )
+
+        self.assertEqual(report["frames_checked"], 3)
+        self.assertEqual(report["expected_frames"], 3)
+        self.assertEqual(report["timestamp_source"], "packet_pts")
+        self.assertIn("-show_frames", commands[0])
+        self.assertIn("-show_packets", commands[1])
+
+    def test_partial_frame_cadence_never_falls_back_to_packets(self):
+        info = alpha.VideoInfo(
+            width=64,
+            height=48,
+            frame_count=2,
+            fps=Fraction(24, 1),
+            duration_seconds=2 / 24,
+            codec_name="hevc",
+            pixel_format="yuva420p",
+            time_base="1/600",
+        )
+        process = mock.Mock()
+        process.stdout = io.BytesIO(b"0.000000\n")
+        process.wait.return_value = 0
+        process.poll.return_value = 0
+        calls = []
+
+        def factory(command, **_kwargs):
+            calls.append(command)
+            return process
+
+        with mock.patch.object(alpha, "require_tool", return_value="ffprobe"):
+            with self.assertRaisesRegex(
+                alpha.ProbeError,
+                r"HEVC delivery cadence exposed 1 timestamps for 2 decoded frames",
+            ):
+                alpha.verify_video_cadence(
+                    "delivery.mov",
+                    info,
+                    label="HEVC delivery",
+                    allow_packet_fallback=True,
+                    process_factory=factory,
+                )
+        self.assertEqual(len(calls), 1)
 
     def test_compact_cadence_probe_terminates_when_output_cap_is_exceeded(self):
         process = mock.Mock()

@@ -766,23 +766,35 @@ def build_ffprobe_cadence_command(
     ]
 
 
-def verify_video_cadence(
-    source: Path | str,
-    info: VideoInfo,
-    *,
-    ffprobe: str = "ffprobe",
-    timeout_seconds: float = DEFAULT_PROBE_TIMEOUT_SECONDS,
-    max_output_bytes: int = 2 * 1024 * 1024,
-    process_factory: Any = subprocess.Popen,
-) -> dict[str, int | float | bool]:
-    """Verify selected-video timestamps with an actively bounded compact probe."""
+def build_ffprobe_packet_cadence_command(
+    source: Path | str, *, stream_index: int, ffprobe: str = "ffprobe"
+) -> list[str]:
+    return [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        str(stream_index),
+        "-show_packets",
+        "-show_entries",
+        "packet=pts_time",
+        "-of",
+        "csv=p=0",
+        str(source),
+    ]
 
-    executable = require_tool("ffprobe", ffprobe)
-    command = build_ffprobe_cadence_command(
-        source, stream_index=info.stream_index, ffprobe=executable
-    )
+
+def _capture_cadence_output(
+    command: list[str],
+    *,
+    timeout_seconds: float,
+    max_output_bytes: int,
+    process_factory: Any,
+) -> bytes:
     try:
-        process = process_factory(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        process = process_factory(
+            command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
     except OSError as exc:
         raise ProbeError("unable to execute ffprobe cadence check") from exc
     if process.stdout is None:
@@ -821,10 +833,16 @@ def verify_video_cadence(
             raise ProbeError("ffprobe cadence check timed out") from exc
         if return_code != 0:
             raise ProbeError(f"ffprobe cadence check failed (exit {return_code})")
+        return bytes(output)
     except BaseException:
         close_process(process)
         raise
+    finally:
+        with contextlib.suppress(OSError):
+            process.stdout.close()
 
+
+def _parse_cadence_timestamps(output: bytes) -> list[float]:
     timestamps: list[float] = []
     for line in output.decode("utf-8", errors="replace").splitlines():
         text = line.strip()
@@ -835,15 +853,69 @@ def verify_video_cadence(
             timestamps.append(float(timestamp_text))
         except ValueError as exc:
             raise ProbeError("video frame timestamp metadata is invalid") from exc
-    tolerance = _validate_video_timestamps(
-        timestamps,
-        frame_count=info.frame_count,
-        fps=info.fps,
-        time_base=info.time_base,
+    return timestamps
+
+
+def verify_video_cadence(
+    source: Path | str,
+    info: VideoInfo,
+    *,
+    label: str = "video",
+    allow_packet_fallback: bool = False,
+    ffprobe: str = "ffprobe",
+    timeout_seconds: float = DEFAULT_PROBE_TIMEOUT_SECONDS,
+    max_output_bytes: int = 2 * 1024 * 1024,
+    process_factory: Any = subprocess.Popen,
+) -> dict[str, int | float | bool]:
+    """Verify selected-video timestamps with an actively bounded compact probe."""
+
+    executable = require_tool("ffprobe", ffprobe)
+    command = build_ffprobe_cadence_command(
+        source, stream_index=info.stream_index, ffprobe=executable
     )
+    deadline = time.monotonic() + timeout_seconds
+    output = _capture_cadence_output(
+        command,
+        timeout_seconds=timeout_seconds,
+        max_output_bytes=max_output_bytes,
+        process_factory=process_factory,
+    )
+    timestamps = _parse_cadence_timestamps(output)
+    timestamp_source = "decoded_frames"
+    if not timestamps and allow_packet_fallback:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProbeError("ffprobe cadence check timed out")
+        packet_command = build_ffprobe_packet_cadence_command(
+            source, stream_index=info.stream_index, ffprobe=executable
+        )
+        packet_output = _capture_cadence_output(
+            packet_command,
+            timeout_seconds=remaining,
+            max_output_bytes=max_output_bytes,
+            process_factory=process_factory,
+        )
+        timestamps = sorted(_parse_cadence_timestamps(packet_output))
+        timestamp_source = "packet_pts"
+    try:
+        tolerance = _validate_video_timestamps(
+            timestamps,
+            frame_count=info.frame_count,
+            fps=info.fps,
+            time_base=info.time_base,
+        )
+    except ProbeError as exc:
+        if str(exc) == "ffprobe video timestamp count does not match decoded frame count":
+            raise ProbeError(
+                "{} cadence exposed {} timestamps for {} decoded frames".format(
+                    label, len(timestamps), info.frame_count
+                )
+            ) from exc
+        raise
     return {
         "frames_checked": len(timestamps),
         "expected_frames": info.frame_count,
+        "timestamp_source": timestamp_source,
         "time_base_tolerance_seconds": tolerance,
         "quality_passed": True,
     }
