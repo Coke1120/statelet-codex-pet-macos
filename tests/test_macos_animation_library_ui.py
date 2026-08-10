@@ -64,6 +64,13 @@ class MacAnimationLibraryUISourceTests(unittest.TestCase):
         self.assertIn("modeHelp.lineBreakMode = .byTruncatingTail", self.source)
         self.assertIn("modeHelp.toolTip = modeHelp.stringValue", self.source)
 
+    def test_mixed_drop_keeps_valid_mp4s_and_reports_each_rejection(self) -> None:
+        self.assertIn("struct MP4ImportRejection", self.source)
+        self.assertIn("case accepted([URL], rejected: [MP4ImportRejection])", self.source)
+        self.assertIn("rejections.append(", self.source)
+        self.assertIn("Skipped \\(rejected.count)", self.source)
+        self.assertIn("onImport?(urls)", self.source)
+
 
 class MacAnimationLibraryUILayoutTests(unittest.TestCase):
     def test_minimum_window_layout_and_state_switch(self) -> None:
@@ -142,6 +149,20 @@ class MacAnimationLibraryUILayoutTests(unittest.TestCase):
                         withIntermediateDirectories: true
                     )
                     defer { try? FileManager.default.removeItem(at: mediaDirectory) }
+
+                    let acceptedMP4 = mediaDirectory.appendingPathComponent("accepted.mp4")
+                    let rejectedMOV = mediaDirectory.appendingPathComponent("rejected.mov")
+                    let emptyMP4 = mediaDirectory.appendingPathComponent("empty.mp4")
+                    try Data([1]).write(to: acceptedMP4)
+                    try Data([1]).write(to: rejectedMOV)
+                    try Data().write(to: emptyMP4)
+                    switch MP4ImportURLValidator.validate([rejectedMOV, acceptedMP4, emptyMP4]) {
+                    case let .accepted(urls, rejected):
+                        try require(urls == [acceptedMP4], "mixed import lost its valid MP4")
+                        try require(rejected.count == 2, "mixed import did not report every rejection")
+                    case let .rejected(reason):
+                        throw HarnessFailure.failed("mixed import rejected the valid MP4: \(reason)")
+                    }
 
                     func entries(prefix: String, count: Int) throws -> [MediaEntry] {
                         try (1...count).map { index in

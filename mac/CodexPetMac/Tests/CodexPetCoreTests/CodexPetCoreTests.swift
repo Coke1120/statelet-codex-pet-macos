@@ -5,11 +5,17 @@ import XCTest
 
 private let reportSourceHash = String(repeating: "a", count: 64)
 private let reportOutputHash = String(repeating: "b", count: 64)
+private let reportProvenanceChallenge = String(repeating: "c", count: 64)
 
 private func validAlphaReportJSON() -> String {
     """
     {
+      "report_schema_version":1,
       "status":"converted",
+      "toolchain":{"converter_version":"1","ffmpeg_version":"ffmpeg version 8.0","ffprobe_version":"ffprobe version 8.0","avconvert_version":"avconvert help"},
+      "profile":{"name":"standard","framing":"fill","keying":"green-screen-continuous-alpha"},
+      "normalization":{"applied":["strip-audio","square-pixel-output"],"warnings":["rotation-sar-vfr-hdr-interlace-rejected-before-decode"]},
+      "provenance":{"method":"invocation-challenge-v1","producer":"statelet","challenge":"\(reportProvenanceChallenge)"},
       "source":{"audio":{"stream_count":1,"codecs":["aac"],"policy":"stripped"}},
       "geometry":{"width":320,"height":486,"pixel_format":"straight-rgba"},
       "geometry_alignment":{"requested_width":321,"requested_height":487,"policy":"floor_to_even","adjusted":true},
@@ -89,6 +95,31 @@ final class CodexPetCoreTests: XCTestCase {
         }
     }
 
+    func testAlphaConversionProgressParserAcceptsSafeTerminalFailure() throws {
+        var parser = AlphaConversionProgressParser()
+        let failure = try XCTUnwrap(parser.parseLine(
+            #"{"event":"progress","status":"failed","percent":42,"stage":"verify","message":"Failed /Users/leoho/My Videos/foo.mp4","code":"QUALITY_GATE_FAILED","safe_message":"Failed '/Users/leoho/My Videos/foo.mp4'"}"#
+        ))
+        XCTAssertTrue(failure.isTerminalFailure)
+        XCTAssertEqual(failure.code, "QUALITY_GATE_FAILED")
+        XCTAssertEqual(failure.stage, "verify")
+        XCTAssertEqual(failure.message, "Failed <local-file>")
+        XCTAssertEqual(failure.safeMessage, "Failed '<local-file>'")
+    }
+
+    func testAlphaConversionProgressParserRejectsMalformedTerminalFailureFields() throws {
+        for line in [
+            #"{"event":"progress","status":"failed","percent":42,"stage":"verify","message":"Failed","code":"UNKNOWN","safe_message":"Failed"}"#,
+            #"{"event":"progress","status":"failed","percent":42,"stage":"/Users/private","message":"Failed","code":"CONVERSION_FAILED","safe_message":"Failed"}"#,
+            #"{"event":"progress","status":"failed","percent":42,"stage":"verify","message":"Failed","code":"CONVERSION_FAILED"}"#,
+            #"{"event":"progress","status":"running","percent":42,"stage":"verify","message":"Working","code":"CONVERSION_FAILED","safe_message":"Failed"}"#,
+            #"{"event":"progress","status":"failed","percent":42,"stage":"verify","message":"Failed","code":"CONVERSION_FAILED","safe_message":"/Users/private/source.mp4 \#(String(repeating: "x", count: 257))"}"#,
+        ] {
+            var parser = AlphaConversionProgressParser()
+            XCTAssertThrowsError(try parser.parseLine(line), "accepted \(line)")
+        }
+    }
+
     func testAlphaConversionProgressRedactsPathsAfterAdversarialDelimiters() throws {
         for (message, expected) in [
             ("source=/Users/person/private/source.mp4", "source=<local-file>"),
@@ -97,6 +128,10 @@ final class CodexPetCoreTests: XCTestCase {
             ("source=/secret.mov", "source=<local-file>"),
             ("source=~/secret.mov", "source=<local-file>"),
             (#"reading "file:///secret.mov""#, #"reading "<local-file>""#),
+            ("reading /Users/leoho/My Videos/foo.mp4", "reading <local-file>"),
+            (#"reading '/Users/leoho/My Videos/foo.mp4'"#, #"reading '<local-file>'"#),
+            ("reading /Users/leoho/My Folder/tool", "reading <local-file>"),
+            (#"reading '/Users/leoho/My Folder/tool'"#, #"reading '<local-file>'"#),
             ("Frame 3/24", "Frame 3/24"),
         ] {
             let progress = try AlphaConversionProgress(percent: 10, stage: "decode", message: message)
@@ -362,6 +397,17 @@ final class CodexPetCoreTests: XCTestCase {
         XCTAssertEqual(validated.height, 486)
         XCTAssertEqual(validated.frames, 241)
         XCTAssertEqual(validated.fps, "24/1")
+        XCTAssertEqual(validated.reportSchemaVersion, 1)
+        XCTAssertEqual(validated.trust, .portableClaim)
+        XCTAssertEqual(validated.toolchain?.converterVersion, "1")
+        XCTAssertEqual(validated.toolchain?.ffmpegVersion, "ffmpeg version 8.0")
+        XCTAssertEqual(validated.profile?.name, "standard")
+        XCTAssertEqual(validated.profile?.framing, "fill")
+        XCTAssertEqual(validated.normalization?.applied, ["strip-audio", "square-pixel-output"])
+        XCTAssertEqual(
+            validated.normalization?.warnings,
+            ["rotation-sar-vfr-hdr-interlace-rejected-before-decode"]
+        )
         XCTAssertEqual(
             validated.notices,
             [
@@ -404,6 +450,11 @@ final class CodexPetCoreTests: XCTestCase {
         legacy.removeValue(forKey: "source")
         legacy.removeValue(forKey: "geometry_alignment")
         legacy.removeValue(forKey: "quality")
+        legacy.removeValue(forKey: "report_schema_version")
+        legacy.removeValue(forKey: "toolchain")
+        legacy.removeValue(forKey: "profile")
+        legacy.removeValue(forKey: "normalization")
+        legacy.removeValue(forKey: "provenance")
 
         let validated = try AlphaConversionReportValidator.validate(
             data: try JSONSerialization.data(withJSONObject: legacy),
@@ -412,6 +463,172 @@ final class CodexPetCoreTests: XCTestCase {
         )
 
         XCTAssertTrue(validated.notices.isEmpty)
+        XCTAssertEqual(validated.reportSchemaVersion, 0)
+        XCTAssertEqual(validated.trust, .legacyPortableClaim)
+        XCTAssertNil(validated.toolchain)
+    }
+
+    func testAlphaConversionReportRejectsUnsupportedFutureSchema() {
+        assertReportError(
+            validAlphaReportJSON().replacingOccurrences(
+                of: "\"report_schema_version\":1",
+                with: "\"report_schema_version\":2"
+            ),
+            actualOutputSHA256: reportOutputHash,
+            equals: .unsupportedSchemaVersion(2)
+        )
+    }
+
+    func testAlphaConversionReportRejectsExplicitLegacySchemaAndIncompleteV1Metadata() {
+        assertReportError(
+            validAlphaReportJSON().replacingOccurrences(
+                of: "\"report_schema_version\":1",
+                with: "\"report_schema_version\":0"
+            ),
+            actualOutputSHA256: reportOutputHash,
+            equals: .unsupportedSchemaVersion(0)
+        )
+        assertReportError(
+            validAlphaReportJSON().replacingOccurrences(
+                of: "\"toolchain\":{\"converter_version\":\"1\",\"ffmpeg_version\":\"ffmpeg version 8.0\",\"ffprobe_version\":\"ffprobe version 8.0\",\"avconvert_version\":\"avconvert help\"},",
+                with: ""
+            ),
+            actualOutputSHA256: reportOutputHash,
+            equals: .invalidMetadata
+        )
+    }
+
+    func testLocalProvenanceRequiresMatchingFreshChallenge() throws {
+        let attested = try AlphaConversionReportValidator.validate(
+            data: Data(validAlphaReportJSON().utf8),
+            expectedOutputBasename: "idle.mov",
+            actualOutputSHA256: reportOutputHash,
+            expectedLocalProvenanceChallenge: reportProvenanceChallenge.uppercased()
+        )
+        XCTAssertEqual(attested.trust, .locallyAttested)
+
+        assertReportError(
+            validAlphaReportJSON(),
+            actualOutputSHA256: reportOutputHash,
+            expectedLocalProvenanceChallenge: String(repeating: "d", count: 64),
+            equals: .provenanceMismatch
+        )
+        assertReportError(
+            validAlphaReportJSON().replacingOccurrences(
+                of: "\"provenance\":{\"method\":\"invocation-challenge-v1\",\"producer\":\"statelet\",\"challenge\":\"\(reportProvenanceChallenge)\"},",
+                with: ""
+            ),
+            actualOutputSHA256: reportOutputHash,
+            expectedLocalProvenanceChallenge: reportProvenanceChallenge,
+            equals: .provenanceRequired
+        )
+    }
+
+    func testPortableSchemaV1RejectsMalformedProvenanceWithoutExpectedChallenge() {
+        assertReportError(
+            validAlphaReportJSON().replacingOccurrences(
+                of: "\"method\":\"invocation-challenge-v1\"",
+                with: "\"method\":\"self-asserted\""
+            ),
+            actualOutputSHA256: reportOutputHash,
+            equals: .invalidMetadata
+        )
+        assertReportError(
+            validAlphaReportJSON().replacingOccurrences(
+                of: "\"producer\":\"statelet\"",
+                with: "\"producer\":\"external\""
+            ),
+            actualOutputSHA256: reportOutputHash,
+            equals: .invalidMetadata
+        )
+        assertReportError(
+            validAlphaReportJSON().replacingOccurrences(
+                of: "\"challenge\":\"\(reportProvenanceChallenge)\"",
+                with: "\"challenge\":\"\(reportProvenanceChallenge.uppercased())\""
+            ),
+            actualOutputSHA256: reportOutputHash,
+            equals: .invalidHash("provenance challenge")
+        )
+        assertReportError(
+            validAlphaReportJSON().replacingOccurrences(
+                of: "\"challenge\":\"\(reportProvenanceChallenge)\"",
+                with: "\"challenge\":\"short\""
+            ),
+            actualOutputSHA256: reportOutputHash,
+            equals: .invalidHash("provenance challenge")
+        )
+    }
+
+    func testAlphaConversionReportRejectsOversizedDataBeforeDecoding() {
+        let oversized = Data(
+            repeating: 0x20,
+            count: AlphaConversionReportValidator.maximumReportBytes + 1
+        )
+        XCTAssertThrowsError(try AlphaConversionReportValidator.validate(
+            data: oversized,
+            expectedOutputBasename: "idle.mov",
+            actualOutputSHA256: reportOutputHash
+        )) { error in
+            XCTAssertEqual(error as? AlphaConversionReportValidationError, .reportTooLarge)
+        }
+    }
+
+    func testPlaybackAcceptanceRequiresPlayableDecodedMatchingHEVC() throws {
+        let report = try AlphaConversionReportValidator.validate(
+            data: Data(validAlphaReportJSON().utf8),
+            expectedOutputBasename: "idle.mov",
+            actualOutputSHA256: reportOutputHash
+        )
+        let accepted = try AlphaPlaybackAcceptanceValidator.validate(
+            probe: AlphaPlaybackProbe(
+                isPlayable: true,
+                videoTrackCount: 1,
+                audioTrackCount: 0,
+                codec: "hevc",
+                width: 320,
+                height: 486,
+                nominalFrameRate: 24,
+                durationSeconds: 241.0 / 24.0,
+                decodedFirstFrame: true
+            ),
+            expected: report
+        )
+        XCTAssertEqual(accepted.width, 320)
+        XCTAssertTrue(accepted.decodedFirstFrame)
+
+        XCTAssertThrowsError(try AlphaPlaybackAcceptanceValidator.validate(
+            probe: AlphaPlaybackProbe(
+                isPlayable: true,
+                videoTrackCount: 1,
+                audioTrackCount: 0,
+                codec: "hevc",
+                width: 320,
+                height: 480,
+                nominalFrameRate: 24,
+                durationSeconds: 241.0 / 24.0,
+                decodedFirstFrame: true
+            ),
+            expected: report
+        )) { error in
+            XCTAssertEqual(error as? AlphaPlaybackAcceptanceError, .geometryMismatch)
+        }
+
+        XCTAssertThrowsError(try AlphaPlaybackAcceptanceValidator.validate(
+            probe: AlphaPlaybackProbe(
+                isPlayable: true,
+                videoTrackCount: 1,
+                audioTrackCount: 1,
+                codec: "hevc",
+                width: 320,
+                height: 486,
+                nominalFrameRate: 24,
+                durationSeconds: 241.0 / 24.0,
+                decodedFirstFrame: true
+            ),
+            expected: report
+        )) { error in
+            XCTAssertEqual(error as? AlphaPlaybackAcceptanceError, .audioPresent)
+        }
     }
 
     func testAlphaConversionReportRejectsIdentityAndSourceFailures() {
@@ -1066,6 +1283,7 @@ final class CodexPetCoreTests: XCTestCase {
         _ json: String,
         expectedOutputBasename: String = "idle.mov",
         actualOutputSHA256: String,
+        expectedLocalProvenanceChallenge: String? = nil,
         equals expected: AlphaConversionReportValidationError,
         file: StaticString = #filePath,
         line: UInt = #line
@@ -1074,7 +1292,8 @@ final class CodexPetCoreTests: XCTestCase {
             try AlphaConversionReportValidator.validate(
                 data: Data(json.utf8),
                 expectedOutputBasename: expectedOutputBasename,
-                actualOutputSHA256: actualOutputSHA256
+                actualOutputSHA256: actualOutputSHA256,
+                expectedLocalProvenanceChallenge: expectedLocalProvenanceChallenge
             ),
             file: file,
             line: line

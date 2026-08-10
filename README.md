@@ -29,6 +29,9 @@ use, not a Developer ID-signed or notarized public binary.
 - Supports Fixed, Random, and Sequential animation libraries for every state.
 - Imports one or more MP4 files through an offline, verified HEVC-with-alpha
   conversion pipeline.
+- Binds local conversions to schema-versioned reports with fresh invocation
+  provenance, reproducibility metadata, immutable alpha gates, and an
+  AVFoundation playback smoke check.
 - Shows structured conversion progress and preserves completed imports when a
   later file fails or the remaining batch is cancelled.
 - Supports one-time preview, temporary state selection, Next Clip, Reduce Motion

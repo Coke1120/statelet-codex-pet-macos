@@ -146,6 +146,19 @@ Statelet performs background removal offline. Runtime playback never chroma-keys
 an MP4. The converter creates Apple HEVC with alpha and verifies the result
 through Apple's media pipeline before adding it to a library.
 
+Every new conversion report uses schema v1 and records the toolchain, selected
+profile, explicit normalization policy, and a fresh 256-bit invocation
+challenge. The app supplies that challenge to the converter and accepts local
+installation only when the returned report matches it. A report copied from
+elsewhere remains a portable, self-asserted claim even if it contains a
+challenge; it cannot acquire local trust without the app's expected value. A
+schema-v1 portable pair therefore requires a separate, explicit user trust
+confirmation and remains labeled portable/unattested. Reports with no schema
+key remain decodable only for legacy diagnostics, while explicit version 0 and
+unknown future versions fail closed. The Swift validator rejects report data
+larger than 1 MiB before JSON decoding and requires canonical schema-v1
+provenance even when no local challenge is expected.
+
 Install `ffmpeg` using a package manager you trust. With Homebrew:
 
 ```bash
@@ -179,6 +192,21 @@ Developers may configure these environment variables before launching the app:
 - `CODEX_PET_AVCONVERT`
 
 Return to **Animations** and choose **Check Again** after changing tools.
+
+To exercise the same AVFoundation extraction used by installed-media playback
+acceptance against a real converted movie:
+
+```bash
+swift run --package-path mac/CodexPetMac \
+  codex-pet-core-self-test \
+  --playback-smoke "$STATELET_OUTPUT" 320 480 24
+```
+
+This smoke requires one playable HEVC video track, zero audio tracks,
+transformed geometry and nominal FPS matching the arguments, and a successfully
+decoded first frame. Source audio may be reported as stripped, but delivery
+audio always fails. The smoke does not replace the report's all-frame Apple
+round-trip, alpha, composite, hash, and source-immutability gates.
 
 ## Upgrade
 

@@ -29,6 +29,7 @@ final class PetPanel: NSPanel {
     }
 
     func apply(alwaysOnTop: Bool, fullScreenAuxiliary: Bool) {
+        let wasAlwaysOnTop = isFloatingPanel || level == .floating
         isFloatingPanel = alwaysOnTop
         level = alwaysOnTop ? .floating : .normal
         var behavior: NSWindow.CollectionBehavior = [.canJoinAllSpaces, .ignoresCycle]
@@ -36,7 +37,11 @@ final class PetPanel: NSPanel {
             behavior.insert(.fullScreenAuxiliary)
         }
         collectionBehavior = behavior
-        orderFrontRegardless()
+        if alwaysOnTop {
+            orderFrontRegardless()
+        } else if wasAlwaysOnTop {
+            orderBack(nil)
+        }
     }
 
 }

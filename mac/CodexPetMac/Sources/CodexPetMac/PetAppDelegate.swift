@@ -1,9 +1,9 @@
 import AppKit
-import AVFoundation
 import CodexPetCore
 import CryptoKit
 import Darwin
 import OSLog
+import Security
 import UniformTypeIdentifiers
 
 private struct LaunchOptions {
@@ -146,7 +146,7 @@ private enum MediaMapLoadResult: Equatable {
     }
 }
 
-private struct VerifiedMovieInstall {
+private struct VerifiedMovieInstall: Sendable {
     let directory: URL
     let movieURL: URL
     let reportURL: URL
@@ -156,6 +156,19 @@ private struct VerifiedMovieInstall {
 private struct MP4ImportFailure {
     let name: String
     let reason: String
+    let sourceURL: URL?
+}
+
+private struct FailedMP4Batch {
+    let state: PetState
+    let sourceURLs: [URL]
+}
+
+private struct ActiveConversionJournal: Codable {
+    let state: String
+    let outputBasename: String
+    let reportBasename: String
+    let invocationChallenge: String
 }
 
 private struct MP4ImportNotice {
@@ -177,11 +190,14 @@ private enum StatusMenuTag: Int {
     case nextClip = 5
     case temporaryState = 6
     case followCodex = 7
+    case alwaysOnTop = 8
 }
 
 final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @unchecked Sendable {
     private static let healthCheckIntervalSeconds = 30
     private static let positionSaveDebounceMilliseconds = 300
+    private static let portableCopyTimeoutSeconds: TimeInterval = 120
+    private static let portableValidationTimeoutSeconds: TimeInterval = 30
 
     private let logger = Logger(subsystem: StateletIdentity.bundleIdentifier, category: "app")
     private let freshnessPolicy = StateFreshnessPolicy.production
@@ -216,11 +232,15 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private let toolchainDiscovery = AlphaToolchainDiscovery()
     private var toolchainState: AlphaToolchainState = .checking
     private let conversionCoordinator = AlphaConversionCoordinator()
+    private var conversionProfile: AlphaConversionProfile = .fill
     private let launchAtLoginManager = LaunchAtLoginManager()
     private let diagnostics = PetDiagnostics()
     private var cachedLaunchAtLoginStatus: LaunchAtLoginManager.Status?
     private var cachedDiagnosticsReport = "Open Diagnostics and choose Refresh to inspect this Mac."
     private var activeMP4BatchID: UUID?
+    private var lastFailedMP4Batch: FailedMP4Batch?
+    private var lastConversionFailureDiagnostic: (code: String, stage: String)?
+    private var pendingRecoveryNotice: (PetState, String)?
     private var mp4BatchCancellationRequested = false
     private var mediaMapReloadDeferred = false
     private var mediaMutationInProgress = false {
@@ -232,6 +252,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        conversionProfile = AlphaConversionProfile.restored()
         options = LaunchOptions.parse(arguments: CommandLine.arguments)
         mediaMapURL = options.mediaMapURL
         loadMediaMap()
@@ -281,7 +302,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         player.setReduceMotion(reduceMotion)
         clickThrough = options.clickThroughOverride ?? configuredWindow.clickThrough
         panel.ignoresMouseEvents = clickThrough
-        panel.orderFrontRegardless()
+        if effectiveAlwaysOnTop {
+            panel.orderFrontRegardless()
+        } else {
+            panel.orderFront(nil)
+        }
 
         installStatusItem()
         NotificationCenter.default.addObserver(
@@ -312,6 +337,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         if options.openSettings {
             DispatchQueue.main.async { [weak self] in self?.showSettings() }
         }
+        recoverInterruptedConversionIfPresent()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -322,7 +348,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         positionSaveGeneration &+= 1
         positionSaveWorkItem?.cancel()
         positionSaveWorkItem = nil
-        conversionCoordinator.cancel()
+        _ = conversionCoordinator.terminateAndWait()
         savePanelFrame()
         NotificationCenter.default.removeObserver(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
@@ -840,6 +866,15 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         temporaryStateItem.submenu = makeTemporaryStateMenu()
         menu.addItem(temporaryStateItem)
         menu.addItem(.separator())
+        let alwaysOnTopItem = NSMenuItem(
+            title: "Keep Statelet on Top",
+            action: #selector(toggleAlwaysOnTop),
+            keyEquivalent: ""
+        )
+        alwaysOnTopItem.target = self
+        alwaysOnTopItem.tag = StatusMenuTag.alwaysOnTop.rawValue
+        alwaysOnTopItem.toolTip = "Turn this off to let other app windows cover Statelet."
+        menu.addItem(alwaysOnTopItem)
         let clickItem = NSMenuItem(title: "Click-through", action: #selector(toggleClickThrough), keyEquivalent: "")
         clickItem.target = self
         clickItem.tag = StatusMenuTag.clickThrough.rawValue
@@ -896,6 +931,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
         if let clickItem = menu?.item(withTag: StatusMenuTag.clickThrough.rawValue) {
             clickItem.state = clickThrough ? .on : .off
+        }
+        if let alwaysOnTopItem = menu?.item(withTag: StatusMenuTag.alwaysOnTop.rawValue) {
+            alwaysOnTopItem.state = effectiveAlwaysOnTop ? .on : .off
         }
         if let stopPreviewItem = menu?.item(withTag: StatusMenuTag.stopOneShot.rawValue) {
             stopPreviewItem.isHidden = activeOneShotPreview == nil
@@ -985,6 +1023,25 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         refreshSettings()
     }
 
+    @objc private func toggleAlwaysOnTop() {
+        do {
+            let window = try mediaMap.window.replacing(alwaysOnTop: !effectiveAlwaysOnTop)
+            let updated = try mediaMap.replacingWindow(window)
+            try publishMediaMap(updated)
+            options.alwaysOnTopOverride = nil
+            applyPublishedMediaMap(updated, refreshPlayback: false)
+        } catch {
+            logger.error("event=window_setting_save_failed setting=always_on_top")
+            presentSettingsError("Keep Statelet on Top could not be saved.")
+            updateStatusMenu()
+            refreshSettings()
+        }
+    }
+
+    private var effectiveAlwaysOnTop: Bool {
+        options?.alwaysOnTopOverride ?? mediaMap.window.alwaysOnTop
+    }
+
     @objc private func showSettings() {
         if settingsController == nil {
             settingsController = makeSettingsController()
@@ -1028,6 +1085,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         controller.onCheckTools = { [weak self] in self?.checkConversionTools() }
         controller.onChoosePython = { [weak self] in self?.choosePythonRuntime() }
         controller.onCancelConversion = { [weak self] in self?.cancelMP4ImportBatch() }
+        controller.onRetryFailedMP4s = { [weak self] in self?.retryLastFailedMP4Batch() }
+        controller.onConversionProfileChange = { [weak self] profile in
+            self?.conversionProfile = profile
+            profile.persist()
+        }
         controller.onWindowSettingsChange = { [weak self] update in self?.applyWindowSettings(update) }
         controller.onResetPosition = { [weak self] in self?.resetPanelPosition() }
         controller.onRefreshDiagnostics = { [weak self] in self?.refreshDiagnosticsSnapshot() }
@@ -1035,6 +1097,10 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         controller.onLaunchAtLoginChange = { [weak self] enabled in self?.setLaunchAtLogin(enabled) }
         controller.onCleanUnusedMedia = { [weak self] in self?.cleanUnusedMedia() }
         controller.update(toolchainState: toolchainState)
+        controller.update(conversionProfile: conversionProfile)
+        if let pendingRecoveryNotice {
+            controller.update(activity: .failed(pendingRecoveryNotice.0, pendingRecoveryNotice.1))
+        }
         return controller
     }
 
@@ -1152,15 +1218,30 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         switch MP4ImportURLValidator.validate(sourceURLs) {
         case let .rejected(reason):
             settingsController?.update(activity: .failed(state, "Nothing imported · \(reason)"))
-        case let .accepted(orderedURLs):
-            startConversionBatch(sourceURLs: orderedURLs, state: state, toolchain: toolchain)
+        case let .accepted(orderedURLs, rejected):
+            let validationFailures = rejected.map {
+                MP4ImportFailure(
+                    name: safeMediaDisplayName($0.sourceURL),
+                    reason: String($0.reason.prefix(300)),
+                    sourceURL: nil
+                )
+            }
+            startConversionBatch(
+                sourceURLs: orderedURLs,
+                state: state,
+                toolchain: toolchain,
+                initialFailures: validationFailures,
+                totalCount: orderedURLs.count + validationFailures.count
+            )
         }
     }
 
     private func startConversionBatch(
         sourceURLs: [URL],
         state: PetState,
-        toolchain: AlphaToolchain
+        toolchain: AlphaToolchain,
+        initialFailures: [MP4ImportFailure] = [],
+        totalCount: Int? = nil
     ) {
         guard !sourceURLs.isEmpty else { return }
         do {
@@ -1173,13 +1254,15 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         let batchID = UUID()
         activeMP4BatchID = batchID
         mp4BatchCancellationRequested = false
+        lastFailedMP4Batch = nil
         convertNextMP4(
             sourceURLs: sourceURLs,
             index: 0,
+            totalCount: totalCount ?? sourceURLs.count,
             state: state,
             toolchain: toolchain,
             imported: 0,
-            failures: [],
+            failures: initialFailures,
             notices: [],
             batchID: batchID
         )
@@ -1188,6 +1271,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private func convertNextMP4(
         sourceURLs: [URL],
         index: Int,
+        totalCount: Int,
         state: PetState,
         toolchain: AlphaToolchain,
         imported: Int,
@@ -1199,7 +1283,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         if mp4BatchCancellationRequested {
             finishMP4Batch(
                 state: state,
-                total: sourceURLs.count,
+                total: totalCount,
                 imported: imported,
                 failures: failures,
                 notices: notices,
@@ -1211,7 +1295,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         guard index < sourceURLs.count else {
             finishMP4Batch(
                 state: state,
-                total: sourceURLs.count,
+                total: totalCount,
                 imported: imported,
                 failures: failures,
                 notices: notices,
@@ -1227,10 +1311,40 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         let reportURL = mediaMapURL.deletingLastPathComponent()
             .appendingPathComponent("\(state.rawValue)-\(token).report.json")
         let position = index + 1
+        let invocationChallenge: String
+        do {
+            invocationChallenge = try Self.makeInvocationChallenge()
+            try writeConversionJournal(
+                ActiveConversionJournal(
+                    state: state.rawValue,
+                    outputBasename: outputURL.lastPathComponent,
+                    reportBasename: reportURL.lastPathComponent,
+                    invocationChallenge: invocationChallenge
+                )
+            )
+        } catch {
+            let failure = MP4ImportFailure(
+                name: safeMediaDisplayName(sourceURL),
+                reason: "Statelet could not create a private recovery record for this conversion.",
+                sourceURL: sourceURL
+            )
+            convertNextMP4(
+                sourceURLs: sourceURLs,
+                index: index + 1,
+                totalCount: totalCount,
+                state: state,
+                toolchain: toolchain,
+                imported: imported,
+                failures: failures + [failure],
+                notices: notices,
+                batchID: batchID
+            )
+            return
+        }
         settingsController?.update(
             activity: .converting(
                 state,
-                "Clip \(position) of \(sourceURLs.count): checking source and conversion tools…"
+                "Clip \(position) of \(sourceURLs.count): preflighting compatibility and disk space…"
             ),
             progressValue: batchProgress(index: index, total: sourceURLs.count, clipPercent: 0)
         )
@@ -1241,6 +1355,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             width: AlphaAuthoringCanvas.width,
             height: AlphaAuthoringCanvas.height,
             toolchain: toolchain,
+            invocationChallenge: invocationChallenge,
+            profile: conversionProfile,
             phase: { [weak self] phase in
                 guard let self else { return }
                 self.settingsController?.update(
@@ -1271,8 +1387,10 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 guard let self else { return }
                 switch result {
                 case let .failure(error):
+                    self.updateConversionFailureDiagnostic(from: error)
                     try? FileManager.default.removeItem(at: outputURL)
                     try? FileManager.default.removeItem(at: reportURL)
+                    self.clearConversionJournal()
                     if self.mp4BatchCancellationRequested
                         || (error as? AlphaConversionFailure).map({
                             if case .cancelled = $0 { return true }
@@ -1280,7 +1398,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                         }) == true {
                         self.finishMP4Batch(
                             state: state,
-                            total: sourceURLs.count,
+                            total: totalCount,
                             imported: imported,
                             failures: failures,
                             notices: notices,
@@ -1290,12 +1408,14 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                     } else {
                         let failure = MP4ImportFailure(
                             name: self.safeMediaDisplayName(sourceURL),
-                            reason: String(error.localizedDescription.prefix(300))
+                            reason: String(error.localizedDescription.prefix(300)),
+                            sourceURL: sourceURL
                         )
                         self.logger.error("event=animation_import_failed state=\(state.rawValue, privacy: .public) batch_index=\(position, privacy: .public) batch_count=\(sourceURLs.count, privacy: .public) stage=converter")
                         self.convertNextMP4(
                             sourceURLs: sourceURLs,
                             index: index + 1,
+                            totalCount: totalCount,
                             state: state,
                             toolchain: toolchain,
                             imported: imported,
@@ -1305,6 +1425,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                         )
                     }
                 case let .success(conversion):
+                    self.lastConversionFailureDiagnostic = nil
                     self.settingsController?.update(
                         activity: .converting(state, "Clip \(position) of \(sourceURLs.count): validating transparency…"),
                         progressValue: self.batchProgress(
@@ -1313,27 +1434,29 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                             clipPercent: 97
                         )
                     )
-                    DispatchQueue.global(qos: .userInitiated).async {
-                        let validation = Result {
-                            let digest = try Self.sha256Hex(of: conversion.outputURL)
-                            return try AlphaConversionReportValidator.validate(
-                                data: conversion.reportData,
+                    Task { @MainActor in
+                        let validation = await Task.detached(priority: .userInitiated) {
+                            try Self.validateLocallyAttestedMovie(
+                                outputURL: conversion.outputURL,
+                                reportURL: conversion.reportURL,
                                 expectedOutputBasename: conversion.outputURL.lastPathComponent,
-                                actualOutputSHA256: digest
+                                invocationChallenge: invocationChallenge,
+                                expectedInitialReportData: conversion.reportData
                             )
-                        }
-                        DispatchQueue.main.async {
+                        }.result
                             guard self.activeMP4BatchID == batchID else {
                                 try? FileManager.default.removeItem(at: conversion.outputURL)
                                 try? FileManager.default.removeItem(at: conversion.reportURL)
+                                self.clearConversionJournal()
                                 return
                             }
                             if self.mp4BatchCancellationRequested {
                                 try? FileManager.default.removeItem(at: conversion.outputURL)
                                 try? FileManager.default.removeItem(at: conversion.reportURL)
+                                self.clearConversionJournal()
                                 self.finishMP4Batch(
                                     state: state,
-                                    total: sourceURLs.count,
+                                    total: totalCount,
                                     imported: imported,
                                     failures: failures,
                                     notices: notices,
@@ -1347,17 +1470,25 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                             var nextNotices = notices
                             switch validation {
                             case let .failure(error):
+                                self.lastConversionFailureDiagnostic = nil
                                 try? FileManager.default.removeItem(at: conversion.outputURL)
                                 try? FileManager.default.removeItem(at: conversion.reportURL)
+                                self.clearConversionJournal()
                                 nextFailures.append(
                                     MP4ImportFailure(
                                         name: self.safeMediaDisplayName(sourceURL),
-                                        reason: String(error.localizedDescription.prefix(300))
+                                        reason: String(error.localizedDescription.prefix(300)),
+                                        sourceURL: sourceURL
                                     )
                                 )
                                 self.logger.error("event=animation_import_failed state=\(state.rawValue, privacy: .public) batch_index=\(position, privacy: .public) batch_count=\(sourceURLs.count, privacy: .public) stage=report_validation")
                             case let .success(report):
                                 do {
+                                    guard report.trust == .locallyAttested else {
+                                        throw AlphaConversionFailure.converterFailed(
+                                            "The converted movie was not locally attested."
+                                        )
+                                    }
                                     self.settingsController?.update(
                                         activity: .converting(
                                             state,
@@ -1373,6 +1504,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                                         for: state,
                                         path: conversion.outputURL.lastPathComponent
                                     )
+                                    self.lastConversionFailureDiagnostic = nil
+                                    self.clearConversionJournal()
                                     nextImported += 1
                                     if !report.notices.isEmpty {
                                         nextNotices.append(
@@ -1386,10 +1519,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                                 } catch {
                                     try? FileManager.default.removeItem(at: conversion.outputURL)
                                     try? FileManager.default.removeItem(at: conversion.reportURL)
+                                    self.clearConversionJournal()
                                     nextFailures.append(
                                         MP4ImportFailure(
                                             name: self.safeMediaDisplayName(sourceURL),
-                                            reason: "The verified movie could not be added to the library."
+                                            reason: "The verified movie could not be added to the library.",
+                                            sourceURL: sourceURL
                                         )
                                     )
                                     self.logger.error("event=animation_import_failed state=\(state.rawValue, privacy: .public) batch_index=\(position, privacy: .public) batch_count=\(sourceURLs.count, privacy: .public) stage=library_install")
@@ -1398,6 +1533,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                             self.convertNextMP4(
                                 sourceURLs: sourceURLs,
                                 index: index + 1,
+                                totalCount: totalCount,
                                 state: state,
                                 toolchain: toolchain,
                                 imported: nextImported,
@@ -1405,7 +1541,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                                 notices: nextNotices,
                                 batchID: batchID
                             )
-                        }
                     }
                 }
             }
@@ -1425,6 +1560,14 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         activeMP4BatchID = nil
         mp4BatchCancellationRequested = false
         mediaMutationInProgress = false
+        let retryURLs = failures.compactMap(\.sourceURL).reduce(into: [URL]()) { urls, url in
+            if !urls.contains(where: { $0.standardizedFileURL == url.standardizedFileURL }) {
+                urls.append(url)
+            }
+        }
+        lastFailedMP4Batch = retryURLs.isEmpty
+            ? nil
+            : FailedMP4Batch(state: state, sourceURLs: retryURLs)
         let noticeSummary = summarizedImportNotices(notices)
         if cancelled {
             let priorFailures = summarizedImportFailures(failures)
@@ -1434,7 +1577,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                     "Import cancelled · \(imported) of \(total) clips were added"
                         + (priorFailures.map { " · Earlier failures: \($0)" } ?? "")
                         + (noticeSummary.map { " · Notices: \($0)" } ?? "")
-                )
+                ),
+                retryFailedAvailable: !retryURLs.isEmpty
             )
         } else if failures.isEmpty {
             settingsController?.update(
@@ -1451,10 +1595,15 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                     "Imported \(imported) of \(total) · "
                         + (summarizedImportFailures(failures) ?? "Conversion failed")
                         + (noticeSummary.map { " · Notices: \($0)" } ?? "")
-                )
+                ),
+                retryFailedAvailable: !retryURLs.isEmpty
             )
         }
         refreshSettings()
+    }
+
+    private func updateConversionFailureDiagnostic(from error: Error) {
+        lastConversionFailureDiagnostic = (error as? AlphaConversionFailure)?.conversionDiagnostic
     }
 
     private func summarizedImportFailures(_ failures: [MP4ImportFailure]) -> String? {
@@ -1481,6 +1630,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         conversionCoordinator.cancel()
     }
 
+    private func retryLastFailedMP4Batch() {
+        guard !mediaMutationInProgress,
+              let batch = lastFailedMP4Batch else { return }
+        importMP4s(batch.sourceURLs, for: batch.state)
+    }
+
     private func batchProgress(index: Int, total: Int, clipPercent: Double) -> Double {
         guard total > 0 else { return 0 }
         let boundedClip = min(100, max(0, clipPercent)) / 100
@@ -1496,12 +1651,197 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         return String((flattened.isEmpty ? "MP4" : flattened).prefix(100))
     }
 
+    private var conversionJournalURL: URL {
+        mediaMapURL.deletingLastPathComponent()
+            .appendingPathComponent(".statelet-conversion-journal.json")
+    }
+
+    private func writeConversionJournal(_ journal: ActiveConversionJournal) throws {
+        let data = try JSONEncoder().encode(journal)
+        let url = conversionJournalURL
+        try data.write(to: url, options: .atomic)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: Int16(0o600))],
+            ofItemAtPath: url.path
+        )
+    }
+
+    private func clearConversionJournal() {
+        try? FileManager.default.removeItem(at: conversionJournalURL)
+    }
+
+    private static func makeInvocationChallenge() throws -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        let status = bytes.withUnsafeMutableBytes { buffer in
+            SecRandomCopyBytes(kSecRandomDefault, buffer.count, buffer.baseAddress!)
+        }
+        guard status == errSecSuccess else {
+            throw AlphaConversionFailure.launchFailed
+        }
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func recoverInterruptedConversionIfPresent() {
+        let journalURL = conversionJournalURL
+        let mediaDirectory = mediaMapURL.deletingLastPathComponent()
+        guard let data = try? PortableMediaSecureCopier.readRegularFile(
+                  at: journalURL,
+                  maximumBytes: PortableMediaCopyLimits().maxReportBytes
+              ),
+              let journal = try? JSONDecoder().decode(ActiveConversionJournal.self, from: data),
+              let state = PetState(rawValue: journal.state),
+              AlphaRecoveryArtifactPolicy.accepts(
+                  stateRawValue: state.rawValue,
+                  outputBasename: journal.outputBasename,
+                  reportBasename: journal.reportBasename
+              ),
+              Self.isValidInvocationChallenge(journal.invocationChallenge) else {
+            try? FileManager.default.removeItem(at: journalURL)
+            return
+        }
+        mediaMutationInProgress = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let outputURL = mediaDirectory.appendingPathComponent(journal.outputBasename)
+            let reportURL = mediaDirectory.appendingPathComponent(journal.reportBasename)
+            let validation = await Task.detached(priority: .utility) {
+                try Self.validateLocallyAttestedMovie(
+                    outputURL: outputURL,
+                    reportURL: reportURL,
+                    expectedOutputBasename: journal.outputBasename,
+                    invocationChallenge: journal.invocationChallenge,
+                    expectedInitialReportData: nil
+                )
+            }.result
+                switch validation {
+                case .failure:
+                    let outputReferenced = self.isMediaPathReferenced(outputURL)
+                    let reportReferenced = self.isMediaPathReferenced(reportURL)
+                    let shouldQuarantine = AlphaRecoveryArtifactPolicy.shouldQuarantine(
+                        outputReferenced: outputReferenced,
+                        reportReferenced: reportReferenced
+                    )
+                    let quarantined = shouldQuarantine
+                        ? self.quarantineFailedRecoveryArtifacts(
+                            outputURL: outputURL,
+                            reportURL: reportURL
+                        )
+                        : 0
+                    let isReferenced = outputReferenced || reportReferenced
+                    self.clearConversionJournal()
+                    let notice: String
+                    if isReferenced {
+                        notice = "Interrupted conversion could not be recovered. Existing library media was left unchanged."
+                    } else if quarantined > 0 {
+                        notice = "Interrupted conversion could not be recovered. \(quarantined) file\(quarantined == 1 ? " was" : "s were") moved to private recovery quarantine; Clean Unused Media can remove them later."
+                    } else {
+                        notice = "Interrupted conversion could not be recovered. No managed media files were changed."
+                    }
+                    self.pendingRecoveryNotice = (state, notice)
+                    self.settingsController?.update(activity: .failed(state, notice))
+                    self.logger.error("event=animation_recovery_quarantined state=\(state.rawValue, privacy: .public) files=\(quarantined, privacy: .public) referenced=\(isReferenced, privacy: .public) cleanup=unused_media")
+                case .success:
+                    do {
+                        let alreadyInstalled = self.mediaMap.playlist(for: state)?
+                            .entries.contains(where: { $0.path == journal.outputBasename }) == true
+                        if !alreadyInstalled {
+                            try self.installMediaEntry(for: state, path: journal.outputBasename)
+                        }
+                        self.clearConversionJournal()
+                        self.logger.info("event=animation_recovered state=\(state.rawValue, privacy: .public)")
+                        self.refreshSettings()
+                    } catch {
+                        self.logger.error("event=animation_recovery_deferred state=\(state.rawValue, privacy: .public)")
+                    }
+                }
+            self.mediaMutationInProgress = false
+        }
+    }
+
+    private static func isValidInvocationChallenge(_ value: String) -> Bool {
+        value.count == 64 && value.allSatisfy { $0.isHexDigit && !$0.isUppercase }
+    }
+
+    private func isMediaPathReferenced(_ url: URL) -> Bool {
+        let target = url.standardizedFileURL.path
+        return mediaMap.states.values.contains { playlist in
+            playlist.entries.contains { entry in
+                mediaMap.resolvedURL(for: entry, relativeTo: mediaMapURL)
+                    .standardizedFileURL.path == target
+            }
+        }
+    }
+
+    private func quarantineFailedRecoveryArtifacts(outputURL: URL, reportURL: URL) -> Int {
+        let mediaDirectory = mediaMapURL.deletingLastPathComponent()
+        let quarantineDirectory = mediaDirectory.appendingPathComponent(
+            ".recovery-quarantine",
+            isDirectory: true
+        )
+        do {
+            try FileManager.default.createDirectory(
+                at: quarantineDirectory,
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
+        } catch CocoaError.fileWriteFileExists {
+            // Existing quarantine is accepted only after the no-follow open below.
+        } catch {
+            return 0
+        }
+        let sourceDirectoryDescriptor = Darwin.open(
+            mediaDirectory.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard sourceDirectoryDescriptor >= 0 else { return 0 }
+        defer { Darwin.close(sourceDirectoryDescriptor) }
+        let quarantineDescriptor = Darwin.open(
+            quarantineDirectory.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard quarantineDescriptor >= 0 else { return 0 }
+        defer { Darwin.close(quarantineDescriptor) }
+        guard Darwin.fchmod(quarantineDescriptor, mode_t(S_IRWXU)) == 0 else { return 0 }
+
+        var moved = 0
+        let suffix = versionToken()
+        for sourceURL in [outputURL, reportURL] {
+            let sourceName = sourceURL.lastPathComponent
+            guard sourceURL.deletingLastPathComponent().standardizedFileURL == mediaDirectory.standardizedFileURL else {
+                continue
+            }
+            let sourceDescriptor = Darwin.openat(
+                sourceDirectoryDescriptor,
+                sourceName,
+                O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+            )
+            guard sourceDescriptor >= 0 else { continue }
+            var sourceStatus = stat()
+            let isRegular = Darwin.fstat(sourceDescriptor, &sourceStatus) == 0
+                && sourceStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG)
+            if isRegular { _ = Darwin.fchmod(sourceDescriptor, mode_t(S_IRUSR | S_IWUSR)) }
+            Darwin.close(sourceDescriptor)
+            guard isRegular else { continue }
+            let destinationName = "\(suffix)-\(sourceName)"
+            guard Darwin.renameat(
+                sourceDirectoryDescriptor,
+                sourceName,
+                quarantineDescriptor,
+                destinationName
+            ) == 0 else { continue }
+            moved += 1
+        }
+        _ = Darwin.fsync(sourceDirectoryDescriptor)
+        _ = Darwin.fsync(quarantineDescriptor)
+        return moved
+    }
+
     private func chooseTransparentMovie(for state: PetState) {
         guard !mediaMutationInProgress else { return }
         guard let settingsWindow = settingsController?.window else { return }
         let openPanel = NSOpenPanel()
-        openPanel.title = "Choose Verified MOVs for \(state.rawValue.capitalized)"
-        openPanel.message = "Choose a HEVC-with-alpha MOV beside its converter-generated .report.json file. Unverified movies are not accepted."
+        openPanel.title = "Choose Portable MOVs for \(state.rawValue.capitalized)"
+        openPanel.message = "Portable MOV reports cannot prove local verification. Prefer importing the source MP4 so Statelet can convert and attest it on this Mac."
         openPanel.prompt = "Import MOVs"
         openPanel.allowedContentTypes = [.quickTimeMovie]
         openPanel.allowsMultipleSelection = true
@@ -1515,23 +1855,46 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private func importVerifiedMovies(
         _ sourceURLs: [URL],
         for state: PetState,
-        replacingPath: String? = nil
+        replacingPath: String? = nil,
+        userConfirmedPortableTrust: Bool = false
     ) {
         guard !sourceURLs.isEmpty else { return }
+        guard userConfirmedPortableTrust else {
+            guard let settingsWindow = settingsController?.window else { return }
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Trust portable verification for this batch?"
+            alert.informativeText = "Statelet will check each report hash, transparency gates, and AVFoundation playback, but it cannot prove that the report was produced on this Mac. Import the source MP4 instead for local attestation."
+            alert.addButton(withTitle: "Import Portable MOVs")
+            alert.addButton(withTitle: "Cancel")
+            alert.beginSheetModal(for: settingsWindow) { [weak self] response in
+                guard response == .alertFirstButtonReturn else { return }
+                self?.importVerifiedMovies(
+                    sourceURLs,
+                    for: state,
+                    replacingPath: replacingPath,
+                    userConfirmedPortableTrust: true
+                )
+            }
+            return
+        }
         mediaMutationInProgress = true
         Task { @MainActor [weak self] in
             guard let self else { return }
             var imported = 0
-            var failedNames: [String] = []
+            var failures: [MP4ImportFailure] = []
             for (index, sourceURL) in sourceURLs.enumerated() {
                 self.settingsController?.update(
                     activity: .working(
                         state,
-                        "Verified MOV \(index + 1) of \(sourceURLs.count): copying and validating…"
+                        "Portable MOV \(index + 1) of \(sourceURLs.count): checking claim and playback…"
                     )
                 )
                 do {
-                    let installed = try await self.prepareVerifiedMovie(sourceURL)
+                    let installed = try await self.prepareVerifiedMovie(
+                        sourceURL,
+                        allowPortableClaim: userConfirmedPortableTrust
+                    )
                     do {
                         if let replacingPath {
                             try self.installRelinkedMediaEntry(
@@ -1543,13 +1906,19 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                             try self.installMediaEntry(for: state, path: installed.relativePath)
                         }
                         imported += 1
-                        self.logger.info("event=verified_animation_imported state=\(state.rawValue, privacy: .public) batch_index=\(index + 1, privacy: .public) batch_count=\(sourceURLs.count, privacy: .public) relink=\(replacingPath != nil, privacy: .public)")
+                        self.logger.info("event=user_trusted_portable_animation_imported state=\(state.rawValue, privacy: .public) batch_index=\(index + 1, privacy: .public) batch_count=\(sourceURLs.count, privacy: .public) relink=\(replacingPath != nil, privacy: .public)")
                     } catch {
                         try? FileManager.default.removeItem(at: installed.directory)
                         throw error
                     }
                 } catch {
-                    failedNames.append(sourceURL.lastPathComponent)
+                    failures.append(
+                        MP4ImportFailure(
+                            name: self.safeMediaDisplayName(sourceURL),
+                            reason: String(error.localizedDescription.prefix(300)),
+                            sourceURL: nil
+                        )
+                    )
                 }
             }
             mediaMutationInProgress = false
@@ -1558,20 +1927,23 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                     settingsController?.update(activity: .succeeded(state, "Missing clip relinked"))
                 } else {
                     settingsController?.update(
-                        activity: .failed(state, "The missing clip could not be relinked with a verified MOV.")
+                        activity: .failed(
+                            state,
+                            "The missing clip could not be relinked with a user-trusted portable MOV · "
+                                + (self.summarizedImportFailures(failures) ?? "Portable import failed")
+                        )
                     )
                 }
-            } else if failedNames.isEmpty {
+            } else if failures.isEmpty {
                 settingsController?.update(
-                    activity: .succeeded(state, "Imported \(imported) verified MOV\(imported == 1 ? "" : "s")")
+                    activity: .succeeded(state, "Imported \(imported) user-trusted portable MOV\(imported == 1 ? "" : "s")")
                 )
             } else {
-                let failed = failedNames.prefix(3).joined(separator: ", ")
-                let suffix = failedNames.count > 3 ? " and \(failedNames.count - 3) more" : ""
                 settingsController?.update(
                     activity: .failed(
                         state,
-                        "Imported \(imported) of \(sourceURLs.count); could not import \(failed)\(suffix)"
+                        "Imported \(imported) of \(sourceURLs.count) · "
+                            + (self.summarizedImportFailures(failures) ?? "Portable import failed")
                     )
                 )
             }
@@ -1579,41 +1951,182 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
     }
 
-    private func prepareVerifiedMovie(_ sourceURL: URL) async throws -> VerifiedMovieInstall {
+    private func prepareVerifiedMovie(
+        _ sourceURL: URL,
+        allowPortableClaim: Bool
+    ) async throws -> VerifiedMovieInstall {
         let reportURL = sourceURL.deletingPathExtension().appendingPathExtension("report.json")
-        guard FileManager.default.isReadableFile(atPath: reportURL.path) else {
-            throw AlphaConversionFailure.converterFailed(
-                "A matching converter-generated .report.json file is required."
+        let installed = try await PortableMediaOperationRunner.run(
+            timeoutSeconds: Self.portableCopyTimeoutSeconds
+        ) { [self] token in
+            try copyVerifiedMovieAndReport(
+                sourceURL,
+                reportURL: reportURL,
+                operationToken: token
             )
         }
-        let installed = try await Task.detached(priority: .userInitiated) { [self] in
-            let copied = try copyVerifiedMovieAndReport(sourceURL, reportURL: reportURL)
-            do {
-                let reportData = try Data(contentsOf: copied.reportURL)
-                let digest = try Self.sha256Hex(of: copied.movieURL)
-                _ = try AlphaConversionReportValidator.validate(
-                    data: reportData,
-                    expectedOutputBasename: copied.movieURL.lastPathComponent,
-                    actualOutputSHA256: digest
-                )
-                return copied
-            } catch {
-                try? FileManager.default.removeItem(at: copied.directory)
-                throw error
-            }
-        }.value
-
         do {
-            let asset = AVURLAsset(url: installed.movieURL)
-            let playable = try await asset.load(.isPlayable)
-            let tracks = try await asset.loadTracks(withMediaType: .video)
-            guard playable, !tracks.isEmpty else {
-                throw AlphaConversionFailure.converterFailed("The selected MOV is not a playable video.")
-            }
-            return installed
+            try await validatePortableMovie(installed, allowPortableClaim: allowPortableClaim)
         } catch {
             try? FileManager.default.removeItem(at: installed.directory)
             throw error
+        }
+        return installed
+    }
+
+    private static func validateLocallyAttestedMovie(
+        outputURL: URL,
+        reportURL: URL,
+        expectedOutputBasename: String,
+        invocationChallenge: String,
+        expectedInitialReportData: Data?
+    ) throws -> ValidatedAlphaConversionReport {
+        let limits = PortableMediaCopyLimits()
+        let movieIdentity = try PortableMediaSecureCopier.regularFileIdentity(
+            at: outputURL,
+            maximumBytes: limits.maxMovieBytes
+        )
+        let reportIdentity = try PortableMediaSecureCopier.regularFileIdentity(
+            at: reportURL,
+            maximumBytes: limits.maxReportBytes
+        )
+        var directoryIdentity = stat()
+        guard Darwin.lstat(outputURL.deletingLastPathComponent().path, &directoryIdentity) == 0,
+              directoryIdentity.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
+            throw PortableMediaCopyError.invalidSource
+        }
+        let reportData = try PortableMediaSecureCopier.readRegularFile(
+            at: reportURL,
+            maximumBytes: limits.maxReportBytes
+        )
+        if let expectedInitialReportData, expectedInitialReportData != reportData {
+            throw PortableMediaCopyError.sourceChanged
+        }
+        let digest = try sha256Hex(of: outputURL)
+        let report = try AlphaConversionReportValidator.validate(
+            data: reportData,
+            expectedOutputBasename: expectedOutputBasename,
+            actualOutputSHA256: digest,
+            expectedLocalProvenanceChallenge: invocationChallenge
+        )
+        guard report.trust == .locallyAttested else {
+            throw AlphaConversionFailure.converterFailed("Local conversion attestation was missing.")
+        }
+        _ = try AlphaPlaybackProcessValidator.validate(url: outputURL, expected: report)
+
+        let reportDataAfterPlayback = try PortableMediaSecureCopier.readRegularFile(
+            at: reportURL,
+            maximumBytes: limits.maxReportBytes
+        )
+        let digestAfterPlayback = try sha256Hex(of: outputURL)
+        let movieIdentityAfterPlayback = try PortableMediaSecureCopier.regularFileIdentity(
+            at: outputURL,
+            maximumBytes: limits.maxMovieBytes
+        )
+        let reportIdentityAfterPlayback = try PortableMediaSecureCopier.regularFileIdentity(
+            at: reportURL,
+            maximumBytes: limits.maxReportBytes
+        )
+        var directoryIdentityAfterPlayback = stat()
+        guard reportDataAfterPlayback == reportData,
+              digestAfterPlayback == report.outputSHA256,
+              movieIdentityAfterPlayback == movieIdentity,
+              reportIdentityAfterPlayback == reportIdentity,
+              Darwin.lstat(
+                  outputURL.deletingLastPathComponent().path,
+                  &directoryIdentityAfterPlayback
+              ) == 0,
+              directoryIdentityAfterPlayback.st_dev == directoryIdentity.st_dev,
+              directoryIdentityAfterPlayback.st_ino == directoryIdentity.st_ino,
+              directoryIdentityAfterPlayback.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
+            throw PortableMediaCopyError.sourceChanged
+        }
+        return report
+    }
+
+    private func validatePortableMovie(
+        _ installed: VerifiedMovieInstall,
+        allowPortableClaim: Bool
+    ) async throws {
+        try await PortableMediaOperationRunner.run(
+            timeoutSeconds: Self.portableValidationTimeoutSeconds
+        ) { token in
+            try token.check()
+            var directoryStatus = stat()
+            guard Darwin.lstat(installed.directory.path, &directoryStatus) == 0,
+                  directoryStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
+                  directoryStatus.st_mode & 0o077 == 0 else {
+                throw PortableMediaCopyError.invalidSource
+            }
+            let limits = PortableMediaCopyLimits()
+            let movieIdentity = try PortableMediaSecureCopier.regularFileIdentity(
+                at: installed.movieURL,
+                maximumBytes: limits.maxMovieBytes
+            )
+            let reportIdentity = try PortableMediaSecureCopier.regularFileIdentity(
+                at: installed.reportURL,
+                maximumBytes: limits.maxReportBytes
+            )
+            let reportData = try PortableMediaSecureCopier.readRegularFile(
+                at: installed.reportURL,
+                maximumBytes: limits.maxReportBytes,
+                operationCheck: token.check
+            )
+            let digest = try Self.sha256Hex(of: installed.movieURL, operationCheck: token.check)
+            let report = try AlphaConversionReportValidator.validate(
+                data: reportData,
+                expectedOutputBasename: installed.movieURL.lastPathComponent,
+                actualOutputSHA256: digest
+            )
+            switch report.trust {
+            case .locallyAttested:
+                break
+            case .portableClaim where allowPortableClaim:
+                break
+            case .portableClaim:
+                throw AlphaConversionFailure.converterFailed(
+                    "Portable verification must be explicitly trusted before import."
+                )
+            case .legacyPortableClaim:
+                throw AlphaConversionFailure.converterFailed(
+                    "Legacy portable reports are not accepted. Reconvert the source MP4 with the current Statelet converter."
+                )
+            }
+            _ = try AlphaPlaybackProcessValidator.validate(
+                url: installed.movieURL,
+                expected: report
+            )
+            try token.check()
+            let reportDataAfterPlayback = try PortableMediaSecureCopier.readRegularFile(
+                at: installed.reportURL,
+                maximumBytes: limits.maxReportBytes,
+                operationCheck: token.check
+            )
+            let digestAfterPlayback = try Self.sha256Hex(
+                of: installed.movieURL,
+                operationCheck: token.check
+            )
+            let movieIdentityAfterPlayback = try PortableMediaSecureCopier.regularFileIdentity(
+                at: installed.movieURL,
+                maximumBytes: limits.maxMovieBytes
+            )
+            let reportIdentityAfterPlayback = try PortableMediaSecureCopier.regularFileIdentity(
+                at: installed.reportURL,
+                maximumBytes: limits.maxReportBytes
+            )
+            var directoryStatusAfterPlayback = stat()
+            guard reportDataAfterPlayback == reportData,
+                  digestAfterPlayback == report.outputSHA256,
+                  movieIdentityAfterPlayback == movieIdentity,
+                  reportIdentityAfterPlayback == reportIdentity,
+                  Darwin.lstat(installed.directory.path, &directoryStatusAfterPlayback) == 0,
+                  directoryStatusAfterPlayback.st_dev == directoryStatus.st_dev,
+                  directoryStatusAfterPlayback.st_ino == directoryStatus.st_ino,
+                  directoryStatusAfterPlayback.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
+                  directoryStatusAfterPlayback.st_mode & 0o077 == 0 else {
+                throw PortableMediaCopyError.sourceChanged
+            }
+            try token.check()
         }
     }
 
@@ -1778,8 +2291,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             return
         }
         let openPanel = NSOpenPanel()
-        openPanel.title = "Relink Missing Verified MOV"
-        openPanel.message = "Choose a verified HEVC-with-alpha MOV beside its matching .report.json file."
+        openPanel.title = "Relink Missing Clip with Portable MOV"
+        openPanel.message = "Choose a portable HEVC-with-alpha MOV beside its matching current-format .report.json file. You will be asked to trust its verification claim."
         openPanel.prompt = "Relink"
         openPanel.allowedContentTypes = [.quickTimeMovie]
         openPanel.allowsMultipleSelection = false
@@ -2051,28 +2564,35 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
 
     private func copyVerifiedMovieAndReport(
         _ sourceURL: URL,
-        reportURL: URL
+        reportURL: URL,
+        operationToken: PortableMediaOperationToken
     ) throws -> VerifiedMovieInstall {
         let root = mediaMapURL.deletingLastPathComponent()
+        let importsRoot = root.appendingPathComponent("imports", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: importsRoot,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        var importsStatus = stat()
+        guard Darwin.lstat(importsRoot.path, &importsStatus) == 0,
+              importsStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
+            throw PortableMediaCopyError.invalidSource
+        }
         let relativeDirectory = "imports/\(versionToken())"
         let destinationDirectory = root.appendingPathComponent(relativeDirectory, isDirectory: true)
         do {
-            try FileManager.default.createDirectory(
-                at: destinationDirectory,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
+            let copied = try PortableMediaSecureCopier(
+                operationCheck: operationToken.check
+            ).copyPair(
+                movieSource: sourceURL,
+                reportSource: reportURL,
+                destinationDirectory: destinationDirectory
             )
-            let movieDestination = destinationDirectory.appendingPathComponent(sourceURL.lastPathComponent)
-            let reportDestination = destinationDirectory.appendingPathComponent(reportURL.lastPathComponent)
-            try FileManager.default.copyItem(at: sourceURL, to: movieDestination)
-            try FileManager.default.copyItem(at: reportURL, to: reportDestination)
-            for path in [movieDestination, reportDestination] {
-                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
-            }
             return VerifiedMovieInstall(
                 directory: destinationDirectory,
-                movieURL: movieDestination,
-                reportURL: reportDestination,
+                movieURL: copied.movieURL,
+                reportURL: copied.reportURL,
                 relativePath: "\(relativeDirectory)/\(sourceURL.lastPathComponent)"
             )
         } catch {
@@ -2258,7 +2778,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             selectedClipName: player?.currentURL?.lastPathComponent,
             previewStatus: diagnosticsPresentationStatus,
             toolchainStatus: diagnosticsToolchainStatus,
-            lastFailureCategory: publisherHealth.usesIdleFallback ? publisherHealth.rawValue : nil
+            lastFailureCategory: publisherHealth.usesIdleFallback ? publisherHealth.rawValue : nil,
+            conversionFailureCategory: lastConversionFailureDiagnostic?.code,
+            conversionFailureStage: lastConversionFailureDiagnostic?.stage
         )
         cachedDiagnosticsReport = diagnostics.build(input: input)
         refreshSettings()
@@ -2487,13 +3009,43 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
     }
 
-    private static func sha256Hex(of url: URL) throws -> String {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
+    private static func sha256Hex(
+        of url: URL,
+        operationCheck: () throws -> Void = {}
+    ) throws -> String {
+        try operationCheck()
+        guard url.isFileURL, url.host.map({ $0.isEmpty || $0 == "localhost" }) ?? true else {
+            throw PortableMediaCopyError.nonLocalFile
+        }
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else { throw PortableMediaCopyError.invalidSource }
+        defer { Darwin.close(descriptor) }
+        var before = stat()
+        guard Darwin.fstat(descriptor, &before) == 0,
+              before.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              before.st_size >= 0,
+              UInt64(before.st_size) <= PortableMediaCopyLimits().maxMovieBytes else {
+            throw PortableMediaCopyError.invalidSource
+        }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
         var hasher = SHA256()
         while let chunk = try handle.read(upToCount: 1_048_576), !chunk.isEmpty {
+            try operationCheck()
             hasher.update(data: chunk)
         }
+        try operationCheck()
+        var after = stat()
+        guard Darwin.fstat(descriptor, &after) == 0,
+              before.st_dev == after.st_dev,
+              before.st_ino == after.st_ino,
+              before.st_size == after.st_size,
+              before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec,
+              before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec,
+              before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec,
+              before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec else {
+            throw PortableMediaCopyError.sourceChanged
+        }
+        try operationCheck()
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 

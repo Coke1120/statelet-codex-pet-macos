@@ -25,6 +25,23 @@ converter = importlib.import_module("tools.convert_codex_pet_macos_alpha")
 
 
 class MacOSAlphaCommandTests(unittest.TestCase):
+    def test_cli_accepts_an_already_owned_process_group(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "tools" / "convert_codex_pet_macos_alpha.py"),
+                "--help",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            start_new_session=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("source constant-frame-rate MP4", result.stdout)
+
     def test_progress_jsonl_is_parseable_flushed_monotonic_and_path_free(self):
         class FlushTrackingStream(io.StringIO):
             def __init__(self):
@@ -84,10 +101,34 @@ class MacOSAlphaCommandTests(unittest.TestCase):
         events = [json.loads(line) for line in stdout.getvalue().splitlines()]
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["status"], "failed")
-        self.assertEqual(events[0]["stage"], "failed")
+        self.assertEqual(events[0]["stage"], "prepare")
+        self.assertEqual(events[0]["code"], "CONVERSION_FAILED")
+        self.assertEqual(events[0]["safe_message"], "Conversion failed.")
         self.assertNotIn("/Users/example", stdout.getvalue())
         self.assertNotIn("/Users/example", stderr.getvalue())
         self.assertIn("error: <local-file>", stderr.getvalue())
+
+    def test_progress_failure_taxonomy_is_stable_bounded_and_path_free(self):
+        cases = (
+            (alpha.MissingToolError("/Users/private/ffmpeg"), "TOOL_MISSING", "prepare"),
+            (alpha.ProbeError("/Users/private/source.mp4"), "SOURCE_UNSUPPORTED", "probe"),
+            (alpha.FrameQualityError("source frame 2 failed"), "QUALITY_GATE_FAILED", "matte"),
+            (converter.AlphaConversionError("encoder timed out"), "PROCESS_TIMEOUT", "encode"),
+            (converter.AlphaConversionError("insufficient disk"), "RESOURCE_LIMIT", "prepare"),
+            (converter.AlphaConversionError("publication manifest invalid"), "PUBLICATION_FAILED", "publish"),
+        )
+        for exc, expected_code, expected_stage in cases:
+            with self.subTest(code=expected_code):
+                stream = io.StringIO()
+                progress = converter._ProgressReporter(True, stream=stream)
+                progress.emit(60, stage="encode", message="Encoding")
+                progress.failed(exc)
+                event = json.loads(stream.getvalue().splitlines()[-1])
+                self.assertEqual(event["status"], "failed")
+                self.assertEqual(event["code"], expected_code)
+                self.assertEqual(event["stage"], expected_stage)
+                self.assertLessEqual(len(event["safe_message"].encode("utf-8")), 256)
+                self.assertNotIn("/Users/private", json.dumps(event))
 
     def test_default_main_output_remains_one_final_json_document(self):
         report = {"status": "converted", "source": {"name": "source.mp4"}}
@@ -149,7 +190,13 @@ class MacOSAlphaCommandTests(unittest.TestCase):
         self.assertIn("r_frame_rate", entries)
         self.assertIn("nb_read_frames", entries)
         self.assertIn("sample_aspect_ratio", entries)
+        self.assertIn("bits_per_raw_sample", entries)
+        self.assertIn("time_base", entries)
+        self.assertIn("best_effort_timestamp_time", entries)
+        self.assertIn("stream_index", entries)
+        self.assertIn("media_type", entries)
         self.assertIn("stream_disposition=attached_pic", entries)
+        self.assertIn("-show_frames", command)
 
     def test_ffmpeg_and_avconvert_commands_use_alpha_contract(self):
         decode = alpha.build_ffmpeg_decode_command(
@@ -499,6 +546,34 @@ class MacOSAlphaCommandTests(unittest.TestCase):
                 label="HEVC delivery",
             )
 
+    def test_verified_delivery_rejects_an_audio_stream(self):
+        expected = alpha.VideoInfo(
+            width=64,
+            height=48,
+            frame_count=6,
+            fps=Fraction(24, 1),
+            duration_seconds=0.25,
+            codec_name="",
+            pixel_format="",
+        )
+        actual = alpha.VideoInfo(
+            width=64,
+            height=48,
+            frame_count=6,
+            fps=Fraction(24, 1),
+            duration_seconds=0.25,
+            codec_name="hevc",
+            pixel_format="yuv420p",
+            audio_codecs=("aac",),
+        )
+        with self.assertRaisesRegex(alpha.FrameQualityError, "must be silent"):
+            converter._verify_basic_info(
+                actual,
+                expected,
+                expected_codec="hevc",
+                label="HEVC delivery",
+            )
+
     def test_rgba_decoder_pair_closes_reference_when_delivery_spawn_fails(self):
         first_decoder = mock.Mock()
         with mock.patch.object(
@@ -515,6 +590,17 @@ class MacOSAlphaCommandTests(unittest.TestCase):
                     ffmpeg="ffmpeg",
                 )
         close_process.assert_called_once_with(first_decoder)
+
+    def test_matte_process_pair_closes_decoder_when_encoder_spawn_fails(self):
+        decoder = mock.Mock()
+        with mock.patch.object(
+            converter,
+            "_start_process",
+            side_effect=[decoder, converter.AlphaConversionError("encoder failed")],
+        ), mock.patch.object(converter, "close_process") as close_process:
+            with self.assertRaisesRegex(converter.AlphaConversionError, "encoder failed"):
+                converter._start_matte_process_pair(["decode"], ["encode"])
+        close_process.assert_called_once_with(decoder)
 
     def test_stream_matte_failure_reports_the_one_based_source_frame(self):
         decoder = mock.Mock()
@@ -1069,6 +1155,1362 @@ class MacOSAlphaCommandTests(unittest.TestCase):
             self.assertEqual(intermediate.read_bytes(), b"old-intermediate")
             self.assertEqual(report.read_text(encoding="utf-8"), '{"status":"old"}\n')
 
+    def test_publication_stages_artifacts_next_to_targets_with_private_permissions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            work = root / "work"
+            target = root / "target"
+            work.mkdir()
+            target.mkdir()
+            output_stage = work / "output.mov"
+            output_stage.write_bytes(b"delivery")
+            output = target / "idle.mov"
+            report = target / "idle.report.json"
+
+            converter._publish_transaction(
+                output_stage,
+                output,
+                None,
+                None,
+                report,
+                {"status": "converted"},
+                replace=False,
+            )
+
+            self.assertEqual(output.read_bytes(), b"delivery")
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(report.stat().st_mode & 0o777, 0o600)
+
+    def test_publication_crash_recovery_restores_every_rename_boundary(self):
+        for crash_after in range(1, 7):
+            with self.subTest(crash_after=crash_after), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                output = root / "idle.mov"
+                intermediate = root / "idle.prores.mov"
+                report = root / "idle.report.json"
+                output.write_bytes(b"old-output")
+                intermediate.write_bytes(b"old-intermediate")
+                report.write_text('{"status":"old"}\n', encoding="utf-8")
+                staged_output = root / "new-output.mov"
+                staged_intermediate = root / "new-intermediate.mov"
+                staged_output.write_bytes(b"new-output")
+                staged_intermediate.write_bytes(b"new-intermediate")
+
+                with self.assertRaises(converter._InjectedPublicationCrash):
+                    converter._publish_transaction(
+                        staged_output,
+                        output,
+                        staged_intermediate,
+                        intermediate,
+                        report,
+                        {"status": "converted"},
+                        replace=True,
+                        _crash_after_rename=crash_after,
+                    )
+                manifest = converter._transaction_manifest_path(report)
+                self.assertTrue(manifest.is_file())
+                self.assertEqual(manifest.stat().st_mode & 0o777, 0o600)
+
+                converter._recover_publish_transaction(output, intermediate, report)
+
+                self.assertEqual(output.read_bytes(), b"old-output")
+                self.assertEqual(intermediate.read_bytes(), b"old-intermediate")
+                self.assertEqual(report.read_text(encoding="utf-8"), '{"status":"old"}\n')
+                self.assertFalse(manifest.exists())
+                self.assertFalse(any(path.suffix in {".tmp", ".bak"} for path in root.iterdir()))
+
+    def test_convert_retry_recovers_partial_publication_before_collision_check(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.mp4"
+            source.write_bytes(b"source")
+            output = root / "idle.mov"
+            intermediate = root / "idle.prores.mov"
+            report = root / "idle.report.json"
+            staged = root / "staged.mov"
+            staged_intermediate = root / "staged.prores.mov"
+            staged.write_bytes(b"new-output")
+            staged_intermediate.write_bytes(b"new-intermediate")
+            with self.assertRaises(converter._InjectedPublicationCrash):
+                converter._publish_transaction(
+                    staged,
+                    output,
+                    staged_intermediate,
+                    intermediate,
+                    report,
+                    {"status": "converted"},
+                    replace=False,
+                    _crash_after_rename=2,
+                )
+            self.assertTrue(output.exists())
+            self.assertTrue(intermediate.exists())
+            manifest = converter._transaction_manifest_path(report)
+            before = {
+                "output": output.read_bytes(),
+                "intermediate": intermediate.read_bytes(),
+                "manifest": manifest.read_bytes(),
+            }
+
+            args = converter.build_parser().parse_args([str(source), str(output)])
+            with mock.patch.object(
+                converter, "require_image_dependencies"
+            ), mock.patch.object(
+                converter, "_check_target_collisions"
+            ) as collision:
+                with self.assertRaisesRegex(
+                    converter.AlphaConversionError,
+                    "identical artifact path flags",
+                ):
+                    converter.convert_video(args)
+            collision.assert_not_called()
+            self.assertEqual(output.read_bytes(), before["output"])
+            self.assertEqual(intermediate.read_bytes(), before["intermediate"])
+            self.assertEqual(manifest.read_bytes(), before["manifest"])
+
+            converter._recover_publish_transaction(output, intermediate, report)
+            self.assertFalse(output.exists())
+            self.assertFalse(intermediate.exists())
+            self.assertFalse(report.exists())
+            self.assertFalse(manifest.exists())
+
+    def test_invalid_publication_manifest_fails_closed_without_paths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "idle.mov"
+            report = root / "idle.report.json"
+            planted = root / "other.mov"
+            planted_stage = root / ".other.mov.x.tmp"
+            planted.write_bytes(b"do-not-touch")
+            planted_stage.write_bytes(b"do-not-touch-stage")
+            manifest = converter._transaction_manifest_path(report)
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "committed": False,
+                        "entries": [
+                            {
+                                "target": str(planted),
+                                "stage": str(planted_stage),
+                                "backup": str(root / ".other.mov.x.bak"),
+                                "had_target": False,
+                                "sha256": "0" * 64,
+                            },
+                            {
+                                "target": str(report),
+                                "stage": str(root / ".idle.report.json.x.tmp"),
+                                "backup": str(root / ".idle.report.json.x.bak"),
+                                "had_target": False,
+                                "sha256": "0" * 64,
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manifest.chmod(0o600)
+            with self.assertRaisesRegex(
+                converter.AlphaConversionError, "manifest is invalid"
+            ) as raised:
+                converter._recover_publish_transaction(output, None, report)
+            self.assertNotIn(temp, str(raised.exception))
+            self.assertEqual(planted.read_bytes(), b"do-not-touch")
+            self.assertEqual(planted_stage.read_bytes(), b"do-not-touch-stage")
+            self.assertTrue(manifest.exists())
+
+    def test_recovery_manifest_rejects_symlink_links_and_nonprivate_mode(self):
+        for mutation in ("symlink", "hardlink", "mode"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                output = root / "idle.mov"
+                report = root / "idle.report.json"
+                staged = root / "staged.mov"
+                staged.write_bytes(b"new-output")
+                with self.assertRaises(converter._InjectedPublicationCrash):
+                    converter._publish_transaction(
+                        staged,
+                        output,
+                        None,
+                        None,
+                        report,
+                        {"status": "converted"},
+                        replace=False,
+                        _crash_after_rename=1,
+                    )
+                manifest = converter._transaction_manifest_path(report)
+                if mutation == "symlink":
+                    actual = root / "actual-manifest.json"
+                    manifest.replace(actual)
+                    manifest.symlink_to(actual)
+                elif mutation == "hardlink":
+                    os.link(manifest, root / "manifest-hardlink.json")
+                else:
+                    manifest.chmod(0o644)
+                before = output.read_bytes()
+                with self.assertRaisesRegex(
+                    converter.AlphaConversionError, "manifest is invalid"
+                ):
+                    converter._recover_publish_transaction(output, None, report)
+                self.assertEqual(output.read_bytes(), before)
+
+    def test_recovery_rejects_planted_private_artifacts_without_touching_unrelated_files(self):
+        for mutation in ("stage-symlink", "stage-hardlink", "backup-symlink", "extra", "dir-symlink"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                output = root / "idle.mov"
+                report = root / "idle.report.json"
+                output.write_bytes(b"old-output")
+                report.write_text('{"status":"old"}\n', encoding="utf-8")
+                staged = root / "staged.mov"
+                staged.write_bytes(b"new-output")
+                unrelated = root / "unrelated.data"
+                unrelated.write_bytes(b"do-not-touch")
+                with self.assertRaises(converter._InjectedPublicationCrash):
+                    converter._publish_transaction(
+                        staged,
+                        output,
+                        None,
+                        None,
+                        report,
+                        {"status": "converted"},
+                        replace=True,
+                        _crash_after_rename=1,
+                    )
+                manifest = converter._transaction_manifest_path(report)
+                payload = json.loads(manifest.read_text(encoding="utf-8"))
+                entry = payload["entries"][0]
+                directory = Path(entry["directory"])
+                stage_path = directory / entry["stage_name"]
+                backup_path = directory / entry["backup_name"]
+                if mutation == "stage-symlink":
+                    stage_path.unlink()
+                    stage_path.symlink_to(unrelated)
+                elif mutation == "stage-hardlink":
+                    stage_path.unlink()
+                    os.link(unrelated, stage_path)
+                elif mutation == "backup-symlink":
+                    backup_path.unlink()
+                    backup_path.symlink_to(unrelated)
+                elif mutation == "extra":
+                    (directory / "planted").write_bytes(b"planted")
+                else:
+                    actual_directory = root / "saved-transaction-directory"
+                    directory.replace(actual_directory)
+                    directory.symlink_to(actual_directory, target_is_directory=True)
+                with self.assertRaisesRegex(
+                    converter.AlphaConversionError,
+                    "publication recovery",
+                ):
+                    converter._recover_publish_transaction(output, None, report)
+                self.assertEqual(unrelated.read_bytes(), b"do-not-touch")
+                self.assertTrue(manifest.exists())
+
+    def test_pre_manifest_failure_removes_all_sibling_stages(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "idle.mov"
+            report = root / "idle.report.json"
+            output.write_bytes(b"old")
+            staged = root / "staged.mov"
+            staged.write_bytes(b"new")
+            with mock.patch.object(
+                converter,
+                "_transaction_directory_identity",
+                side_effect=converter.AlphaConversionError("injected backup failure"),
+            ):
+                with self.assertRaisesRegex(
+                    converter.AlphaConversionError, "injected backup failure"
+                ):
+                    converter._publish_transaction(
+                        staged,
+                        output,
+                        None,
+                        None,
+                        report,
+                        {"status": "converted"},
+                        replace=True,
+                    )
+            self.assertFalse(any(path.name.startswith(".statelet-") for path in root.iterdir()))
+            self.assertFalse(converter._transaction_manifest_path(report).exists())
+
+    def test_cross_volume_stage_copy_detects_silent_corruption(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.mov"
+            target = root / "target.mov"
+            source.write_bytes(b"verified-source")
+
+            def corrupt_copy(_source, destination, **_kwargs):
+                destination.write(b"silent-corruption")
+
+            with mock.patch.object(
+                converter.shutil, "copyfileobj", side_effect=corrupt_copy
+            ):
+                with self.assertRaisesRegex(
+                    converter.AlphaConversionError, "digest mismatch"
+                ):
+                    converter._stage_artifact_for_target(source, target)
+            self.assertFalse(any(path.suffix == ".tmp" for path in root.iterdir()))
+
+    def test_final_target_digest_corruption_rolls_back_before_commit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "idle.mov"
+            report = root / "idle.report.json"
+            output.write_bytes(b"old-output")
+            report.write_text('{"status":"old"}\n', encoding="utf-8")
+            staged = root / "staged.mov"
+            staged.write_bytes(b"new-output")
+            expected_digest = hashlib.sha256(b"new-output").hexdigest()
+            original_replace = converter._durable_replace
+
+            def replace_then_corrupt(source, target):
+                original_replace(source, target)
+                if Path(target) == output and Path(source).name == "stage-0":
+                    output.write_bytes(b"corrupted-after-rename")
+
+            with mock.patch.object(
+                converter, "_durable_replace", side_effect=replace_then_corrupt
+            ):
+                with self.assertRaisesRegex(
+                    converter.AlphaConversionError, "digest mismatch"
+                ):
+                    converter._publish_transaction(
+                        staged,
+                        output,
+                        None,
+                        None,
+                        report,
+                        {
+                            "status": "converted",
+                            "artifacts": {"output_sha256": expected_digest},
+                        },
+                        replace=True,
+                    )
+            self.assertEqual(output.read_bytes(), b"old-output")
+            self.assertEqual(report.read_text(encoding="utf-8"), '{"status":"old"}\n')
+
+    def test_report_artifact_digest_mismatch_rejects_before_commit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "idle.mov"
+            report = root / "idle.report.json"
+            staged = root / "staged.mov"
+            staged.write_bytes(b"verified-output")
+            with self.assertRaisesRegex(
+                converter.AlphaConversionError, "does not match report digest"
+            ):
+                converter._publish_transaction(
+                    staged,
+                    output,
+                    None,
+                    None,
+                    report,
+                    {
+                        "status": "converted",
+                        "artifacts": {"output_sha256": "0" * 64},
+                    },
+                    replace=False,
+                )
+            self.assertFalse(output.exists())
+            self.assertFalse(report.exists())
+            self.assertFalse(converter._transaction_manifest_path(report).exists())
+
+    def test_avconvert_timeout_is_bounded_and_path_private(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with mock.patch.object(
+                converter.alpha_engine,
+                "_run_bounded_capture",
+                side_effect=alpha.ProbeError("avconvert timed out"),
+            ):
+                with self.assertRaisesRegex(
+                    converter.AlphaConversionError,
+                    "avconvert timed out",
+                ) as raised:
+                    converter._run_avconvert(
+                        root / "private.mov",
+                        root / "output.mov",
+                        avconvert="avconvert",
+                        preset=converter.DEFAULT_PRESET,
+                        timeout_seconds=1,
+                    )
+            self.assertNotIn(str(root), str(raised.exception))
+
+    def test_roundtrip_metric_aggregation_is_bounded_across_many_frames(self):
+        accumulator = converter._RoundtripMetricsAccumulator()
+        background = {
+            "green_fringe_ratio": 0.01,
+            "magenta_fringe_ratio": 0.02,
+            "introduced_green_fringe_ratio": 0.003,
+            "introduced_magenta_fringe_ratio": 0.004,
+            "green_fringe_pixels": 2,
+            "green_fringe_max_excess": 20,
+            "introduced_green_fringe_max_excess": 12,
+            "magenta_fringe_pixels": 3,
+            "magenta_fringe_max_excess": 22,
+            "introduced_magenta_fringe_max_excess": 14,
+        }
+        comparison = {
+            "mean_absolute_error": 1.0,
+            "p95_absolute_error": 2.0,
+            "maximum_absolute_error": 3,
+            "lost_alpha_pixels": 0,
+        }
+        composite = {
+            "background_names": ["white", "black", "checkerboard"],
+            "backgrounds": {
+                name: dict(background)
+                for name in ("white", "black", "checkerboard")
+            },
+            "maximum_delivery_green_fringe_ratio": 0.01,
+            "maximum_delivery_magenta_fringe_ratio": 0.02,
+            "maximum_introduced_green_fringe_ratio": 0.003,
+            "maximum_introduced_magenta_fringe_ratio": 0.004,
+            "maximum_introduced_green_fringe_excess": 12,
+            "maximum_introduced_magenta_fringe_excess": 14,
+        }
+        for _ in range(10_000):
+            accumulator.add(comparison, composite)
+
+        self.assertEqual(accumulator.frames, 10_000)
+        self.assertEqual(
+            accumulator.backgrounds["white"]["green_fringe_pixels_total"],
+            20_000,
+        )
+        self.assertFalse(
+            any(isinstance(value, list) for value in vars(accumulator).values())
+        )
+        self.assertEqual(
+            accumulator.snapshot(),
+            {
+                "frames": 10_000,
+                "backgrounds": accumulator.backgrounds,
+                "composite_maxima": {
+                    "maximum_delivery_green_fringe_ratio": 0.01,
+                    "maximum_delivery_magenta_fringe_ratio": 0.02,
+                    "maximum_introduced_green_fringe_ratio": 0.003,
+                    "maximum_introduced_magenta_fringe_ratio": 0.004,
+                    "maximum_introduced_green_fringe_excess": 12,
+                    "maximum_introduced_magenta_fringe_excess": 14,
+                },
+                "alpha": {
+                    "mean_absolute_error_max": 1.0,
+                    "p95_absolute_error_max": 2.0,
+                    "maximum_absolute_error_max": 3,
+                    "lost_alpha_pixels_total": 0,
+                },
+            },
+        )
+
+    def test_resource_preflight_enforces_every_configurable_budget(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.mp4"
+            source.write_bytes(b"x" * 11)
+            base = alpha.VideoInfo(
+                width=10,
+                height=10,
+                frame_count=10,
+                fps=Fraction(24, 1),
+                duration_seconds=10 / 24,
+                codec_name="h264",
+                pixel_format="yuv420p",
+            )
+            defaults = {
+                "width": 10,
+                "height": 10,
+                "max_source_bytes": 11,
+                "max_source_pixels": 100,
+                "max_source_frames": 10,
+                "max_source_duration_seconds": 10 / 24,
+                "max_source_fps": 24.0,
+                "min_free_disk_bytes": 1,
+            }
+            cases = (
+                ("size", base, {"max_source_bytes": 10}, "size budget"),
+                (
+                    "pixels",
+                    alpha.VideoInfo(**{**vars(base), "width": 11}),
+                    {},
+                    "pixel budget",
+                ),
+                (
+                    "frames",
+                    alpha.VideoInfo(**{**vars(base), "frame_count": 11}),
+                    {},
+                    "frame budget",
+                ),
+                (
+                    "duration",
+                    alpha.VideoInfo(**{**vars(base), "duration_seconds": 1.0}),
+                    {},
+                    "duration budget",
+                ),
+                (
+                    "fps",
+                    alpha.VideoInfo(**{**vars(base), "fps": Fraction(25, 1)}),
+                    {},
+                    "frame-rate budget",
+                ),
+            )
+            with mock.patch.object(
+                converter.shutil,
+                "disk_usage",
+                return_value=mock.Mock(free=10**12),
+            ):
+                # Exact configured limits are accepted.
+                accepted = converter._preflight_resources(
+                    source,
+                    root / "out.mov",
+                    root / "out.report.json",
+                    None,
+                    base,
+                    **defaults,
+                )
+                self.assertTrue(accepted["passed"])
+                for label, info, overrides, message in cases:
+                    with self.subTest(label=label), self.assertRaisesRegex(
+                        converter.AlphaConversionError, message
+                    ):
+                        converter._preflight_resources(
+                            source,
+                            root / "out.mov",
+                            root / "out.report.json",
+                            None,
+                            info,
+                            **{**defaults, **overrides},
+                        )
+
+    def test_peak_disk_model_aggregates_shared_targets_and_separates_volumes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "output" / "pet.mov"
+            report = root / "report" / "pet.report.json"
+            intermediate = root / "intermediate" / "pet.prores.mov"
+            output.parent.mkdir()
+            report.parent.mkdir()
+            intermediate.parent.mkdir()
+            info = alpha.VideoInfo(
+                width=4,
+                height=4,
+                frame_count=2,
+                fps=Fraction(24, 1),
+                duration_seconds=2 / 24,
+                codec_name="h264",
+                pixel_format="yuv420p",
+            )
+            temp_root = Path(tempfile.gettempdir())
+
+            shared_devices = {
+                temp_root: 10,
+                output.parent: 20,
+                report.parent: 20,
+                intermediate.parent: 30,
+            }
+            with mock.patch.object(
+                converter.os,
+                "stat",
+                side_effect=lambda path: mock.Mock(st_dev=shared_devices[Path(path)]),
+            ), mock.patch.object(
+                converter.shutil, "disk_usage", return_value=mock.Mock(free=10**12)
+            ):
+                shared = converter._check_peak_disk_capacity(
+                    output,
+                    report,
+                    intermediate,
+                    info=info,
+                    width=4,
+                    height=4,
+                    reserve_bytes=100,
+                )
+            self.assertEqual(shared["volume_count"], 3)
+            shared_target_volume = next(
+                item
+                for item in shared["volumes"]
+                if "delivery-stage" in item["components"]
+            )
+            self.assertEqual(
+                shared_target_volume["components"],
+                ["delivery-stage", "report-stage"],
+            )
+            self.assertEqual(
+                shared_target_volume["required_bytes"],
+                100
+                + converter._allocation_with_overhead(
+                    2 * 4 * 4 * converter.HEVC_PEAK_BYTES_PER_PIXEL
+                )
+                + converter._allocation_with_overhead(
+                    converter.REPORT_STAGE_RESERVE_BYTES
+                ),
+            )
+            raw_simultaneous_bytes = 2 * 4 * 4 * (
+                converter.PRORES_PEAK_BYTES_PER_PIXEL
+                + converter.HEVC_PEAK_BYTES_PER_PIXEL
+                + converter.ALPHA_REFERENCE_BYTES_PER_PIXEL
+                + converter.PRORES_PEAK_BYTES_PER_PIXEL
+            )
+            temp_volume = next(
+                item
+                for item in shared["volumes"]
+                if item["components"] == ["conversion-temp"]
+            )
+            self.assertGreater(
+                temp_volume["required_bytes"] - 100,
+                raw_simultaneous_bytes,
+            )
+            self.assertNotIn(str(root), json.dumps(shared))
+
+            separate_devices = {
+                temp_root: 10,
+                output.parent: 20,
+                report.parent: 30,
+                intermediate.parent: 40,
+            }
+            with mock.patch.object(
+                converter.os,
+                "stat",
+                side_effect=lambda path: mock.Mock(st_dev=separate_devices[Path(path)]),
+            ), mock.patch.object(
+                converter.shutil, "disk_usage", return_value=mock.Mock(free=10**12)
+            ):
+                separate = converter._check_peak_disk_capacity(
+                    output,
+                    report,
+                    intermediate,
+                    info=info,
+                    width=4,
+                    height=4,
+                    reserve_bytes=100,
+                )
+            self.assertEqual(separate["volume_count"], 4)
+            self.assertEqual(
+                separate["total_required_bytes"],
+                shared["total_required_bytes"] + 100,
+            )
+
+    def test_peak_disk_model_accepts_exact_boundary_and_rejects_one_byte_less(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "output" / "pet.mov"
+            report = root / "report" / "pet.report.json"
+            output.parent.mkdir()
+            report.parent.mkdir()
+            info = alpha.VideoInfo(
+                width=8,
+                height=6,
+                frame_count=3,
+                fps=Fraction(24, 1),
+                duration_seconds=3 / 24,
+                codec_name="h264",
+                pixel_format="yuv420p",
+            )
+            locations = {
+                Path(tempfile.gettempdir()): 10,
+                output.parent: 20,
+                report.parent: 30,
+            }
+            stat_side_effect = lambda path: mock.Mock(st_dev=locations[Path(path)])
+            with mock.patch.object(
+                converter.os, "stat", side_effect=stat_side_effect
+            ), mock.patch.object(
+                converter.shutil, "disk_usage", return_value=mock.Mock(free=10**12)
+            ):
+                measured = converter._check_peak_disk_capacity(
+                    output,
+                    report,
+                    None,
+                    info=info,
+                    width=8,
+                    height=6,
+                    reserve_bytes=256,
+                )
+            required_by_device = {
+                device: item["required_bytes"]
+                for device, item in zip(
+                    sorted(set(locations.values())), measured["volumes"], strict=True
+                )
+            }
+
+            def exact_disk_usage(path):
+                return mock.Mock(free=required_by_device[locations[Path(path)]])
+
+            with mock.patch.object(
+                converter.os, "stat", side_effect=stat_side_effect
+            ), mock.patch.object(
+                converter.shutil, "disk_usage", side_effect=exact_disk_usage
+            ):
+                accepted = converter._check_peak_disk_capacity(
+                    output,
+                    report,
+                    None,
+                    info=info,
+                    width=8,
+                    height=6,
+                    reserve_bytes=256,
+                )
+            self.assertEqual(accepted["total_required_bytes"], measured["total_required_bytes"])
+
+            def short_disk_usage(path):
+                device = locations[Path(path)]
+                free = required_by_device[device] - (1 if device == 20 else 0)
+                return mock.Mock(free=free)
+
+            with mock.patch.object(
+                converter.os, "stat", side_effect=stat_side_effect
+            ), mock.patch.object(
+                converter.shutil, "disk_usage", side_effect=short_disk_usage
+            ), self.assertRaisesRegex(
+                converter.AlphaConversionError, "insufficient free disk space"
+            ):
+                converter._check_peak_disk_capacity(
+                    output,
+                    report,
+                    None,
+                    info=info,
+                    width=8,
+                    height=6,
+                    reserve_bytes=256,
+                )
+
+    def test_publication_disk_recheck_counts_only_remaining_target_allocations(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output_stage = root / "work" / "output.mov"
+            intermediate_stage = root / "work" / "intermediate.mov"
+            output = root / "target" / "output.mov"
+            intermediate = root / "target" / "intermediate.mov"
+            report = root / "target" / "output.report.json"
+            output_stage.parent.mkdir()
+            output.parent.mkdir()
+            output_stage.write_bytes(b"o" * 101)
+            intermediate_stage.write_bytes(b"i" * 203)
+            payload = {"status": "converted", "quality": {"frames_checked": 1}}
+            with mock.patch.object(
+                converter.shutil, "disk_usage", return_value=mock.Mock(free=10**12)
+            ):
+                measured = converter._check_publication_disk_capacity(
+                    output_stage,
+                    output,
+                    intermediate_stage,
+                    intermediate,
+                    report,
+                    payload,
+                    reserve_bytes=512,
+                )
+            self.assertEqual(measured["model"], "publication-remaining-v1")
+            self.assertEqual(measured["volume_count"], 1)
+            self.assertNotIn(str(root), json.dumps(measured))
+            self.assertEqual(
+                measured["volumes"][0]["components"],
+                ["delivery-stage", "intermediate-stage", "report-stage"],
+            )
+            self.assertNotIn("conversion-temp", measured["volumes"][0]["components"])
+
+            output.write_bytes(b"old-output")
+            intermediate.write_bytes(b"old-intermediate")
+            report.write_text('{"status":"old"}\n', encoding="utf-8")
+            with mock.patch.object(
+                converter.shutil, "disk_usage", return_value=mock.Mock(free=10**12)
+            ):
+                with_existing_targets = converter._check_publication_disk_capacity(
+                    output_stage,
+                    output,
+                    intermediate_stage,
+                    intermediate,
+                    report,
+                    payload,
+                    reserve_bytes=512,
+                )
+            self.assertEqual(
+                with_existing_targets["total_required_bytes"],
+                measured["total_required_bytes"],
+            )
+
+            exact_required = measured["volumes"][0]["required_bytes"]
+            with mock.patch.object(
+                converter.shutil,
+                "disk_usage",
+                return_value=mock.Mock(free=exact_required),
+            ):
+                accepted = converter._check_publication_disk_capacity(
+                    output_stage,
+                    output,
+                    intermediate_stage,
+                    intermediate,
+                    report,
+                    payload,
+                    reserve_bytes=512,
+                )
+            self.assertEqual(
+                accepted["maximum_volume_required_bytes"], exact_required
+            )
+
+    def test_late_free_space_drop_blocks_publication_and_preserves_old_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.mp4"
+            output = root / "idle.mov"
+            intermediate = root / "idle.prores.mov"
+            report = root / "idle.report.json"
+            source.write_bytes(b"source")
+            output.write_bytes(b"old-output")
+            intermediate.write_bytes(b"old-intermediate")
+            report.write_text('{"status":"old"}\n', encoding="utf-8")
+            args = converter.build_parser().parse_args(
+                [
+                    str(source),
+                    str(output),
+                    "--report",
+                    str(report),
+                    "--intermediate-output",
+                    str(intermediate),
+                    "--replace",
+                    "--min-free-disk-bytes",
+                    "1",
+                ]
+            )
+            source_info = alpha.VideoInfo(
+                width=4,
+                height=4,
+                frame_count=1,
+                fps=Fraction(24, 1),
+                duration_seconds=1 / 24,
+                codec_name="h264",
+                pixel_format="yuv420p",
+            )
+            intermediate_info = alpha.VideoInfo(
+                width=4,
+                height=4,
+                frame_count=1,
+                fps=Fraction(24, 1),
+                duration_seconds=1 / 24,
+                codec_name="prores",
+                pixel_format="yuva444p10le",
+                codec_profile="4444",
+            )
+
+            def fake_probe(path, **_kwargs):
+                return (
+                    intermediate_info
+                    if Path(path).name == "intermediate.prores4444.mov"
+                    else source_info
+                )
+
+            def fake_stream(_source, stage, reference_alpha, **_kwargs):
+                stage.write_bytes(b"new-intermediate")
+                reference_alpha.write_bytes(b"\0" * 16)
+                return {"frames_checked": 1, "quality_passed": True}
+
+            def fake_avconvert(_source, stage, **_kwargs):
+                stage.write_bytes(b"new-output")
+
+            publication = mock.Mock()
+            with mock.patch.object(
+                converter, "require_image_dependencies"
+            ), mock.patch.object(
+                converter, "require_tool", return_value="tool"
+            ), mock.patch.object(
+                converter,
+                "_preflight_tool_capabilities",
+                return_value={"toolchain": {}, "capabilities": {}},
+            ), mock.patch.object(
+                converter, "probe_video", side_effect=fake_probe
+            ), mock.patch.object(
+                converter,
+                "verify_video_cadence",
+                return_value={"quality_passed": True},
+            ), mock.patch.object(
+                converter,
+                "_verify_source_background",
+                return_value={"quality_passed": True},
+            ), mock.patch.object(
+                converter, "_stream_matte_to_prores", side_effect=fake_stream
+            ), mock.patch.object(
+                converter, "_run_avconvert", side_effect=fake_avconvert
+            ), mock.patch.object(
+                converter,
+                "_verify_alpha_roundtrip",
+                return_value={"performed": True, "unsafe": False, "frames_verified": 1},
+            ), mock.patch.object(
+                converter.shutil,
+                "disk_usage",
+                side_effect=[mock.Mock(free=10**12), mock.Mock(free=0)],
+            ), mock.patch.object(
+                converter, "_publish_transaction", publication
+            ):
+                with self.assertRaisesRegex(
+                    converter.AlphaConversionError, "insufficient free disk space"
+                ):
+                    converter.convert_video(args)
+            publication.assert_not_called()
+            self.assertEqual(output.read_bytes(), b"old-output")
+            self.assertEqual(intermediate.read_bytes(), b"old-intermediate")
+            self.assertEqual(
+                report.read_text(encoding="utf-8"), '{"status":"old"}\n'
+            )
+
+    def test_insufficient_disk_fails_before_any_conversion_process_starts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.mp4"
+            source.write_bytes(b"source")
+            args = converter.build_parser().parse_args(
+                [
+                    str(source),
+                    str(root / "output.mov"),
+                    "--min-free-disk-bytes",
+                    "1000",
+                ]
+            )
+            info = alpha.VideoInfo(
+                width=4,
+                height=4,
+                frame_count=1,
+                fps=Fraction(24, 1),
+                duration_seconds=1 / 24,
+                codec_name="h264",
+                pixel_format="yuv420p",
+            )
+            with mock.patch.object(
+                converter, "require_image_dependencies"
+            ), mock.patch.object(
+                converter, "require_tool", side_effect=lambda _name, value: value
+            ), mock.patch.object(
+                converter, "probe_video", return_value=info
+            ), mock.patch.object(
+                converter.shutil, "disk_usage", return_value=mock.Mock(free=999)
+            ), mock.patch.object(converter, "_start_process") as start_process:
+                with self.assertRaisesRegex(
+                    converter.AlphaConversionError, "insufficient free disk space"
+                ):
+                    converter.convert_video(args)
+            start_process.assert_not_called()
+
+    def test_source_size_budget_fails_before_hash_probe_or_decoder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.mp4"
+            source.write_bytes(b"x" * 11)
+            args = converter.build_parser().parse_args(
+                [
+                    str(source),
+                    str(root / "output.mov"),
+                    "--max-source-bytes",
+                    "10",
+                ]
+            )
+            with mock.patch.object(
+                converter, "require_image_dependencies"
+            ), mock.patch.object(
+                converter, "require_tool", side_effect=lambda name, _value: name
+            ), mock.patch.object(
+                converter,
+                "_preflight_tool_capabilities",
+                return_value={"toolchain": {}, "capabilities": {}},
+            ), mock.patch.object(
+                converter, "_sha256_source_file"
+            ) as source_hash, mock.patch.object(
+                converter, "probe_video"
+            ) as probe, mock.patch.object(
+                converter, "_start_process"
+            ) as start_process:
+                with self.assertRaisesRegex(
+                    converter.AlphaConversionError, "size budget"
+                ):
+                    converter.convert_video(args)
+            source_hash.assert_not_called()
+            probe.assert_not_called()
+            start_process.assert_not_called()
+
+    def test_frame_budget_fails_before_deep_cadence_probe(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "small.mp4"
+            source.write_bytes(b"small")
+            args = converter.build_parser().parse_args(
+                [
+                    str(source),
+                    str(root / "output.mov"),
+                    "--max-source-frames",
+                    "10",
+                ]
+            )
+            info = alpha.VideoInfo(
+                width=4,
+                height=4,
+                frame_count=1_000_000,
+                fps=Fraction(24, 1),
+                duration_seconds=1.0,
+                codec_name="h264",
+                pixel_format="yuv420p",
+            )
+            with mock.patch.object(
+                converter, "require_image_dependencies"
+            ), mock.patch.object(
+                converter, "require_tool", side_effect=lambda name, _value: name
+            ), mock.patch.object(
+                converter,
+                "_preflight_tool_capabilities",
+                return_value={"toolchain": {}, "capabilities": {}},
+            ), mock.patch.object(
+                converter, "probe_video", return_value=info
+            ), mock.patch.object(
+                converter.shutil, "disk_usage", return_value=mock.Mock(free=10**12)
+            ), mock.patch.object(
+                converter, "verify_video_cadence"
+            ) as cadence:
+                with self.assertRaisesRegex(
+                    converter.AlphaConversionError, "frame budget"
+                ):
+                    converter.convert_video(args)
+            cadence.assert_not_called()
+
+    def test_compact_cadence_probe_terminates_when_output_cap_is_exceeded(self):
+        process = mock.Mock()
+        process.stdout = io.BytesIO(b"0.000000\n0.041667\n")
+        process.stdin = None
+        process.stderr = None
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        info = alpha.VideoInfo(
+            width=4,
+            height=4,
+            frame_count=2,
+            fps=Fraction(24, 1),
+            duration_seconds=2 / 24,
+            codec_name="h264",
+            pixel_format="yuv420p",
+        )
+        with mock.patch.object(alpha, "require_tool", return_value="ffprobe"):
+            with self.assertRaisesRegex(alpha.ProbeError, "output exceeds"):
+                alpha.verify_video_cadence(
+                    "source.mp4",
+                    info,
+                    ffprobe="ffprobe",
+                    max_output_bytes=8,
+                    process_factory=lambda *_args, **_kwargs: process,
+                )
+        self.assertTrue(process.stdout.closed)
+
+    def test_source_background_reference_io_failure_is_path_private(self):
+        info = alpha.VideoInfo(
+            width=4,
+            height=4,
+            frame_count=1,
+            fps=Fraction(24, 1),
+            duration_seconds=1 / 24,
+            codec_name="h264",
+            pixel_format="yuv420p",
+        )
+        decoder = mock.Mock()
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(
+            converter, "_start_process", return_value=decoder
+        ), mock.patch.object(converter, "close_process"):
+            private_path = Path(temp) / "missing" / "background.rgb"
+            with self.assertRaisesRegex(
+                converter.AlphaConversionError,
+                "unable to write source background reference",
+            ) as raised:
+                converter._verify_source_background(
+                    Path(temp) / "source.mp4",
+                    background_reference=private_path,
+                    info=info,
+                    ffmpeg="ffmpeg",
+                    timeout_seconds=1,
+                )
+            self.assertNotIn(temp, str(raised.exception))
+
+    def test_source_background_reference_write_and_fsync_failures_are_sanitized(self):
+        info = alpha.VideoInfo(
+            width=2,
+            height=2,
+            frame_count=1,
+            fps=Fraction(24, 1),
+            duration_seconds=1 / 24,
+            codec_name="h264",
+            pixel_format="yuv420p",
+        )
+        evidence = {
+            "background_rgb": [0, 255, 0],
+            "green_source_ratio": 1.0,
+            "green_source_border_ratio": 1.0,
+            "green_source_row_coverage": 1.0,
+            "green_source_column_coverage": 1.0,
+        }
+        for stage in ("write", "fsync"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                reference = root / "background.rgb"
+                decoder = mock.Mock()
+                patches = [
+                    mock.patch.object(converter, "_start_process", return_value=decoder),
+                    mock.patch.object(converter, "close_process"),
+                    mock.patch.object(converter, "read_raw_frames", return_value=iter([object()])),
+                    mock.patch.object(converter, "assess_green_background", return_value=evidence),
+                ]
+                if stage == "write":
+                    handle = mock.MagicMock()
+                    handle.__enter__.return_value = handle
+                    handle.write.side_effect = OSError("private write failure")
+                    patches.append(mock.patch.object(Path, "open", return_value=handle))
+                else:
+                    patches.append(mock.patch.object(converter.os, "fsync", side_effect=OSError("private fsync failure")))
+                for active in patches:
+                    active.start()
+                try:
+                    with self.assertRaisesRegex(
+                        converter.AlphaConversionError,
+                        "unable to write source background reference",
+                    ) as raised:
+                        converter._verify_source_background(
+                            root / "source.mp4",
+                            background_reference=reference,
+                            info=info,
+                            ffmpeg="ffmpeg",
+                            timeout_seconds=1,
+                        )
+                    self.assertNotIn(temp, str(raised.exception))
+                finally:
+                    for active in reversed(patches):
+                        active.stop()
+
+    def test_source_background_preflight_emits_per_frame_progress(self):
+        if alpha.np is None:
+            self.skipTest("NumPy is required")
+        np = alpha.np
+        frame = np.zeros((4, 4, 3), dtype=np.uint8)
+        frame[:, :] = (0, 255, 0)
+        info = alpha.VideoInfo(
+            width=4,
+            height=4,
+            frame_count=3,
+            fps=Fraction(24, 1),
+            duration_seconds=3 / 24,
+            codec_name="h264",
+            pixel_format="yuv420p",
+        )
+        progress = mock.Mock()
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(
+            converter, "_start_process", return_value=mock.Mock()
+        ), mock.patch.object(
+            converter, "read_raw_frames", return_value=iter([frame, frame, frame])
+        ), mock.patch.object(converter, "close_process"):
+            report = converter._verify_source_background(
+                Path(temp) / "source.mp4",
+                background_reference=Path(temp) / "background.rgb",
+                info=info,
+                ffmpeg="ffmpeg",
+                timeout_seconds=10,
+                progress=progress,
+            )
+        self.assertEqual(report["frames_checked"], 3)
+        self.assertEqual(progress.emit.call_count, 3)
+        self.assertEqual(progress.emit.call_args.kwargs["frame_completed"], 3)
+
+    def test_roundtrip_verification_threads_nondefault_timeout_everywhere(self):
+        if alpha.np is None:
+            self.skipTest("NumPy is required")
+        np = alpha.np
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            delivery = root / "delivery.mov"
+            reference_video = root / "reference.mov"
+            reference_alpha = root / "alpha.raw"
+            delivery.write_bytes(b"delivery")
+            reference_video.write_bytes(b"reference")
+            reference_alpha.write_bytes(b"\0")
+            expected = alpha.VideoInfo(
+                width=1,
+                height=1,
+                frame_count=1,
+                fps=Fraction(24, 1),
+                duration_seconds=1 / 24,
+                codec_name="",
+                pixel_format="",
+            )
+            delivery_info = alpha.VideoInfo(
+                **{**vars(expected), "codec_name": "hevc", "pixel_format": "yuv420p"}
+            )
+            roundtrip_info = alpha.VideoInfo(
+                **{
+                    **vars(expected),
+                    "codec_name": "prores",
+                    "pixel_format": "yuva444p10le",
+                    "codec_profile": "4444",
+                    "bit_depth": 10,
+                }
+            )
+            rgba = np.zeros((1, 1, 4), dtype=np.uint8)
+            process_pair = (mock.Mock(), mock.Mock())
+
+            def fake_avconvert(_source, output, **_kwargs):
+                output.write_bytes(b"roundtrip")
+
+            with mock.patch.object(
+                converter, "probe_video", side_effect=[delivery_info, roundtrip_info]
+            ) as probe, mock.patch.object(
+                converter, "_run_avconvert", side_effect=fake_avconvert
+            ) as avconvert, mock.patch.object(
+                converter, "_start_rgba_decoder_pair", return_value=process_pair
+            ), mock.patch.object(
+                converter,
+                "verify_video_cadence",
+                return_value={"quality_passed": True},
+            ) as cadence, mock.patch.object(
+                converter,
+                "read_raw_frames",
+                side_effect=[iter([rgba.copy()]), iter([rgba.copy()])],
+            ) as raw_frames, mock.patch.object(converter, "close_process"):
+                report = converter._verify_alpha_roundtrip(
+                    delivery,
+                    reference_alpha,
+                    reference_video=reference_video,
+                    expected=expected,
+                    avconvert="avconvert",
+                    ffprobe="ffprobe",
+                    ffmpeg="ffmpeg",
+                    max_border_alpha=16,
+                    max_green_edge_ratio=0.05,
+                    max_magenta_edge_ratio=0.05,
+                    source_edge_alpha_floor=64,
+                    max_mean_abs_error=8,
+                    max_p95_abs_error=24,
+                    max_abs_error=64,
+                    loss_threshold=20,
+                    require_foreground=False,
+                    timeout_seconds=7,
+                )
+            self.assertTrue(report["performed"])
+            self.assertTrue(all(call.kwargs["timeout_seconds"] == 7 for call in probe.call_args_list))
+            self.assertEqual(avconvert.call_args.kwargs["timeout_seconds"], 7)
+            self.assertTrue(
+                all(call.kwargs["timeout_seconds"] == 7 for call in cadence.call_args_list)
+            )
+            self.assertTrue(
+                all(call.kwargs["timeout_seconds"] == 7 for call in raw_frames.call_args_list)
+            )
+
+    def test_missing_tool_capability_fails_before_hash_or_decoder_start(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.mp4"
+            source.write_bytes(b"source")
+            args = converter.build_parser().parse_args(
+                [str(source), str(root / "output.mov")]
+            )
+            complete = {
+                ("ffmpeg", ("-hide_banner", "-encoders")): " VFS... prores_ks encoder\n",
+                ("ffmpeg", ("-hide_banner", "-filters")): (
+                    " .. scale V->V\n .. crop V->V\n .. pad V->V\n"
+                ),
+                ("avconvert", ("--help",)): (
+                    f"{converter.DEFAULT_PRESET}\n{converter.ROUNDTRIP_PRESET}\n"
+                ),
+                ("ffmpeg", ("-version",)): "ffmpeg version test\n",
+                ("ffprobe", ("-version",)): "ffprobe version test\n",
+                ("/usr/bin/sw_vers", ("-buildVersion",)): "23G93\n",
+            }
+            cases = (
+                ("encoder", ("ffmpeg", ("-hide_banner", "-encoders")), "", "prores_ks"),
+                ("scale", ("ffmpeg", ("-hide_banner", "-filters")), " .. crop V->V\n .. pad V->V\n", "scale filter"),
+                ("crop", ("ffmpeg", ("-hide_banner", "-filters")), " .. scale V->V\n .. pad V->V\n", "crop filter"),
+                ("pad", ("ffmpeg", ("-hide_banner", "-filters")), " .. scale V->V\n .. crop V->V\n", "pad filter"),
+                ("delivery preset", ("avconvert", ("--help",)), converter.ROUNDTRIP_PRESET, converter.DEFAULT_PRESET),
+                ("roundtrip preset", ("avconvert", ("--help",)), converter.DEFAULT_PRESET, converter.ROUNDTRIP_PRESET),
+            )
+            for label, missing_key, replacement, message in cases:
+                outputs = dict(complete)
+                outputs[missing_key] = replacement
+
+                def fake_output(executable, arguments, **_kwargs):
+                    return outputs[(executable, arguments)]
+
+                with self.subTest(label=label), mock.patch.object(
+                    converter, "require_image_dependencies"
+                ), mock.patch.object(
+                    converter, "require_tool", side_effect=lambda name, _value: name
+                ), mock.patch.object(
+                    converter, "_bounded_tool_output", side_effect=fake_output
+                ), mock.patch.object(
+                    converter, "_sha256_source_file"
+                ) as source_hash, mock.patch.object(
+                    converter, "_start_process"
+                ) as start_process:
+                    with self.assertRaisesRegex(converter.AlphaConversionError, message):
+                        converter.convert_video(args)
+                source_hash.assert_not_called()
+                start_process.assert_not_called()
+
+    def test_tool_capability_preflight_reuses_cached_help_for_report_versions(self):
+        outputs = {
+            ("ffmpeg", ("-hide_banner", "-encoders")): " VFS... prores_ks encoder\n",
+            ("ffmpeg", ("-hide_banner", "-filters")): " .. scale V->V\n .. crop V->V\n .. pad V->V\n",
+            ("avconvert", ("--help",)): f"avconvert help\n{converter.DEFAULT_PRESET}\n{converter.ROUNDTRIP_PRESET}\n",
+            ("ffmpeg", ("-version",)): "ffmpeg version test\n",
+            ("ffprobe", ("-version",)): "ffprobe version test\n",
+            ("/usr/bin/sw_vers", ("-buildVersion",)): "23G93\n",
+        }
+
+        with mock.patch.object(
+            converter, "_bounded_tool_output", side_effect=lambda executable, arguments, **_kwargs: outputs[(executable, arguments)]
+        ) as bounded:
+            result = converter._preflight_tool_capabilities(
+                ffmpeg="ffmpeg", ffprobe="ffprobe", avconvert="avconvert"
+            )
+        self.assertTrue(result["capabilities"]["passed"])
+        av_help_calls = [
+            call for call in bounded.call_args_list
+            if call.args[:2] == ("avconvert", ("--help",))
+        ]
+        self.assertEqual(len(av_help_calls), 1)
+
+    def test_toolchain_fingerprints_are_deterministic_and_path_free(self):
+        with tempfile.NamedTemporaryFile() as avconvert_file:
+            avconvert_path = avconvert_file.name
+
+            def fake_output(executable, arguments, **_kwargs):
+                if arguments == ("-hide_banner", "-encoders"):
+                    return " VFS... prores_ks encoder\n"
+                if arguments == ("-hide_banner", "-filters"):
+                    return " .. scale V->V\n .. crop V->V\n .. pad V->V\n"
+                if arguments == ("--help",):
+                    return f"help\n{converter.DEFAULT_PRESET}\n{converter.ROUNDTRIP_PRESET}\n"
+                if executable == "/usr/bin/sw_vers":
+                    return "23G93\n"
+                return f"{Path(executable).name} version test\n"
+
+            def fake_hash(path):
+                if Path(path) == Path(avconvert_path):
+                    return "a" * 64
+                if Path(path) == Path(alpha.__file__):
+                    return "d" * 64
+                return "c" * 64
+
+            with mock.patch.object(
+                converter, "_bounded_tool_output", side_effect=fake_output
+            ), mock.patch.object(converter, "_sha256_file", side_effect=fake_hash):
+                first = converter._preflight_tool_capabilities(
+                    ffmpeg="ffmpeg",
+                    ffprobe="ffprobe",
+                    avconvert=avconvert_path,
+                )
+                second = converter._preflight_tool_capabilities(
+                    ffmpeg="ffmpeg",
+                    ffprobe="ffprobe",
+                    avconvert=avconvert_path,
+                )
+            self.assertEqual(first["toolchain"], second["toolchain"])
+            combined = hashlib.sha256(
+                (("c" * 64) + ":" + ("d" * 64)).encode("ascii")
+            ).hexdigest()
+            self.assertEqual(
+                first["toolchain"]["converter_version"], "sha256-" + combined
+            )
+            self.assertEqual(first["toolchain"]["avconvert_version"], "sha256-" + "a" * 64)
+            self.assertEqual(first["toolchain"]["macos_build"], "23G93")
+            self.assertNotIn(tempfile.gettempdir(), json.dumps(first["toolchain"]))
+
     def test_converter_composite_gate_aborts_before_publication(self):
         if alpha.np is None:
             self.skipTest("NumPy is required")
@@ -1147,6 +2589,16 @@ class MacOSAlphaCommandTests(unittest.TestCase):
             publication = mock.Mock()
             with mock.patch.object(converter, "require_image_dependencies"), mock.patch.object(
                 converter, "require_tool", return_value="tool"
+            ), mock.patch.object(
+                converter,
+                "_preflight_tool_capabilities",
+                return_value={"toolchain": {}, "capabilities": {}},
+            ), mock.patch.object(
+                converter, "verify_video_cadence", return_value={"quality_passed": True}
+            ), mock.patch.object(
+                converter,
+                "_verify_source_background",
+                return_value={"quality_passed": True},
             ), mock.patch.object(converter, "probe_video", side_effect=fake_probe), mock.patch.object(
                 converter, "_stream_matte_to_prores", side_effect=fake_stream
             ), mock.patch.object(converter, "_run_avconvert", side_effect=fake_avconvert), mock.patch.object(
@@ -1174,7 +2626,7 @@ class MacOSAlphaCommandTests(unittest.TestCase):
 
             def unlink_with_cleanup_failure(path, *args, **kwargs):
                 nonlocal reserved
-                if path.suffix == ".bak":
+                if path.name.startswith("backup-"):
                     if not reserved:
                         reserved = True
                         return original_unlink(path, *args, **kwargs)
@@ -1212,7 +2664,9 @@ class MacOSAlphaCommandTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 converter.AlphaConversionError, "source video changed"
             ):
-                converter._assert_source_unchanged(source, digest)
+                converter._assert_source_unchanged(
+                    source, digest, max_source_bytes=1024
+                )
 
     def test_source_digest_hashes_normal_nonempty_mp4(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1224,6 +2678,30 @@ class MacOSAlphaCommandTests(unittest.TestCase):
                 converter._sha256_source_file(source),
                 hashlib.sha256(payload).hexdigest(),
             )
+
+    def test_source_digest_rejects_growth_during_capped_fd_hash(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source.mp4"
+            source.write_bytes(b"bounded-source")
+            original_read = os.read
+            appended = False
+
+            def read_then_append(descriptor, count):
+                nonlocal appended
+                chunk = original_read(descriptor, count)
+                if chunk and not appended:
+                    appended = True
+                    with source.open("ab") as handle:
+                        handle.write(b"growth")
+                return chunk
+
+            with mock.patch.object(converter.os, "read", side_effect=read_then_append):
+                with self.assertRaisesRegex(
+                    converter.AlphaConversionError, "changed during hashing"
+                ):
+                    converter._sha256_source_file(
+                        source, max_source_bytes=len(b"bounded-source")
+                    )
 
     def test_source_digest_rejects_symlink_fifo_and_nonregular_without_path_leak(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1346,6 +2824,16 @@ class MacOSAlphaCommandTests(unittest.TestCase):
             publication = mock.Mock()
             with mock.patch.object(converter, "require_image_dependencies"), mock.patch.object(
                 converter, "require_tool", return_value="tool"
+            ), mock.patch.object(
+                converter,
+                "_preflight_tool_capabilities",
+                return_value={"toolchain": {}, "capabilities": {}},
+            ), mock.patch.object(
+                converter, "verify_video_cadence", return_value={"quality_passed": True}
+            ), mock.patch.object(
+                converter,
+                "_verify_source_background",
+                return_value={"quality_passed": True},
             ), mock.patch.object(converter, "probe_video", side_effect=fake_probe), mock.patch.object(
                 converter, "_stream_matte_to_prores", side_effect=fake_stream
             ), mock.patch.object(converter, "_run_avconvert", side_effect=fake_avconvert), mock.patch.object(
@@ -1367,6 +2855,8 @@ class MacOSAlphaCommandTests(unittest.TestCase):
                     {
                         "codec_type": "video",
                         "codec_name": "h264",
+                        "pix_fmt": "yuv420p",
+                        "bits_per_raw_sample": "8",
                         "width": 16,
                         "height": 16,
                         "avg_frame_rate": "23/1",
@@ -1394,6 +2884,8 @@ class MacOSAlphaCommandTests(unittest.TestCase):
                         "codec_type": "video",
                         "codec_name": "h264",
                         "profile": "High",
+                        "pix_fmt": "yuv420p",
+                        "bits_per_raw_sample": "8",
                         "width": 16,
                         "height": 16,
                         "sample_aspect_ratio": "1:1",
@@ -1451,6 +2943,8 @@ class MacOSAlphaCommandTests(unittest.TestCase):
             stream = {
                 "codec_type": "video",
                 "codec_name": "h264",
+                "pix_fmt": "yuv420p",
+                "bits_per_raw_sample": "8",
                 "width": 16,
                 "height": 16,
                 "avg_frame_rate": "24/1",
@@ -1479,6 +2973,508 @@ class MacOSAlphaCommandTests(unittest.TestCase):
                     ffprobe="/opt/homebrew/bin/ffprobe",
                     runner=run_probe,
                 )
+
+    def test_probe_records_selected_playable_stream_index_for_decode(self):
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as source:
+            playable = {
+                "index": 7,
+                "codec_type": "video",
+                "codec_name": "h264",
+                "pix_fmt": "yuv420p",
+                "bits_per_raw_sample": "8",
+                "width": 16,
+                "height": 16,
+                "avg_frame_rate": "24/1",
+                "r_frame_rate": "24/1",
+                "nb_read_frames": "2",
+                "duration": "0.083333",
+            }
+            cover = dict(playable, index=0, disposition={"attached_pic": 1})
+            result = subprocess.CompletedProcess(
+                ["ffprobe"], 0, json.dumps({"streams": [cover, playable]}), ""
+            )
+
+            info = alpha.probe_video(
+                source.name,
+                ffprobe="/opt/homebrew/bin/ffprobe",
+                runner=lambda *args, **kwargs: result,
+            )
+            command = alpha.build_ffmpeg_decode_command(
+                source.name,
+                width=16,
+                height=16,
+                stream_index=info.stream_index,
+            )
+
+            self.assertEqual(info.stream_index, 7)
+            self.assertEqual(command[command.index("-map") + 1], "0:7")
+
+    def test_probe_rejects_hdr_and_interlaced_sources_before_decode(self):
+        base_stream = {
+            "index": 0,
+            "codec_type": "video",
+            "codec_name": "hevc",
+            "width": 16,
+            "height": 16,
+            "avg_frame_rate": "24/1",
+            "r_frame_rate": "24/1",
+            "nb_read_frames": "2",
+            "duration": "0.083333",
+        }
+        for metadata, message in (
+            ({"color_transfer": "smpte2084", "color_primaries": "bt2020"}, "HDR"),
+            ({"field_order": "tt"}, "interlaced"),
+        ):
+            with self.subTest(metadata=metadata), tempfile.NamedTemporaryFile(
+                suffix=".mp4"
+            ) as source:
+                stream = dict(base_stream, **metadata)
+                result = subprocess.CompletedProcess(
+                    ["ffprobe"], 0, json.dumps({"streams": [stream]}), ""
+                )
+                with self.assertRaisesRegex(alpha.ProbeError, message):
+                    alpha.probe_video(
+                        source.name,
+                        ffprobe="/opt/homebrew/bin/ffprobe",
+                        runner=lambda *args, **kwargs: result,
+                    )
+
+    def test_probe_rejects_ten_bit_sdr_source_before_rgb24_decode(self):
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as source:
+            stream = {
+                "index": 0,
+                "codec_type": "video",
+                "codec_name": "hevc",
+                "pix_fmt": "yuv420p10le",
+                "bits_per_raw_sample": "10",
+                "color_primaries": "bt709",
+                "color_transfer": "bt709",
+                "width": 16,
+                "height": 16,
+                "avg_frame_rate": "24/1",
+                "r_frame_rate": "24/1",
+                "nb_read_frames": "2",
+                "duration": "0.083333",
+            }
+            result = subprocess.CompletedProcess(
+                ["ffprobe"], 0, json.dumps({"streams": [stream]}), ""
+            )
+            with self.assertRaisesRegex(alpha.ProbeError, "more than 8 bits"):
+                alpha.probe_video(
+                    source.name,
+                    ffprobe="/opt/homebrew/bin/ffprobe",
+                    runner=lambda *args, **kwargs: result,
+                )
+
+    def test_pixel_format_bit_depth_fallback_covers_planar_and_packed_formats(self):
+        for pixel_format, expected in (
+            ("gray10le", 10),
+            ("rgb48le", 16),
+            ("rgba64le", 16),
+            ("xyz12le", 12),
+            ("x2rgb10le", 10),
+            ("nv20le", 10),
+            ("gray", 8),
+            ("rgb24", 8),
+            ("rgba", 8),
+            ("unknown-private-format", None),
+        ):
+            with self.subTest(pixel_format=pixel_format):
+                self.assertEqual(
+                    alpha._pixel_format_bit_depth(pixel_format), expected
+                )
+
+    def test_probe_rejects_unknown_bit_depth_instead_of_assuming_eight_bit(self):
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as source:
+            stream = {
+                "index": 0,
+                "codec_type": "video",
+                "codec_name": "private",
+                "pix_fmt": "unknown-private-format",
+                "bits_per_raw_sample": "0",
+                "color_primaries": "bt709",
+                "color_transfer": "bt709",
+                "color_space": "bt709",
+                "color_range": "tv",
+                "width": 16,
+                "height": 16,
+                "avg_frame_rate": "24/1",
+                "r_frame_rate": "24/1",
+                "nb_read_frames": "2",
+                "duration": "0.083333",
+            }
+            result = subprocess.CompletedProcess(
+                ["ffprobe"], 0, json.dumps({"streams": [stream]}), ""
+            )
+            with self.assertRaisesRegex(alpha.ProbeError, "could not be verified"):
+                alpha.probe_video(
+                    source.name,
+                    ffprobe="/opt/homebrew/bin/ffprobe",
+                    runner=lambda *args, **kwargs: result,
+                )
+
+    def test_probe_accepts_bt709_sdr_color_metadata(self):
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as source:
+            stream = {
+                "index": 0,
+                "codec_type": "video",
+                "codec_name": "h264",
+                "pix_fmt": "yuv420p",
+                "bits_per_raw_sample": "8",
+                "color_primaries": "bt709",
+                "color_transfer": "bt709",
+                "color_space": "bt709",
+                "color_range": "tv",
+                "width": 16,
+                "height": 16,
+                "avg_frame_rate": "24/1",
+                "r_frame_rate": "24/1",
+                "nb_read_frames": "2",
+                "duration": "0.083333",
+            }
+            result = subprocess.CompletedProcess(
+                ["ffprobe"], 0, json.dumps({"streams": [stream]}), ""
+            )
+            info = alpha.probe_video(
+                source.name,
+                ffprobe="/opt/homebrew/bin/ffprobe",
+                runner=lambda *args, **kwargs: result,
+            )
+            self.assertEqual(info.color_primaries, "bt709")
+            self.assertEqual(info.bit_depth, 8)
+
+    def test_probe_rejects_display_p3_wide_gamut_metadata(self):
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as source:
+            stream = {
+                "index": 0,
+                "codec_type": "video",
+                "codec_name": "h264",
+                "pix_fmt": "yuv420p",
+                "bits_per_raw_sample": "8",
+                "color_primaries": "smpte432",
+                "color_transfer": "iec61966-2-1",
+                "color_space": "bt709",
+                "color_range": "pc",
+                "width": 16,
+                "height": 16,
+                "avg_frame_rate": "24/1",
+                "r_frame_rate": "24/1",
+                "nb_read_frames": "2",
+                "duration": "0.083333",
+            }
+            result = subprocess.CompletedProcess(
+                ["ffprobe"], 0, json.dumps({"streams": [stream]}), ""
+            )
+            with self.assertRaisesRegex(alpha.ProbeError, "wide-gamut"):
+                alpha.probe_video(
+                    source.name,
+                    ffprobe="/opt/homebrew/bin/ffprobe",
+                    runner=lambda *args, **kwargs: result,
+                )
+
+    def test_probe_rejects_nonuniform_pts_even_when_aggregate_rates_match(self):
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as source:
+            stream = {
+                "index": 0,
+                "codec_type": "video",
+                "codec_name": "h264",
+                "pix_fmt": "yuv420p",
+                "bits_per_raw_sample": "8",
+                "width": 16,
+                "height": 16,
+                "avg_frame_rate": "24/1",
+                "r_frame_rate": "24/1",
+                "nb_read_frames": "4",
+                "duration": "0.166667",
+            }
+            payload = {
+                "streams": [stream],
+                "frames": [
+                    {
+                        "stream_index": 0,
+                        "media_type": "video",
+                        "best_effort_timestamp_time": value,
+                    }
+                    for value in ("0.000000", "0.030000", "0.083333", "0.113333")
+                ],
+            }
+            result = subprocess.CompletedProcess(
+                ["ffprobe"], 0, json.dumps(payload), ""
+            )
+            with self.assertRaisesRegex(alpha.ProbeError, "not uniformly spaced"):
+                alpha.probe_video(
+                    source.name,
+                    ffprobe="/opt/homebrew/bin/ffprobe",
+                    runner=lambda *args, **kwargs: result,
+                    validate_timestamps=True,
+                )
+
+    def test_probe_cadence_ignores_interleaved_audio_frames(self):
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as source:
+            stream = {
+                "index": 1,
+                "codec_type": "video",
+                "codec_name": "h264",
+                "pix_fmt": "yuv420p",
+                "bits_per_raw_sample": "8",
+                "width": 16,
+                "height": 16,
+                "avg_frame_rate": "24/1",
+                "r_frame_rate": "24/1",
+                "nb_read_frames": "3",
+                "duration": "0.125",
+            }
+            payload = {
+                "streams": [stream, {"index": 0, "codec_type": "audio", "codec_name": "aac"}],
+                "frames": [
+                    {"stream_index": 0, "media_type": "audio", "best_effort_timestamp_time": "0.000"},
+                    {"stream_index": 1, "media_type": "video", "best_effort_timestamp_time": "0.000000"},
+                    {"stream_index": 0, "media_type": "audio", "best_effort_timestamp_time": "0.021"},
+                    {"stream_index": 1, "media_type": "video", "best_effort_timestamp_time": "0.041667"},
+                    {"stream_index": 1, "media_type": "video", "best_effort_timestamp_time": "0.083333"},
+                ],
+            }
+            result = subprocess.CompletedProcess(["ffprobe"], 0, json.dumps(payload), "")
+            info = alpha.probe_video(
+                source.name,
+                ffprobe="/opt/homebrew/bin/ffprobe",
+                runner=lambda *args, **kwargs: result,
+                validate_timestamps=True,
+            )
+            self.assertEqual(info.frame_count, 3)
+
+    def test_probe_accepts_cfr_timestamps_quantized_to_container_time_base(self):
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as source:
+            stream = {
+                "index": 0,
+                "codec_type": "video",
+                "codec_name": "h264",
+                "pix_fmt": "yuv420p",
+                "bits_per_raw_sample": "8",
+                "width": 16,
+                "height": 16,
+                "time_base": "1/1000",
+                "avg_frame_rate": "24/1",
+                "r_frame_rate": "24/1",
+                "nb_read_frames": "4",
+                "duration": "0.166667",
+            }
+            payload = {
+                "streams": [stream],
+                "frames": [
+                    {
+                        "stream_index": 0,
+                        "media_type": "video",
+                        "best_effort_timestamp_time": value,
+                    }
+                    for value in ("0.000", "0.042", "0.083", "0.125")
+                ],
+            }
+            result = subprocess.CompletedProcess(["ffprobe"], 0, json.dumps(payload), "")
+            info = alpha.probe_video(
+                source.name,
+                ffprobe="/opt/homebrew/bin/ffprobe",
+                runner=lambda *args, **kwargs: result,
+                validate_timestamps=True,
+            )
+            self.assertEqual(info.time_base, "1/1000")
+
+    def test_probe_cadence_rejects_missing_selected_video_timestamp(self):
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as source:
+            stream = {
+                "index": 0,
+                "codec_type": "video",
+                "codec_name": "h264",
+                "pix_fmt": "yuv420p",
+                "bits_per_raw_sample": "8",
+                "width": 16,
+                "height": 16,
+                "avg_frame_rate": "24/1",
+                "r_frame_rate": "24/1",
+                "nb_read_frames": "2",
+                "duration": "0.083333",
+            }
+            payload = {
+                "streams": [stream],
+                "frames": [
+                    {"stream_index": 0, "media_type": "video", "best_effort_timestamp_time": "0.000000"},
+                    {"stream_index": 0, "media_type": "video", "best_effort_timestamp_time": "N/A"},
+                ],
+            }
+            result = subprocess.CompletedProcess(["ffprobe"], 0, json.dumps(payload), "")
+            with self.assertRaisesRegex(alpha.ProbeError, "timestamp metadata is missing"):
+                alpha.probe_video(
+                    source.name,
+                    ffprobe="/opt/homebrew/bin/ffprobe",
+                    runner=lambda *args, **kwargs: result,
+                    validate_timestamps=True,
+                )
+
+    def test_probe_runner_has_a_bounded_deadline(self):
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as source:
+            runner = mock.Mock(side_effect=subprocess.TimeoutExpired("ffprobe", 1))
+            with self.assertRaisesRegex(alpha.ProbeError, "timed out"):
+                alpha.probe_video(
+                    source.name,
+                    ffprobe="/opt/homebrew/bin/ffprobe",
+                    runner=runner,
+                    timeout_seconds=1,
+                )
+            self.assertEqual(runner.call_args.kwargs["timeout"], 1)
+
+    def test_read_raw_frames_accumulates_short_pipe_reads(self):
+        np = alpha.np
+        if np is None:
+            self.skipTest("NumPy is required")
+
+        class ShortReader:
+            def __init__(self, payload):
+                self.payload = bytearray(payload)
+
+            def read(self, count):
+                if not self.payload:
+                    return b""
+                take = min(2, count, len(self.payload))
+                chunk = bytes(self.payload[:take])
+                del self.payload[:take]
+                return chunk
+
+        process = mock.Mock()
+        process.stdout = ShortReader(bytes(range(12)))
+        process.wait.return_value = 0
+        frames = list(
+            alpha.read_raw_frames(
+                process, width=2, height=2, expected_frames=1, channels=3
+            )
+        )
+        self.assertEqual(frames[0].tobytes(), bytes(range(12)))
+
+    def test_read_raw_frames_times_out_when_partial_frame_stalls(self):
+        if alpha.np is None:
+            self.skipTest("NumPy is required")
+        read_descriptor, write_descriptor = os.pipe()
+        os.write(write_descriptor, b"\x00\x01")
+        process = mock.Mock()
+        process.stdout = os.fdopen(read_descriptor, "rb", buffering=0)
+        process.stdin = None
+        process.stderr = None
+        process.poll.return_value = 0
+        try:
+            with self.assertRaisesRegex(alpha.AlphaConversionError, "timed out"):
+                list(
+                    alpha.read_raw_frames(
+                        process,
+                        width=2,
+                        height=2,
+                        expected_frames=1,
+                        channels=3,
+                        timeout_seconds=0.05,
+                    )
+                )
+        finally:
+            os.close(write_descriptor)
+
+    def test_read_raw_frames_wait_uses_remaining_absolute_deadline(self):
+        if alpha.np is None:
+            self.skipTest("NumPy is required")
+
+        class Reader:
+            def __init__(self):
+                self.chunks = [b"\0\0\0", b""]
+
+            def read(self, _count):
+                return self.chunks.pop(0)
+
+        process = mock.Mock()
+        process.stdout = Reader()
+        process.wait.return_value = 0
+        with mock.patch.object(
+            alpha.time, "monotonic", side_effect=[0.0, 0.1, 0.2, 0.7]
+        ):
+            list(
+                alpha.read_raw_frames(
+                    process,
+                    width=1,
+                    height=1,
+                    expected_frames=1,
+                    channels=3,
+                    timeout_seconds=1.0,
+                )
+            )
+        self.assertAlmostEqual(process.wait.call_args.kwargs["timeout"], 0.3)
+
+    def test_bounded_capture_inherits_converter_group_and_stops_noisy_output(self):
+        group_result = alpha._run_bounded_capture(
+            [sys.executable, "-c", "import os; print(os.getpgrp())"],
+            timeout_seconds=2,
+            stdout_limit=1024,
+            stderr_limit=1024,
+            overflow_message="overflow",
+            timeout_message="timeout",
+        )
+        self.assertEqual(int(group_result.stdout.strip()), os.getpgrp())
+
+        started = time.monotonic()
+        with self.assertRaisesRegex(alpha.ProbeError, "overflow"):
+            alpha._run_bounded_capture(
+                [sys.executable, "-c", "import os; os.write(1, b'x' * 2000000)"],
+                timeout_seconds=2,
+                stdout_limit=1024 * 1024,
+                stderr_limit=1024,
+                overflow_message="overflow",
+                timeout_message="timeout",
+            )
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_close_process_reaps_after_kill(self):
+        process = mock.Mock()
+        process.stdin = None
+        process.stdout = None
+        process.stderr = None
+        process.poll.return_value = None
+        process.wait.side_effect = [subprocess.TimeoutExpired("ffmpeg", 2), 0]
+
+        alpha.close_process(process)
+
+        process.terminate.assert_called_once()
+        process.kill.assert_called_once()
+        self.assertEqual(process.wait.call_count, 2)
+        self.assertEqual(process.wait.call_args_list[-1].kwargs["timeout"], 2)
+
+    def test_encoder_write_deadline_bounds_a_full_pipe(self):
+        read_descriptor, write_descriptor = os.pipe()
+        os.set_blocking(write_descriptor, False)
+        try:
+            while True:
+                os.write(write_descriptor, b"x" * 65536)
+        except BlockingIOError:
+            pass
+        stream = os.fdopen(write_descriptor, "wb", buffering=0)
+        started = time.monotonic()
+        try:
+            with self.assertRaisesRegex(
+                converter.AlphaConversionError, "encoding timed out"
+            ):
+                converter._write_all_with_deadline(
+                    stream,
+                    b"frame",
+                    deadline=time.monotonic() + 0.05,
+                )
+        finally:
+            stream.close()
+            os.close(read_descriptor)
+        self.assertLess(time.monotonic() - started, 0.5)
+
+    def test_encoder_write_rejects_non_fd_stream_instead_of_bypassing_deadline(self):
+        stream = mock.Mock()
+        stream.fileno.side_effect = OSError("no descriptor")
+        with self.assertRaisesRegex(
+            converter.AlphaConversionError, "does not support bounded writes"
+        ):
+            converter._write_all_with_deadline(
+                stream, b"frame", deadline=time.monotonic() + 1
+            )
+        stream.write.assert_not_called()
 
     def test_missing_dependency_error_is_actionable(self):
         with mock.patch.object(alpha, "np", None), mock.patch.object(alpha, "Image", None):
@@ -1542,6 +3538,98 @@ class MacOSAlphaSyntheticMatteTests(unittest.TestCase):
             rgba[:, :, 0], rgba[:, :, 2]
         ).astype(np.int16)
         self.assertLessEqual(int(green_excess[retained].max()), 3)
+
+    def test_non_green_background_is_rejected_before_false_opaque_success(self):
+        np = alpha.np
+        frame = np.zeros((40, 48, 3), dtype=np.uint8)
+        frame[:, :] = (32, 32, 180)
+        frame[12:28, 15:33] = (220, 184, 170)
+
+        with self.assertRaisesRegex(alpha.FrameQualityError, "green-screen background"):
+            alpha.matte_frame(frame)
+
+    def test_green_background_suitability_is_reported(self):
+        frame, _ = self._synthetic_frame()
+        diagnostics = {}
+        alpha.matte_frame(frame, diagnostics=diagnostics)
+        self.assertGreaterEqual(diagnostics["green_background_border_ratio"], 0.5)
+
+    def test_fit_suitability_excludes_synthetic_green_padding(self):
+        np = alpha.np
+        canvas = np.zeros((40, 40, 3), dtype=np.uint8)
+        canvas[:, :] = (0, 255, 0)
+        bounds = (11, 4, 29, 36)  # 9:16 source fitted inside a square canvas.
+        left, top, right, bottom = bounds
+        canvas[top:bottom, left:right] = (80, 80, 80)
+        canvas[14:26, 14:26] = (220, 184, 170)
+
+        with self.assertRaisesRegex(alpha.FrameQualityError, "green-screen background"):
+            alpha.matte_frame(canvas, suitability_bounds=bounds)
+
+    def test_fit_suitability_accepts_real_green_source_inside_padding(self):
+        np = alpha.np
+        canvas = np.zeros((40, 40, 3), dtype=np.uint8)
+        canvas[:, :] = (0, 255, 0)
+        bounds = (11, 4, 29, 36)
+        canvas[14:26, 14:26] = (220, 184, 170)
+
+        rgba = alpha.matte_frame(canvas, suitability_bounds=bounds)
+        self.assertGreater(int(rgba[:, :, 3].max()), 0)
+
+    def test_source_attestation_rejects_green_subject_on_non_green_background(self):
+        np = alpha.np
+        frame = np.zeros((40, 40, 3), dtype=np.uint8)
+        frame[:, :] = (90, 90, 90)
+        frame[10:30, 10:30] = (0, 255, 0)
+        with self.assertRaisesRegex(alpha.FrameQualityError, "green-screen background"):
+            alpha.assess_green_background(frame)
+
+    def test_source_attestation_rejects_top_touching_green_object_on_gray(self):
+        np = alpha.np
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        frame[:, :] = (96, 96, 96)
+        frame[:20, 35:65] = (0, 255, 0)
+        with self.assertRaisesRegex(
+            alpha.FrameQualityError, "green-screen background"
+        ):
+            alpha.assess_green_background(frame)
+
+    def test_source_attestation_rejects_three_pixel_green_cross_on_gray(self):
+        np = alpha.np
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        frame[:, :] = (96, 96, 96)
+        frame[:, 49:52] = (0, 255, 0)
+        frame[49:52, :] = (0, 255, 0)
+        with self.assertRaisesRegex(
+            alpha.FrameQualityError, "green-screen background"
+        ):
+            alpha.assess_green_background(frame)
+
+    def test_relaxed_edge_contact_uses_attested_source_green_not_cropped_perimeter(self):
+        np = alpha.np
+        source = np.zeros((40, 40, 3), dtype=np.uint8)
+        source[:, :] = (0, 255, 0)
+        # Subject/effect covers most of the perimeter but leaves small,
+        # connected green source-space evidence and a green interior pocket.
+        source[:8, :] = (210, 180, 160)
+        source[-8:, :] = (210, 180, 160)
+        source[:, :8] = (210, 180, 160)
+        source[:, -8:] = (210, 180, 160)
+        source[:9, 18:22] = (0, 255, 0)
+        evidence = alpha.assess_green_background(source)
+        self.assertGreater(evidence["green_source_border_ratio"], 0.02)
+
+        cropped = np.zeros((24, 24, 3), dtype=np.uint8)
+        cropped[:, :] = (210, 180, 160)
+        cropped[8:16, 8:16] = (0, 255, 0)
+        rgba = alpha.matte_frame(
+            cropped,
+            background_attested=True,
+            background_rgb=tuple(evidence["background_rgb"]),
+            reject_edge_contact=False,
+        )
+        self.assertEqual(int(rgba[0, :, 3].max()), 0)
+        self.assertGreater(int(rgba[4:8, 4:8, 3].mean()), 200)
 
 
 @unittest.skipUnless(
@@ -1643,6 +3731,8 @@ class MacOSAlphaIntegrationTests(unittest.TestCase):
                 ffprobe,
                 "--avconvert",
                 avconvert,
+                "--invocation-challenge",
+                "a" * 64,
             ]
             converted = subprocess.run(
                 command,
@@ -1654,6 +3744,16 @@ class MacOSAlphaIntegrationTests(unittest.TestCase):
             self.assertEqual(converted.returncode, 0, converted.stderr)
             payload = json.loads(report.read_text(encoding="utf-8"))
             self.assertEqual(payload["status"], "converted")
+            self.assertEqual(payload["report_schema_version"], 1)
+            self.assertEqual(payload["profile"]["name"], "standard")
+            self.assertEqual(
+                payload["provenance"],
+                {
+                    "method": "invocation-challenge-v1",
+                    "producer": "statelet",
+                    "challenge": "a" * 64,
+                },
+            )
             self.assertEqual(
                 payload["source"]["audio"],
                 {"stream_count": 0, "codecs": [], "policy": "none"},
@@ -1744,6 +3844,29 @@ class MacOSAlphaIntegrationTests(unittest.TestCase):
             )
             self.assertTrue(output.is_file())
             self.assertTrue(intermediate.is_file())
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(intermediate.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(report.stat().st_mode & 0o777, 0o600)
+            played = subprocess.run(
+                [
+                    "swift",
+                    "run",
+                    "--package-path",
+                    "mac/CodexPetMac",
+                    "codex-pet-core-self-test",
+                    "--playback-smoke",
+                    str(output),
+                    "64",
+                    "48",
+                    "24",
+                ],
+                cwd=ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            self.assertEqual(played.returncode, 0, played.stderr)
             report_text = report.read_text(encoding="utf-8")
             self.assertNotIn(str(ROOT), report_text)
             self.assertNotIn(str(temp_path.parent), report_text)

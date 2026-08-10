@@ -63,6 +63,9 @@ The badge reports:
   changes.
 - The final width and height are saved in `media-map.json`.
 - Right-click the pet for the context menu.
+- Clear **Keep Statelet on Top** to use normal window stacking, so other app
+  windows can cover the pet. The same control is available in **Settings →
+  General**.
 - Enable **Click-through** to send pointer events to the app underneath.
 
 When click-through is enabled, the pet cannot receive clicks or drags. Use the
@@ -150,7 +153,7 @@ The recommended source is:
 - square pixels with no rotation metadata;
 - a full-body character with clean margin on every side;
 - a locked camera and stable framing, exposure, scale, and focus;
-- a completely uniform RGB `#00FF00` background;
+- a clean, stable green-screen background (uniform RGB `#00FF00` is ideal);
 - no floor, shadow, reflection, gradient, smoke, text, logo, watermark, camera
   movement, cut, entrance, or exit;
 - an 8–10 second seamless loop with no audio; and
@@ -163,9 +166,10 @@ in the delivered frame. Resizing the on-screen pet changes AppKit display points
 not the pixel geometry used for future conversions.
 
 Select **Add Clip… → Import MP4s…**, or drag local `.mp4` files from Finder onto
-the selected state's drop zone. A drop preserves Finder order, removes exact
-duplicate paths, and is rejected before conversion if any item is missing,
-unreadable, a directory, remote, or not an MP4.
+the selected state's drop zone. A drop preserves Finder order and removes exact
+duplicate paths. Missing, unreadable, directory, remote, and non-MP4 items are
+reported individually while the remaining valid MP4s continue through the
+batch.
 
 Explicit non-square sample-aspect-ratio media is rejected before decoding.
 Audio tracks are removed because Statelet animations are silent; the completed
@@ -185,6 +189,21 @@ source probe
   -> Swift report validation and atomic library install
 ```
 
+Before expensive frame processing, conversion preflight rejects unsupported
+rotation, non-square pixels, variable frame rate, HDR/BT.2020, interlacing,
+oversized sources, excessive duration or frame count, and insufficient working
+disk space. These are actionable source-compatibility failures, not reasons to
+relax delivery verification. Audio is the exception: it is intentionally
+stripped and reported as a warning because Statelet animations are silent.
+
+The `standard` profile keeps strict source preparation and delivery gates. Its
+framing mode can be `fill` (crop to the stable canvas) or `fit` (preserve the
+whole frame and pad with the supported green key background). Profile and
+normalization choices are written into report schema v1 so an imported result
+can be explained and reproduced. The profile never changes the required codec,
+geometry/frame agreement, Apple round-trip, all-frame alpha/composite checks,
+artifact hashes, or atomic publication rules.
+
 The progress indicator uses structured probe, per-frame matte, encode,
 round-trip, and Swift installation stages. It measures completed work rather
 than estimating time remaining. Verification can take several minutes.
@@ -194,21 +213,39 @@ filenames and actionable sanitized reasons. **Cancel Conversion** stops the
 active MP4, skips the remaining batch, removes incomplete artifacts, and keeps
 clips already appended.
 
-## Import verified MOV files
+## Portable MOV reports
 
-Use **Add Clip… → Verified MOVs…** only for files created by the maintained
-converter. Keep each movie beside its matching report:
+Keep each locally created movie beside its matching report when diagnosing or
+recovering conversion output:
 
 ```text
 idle.mov
 idle.report.json
 ```
 
-Statelet copies each pair into a private staging directory, validates the copied
-bytes and report, and appends it only after the movie is playable. An arbitrary
-MOV, opaque H.264 MP4, renamed file, missing report, or mismatched report is
-rejected. This batch is sequential, can report partial failures, and does not
-show the MP4 conversion cancel button.
+Report schema v1 records toolchain, profile,
+normalization, and invocation provenance; unknown future schema versions fail
+closed. Report JSON is limited to 1 MiB and schema-v1 provenance must use the
+canonical Statelet method, producer, and a 64-character lowercase hexadecimal
+challenge even when the report is being considered as a portable claim.
+Reports without a schema remain parseable only as legacy portable
+claims. A challenge written in a portable report is self-asserted and does not
+grant local trust. Output bound to the current conversion is installed as
+**locally attested**. A schema-v1 portable pair can be installed only after the
+app clearly labels it **portable/unattested** and the user explicitly accepts
+that trust decision; confirmation does not rewrite the report or claim it was
+produced locally. Legacy schema-less claims remain parser-compatible but may be
+rejected by the app. Statelet also verifies AVFoundation can open exactly one
+HEVC video track, find zero delivery audio tracks, match the reported
+geometry/FPS/duration, and decode its first frame. A source-audio-stripped
+notice describes authoring input; it never permits audio in the delivered movie.
+
+An arbitrary MOV, opaque H.264 MP4, renamed file, missing report, mismatched
+report is rejected. A portable unattested report never passes silently: either
+the user explicitly accepts it or imports the authorized source MP4 so this
+Statelet installation can convert and attest it locally. This runtime playback
+smoke check complements rather than replaces the converter's all-frame Apple
+round-trip and alpha/composite gates.
 
 ## Remove clips and clean media
 

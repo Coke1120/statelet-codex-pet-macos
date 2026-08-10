@@ -3,28 +3,39 @@ import Foundation
 public enum AlphaConversionProgressError: Error, Equatable, Sendable {
     case malformedProgressEvent
     case invalidEvent
+    case invalidStatus
     case invalidPercent
     case invalidStage
     case invalidMessage
+    case invalidCode
+    case invalidSafeMessage
     case invalidFrameCounts
     case regressingPercent(previous: Double, incoming: Double)
 }
 
 public struct AlphaConversionProgress: Decodable, Equatable, Sendable {
     public let event: String
+    public let status: String?
     public let percent: Double
     public let stage: String
     public let message: String
     public let completedFrames: Int?
     public let totalFrames: Int?
+    public let code: String?
+    public let safeMessage: String?
+
+    public var isTerminalFailure: Bool { status == "failed" }
 
     private enum CodingKeys: String, CodingKey {
         case event
+        case status
         case percent
         case stage
         case message
         case completedFrames = "completed_frames"
         case totalFrames = "total_frames"
+        case code
+        case safeMessage = "safe_message"
     }
 
     public init(
@@ -32,15 +43,49 @@ public struct AlphaConversionProgress: Decodable, Equatable, Sendable {
         stage: String,
         message: String,
         completedFrames: Int? = nil,
-        totalFrames: Int? = nil
+        totalFrames: Int? = nil,
+        status: String? = nil,
+        code: String? = nil,
+        safeMessage: String? = nil
     ) throws {
         guard percent.isFinite, (0 ... 100).contains(percent) else {
             throw AlphaConversionProgressError.invalidPercent
         }
-        let safeStage = Self.pathSafeText(stage)
-        let safeMessage = Self.pathSafeText(message)
-        guard !safeStage.isEmpty else { throw AlphaConversionProgressError.invalidStage }
-        guard !safeMessage.isEmpty else { throw AlphaConversionProgressError.invalidMessage }
+        guard Self.isSafeStage(stage) else { throw AlphaConversionProgressError.invalidStage }
+        let safeProgressMessage = try Self.pathSafeText(
+            message,
+            maximumUTF8Bytes: 500,
+            error: .invalidMessage
+        )
+        guard !safeProgressMessage.isEmpty else {
+            throw AlphaConversionProgressError.invalidMessage
+        }
+        guard status == nil || ["running", "completed", "failed"].contains(status!) else {
+            throw AlphaConversionProgressError.invalidStatus
+        }
+        let safeFailureMessage: String?
+        if status == "failed" {
+            guard let code, Self.allowedFailureCodes.contains(code) else {
+                throw AlphaConversionProgressError.invalidCode
+            }
+            guard let safeMessage else {
+                throw AlphaConversionProgressError.invalidSafeMessage
+            }
+            safeFailureMessage = try Self.pathSafeText(
+                safeMessage,
+                maximumUTF8Bytes: 256,
+                error: .invalidSafeMessage
+            )
+            guard safeFailureMessage?.isEmpty == false else {
+                throw AlphaConversionProgressError.invalidSafeMessage
+            }
+        } else {
+            guard code == nil else { throw AlphaConversionProgressError.invalidCode }
+            guard safeMessage == nil else {
+                throw AlphaConversionProgressError.invalidSafeMessage
+            }
+            safeFailureMessage = nil
+        }
         guard (completedFrames == nil) == (totalFrames == nil) else {
             throw AlphaConversionProgressError.invalidFrameCounts
         }
@@ -50,11 +95,14 @@ public struct AlphaConversionProgress: Decodable, Equatable, Sendable {
             }
         }
         self.event = "progress"
+        self.status = status
         self.percent = percent
-        self.stage = safeStage
-        self.message = safeMessage
+        self.stage = stage
+        self.message = safeProgressMessage
         self.completedFrames = completedFrames
         self.totalFrames = totalFrames
+        self.code = code
+        self.safeMessage = safeFailureMessage
     }
 
     public init(from decoder: Decoder) throws {
@@ -67,14 +115,52 @@ public struct AlphaConversionProgress: Decodable, Equatable, Sendable {
             stage: values.decode(String.self, forKey: .stage),
             message: values.decode(String.self, forKey: .message),
             completedFrames: values.decodeIfPresent(Int.self, forKey: .completedFrames),
-            totalFrames: values.decodeIfPresent(Int.self, forKey: .totalFrames)
+            totalFrames: values.decodeIfPresent(Int.self, forKey: .totalFrames),
+            status: values.decodeIfPresent(String.self, forKey: .status),
+            code: values.decodeIfPresent(String.self, forKey: .code),
+            safeMessage: values.decodeIfPresent(String.self, forKey: .safeMessage)
         )
     }
 
-    private static func pathSafeText(_ value: String) -> String {
+    private static let allowedFailureCodes: Set<String> = [
+        "TOOL_MISSING",
+        "DEPENDENCY_MISSING",
+        "SOURCE_UNSUPPORTED",
+        "QUALITY_GATE_FAILED",
+        "PROCESS_TIMEOUT",
+        "RESOURCE_LIMIT",
+        "PUBLICATION_FAILED",
+        "CANCELLED",
+        "CONVERSION_FAILED",
+    ]
+
+    private static func isSafeStage(_ value: String) -> Bool {
+        guard !value.isEmpty, value.utf8.count <= 64 else { return false }
+        return value.range(
+            of: #"^[a-z][a-z0-9_-]*$"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    private static func pathSafeText(
+        _ value: String,
+        maximumUTF8Bytes: Int,
+        error: AlphaConversionProgressError
+    ) throws -> String {
+        guard value.utf8.count <= maximumUTF8Bytes else { throw error }
         let flattened = value
             .components(separatedBy: .controlCharacters)
             .joined(separator: " ")
+            .replacingOccurrences(
+                of: #"(?i)/(?:Users|Volumes|private|tmp|var|Applications|Library)/[^\r\n\"']*?\.(?:mp4|mov|m4v|json|py|png|jpe?g|heic|webm|mkv)"#,
+                with: "<local-file>",
+                options: .regularExpression
+            )
+            .replacingOccurrences(
+                of: #"(?i)/(?:Users|Volumes|private|tmp|var|Applications|Library)/[^\r\n\"']+"#,
+                with: "<local-file>",
+                options: .regularExpression
+            )
             .replacingOccurrences(
                 of: #"(?i)(?<![a-z0-9])(?:(?:file://|~)?/[^/\s:'\"<>()\[\]{},;]+(?:/[^/\s:'\"<>()\[\]{},;]+)*)"#,
                 with: "<local-file>",
@@ -83,8 +169,6 @@ public struct AlphaConversionProgress: Decodable, Equatable, Sendable {
         return flattened
             .split(whereSeparator: { $0.isWhitespace })
             .joined(separator: " ")
-            .prefix(500)
-            .description
     }
 }
 

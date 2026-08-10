@@ -18,6 +18,8 @@ struct PetDiagnosticsInput {
     var previewStatus: String
     var toolchainStatus: String
     var lastFailureCategory: String?
+    var conversionFailureCategory: String?
+    var conversionFailureStage: String?
 
     init(
         appVersion: String,
@@ -32,7 +34,9 @@ struct PetDiagnosticsInput {
         selectedClipName: String? = nil,
         previewStatus: String,
         toolchainStatus: String,
-        lastFailureCategory: String? = nil
+        lastFailureCategory: String? = nil,
+        conversionFailureCategory: String? = nil,
+        conversionFailureStage: String? = nil
     ) {
         self.appVersion = appVersion
         self.appBuild = appBuild
@@ -47,6 +51,8 @@ struct PetDiagnosticsInput {
         self.previewStatus = previewStatus
         self.toolchainStatus = toolchainStatus
         self.lastFailureCategory = lastFailureCategory
+        self.conversionFailureCategory = conversionFailureCategory
+        self.conversionFailureStage = conversionFailureStage
     }
 }
 
@@ -96,6 +102,8 @@ struct PetDiagnostics {
             "preview.status: \(safeLabel(input.previewStatus))",
             "toolchain.status: \(safeLabel(input.toolchainStatus))",
             "failure.category: \(safeOptionalLabel(input.lastFailureCategory))",
+            "conversion.failure_category: \(safeOptionalLabel(input.conversionFailureCategory))",
+            "conversion.failure_stage: \(safeOptionalLabel(input.conversionFailureStage))",
             "startup.player_plist: \(stateLabel(startup.state))",
             "startup.player_job: \(startupJobLabel(startup))",
             "startup.aggregator_plist: \(aggregator)",

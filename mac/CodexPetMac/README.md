@@ -136,6 +136,9 @@ menu-bar/right-click menu:
 - Click-through routes all pointer events past the pet, so neither pet-side
   button can be used while it is enabled. **Next Clip**, **Temporary State**,
   and **Follow Codex** remain available from the Statelet menu-bar icon.
+- **Keep Statelet on Top** is enabled by default. Clear it from the pet's
+  right-click menu, the menu-bar icon, or **Settings → General** to return the
+  pet to normal window stacking so other app windows can cover it.
 
 A simple primary click on the pet body invokes the same eligible **Next Clip**
 action for the effective temporary or live state. Moving the panel, resizing it
@@ -446,6 +449,9 @@ launchctl bootstrap gui/$(id -u) \
 Click-through is disabled by default. Right-click the pet to open its context
 menu. If click-through is enabled and the pet cannot be clicked, open the
 Statelet menu-bar icon and clear **Click-through**.
+
+Always-on-top is enabled by default. Clear **Keep Statelet on Top** in the same
+menu, or in **Settings → General**, when other app windows should cover the pet.
 
 Drag the body to move the panel. Drag any border or corner to resize it while
 preserving the current aspect ratio, down to a minimum width of 160 points. The

@@ -10,12 +10,16 @@ without requiring a real/private character video.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
 import re
+import selectors
 import shutil
 import subprocess
+import tempfile
+import time
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -128,6 +132,14 @@ DEFAULT_MAX_UNSUPPORTED_GREEN_EDGE_EXCESS = 96
 DEFAULT_MAX_UNSUPPORTED_MAGENTA_EDGE_EXCESS = 96
 DEFAULT_CHECKERBOARD_TILE = 24
 SOURCE_RESIZE_MODE = "aspect_fill_center_crop"
+DEFAULT_PROBE_TIMEOUT_SECONDS = 30.0
+DEFAULT_PROCESS_TIMEOUT_SECONDS = 900.0
+DEFAULT_MIN_GREEN_BORDER_RATIO = 0.50
+DEFAULT_GREEN_BORDER_EXCESS = 24
+DEFAULT_MIN_GREEN_SOURCE_RATIO = 0.05
+DEFAULT_MIN_GREEN_SOURCE_BORDER_RATIO = 0.02
+DEFAULT_MIN_GREEN_SOURCE_AXIS_COVERAGE = 0.50
+DEFAULT_MIN_GREEN_CONNECTED_RATIO = 0.08
 
 
 @dataclass(frozen=True)
@@ -144,6 +156,14 @@ class VideoInfo:
     codec_profile: str = "unknown"
     sample_aspect_ratio: str = "1:1"
     audio_codecs: tuple[str, ...] = ()
+    stream_index: int = 0
+    color_primaries: str = "unknown"
+    color_transfer: str = "unknown"
+    color_space: str = "unknown"
+    color_range: str = "unknown"
+    field_order: str = "progressive"
+    bit_depth: int = 8
+    time_base: str = "unknown"
 
     @property
     def fps_text(self) -> str:
@@ -263,25 +283,34 @@ def build_ffprobe_command(
     source: Path | str,
     *,
     ffprobe: str = "ffprobe",
+    include_frames: bool = True,
 ) -> list[str]:
     """Build the strict probe command used before any frame decoding."""
 
-    return [
+    entries = (
+        "stream=index,codec_type,codec_name,profile,width,height,avg_frame_rate,"
+        "r_frame_rate,nb_frames,nb_read_frames,duration,pix_fmt,sample_aspect_ratio,"
+        "color_primaries,color_transfer,color_space,color_range,field_order,"
+        "bits_per_raw_sample,time_base:"
+        "stream_tags=rotate:stream_side_data=rotation:"
+        "stream_disposition=attached_pic:format=duration"
+    )
+    if include_frames:
+        entries += ":frame=stream_index,media_type,best_effort_timestamp_time,pkt_duration_time"
+    command = [
         ffprobe,
         "-v",
         "error",
         "-count_frames",
         "-show_entries",
-        (
-            "stream=index,codec_type,codec_name,profile,width,height,avg_frame_rate,"
-            "r_frame_rate,nb_frames,nb_read_frames,duration,pix_fmt,sample_aspect_ratio:"
-            "stream_tags=rotate:stream_side_data=rotation:"
-            "stream_disposition=attached_pic:format=duration"
-        ),
+        entries,
         "-of",
         "json",
-        str(source),
     ]
+    if include_frames:
+        command.append("-show_frames")
+    command.append(str(source))
+    return command
 
 
 def _probe_failure(result: subprocess.CompletedProcess[str]) -> ProbeError:
@@ -316,9 +345,145 @@ def _normalized_sample_aspect_ratio(value: Any) -> str:
         raise ProbeError("video sample aspect ratio is invalid") from exc
     if ratio != 1:
         raise ProbeError(
-            "input video must use square pixels (sample aspect ratio 1:1)"
+            "input video must use square pixels; normalize externally to sample aspect ratio 1:1, then retry"
         )
     return "1:1"
+
+
+def _pixel_format_bit_depth(pixel_format: str) -> int | None:
+    text = pixel_format.lower()
+    match = re.fullmatch(r"ya(8|16|32)(?:le|be)?", text)
+    if match:
+        return int(match.group(1)) // 2
+    match = re.fullmatch(r"(?:rgb|bgr)(24|30|36|48)(?:le|be)?", text)
+    if match:
+        return int(match.group(1)) // 3
+    match = re.fullmatch(r"(?:rgba|bgra|argb|abgr)(32|64)(?:le|be)?", text)
+    if match:
+        return int(match.group(1)) // 4
+    if re.fullmatch(r"nv20(?:le|be)?", text):
+        return 10
+    # FFmpeg's high-depth planar and packed names consistently carry the
+    # per-component depth immediately before an optional endian suffix.  This
+    # covers formats such as yuv420p10le, xyz12le, x2rgb10le, v210, and y216.
+    match = re.search(r"(9|10|12|14|16)(?:le|be)?$", text)
+    if match:
+        return int(match.group(1))
+    if re.fullmatch(
+        r"(?:"
+        r"yuvj?\d+p|yuva\d+p|gbrp|gbrap|gray8?|"
+        r"nv12|nv21|nv16|nv24|"
+        r"rgb24|bgr24|rgba|bgra|argb|abgr|rgb0|bgr0|0rgb|0bgr|"
+        r"rgb(?:444|555|565)(?:le|be)?|bgr(?:444|555|565)(?:le|be)?|"
+        r"yuyv422|uyvy422|uyyvyy411|pal8|monow|monob"
+        r")",
+        text,
+    ):
+        return 8
+    return None
+
+
+def _validate_video_timestamps(
+    timestamps: Sequence[float],
+    *,
+    frame_count: int,
+    fps: Fraction,
+    time_base: str,
+) -> float:
+    if len(timestamps) != frame_count:
+        raise ProbeError("ffprobe video timestamp count does not match decoded frame count")
+
+    expected_delta = 1.0 / float(fps)
+    try:
+        time_base_seconds = float(_parse_rate(time_base, label="time base"))
+    except ProbeError:
+        time_base_seconds = 0.0
+    tolerance = max(0.0005, expected_delta * 0.01, time_base_seconds * 1.1)
+
+    for previous, current in zip(timestamps, timestamps[1:]):
+        delta = current - previous
+        if (
+            not math.isfinite(delta)
+            or delta <= 0
+            or abs(delta - expected_delta) > tolerance
+        ):
+            raise ProbeError(
+                "input video frame timestamps are not uniformly spaced "
+                f"within {tolerance:.6f} seconds"
+            )
+    return tolerance
+
+
+def _run_bounded_capture(
+    command: list[str],
+    *,
+    timeout_seconds: float,
+    stdout_limit: int,
+    stderr_limit: int,
+    overflow_message: str,
+    timeout_message: str,
+    total_limit: int | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Capture a child actively and terminate it at hard output/time bounds."""
+
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    limits = {"stdout": stdout_limit, "stderr": stderr_limit}
+    selector = selectors.DefaultSelector()
+    try:
+        assert process.stdout is not None and process.stderr is not None
+        selector.register(process.stdout.fileno(), selectors.EVENT_READ, "stdout")
+        selector.register(process.stderr.fileno(), selectors.EVENT_READ, "stderr")
+        deadline = time.monotonic() + timeout_seconds
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ProbeError(timeout_message)
+            events = selector.select(remaining)
+            if not events:
+                raise ProbeError(timeout_message)
+            for key, _mask in events:
+                chunk = os.read(key.fd, 65536)
+                if not chunk:
+                    selector.unregister(key.fd)
+                    continue
+                name = key.data
+                buffers[name].extend(chunk)
+                if len(buffers[name]) > limits[name] or (
+                    total_limit is not None
+                    and sum(len(buffer) for buffer in buffers.values()) > total_limit
+                ):
+                    raise ProbeError(overflow_message)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProbeError(timeout_message)
+        try:
+            return_code = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired as exc:
+            raise ProbeError(timeout_message) from exc
+    except BaseException:
+        if process.poll() is None:
+            with contextlib.suppress(OSError):
+                process.kill()
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                process.wait(timeout=2)
+        raise
+    finally:
+        selector.close()
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                with contextlib.suppress(OSError):
+                    stream.close()
+    return subprocess.CompletedProcess(
+        command,
+        return_code,
+        buffers["stdout"].decode("utf-8", errors="replace"),
+        buffers["stderr"].decode("utf-8", errors="replace"),
+    )
 
 
 def probe_video(
@@ -326,21 +491,42 @@ def probe_video(
     *,
     ffprobe: str = "ffprobe",
     runner: Any = subprocess.run,
+    timeout_seconds: float = DEFAULT_PROBE_TIMEOUT_SECONDS,
+    validate_timestamps: bool | None = None,
+    enforce_source_color_policy: bool = True,
 ) -> VideoInfo:
     """Probe and validate one CFR video stream before starting the matte pass."""
 
     source_path = Path(source)
+    if validate_timestamps is None:
+        validate_timestamps = False
     if not source_path.is_file():
         raise ProbeError("input video does not exist or is not a regular file")
     executable = require_tool("ffprobe", ffprobe)
-    command = build_ffprobe_command(source_path, ffprobe=executable)
+    command = build_ffprobe_command(
+        source_path, ffprobe=executable, include_frames=validate_timestamps
+    )
     try:
-        result = runner(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        if runner is subprocess.run:
+            result = _run_bounded_capture(
+                command,
+                timeout_seconds=timeout_seconds,
+                stdout_limit=16 * 1024 * 1024,
+                stderr_limit=4096,
+                total_limit=16 * 1024 * 1024,
+                overflow_message="ffprobe metadata exceeds the supported size",
+                timeout_message="ffprobe timed out while inspecting the input video",
+            )
+        else:
+            result = runner(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
+    except subprocess.TimeoutExpired as exc:
+        raise ProbeError("ffprobe timed out while inspecting the input video") from exc
     except OSError as exc:
         raise ProbeError("unable to execute ffprobe") from exc
     if result.returncode != 0:
@@ -367,6 +553,10 @@ def probe_video(
             f"(found {len(video_streams)})"
         )
     stream = video_streams[0]
+    try:
+        stream_index = int(stream.get("index", 0))
+    except (TypeError, ValueError) as exc:
+        raise ProbeError("video stream index is invalid") from exc
     sample_aspect_ratio = _normalized_sample_aspect_ratio(
         stream.get("sample_aspect_ratio")
     )
@@ -390,7 +580,7 @@ def probe_video(
     if average_rate != nominal_rate:
         raise ProbeError(
             "input video must be constant frame rate "
-            f"(avg {average_rate} != nominal {nominal_rate})"
+            f"(avg {average_rate} != nominal {nominal_rate}); transcode externally to CFR, then retry"
         )
 
     frame_value = stream.get("nb_read_frames")
@@ -441,7 +631,100 @@ def probe_video(
             except (TypeError, ValueError) as exc:
                 raise ProbeError("video rotation metadata is invalid") from exc
     if rotation % 360:
-        raise ProbeError("input video must not require rotation metadata")
+        raise ProbeError(
+            "input video requires rotation metadata; bake rotation externally, then retry"
+        )
+
+    color_primaries = str(stream.get("color_primaries") or "unknown").lower()
+    color_transfer = str(stream.get("color_transfer") or "unknown").lower()
+    color_space = str(stream.get("color_space") or "unknown").lower()
+    color_range = str(stream.get("color_range") or "unknown").lower()
+    field_order = str(stream.get("field_order") or "progressive").lower()
+    if enforce_source_color_policy:
+        allowed_primaries = {"unknown", "bt709", "smpte170m", "bt470bg"}
+        allowed_transfers = {
+            "unknown",
+            "bt709",
+            "smpte170m",
+            "bt470bg",
+            "gamma22",
+            "gamma28",
+            "iec61966-2-1",
+        }
+        allowed_spaces = {"unknown", "bt709", "smpte170m", "bt470bg", "fcc"}
+        allowed_ranges = {"unknown", "tv", "pc"}
+        if (
+            color_primaries not in allowed_primaries
+            or color_transfer not in allowed_transfers
+            or color_space not in allowed_spaces
+            or color_range not in allowed_ranges
+        ):
+            raise ProbeError(
+                "wide-gamut, HDR, or unsupported color metadata; normalize externally to 8-bit BT.709 SDR, then retry"
+            )
+        if (
+            color_primaries == "bt709"
+            and color_space not in {"unknown", "bt709"}
+        ):
+            raise ProbeError(
+                "unsupported color primaries and matrix combination; normalize externally to BT.709 SDR, then retry"
+            )
+    if enforce_source_color_policy and field_order not in {"progressive", "unknown"}:
+        raise ProbeError(
+            "interlaced input; deinterlace externally to progressive video, then retry"
+        )
+    bits_value = stream.get("bits_per_raw_sample")
+    bit_depth = 0
+    if bits_value not in (None, "", "N/A", "0", 0):
+        try:
+            bit_depth = int(bits_value)
+        except (TypeError, ValueError) as exc:
+            raise ProbeError("video bit depth metadata is invalid") from exc
+    if bit_depth <= 0:
+        pixel_format = str(stream.get("pix_fmt") or "unknown").lower()
+        inferred_bit_depth = _pixel_format_bit_depth(pixel_format)
+        if inferred_bit_depth is None:
+            if enforce_source_color_policy:
+                raise ProbeError(
+                    "source video bit depth could not be verified; normalize externally to 8-bit BT.709 SDR, then retry"
+                )
+            bit_depth = 0
+        else:
+            bit_depth = inferred_bit_depth
+    if enforce_source_color_policy and bit_depth > 8:
+        raise ProbeError(
+            "source video uses more than 8 bits per channel; normalize externally to 8-bit BT.709 SDR, then retry"
+        )
+
+    frames = payload.get("frames")
+    if validate_timestamps:
+        if not isinstance(frames, list):
+            raise ProbeError("ffprobe did not return all-frame timestamp metadata")
+        timestamps: list[float] = []
+        for frame in frames:
+            if not isinstance(frame, Mapping):
+                continue
+            if frame.get("media_type") not in (None, "video"):
+                continue
+            try:
+                frame_stream_index = int(frame.get("stream_index", stream_index))
+            except (TypeError, ValueError) as exc:
+                raise ProbeError("video frame stream index is invalid") from exc
+            if frame_stream_index != stream_index:
+                continue
+            value = frame.get("best_effort_timestamp_time")
+            if value in (None, "", "N/A"):
+                raise ProbeError("video frame timestamp metadata is missing")
+            try:
+                timestamps.append(float(value))
+            except (TypeError, ValueError) as exc:
+                raise ProbeError("video frame timestamp metadata is invalid") from exc
+        _validate_video_timestamps(
+            timestamps,
+            frame_count=frame_count,
+            fps=average_rate,
+            time_base=str(stream.get("time_base") or "unknown"),
+        )
 
     return VideoInfo(
         width=width,
@@ -454,7 +737,114 @@ def probe_video(
         codec_profile=str(stream.get("profile") or "unknown"),
         sample_aspect_ratio=sample_aspect_ratio,
         audio_codecs=audio_codecs,
+        stream_index=stream_index,
+        color_primaries=color_primaries,
+        color_transfer=color_transfer,
+        color_space=color_space,
+        color_range=color_range,
+        field_order=field_order,
+        bit_depth=bit_depth,
+        time_base=str(stream.get("time_base") or "unknown"),
     )
+
+
+def build_ffprobe_cadence_command(
+    source: Path | str, *, stream_index: int, ffprobe: str = "ffprobe"
+) -> list[str]:
+    return [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        str(stream_index),
+        "-show_entries",
+        "frame=best_effort_timestamp_time",
+        "-of",
+        "csv=p=0",
+        str(source),
+    ]
+
+
+def verify_video_cadence(
+    source: Path | str,
+    info: VideoInfo,
+    *,
+    ffprobe: str = "ffprobe",
+    timeout_seconds: float = DEFAULT_PROBE_TIMEOUT_SECONDS,
+    max_output_bytes: int = 2 * 1024 * 1024,
+    process_factory: Any = subprocess.Popen,
+) -> dict[str, int | float | bool]:
+    """Verify selected-video timestamps with an actively bounded compact probe."""
+
+    executable = require_tool("ffprobe", ffprobe)
+    command = build_ffprobe_cadence_command(
+        source, stream_index=info.stream_index, ffprobe=executable
+    )
+    try:
+        process = process_factory(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        raise ProbeError("unable to execute ffprobe cadence check") from exc
+    if process.stdout is None:
+        close_process(process)
+        raise ProbeError("ffprobe cadence check did not expose output")
+    deadline = time.monotonic() + timeout_seconds
+    output = bytearray()
+    try:
+        try:
+            descriptor = process.stdout.fileno()
+        except (AttributeError, OSError):
+            descriptor = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ProbeError("ffprobe cadence check timed out")
+            if descriptor is None:
+                chunk = process.stdout.read(65536)
+            else:
+                selector = selectors.DefaultSelector()
+                try:
+                    selector.register(descriptor, selectors.EVENT_READ)
+                    if not selector.select(remaining):
+                        raise ProbeError("ffprobe cadence check timed out")
+                    chunk = os.read(descriptor, 65536)
+                finally:
+                    selector.close()
+            if not chunk:
+                break
+            output.extend(chunk)
+            if len(output) > max_output_bytes:
+                raise ProbeError("ffprobe cadence output exceeds the configured bound")
+        try:
+            return_code = process.wait(timeout=max(0.001, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired as exc:
+            raise ProbeError("ffprobe cadence check timed out") from exc
+        if return_code != 0:
+            raise ProbeError(f"ffprobe cadence check failed (exit {return_code})")
+    except BaseException:
+        close_process(process)
+        raise
+
+    timestamps: list[float] = []
+    for line in output.decode("utf-8", errors="replace").splitlines():
+        text = line.strip().rstrip(",")
+        if not text or text == "N/A":
+            raise ProbeError("video frame timestamp metadata is missing")
+        try:
+            timestamps.append(float(text))
+        except ValueError as exc:
+            raise ProbeError("video frame timestamp metadata is invalid") from exc
+    tolerance = _validate_video_timestamps(
+        timestamps,
+        frame_count=info.frame_count,
+        fps=info.fps,
+        time_base=info.time_base,
+    )
+    return {
+        "frames_checked": len(timestamps),
+        "expected_frames": info.frame_count,
+        "time_base_tolerance_seconds": tolerance,
+        "quality_passed": True,
+    }
 
 
 def build_ffmpeg_decode_command(
@@ -463,6 +853,8 @@ def build_ffmpeg_decode_command(
     width: int,
     height: int,
     ffmpeg: str = "ffmpeg",
+    stream_index: int = 0,
+    resize_mode: str = "fill",
 ) -> list[str]:
     """Build an aspect-filled raw RGB stream; no runtime key is involved.
 
@@ -481,18 +873,28 @@ def build_ffmpeg_decode_command(
         "-i",
         str(source),
         "-map",
-        "0:v:0",
+        f"0:{stream_index}",
         "-an",
     ]
+    if resize_mode not in {"fill", "fit"}:
+        raise AlphaConversionError("source resize mode must be fill or fit")
     if width > 0 and height > 0:
+        if resize_mode == "fill":
+            video_filter = (
+                f"scale={width}:{height}:force_original_aspect_ratio=increase:"
+                "flags=lanczos,"
+                f"crop={width}:{height}:(iw-ow)*0.5:(ih-oh)*0.5,setsar=1"
+            )
+        else:
+            video_filter = (
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease:"
+                "flags=lanczos,"
+                f"pad={width}:{height}:(ow-iw)*0.5:(oh-ih)*0.5:color=0x00ff00,setsar=1"
+            )
         command.extend(
             [
                 "-vf",
-                (
-                    f"scale={width}:{height}:force_original_aspect_ratio=increase:"
-                    "flags=lanczos,"
-                    f"crop={width}:{height}:(iw-ow)*0.5:(ih-oh)*0.5,setsar=1"
-                ),
+                video_filter,
             ]
         )
     command.extend(["-vsync", "0", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
@@ -766,8 +1168,13 @@ def matte_frame(
     key_ceiling: float = 0.94,
     despill_strength: float = 0.80,
     despill_allowance: float = 2.0,
-    diagnostics: dict[str, int] | None = None,
+    diagnostics: dict[str, Any] | None = None,
     reject_edge_contact: bool = False,
+    min_green_border_ratio: float = DEFAULT_MIN_GREEN_BORDER_RATIO,
+    green_border_excess: int = DEFAULT_GREEN_BORDER_EXCESS,
+    suitability_bounds: tuple[int, int, int, int] | None = None,
+    background_attested: bool = False,
+    background_rgb: tuple[int, int, int] | None = None,
 ) -> Any:
     """Return straight RGBA for one RGB frame using a continuous matte.
 
@@ -786,8 +1193,43 @@ def matte_frame(
         raise ValueError("despill strength must be between zero and one")
     if despill_allowance < 0.0:
         raise ValueError("despill allowance must not be negative")
+    if not 0.0 <= min_green_border_ratio <= 1.0:
+        raise ValueError("minimum green border ratio must be between zero and one")
 
-    background = estimate_background(frame, border_width=border_width)
+    suitability_frame = frame
+    if suitability_bounds is not None:
+        left, top, right, bottom = suitability_bounds
+        if not (0 <= left < right <= frame.shape[1] and 0 <= top < bottom <= frame.shape[0]):
+            raise FrameQualityError("source suitability bounds are invalid")
+        suitability_frame = frame[top:bottom, left:right]
+    if background_attested:
+        green_background_border_ratio = 1.0
+    else:
+        suitability = assess_green_background(
+            suitability_frame,
+            green_excess=green_border_excess,
+        )
+        green_background_border_ratio = float(suitability["green_source_ratio"])
+
+    use_spatial_background = background_rgb is None
+    if background_rgb is not None:
+        border_mask = module.zeros(frame.shape[:2], dtype=bool)
+        border_mask[0, :] = True
+        border_mask[-1, :] = True
+        border_mask[:, 0] = True
+        border_mask[:, -1] = True
+        border_pixels = frame[border_mask]
+        border_excess = border_pixels[:, 1] - module.maximum(
+            border_pixels[:, 0], border_pixels[:, 2]
+        )
+        use_spatial_background = float(
+            (border_excess >= green_border_excess).mean()
+        ) >= 0.50
+    if use_spatial_background:
+        background = estimate_background(frame, border_width=border_width)
+    else:
+        background = module.empty_like(frame)
+        background[:, :, :] = module.asarray(background_rgb, dtype=module.float32)
     observed_excess = frame[:, :, 1] - module.maximum(frame[:, :, 0], frame[:, :, 2])
     background_excess = background[:, :, 1] - module.maximum(
         background[:, :, 0], background[:, :, 2]
@@ -830,6 +1272,8 @@ def matte_frame(
             {
                 "preclean_outer_edge_alpha_maximum": preclean_edge_alpha_maximum,
                 "preclean_outer_edge_contact_pixels": preclean_edge_contact_pixels,
+                "green_background_border_ratio": green_background_border_ratio,
+                "green_background_minimum_ratio": min_green_border_ratio,
             }
         )
     if reject_edge_contact and preclean_edge_contact_pixels:
@@ -855,6 +1299,137 @@ def matte_frame(
     rgba[:, 0, :] = 0
     rgba[:, -1, :] = 0
     return rgba.astype(module.uint8, copy=False)
+
+
+def assess_green_background(
+    rgb: Any,
+    *,
+    min_green_ratio: float = DEFAULT_MIN_GREEN_SOURCE_RATIO,
+    green_excess: int = DEFAULT_GREEN_BORDER_EXCESS,
+    min_green_border_ratio: float = DEFAULT_MIN_GREEN_SOURCE_BORDER_RATIO,
+    min_green_axis_coverage: float = DEFAULT_MIN_GREEN_SOURCE_AXIS_COVERAGE,
+    min_connected_green_ratio: float = DEFAULT_MIN_GREEN_CONNECTED_RATIO,
+) -> dict[str, int | float | bool]:
+    """Attest one border-connected source-space green background component."""
+
+    module = _require_numpy()
+    frame = _array_from_rgb(rgb).astype(module.int16)
+    if not 0.0 <= min_green_ratio <= 1.0:
+        raise ValueError("minimum green source ratio must be between zero and one")
+    if not 0.0 <= min_green_axis_coverage <= 1.0:
+        raise ValueError("minimum green source axis coverage must be between zero and one")
+    if not 0.0 <= min_connected_green_ratio <= 1.0:
+        raise ValueError("minimum connected green ratio must be between zero and one")
+    excess = frame[:, :, 1] - module.maximum(frame[:, :, 0], frame[:, :, 2])
+    green_pixels = excess >= green_excess
+    ratio = float(green_pixels.mean())
+    connected = _largest_connected_mask(green_pixels)
+    connected_ratio = float(connected.mean())
+    border_mask = module.zeros(green_pixels.shape, dtype=bool)
+    border_mask[0, :] = True
+    border_mask[-1, :] = True
+    border_mask[:, 0] = True
+    border_mask[:, -1] = True
+    border_ratio = float(green_pixels[border_mask].mean())
+    row_coverage = float(connected.any(axis=1).mean())
+    column_coverage = float(connected.any(axis=0).mean())
+    if (
+        ratio < min_green_ratio
+        or connected_ratio < min_connected_green_ratio
+        or border_ratio < min_green_border_ratio
+        or row_coverage < min_green_axis_coverage
+        or column_coverage < min_green_axis_coverage
+    ):
+        raise FrameQualityError(
+            "source does not have a supported green-screen background "
+            f"(source ratio {ratio:.3f}, connected ratio {connected_ratio:.3f}, "
+            f"border ratio {border_ratio:.3f}, "
+            f"row coverage {row_coverage:.3f}, column coverage {column_coverage:.3f})"
+        )
+    background_rgb = module.median(frame[connected], axis=0)
+    return {
+        "green_source_ratio": ratio,
+        "minimum_green_source_ratio": min_green_ratio,
+        "green_source_connected_ratio": connected_ratio,
+        "minimum_green_source_connected_ratio": min_connected_green_ratio,
+        "green_source_border_ratio": border_ratio,
+        "minimum_green_source_border_ratio": min_green_border_ratio,
+        "green_source_row_coverage": row_coverage,
+        "green_source_column_coverage": column_coverage,
+        "minimum_green_source_axis_coverage": min_green_axis_coverage,
+        "green_excess": green_excess,
+        "background_rgb": [int(round(value)) for value in background_rgb],
+        "quality_passed": True,
+    }
+
+
+def _largest_connected_mask(mask: Any) -> Any:
+    """Return the largest border-seeded 4-connected true component.
+
+    Selecting one substantial component prevents a thin green cross or green
+    clothing from becoming the background reference.  Relaxed edge contact is
+    still accepted when a narrow visible green corridor connects the border to
+    the large background pocket.
+    """
+
+    module = _require_numpy()
+    source = module.asarray(mask, dtype=bool)
+    if source.ndim != 2:
+        raise ValueError("green component mask must be two-dimensional")
+    height, width = source.shape
+    visited = module.zeros(source.shape, dtype=bool)
+    largest_spans: list[tuple[int, int, int]] = []
+    largest_size = 0
+    for seed_y, seed_x in zip(*module.nonzero(source)):
+        if visited[seed_y, seed_x]:
+            continue
+        seeds: list[tuple[int, int]] = [(int(seed_y), int(seed_x))]
+        spans: list[tuple[int, int, int]] = []
+        component_size = 0
+        touches_border = False
+        while seeds:
+            y, x = seeds.pop()
+            if visited[y, x] or not source[y, x]:
+                continue
+            left = x
+            while left > 0 and source[y, left - 1] and not visited[y, left - 1]:
+                left -= 1
+            right = x
+            while (
+                right + 1 < width
+                and source[y, right + 1]
+                and not visited[y, right + 1]
+            ):
+                right += 1
+            visited[y, left : right + 1] = True
+            spans.append((y, left, right))
+            component_size += right - left + 1
+            touches_border = touches_border or (
+                y == 0 or y == height - 1 or left == 0 or right == width - 1
+            )
+            for adjacent_y in (y - 1, y + 1):
+                if not 0 <= adjacent_y < height:
+                    continue
+                cursor = left
+                while cursor <= right:
+                    if source[adjacent_y, cursor] and not visited[adjacent_y, cursor]:
+                        seeds.append((adjacent_y, cursor))
+                        cursor += 1
+                        while (
+                            cursor <= right
+                            and source[adjacent_y, cursor]
+                            and not visited[adjacent_y, cursor]
+                        ):
+                            cursor += 1
+                    else:
+                        cursor += 1
+        if touches_border and component_size > largest_size:
+            largest_size = component_size
+            largest_spans = spans
+    connected = module.zeros(source.shape, dtype=bool)
+    for y, left, right in largest_spans:
+        connected[y, left : right + 1] = True
+    return connected
 
 
 def frame_quality(
@@ -1445,6 +2020,7 @@ def read_raw_frames(
     height: int,
     expected_frames: int,
     channels: int = 3,
+    timeout_seconds: float = DEFAULT_PROCESS_TIMEOUT_SECONDS,
 ) -> Iterable[Any]:
     """Yield raw frames from ffmpeg and verify the exact expected count."""
 
@@ -1454,20 +2030,58 @@ def read_raw_frames(
     if channels not in (3, 4):
         raise AlphaConversionError("rawvideo channel count must be three or four")
     frame_bytes = width * height * channels
+    deadline = time.monotonic() + timeout_seconds
+
+    def read_bounded(size: int) -> bytes:
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            close_process(process)
+            raise AlphaConversionError("ffmpeg source decode timed out")
+        try:
+            descriptor = process.stdout.fileno()
+        except (AttributeError, OSError):
+            return process.stdout.read(size)
+        selector = selectors.DefaultSelector()
+        try:
+            selector.register(descriptor, selectors.EVENT_READ)
+            if not selector.select(remaining_seconds):
+                close_process(process)
+                raise AlphaConversionError("ffmpeg source decode timed out")
+            return os.read(descriptor, size)
+        finally:
+            selector.close()
+
     count = 0
-    while True:
-        raw = process.stdout.read(frame_bytes)
-        if not raw:
+    while count < expected_frames:
+        chunks: list[bytes] = []
+        remaining = frame_bytes
+        while remaining:
+            chunk = read_bounded(remaining)
+            if not chunk:
+                if not chunks:
+                    break
+                raise AlphaConversionError("ffmpeg returned a truncated raw frame")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if not chunks:
             break
-        if len(raw) != frame_bytes:
-            raise AlphaConversionError("ffmpeg returned a truncated raw frame")
+        raw = b"".join(chunks)
         count += 1
-        if count > expected_frames:
-            raise AlphaConversionError("ffmpeg decoded more frames than expected")
         yield module.frombuffer(raw, dtype=module.uint8).reshape(
             height, width, channels
         ).copy()
-    return_code = process.wait()
+    extra = read_bounded(1)
+    if extra:
+        raise AlphaConversionError("ffmpeg decoded more frames than expected")
+    remaining_seconds = deadline - time.monotonic()
+    if remaining_seconds <= 0:
+        close_process(process)
+        raise AlphaConversionError("ffmpeg source decode timed out")
+    try:
+        return_code = process.wait(timeout=remaining_seconds)
+    except subprocess.TimeoutExpired as exc:
+        close_process(process)
+        raise AlphaConversionError("ffmpeg source decode timed out") from exc
     if return_code != 0:
         raise AlphaConversionError(f"ffmpeg source decode failed (exit {return_code})")
     if count != expected_frames:
@@ -1493,6 +2107,10 @@ def close_process(process: subprocess.Popen[Any]) -> None:
             try:
                 process.kill()
             except OSError:
+                return
+            try:
+                process.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
                 pass
 
 

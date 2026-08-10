@@ -7,7 +7,9 @@ import json
 import os
 import plistlib
 import shlex
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,7 +21,11 @@ BUILD_SCRIPT = PACKAGE / "scripts" / "build_app.sh"
 INSTALL_SCRIPT = PACKAGE / "scripts" / "install.sh"
 UNINSTALL_SCRIPT = PACKAGE / "scripts" / "uninstall.sh"
 ALPHA_COORDINATOR = PACKAGE / "Sources" / "CodexPetMac" / "AlphaConversion.swift"
+STATELET_IDENTITY = PACKAGE / "Sources" / "CodexPetMac" / "StateletIdentity.swift"
 PET_APP_DELEGATE = PACKAGE / "Sources" / "CodexPetMac" / "PetAppDelegate.swift"
+PET_PANEL = PACKAGE / "Sources" / "CodexPetMac" / "PetPanel.swift"
+SETTINGS_CONTROLLER = PACKAGE / "Sources" / "CodexPetMac" / "SettingsWindowController.swift"
+MAC_MAIN = PACKAGE / "Sources" / "CodexPetMac" / "main.swift"
 MANAGED_MARKER = "mac-widget-v1"
 HOOK_EVENTS = (
     "SessionStart",
@@ -238,6 +244,887 @@ esac
         source = ALPHA_COORDINATOR.read_text(encoding="utf-8")
         self.assertIn('"-B",\n            toolchain.converter.path', source)
         self.assertIn('"PYTHONDONTWRITEBYTECODE": "1"', source)
+
+    def test_pet_panel_switches_window_level_without_losing_space_behavior(self) -> None:
+        if sys.platform != "darwin":
+            self.skipTest("PetPanel AppKit verification requires macOS")
+        swiftc = shutil.which("swiftc")
+        self.assertIsNotNone(swiftc)
+        with tempfile.TemporaryDirectory(prefix="statelet-pet-panel-") as temporary:
+            temp = Path(temporary)
+            harness = temp / "PetPanelHarness.swift"
+            harness.write_text(
+                r'''
+import AppKit
+
+@main
+struct PetPanelHarness {
+    static func main() {
+        _ = NSApplication.shared
+        let panel = PetPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 480),
+            alwaysOnTop: true,
+            fullScreenAuxiliary: true
+        )
+        guard panel.level == .floating, panel.isFloatingPanel else { exit(1) }
+        guard panel.collectionBehavior.contains(.canJoinAllSpaces) else { exit(2) }
+        guard panel.collectionBehavior.contains(.ignoresCycle) else { exit(3) }
+        guard panel.collectionBehavior.contains(.fullScreenAuxiliary) else { exit(4) }
+
+        panel.apply(alwaysOnTop: false, fullScreenAuxiliary: true)
+        guard panel.level == .normal, !panel.isFloatingPanel else { exit(5) }
+        guard panel.collectionBehavior.contains(.canJoinAllSpaces) else { exit(6) }
+        guard panel.collectionBehavior.contains(.ignoresCycle) else { exit(7) }
+        guard panel.collectionBehavior.contains(.fullScreenAuxiliary) else { exit(8) }
+
+        panel.apply(alwaysOnTop: true, fullScreenAuxiliary: false)
+        guard panel.level == .floating, panel.isFloatingPanel else { exit(9) }
+        guard panel.collectionBehavior.contains(.canJoinAllSpaces) else { exit(10) }
+        guard panel.collectionBehavior.contains(.ignoresCycle) else { exit(11) }
+        guard !panel.collectionBehavior.contains(.fullScreenAuxiliary) else { exit(12) }
+        print("pet-panel-level-ok")
+    }
+}
+''',
+                encoding="utf-8",
+            )
+            executable = temp / "pet-panel-harness"
+            compiled = subprocess.run(
+                [
+                    swiftc,
+                    "-parse-as-library",
+                    str(PET_PANEL),
+                    str(harness),
+                    "-framework",
+                    "AppKit",
+                    "-o",
+                    str(executable),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            verified = subprocess.run(
+                [str(executable)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(verified.returncode, 0, verified.stderr)
+            self.assertEqual(verified.stdout.strip(), "pet-panel-level-ok")
+
+    def test_always_on_top_menu_is_checked_and_uses_window_settings_persistence(self) -> None:
+        delegate = PET_APP_DELEGATE.read_text(encoding="utf-8")
+        settings = SETTINGS_CONTROLLER.read_text(encoding="utf-8")
+
+        self.assertIn("case alwaysOnTop", delegate)
+        self.assertIn('title: "Keep Statelet on Top"', delegate)
+        self.assertIn("action: #selector(toggleAlwaysOnTop)", delegate)
+        self.assertIn("alwaysOnTopItem.state = effectiveAlwaysOnTop ? .on : .off", delegate)
+        self.assertIn("@objc private func toggleAlwaysOnTop()", delegate)
+        self.assertIn("mediaMap.window.replacing(alwaysOnTop: !effectiveAlwaysOnTop)", delegate)
+        self.assertIn("options.alwaysOnTopOverride = nil", delegate)
+        self.assertIn("applyPublishedMediaMap(updated, refreshPlayback: false)", delegate)
+        self.assertIn("alwaysOnTop: update.alwaysOnTop", delegate)
+        self.assertIn("try publishMediaMap(updated)", delegate)
+        self.assertIn('checkboxWithTitle: "Keep Statelet on Top"', settings)
+
+    def test_conversion_process_is_bounded_and_force_terminates_when_stuck(self) -> None:
+        source = ALPHA_COORDINATOR.read_text(encoding="utf-8")
+        self.assertIn("maximumCapturedOutputBytes", source)
+        self.assertIn("overallDeadlineSeconds", source)
+        self.assertIn("noProgressDeadlineSeconds", source)
+        self.assertIn("terminationGraceSeconds", source)
+        self.assertIn("SIGKILL", source)
+        self.assertIn("recordActivity", source)
+        self.assertIn("AlphaPlaybackProcessValidator", source)
+        self.assertIn("--statelet-playback-smoke-helper", MAC_MAIN.read_text(encoding="utf-8"))
+
+    def test_conversion_watchdog_kills_stderr_noise_and_releases_coordinator(self) -> None:
+        if sys.platform != "darwin":
+            self.skipTest("Swift process-group watchdog verification requires macOS")
+        swiftc = shutil.which("swiftc")
+        self.assertIsNotNone(swiftc)
+        core_sources = sorted((PACKAGE / "Sources" / "CodexPetCore").glob("*.swift"))
+        with tempfile.TemporaryDirectory(prefix="statelet-watchdog-") as temporary:
+            temp = Path(temporary)
+            fake_python = temp / "fake-python"
+            fake_python.write_text(
+                "#!/bin/sh\ntrap '' TERM\nsleep 1000 &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$2.childpid\"\nwhile :; do echo harmless-noise >&2; sleep 0.02; done\n",
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            failing_python = temp / "failing-python"
+            failing_python.write_text(
+                "#!/bin/sh\nprintf '%s\\n' '{\"event\":\"progress\",\"status\":\"failed\",\"percent\":37,\"stage\":\"verify\",\"message\":\"The animation failed a quality gate.\",\"code\":\"QUALITY_GATE_FAILED\",\"safe_message\":\"The animation failed a quality gate.\"}'\necho '/Users/private/raw-tool-error' >&2\nsleep 0.1\nexit 2\n",
+                encoding="utf-8",
+            )
+            failing_python.chmod(0o755)
+            converter = temp / "converter.py"
+            converter.write_text("# fake\n", encoding="utf-8")
+            playback_helper = temp / "playback-helper"
+            playback_helper.write_text(
+                "#!/bin/sh\nprintf '%s' '{\"isPlayable\":true,\"videoTrackCount\":1,\"audioTrackCount\":0,\"codec\":\"hevc\",\"width\":320,\"height\":480,\"nominalFrameRate\":24,\"durationSeconds\":2.6666666667,\"decodedFirstFrame\":true}'\n",
+                encoding="utf-8",
+            )
+            playback_helper.chmod(0o755)
+            hanging_playback_helper = temp / "hanging-playback-helper"
+            playback_child_pid = temp / "playback-child.pid"
+            hanging_playback_helper.write_text(
+                f"#!/bin/sh\ntrap '' TERM\nsleep 1000 &\nprintf '%s\\n' \"$!\" > '{playback_child_pid}'\nwhile :; do sleep 1; done\n",
+                encoding="utf-8",
+            )
+            hanging_playback_helper.chmod(0o755)
+            harness = temp / "WatchdogHarness.swift"
+            harness.write_text(
+                r'''
+import Foundation
+import Darwin
+import CodexPetCore
+
+final class LockedResult<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Result<Value, Error>?
+
+    func set(_ value: Result<Value, Error>) {
+        lock.lock()
+        stored = value
+        lock.unlock()
+    }
+
+    func clear() {
+        lock.lock()
+        stored = nil
+        lock.unlock()
+    }
+
+    var value: Result<Value, Error>? {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+}
+
+@main
+struct WatchdogHarness {
+    static func main() {
+        let arguments = CommandLine.arguments
+        let temporary = URL(fileURLWithPath: arguments[1], isDirectory: true)
+        let suiteName = "statelet-profile-test-\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else { exit(10) }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("fit", forKey: AlphaConversionProfile.defaultsKey)
+        guard AlphaConversionProfile.restored(from: defaults) == .fit else { exit(11) }
+        defaults.set("future-invalid-profile", forKey: AlphaConversionProfile.defaultsKey)
+        guard AlphaConversionProfile.restored(from: defaults) == .fill else { exit(12) }
+        AlphaConversionProfile.fit.persist(to: defaults)
+        guard defaults.string(forKey: AlphaConversionProfile.defaultsKey) == "fit" else { exit(13) }
+        guard AlphaRecoveryArtifactPolicy.accepts(
+            stateRawValue: "idle",
+            outputBasename: "idle-1723456789-deadbeef.mov",
+            reportBasename: "idle-1723456789-deadbeef.report.json"
+        ) else { exit(14) }
+        guard AlphaRecoveryArtifactPolicy.shouldQuarantine(
+            outputReferenced: false,
+            reportReferenced: false
+        ), !AlphaRecoveryArtifactPolicy.shouldQuarantine(
+            outputReferenced: false,
+            reportReferenced: true
+        ), !AlphaRecoveryArtifactPolicy.shouldQuarantine(
+            outputReferenced: true,
+            reportReferenced: false
+        ) else { exit(40) }
+        let hostilePairs = [
+            ("media-map.json", "media-map.report.json"),
+            ("running-1723456789-deadbeef.mov", "running-1723456789-deadbeef.report.json"),
+            ("idle-1723456789-deadbeef.mov", "idle-1723456789-cafebabe.report.json"),
+            ("idle-1723456789-DEADBEEF.mov", "idle-1723456789-DEADBEEF.report.json"),
+            ("idle-1723456789-deadbeef.mov", "media-map.json"),
+        ]
+        for pair in hostilePairs {
+            guard !AlphaRecoveryArtifactPolicy.accepts(
+                stateRawValue: "idle",
+                outputBasename: pair.0,
+                reportBasename: pair.1
+            ) else { exit(15) }
+        }
+        func requireCopyFailure(_ operation: () throws -> Void, _ code: Int32) {
+            do { try operation(); exit(code) } catch { }
+        }
+        let portableRoot = temporary.appendingPathComponent("portable-tests", isDirectory: true)
+        try! FileManager.default.createDirectory(at: portableRoot, withIntermediateDirectories: true)
+        let movie = portableRoot.appendingPathComponent("sample.mov")
+        let report = portableRoot.appendingPathComponent("sample.report.json")
+        try! Data(repeating: 0x41, count: 64).write(to: movie)
+        try! Data("{}".utf8).write(to: report)
+        let safeCopier = PortableMediaSecureCopier(
+            limits: PortableMediaCopyLimits(
+                maxMovieBytes: 1_024,
+                maxReportBytes: 1_024,
+                minimumFreeSpaceReserveBytes: 0,
+                chunkBytes: 8
+            ),
+            availableDiskBytes: { _ in 1_000_000 }
+        )
+        let safeDestination = portableRoot.appendingPathComponent("safe", isDirectory: true)
+        let copied = try! safeCopier.copyPair(
+            movieSource: movie,
+            reportSource: report,
+            destinationDirectory: safeDestination
+        )
+        guard (try! Data(contentsOf: copied.movieURL)) == Data(repeating: 0x41, count: 64),
+              (try! Data(contentsOf: copied.reportURL)) == Data("{}".utf8) else { exit(16) }
+        var mode = stat()
+        guard lstat(copied.movieURL.path, &mode) == 0,
+              mode.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              mode.st_mode & 0o777 == 0o600 else { exit(17) }
+
+        requireCopyFailure({
+            _ = try safeCopier.copyPair(
+                movieSource: URL(string: "https://example.invalid/sample.mov")!,
+                reportSource: report,
+                destinationDirectory: portableRoot.appendingPathComponent("non-local")
+            )
+        }, 26)
+
+        let movieLink = portableRoot.appendingPathComponent("movie-link.mov")
+        try! FileManager.default.createSymbolicLink(at: movieLink, withDestinationURL: movie)
+        requireCopyFailure({
+            _ = try safeCopier.copyPair(
+                movieSource: movieLink,
+                reportSource: report,
+                destinationDirectory: portableRoot.appendingPathComponent("symlink-movie")
+            )
+        }, 18)
+        let reportLink = portableRoot.appendingPathComponent("sample-link.report.json")
+        try! FileManager.default.createSymbolicLink(at: reportLink, withDestinationURL: report)
+        requireCopyFailure({
+            _ = try safeCopier.copyPair(
+                movieSource: movie,
+                reportSource: reportLink,
+                destinationDirectory: portableRoot.appendingPathComponent("symlink-report")
+            )
+        }, 19)
+        let fifo = portableRoot.appendingPathComponent("special.mov")
+        guard mkfifo(fifo.path, 0o600) == 0 else { exit(20) }
+        requireCopyFailure({
+            _ = try safeCopier.copyPair(
+                movieSource: fifo,
+                reportSource: report,
+                destinationDirectory: portableRoot.appendingPathComponent("special")
+            )
+        }, 21)
+        let tinyReportCopier = PortableMediaSecureCopier(
+            limits: PortableMediaCopyLimits(maxMovieBytes: 1_024, maxReportBytes: 1),
+            availableDiskBytes: { _ in 1_000_000 }
+        )
+        requireCopyFailure({
+            _ = try tinyReportCopier.copyPair(
+                movieSource: movie,
+                reportSource: report,
+                destinationDirectory: portableRoot.appendingPathComponent("large-report")
+            )
+        }, 22)
+        let tinyMovieCopier = PortableMediaSecureCopier(
+            limits: PortableMediaCopyLimits(maxMovieBytes: 8, maxReportBytes: 1_024),
+            availableDiskBytes: { _ in 1_000_000 }
+        )
+        requireCopyFailure({
+            _ = try tinyMovieCopier.copyPair(
+                movieSource: movie,
+                reportSource: report,
+                destinationDirectory: portableRoot.appendingPathComponent("large-movie")
+            )
+        }, 23)
+        let noDiskCopier = PortableMediaSecureCopier(
+            limits: PortableMediaCopyLimits(
+                maxMovieBytes: 1_024,
+                maxReportBytes: 1_024,
+                minimumFreeSpaceReserveBytes: 1
+            ),
+            availableDiskBytes: { _ in 0 }
+        )
+        requireCopyFailure({
+            _ = try noDiskCopier.copyPair(
+                movieSource: movie,
+                reportSource: report,
+                destinationDirectory: portableRoot.appendingPathComponent("no-disk")
+            )
+        }, 24)
+        var mutated = false
+        let mutationCopier = PortableMediaSecureCopier(
+            limits: PortableMediaCopyLimits(
+                maxMovieBytes: 1_024,
+                maxReportBytes: 1_024,
+                minimumFreeSpaceReserveBytes: 0,
+                chunkBytes: 8
+            ),
+            availableDiskBytes: { _ in 1_000_000 },
+            afterChunk: { kind in
+                guard kind == .movie, !mutated else { return }
+                mutated = true
+                let handle = try! FileHandle(forWritingTo: movie)
+                try! handle.seekToEnd()
+                try! handle.write(contentsOf: Data([0x42]))
+                try! handle.close()
+            }
+        )
+        requireCopyFailure({
+            _ = try mutationCopier.copyPair(
+                movieSource: movie,
+                reportSource: report,
+                destinationDirectory: portableRoot.appendingPathComponent("mutated")
+            )
+        }, 25)
+        try! Data("{}".utf8).write(to: report)
+        var reportMutated = false
+        let reportMutationCopier = PortableMediaSecureCopier(
+            limits: PortableMediaCopyLimits(
+                maxMovieBytes: 1_024,
+                maxReportBytes: 1_024,
+                minimumFreeSpaceReserveBytes: 0,
+                chunkBytes: 1
+            ),
+            availableDiskBytes: { _ in 1_000_000 },
+            afterChunk: { kind in
+                guard kind == .report, !reportMutated else { return }
+                reportMutated = true
+                let handle = try! FileHandle(forWritingTo: report)
+                try! handle.seekToEnd()
+                try! handle.write(contentsOf: Data([0x20]))
+                try! handle.close()
+            }
+        )
+        requireCopyFailure({
+            _ = try reportMutationCopier.copyPair(
+                movieSource: movie,
+                reportSource: report,
+                destinationDirectory: portableRoot.appendingPathComponent("report-mutated")
+            )
+        }, 27)
+        let timedResult = LockedResult<Int>()
+        let timeoutStarted = Date()
+        Task {
+            do {
+                let value = try await PortableMediaOperationRunner.run(timeoutSeconds: 0.1) { token in
+                    while true {
+                        try token.check()
+                        try await Task.sleep(nanoseconds: 10_000_000)
+                    }
+                } as Int
+                timedResult.set(.success(value))
+            } catch {
+                timedResult.set(.failure(error))
+            }
+        }
+        while timedResult.value == nil, Date().timeIntervalSince(timeoutStarted) < 2.5 {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+        guard case let .failure(timeoutError)? = timedResult.value,
+              timeoutError.localizedDescription.contains("timed out"),
+              Date().timeIntervalSince(timeoutStarted) < 2.5 else { exit(28) }
+        let resetResult = LockedResult<Int>()
+        Task {
+            do {
+                resetResult.set(.success(
+                    try await PortableMediaOperationRunner.run(timeoutSeconds: 1) { token in
+                        try token.check()
+                        return 42
+                    }
+                ))
+            } catch {
+                resetResult.set(.failure(error))
+            }
+        }
+        let resetDeadline = Date().addingTimeInterval(1)
+        while resetResult.value == nil, Date() < resetDeadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+        guard case let .success(value)? = resetResult.value, value == 42 else { exit(29) }
+        let slowDestination = portableRoot.appendingPathComponent("slow-timeout", isDirectory: true)
+        let slowResult = LockedResult<PortableMediaCopyResult>()
+        Task {
+            do {
+                slowResult.set(.success(
+                    try await PortableMediaOperationRunner.run(timeoutSeconds: 0.05) { token in
+                        try PortableMediaSecureCopier(
+                            limits: PortableMediaCopyLimits(
+                                maxMovieBytes: 1_024,
+                                maxReportBytes: 1_024,
+                                minimumFreeSpaceReserveBytes: 0,
+                                chunkBytes: 1
+                            ),
+                            availableDiskBytes: { _ in 1_000_000 },
+                            afterChunk: { _ in usleep(100_000) },
+                            operationCheck: token.check
+                        ).copyPair(
+                            movieSource: movie,
+                            reportSource: report,
+                            destinationDirectory: slowDestination
+                        )
+                    }
+                ))
+            } catch {
+                slowResult.set(.failure(error))
+            }
+        }
+        let slowDeadline = Date().addingTimeInterval(1)
+        while slowResult.value == nil, Date() < slowDeadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+        guard case let .failure(slowError)? = slowResult.value,
+              slowError.localizedDescription.contains("timed out") else { exit(30) }
+        let cleanupDeadline = Date().addingTimeInterval(1)
+        while FileManager.default.fileExists(atPath: slowDestination.path), Date() < cleanupDeadline {
+            usleep(10_000)
+        }
+        guard !FileManager.default.fileExists(atPath: slowDestination.path) else { exit(31) }
+        let unquotedPath = "/Users/leoho/My Videos/foo.mp4"
+        let quotedPath = "'/Users/leoho/My Videos/foo.mp4'"
+        let sanitized = AlphaConversionCoordinator.sanitizedFailureMessage(
+            from: Data("failed \(unquotedPath) and \(quotedPath): codec error\n".utf8)
+        )
+        guard !sanitized.contains("/Users/"),
+              !sanitized.contains("leoho"),
+              !sanitized.contains("My Videos"),
+              sanitized.components(separatedBy: "<local-file>").count >= 3 else { exit(32) }
+        let extensionless = AlphaConversionCoordinator.sanitizedFailureMessage(
+            from: Data("failed /Users/leoho/My Folder/tool and '/Users/leoho/My Folder/tool'\n".utf8)
+        )
+        guard !extensionless.contains("/Users/"),
+              !extensionless.contains("My Folder"),
+              !extensionless.contains("Videos/foo"),
+              extensionless.contains("<local-file>") else { exit(41) }
+        let probe = try! AlphaPlaybackProcessValidator.probe(
+            url: movie,
+            timeoutSeconds: 1,
+            helperExecutableURL: URL(fileURLWithPath: arguments[4])
+        )
+        guard probe.isPlayable, probe.width == 320, probe.height == 480 else { exit(33) }
+        let hangingHelper = URL(fileURLWithPath: arguments[5])
+        let playbackTimeoutStarted = Date()
+        do {
+            _ = try AlphaPlaybackProcessValidator.probe(
+                url: movie,
+                timeoutSeconds: 1,
+                helperExecutableURL: hangingHelper
+            )
+            exit(34)
+        } catch {
+            guard error.localizedDescription.contains("timed out"),
+                  Date().timeIntervalSince(playbackTimeoutStarted) < 2.5 else { exit(35) }
+        }
+        let helperChildURL = URL(fileURLWithPath: arguments[6])
+        guard let helperChildText = try? String(contentsOf: helperChildURL, encoding: .utf8),
+              let helperChildPID = pid_t(helperChildText.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            exit(36)
+        }
+        let helperReapDeadline = Date().addingTimeInterval(1)
+        while kill(helperChildPID, 0) == 0, Date() < helperReapDeadline {
+            usleep(10_000)
+        }
+        guard kill(helperChildPID, 0) != 0, errno == ESRCH else { exit(37) }
+        let stableDiagnostics = [
+            AlphaConversionFailure.alreadyRunning.conversionDiagnostic,
+            AlphaConversionFailure.launchFailed.conversionDiagnostic,
+            AlphaConversionFailure.cancelled.conversionDiagnostic,
+            AlphaConversionFailure.converterFailed("safe").conversionDiagnostic,
+            AlphaConversionFailure.timedOut("ignored").conversionDiagnostic,
+            AlphaConversionFailure.invalidProgressProtocol.conversionDiagnostic,
+            AlphaConversionFailure.missingArtifact.conversionDiagnostic,
+        ]
+        guard stableDiagnostics.map(\.code) == [
+            "ALREADY_RUNNING", "LAUNCH_FAILED", "CANCELLED", "CONVERSION_FAILED",
+            "PROCESS_TIMEOUT", "PROGRESS_PROTOCOL_INVALID", "ARTIFACT_MISSING",
+        ] else { exit(38) }
+        let failureCoordinator = AlphaConversionCoordinator(
+            overallDeadlineSeconds: 2,
+            noProgressDeadlineSeconds: 1,
+            terminationGraceSeconds: 0.15
+        )
+        let failureResult = LockedResult<AlphaConversionResult>()
+        failureCoordinator.convert(
+            sourceURL: temporary.appendingPathComponent("failing-source.mp4"),
+            outputURL: temporary.appendingPathComponent("failing-output.mov"),
+            reportURL: temporary.appendingPathComponent("failing-output.report.json"),
+            width: 320,
+            height: 480,
+            toolchain: AlphaToolchain(
+                python: URL(fileURLWithPath: arguments[7]),
+                converter: URL(fileURLWithPath: arguments[3]),
+                ffmpeg: URL(fileURLWithPath: "/Users/private/ffmpeg"),
+                ffprobe: URL(fileURLWithPath: "/Users/private/ffprobe"),
+                avconvert: URL(fileURLWithPath: "/Users/private/avconvert")
+            ),
+            invocationChallenge: String(repeating: "d", count: 64),
+            phase: { _ in },
+            completion: { failureResult.set($0) }
+        )
+        let failureDeadline = Date().addingTimeInterval(2)
+        while failureResult.value == nil, Date() < failureDeadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+        guard case let .failure(structuredError)? = failureResult.value,
+              let alphaFailure = structuredError as? AlphaConversionFailure,
+              alphaFailure.conversionDiagnostic.code == "QUALITY_GATE_FAILED",
+              alphaFailure.conversionDiagnostic.stage == "verify",
+              !structuredError.localizedDescription.contains("/Users/") else { exit(39) }
+        let coordinator = AlphaConversionCoordinator(
+            overallDeadlineSeconds: 2,
+            noProgressDeadlineSeconds: 0.3,
+            terminationGraceSeconds: 0.15
+        )
+        let toolchain = AlphaToolchain(
+            python: URL(fileURLWithPath: arguments[2]),
+            converter: URL(fileURLWithPath: arguments[3]),
+            ffmpeg: URL(fileURLWithPath: "/usr/bin/true"),
+            ffprobe: URL(fileURLWithPath: "/usr/bin/true"),
+            avconvert: URL(fileURLWithPath: "/usr/bin/true")
+        )
+        let result = LockedResult<AlphaConversionResult>()
+        let started = Date()
+        coordinator.convert(
+            sourceURL: temporary.appendingPathComponent("source.mp4"),
+            outputURL: temporary.appendingPathComponent("output.mov"),
+            reportURL: temporary.appendingPathComponent("output.report.json"),
+            width: 320,
+            height: 480,
+            toolchain: toolchain,
+            invocationChallenge: String(repeating: "a", count: 64),
+            phase: { _ in },
+            completion: { result.set($0) }
+        )
+        while result.value == nil, Date().timeIntervalSince(started) < 3 {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        }
+        guard case let .failure(error)? = result.value else { exit(2) }
+        guard error.localizedDescription.contains("no progress") else { exit(3) }
+        guard !coordinator.isRunning else { exit(4) }
+        result.clear()
+        coordinator.convert(
+            sourceURL: temporary.appendingPathComponent("source.mp4"),
+            outputURL: temporary.appendingPathComponent("output-2.mov"),
+            reportURL: temporary.appendingPathComponent("output-2.report.json"),
+            width: 320,
+            height: 480,
+            toolchain: toolchain,
+            invocationChallenge: String(repeating: "b", count: 64),
+            phase: { _ in },
+            completion: { result.set($0) }
+        )
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
+            coordinator.cancel()
+        }
+        let cancelStarted = Date()
+        while result.value == nil, Date().timeIntervalSince(cancelStarted) < 2 {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        }
+        guard case let .failure(cancelError)? = result.value,
+              cancelError.localizedDescription.contains("cancelled") else { exit(5) }
+        guard !coordinator.isRunning else { exit(6) }
+        result.clear()
+        coordinator.convert(
+            sourceURL: temporary.appendingPathComponent("source.mp4"),
+            outputURL: temporary.appendingPathComponent("output-3.mov"),
+            reportURL: temporary.appendingPathComponent("output-3.report.json"),
+            width: 320,
+            height: 480,
+            toolchain: toolchain,
+            invocationChallenge: String(repeating: "c", count: 64),
+            phase: { _ in },
+            completion: { result.set($0) }
+        )
+        let launchDeadline = Date().addingTimeInterval(1)
+        while !coordinator.isRunning, Date() < launchDeadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+        guard coordinator.terminateAndWait(graceSeconds: 0.1, deadlineSeconds: 1.5),
+              !coordinator.isRunning else { exit(7) }
+        let childPIDURL = URL(fileURLWithPath: arguments[3] + ".childpid")
+        guard let childText = try? String(contentsOf: childPIDURL, encoding: .utf8),
+              let childPID = pid_t(childText.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            exit(8)
+        }
+        let reapDeadline = Date().addingTimeInterval(1)
+        while kill(childPID, 0) == 0, Date() < reapDeadline {
+            usleep(10_000)
+        }
+        guard kill(childPID, 0) != 0, errno == ESRCH else { exit(9) }
+        print("watchdog-ok")
+    }
+}
+''',
+                encoding="utf-8",
+            )
+            module = temp / "CodexPetCore.swiftmodule"
+            library = temp / "libCodexPetCore.dylib"
+            core = subprocess.run(
+                [
+                    swiftc,
+                    "-parse-as-library",
+                    "-emit-library",
+                    "-emit-module",
+                    "-module-name",
+                    "CodexPetCore",
+                    *map(str, core_sources),
+                    "-framework",
+                    "AVFoundation",
+                    "-emit-module-path",
+                    str(module),
+                    "-o",
+                    str(library),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+            self.assertEqual(core.returncode, 0, core.stderr)
+            executable = temp / "watchdog-harness"
+            app = subprocess.run(
+                [
+                    swiftc,
+                    "-parse-as-library",
+                    "-I",
+                    str(temp),
+                    "-L",
+                    str(temp),
+                    "-lCodexPetCore",
+                    str(STATELET_IDENTITY),
+                    str(ALPHA_COORDINATOR),
+                    str(harness),
+                    "-Xlinker",
+                    "-rpath",
+                    "-Xlinker",
+                    str(temp),
+                    "-o",
+                    str(executable),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+            self.assertEqual(app.returncode, 0, app.stderr)
+            for iteration in range(5):
+                runtime_root = temp / f"run-{iteration}"
+                runtime_root.mkdir()
+                playback_child_pid.unlink(missing_ok=True)
+                Path(str(converter) + ".childpid").unlink(missing_ok=True)
+                result = subprocess.run(
+                    [
+                        str(executable),
+                        str(runtime_root),
+                        str(fake_python),
+                        str(converter),
+                        str(playback_helper),
+                        str(hanging_playback_helper),
+                        str(playback_child_pid),
+                        str(failing_python),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=6,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "watchdog-ok")
+
+    def test_failed_mp4s_can_be_retried_without_reimporting_successes(self) -> None:
+        source = PET_APP_DELEGATE.read_text(encoding="utf-8")
+        self.assertIn("lastFailedMP4Batch", source)
+        self.assertIn("retryLastFailedMP4Batch", source)
+        self.assertIn("retryFailedAvailable: !retryURLs.isEmpty", source)
+        validation_failures = source.split("let validationFailures = rejected.map", 1)[1].split(
+            "startConversionBatch(", 1
+        )[0]
+        self.assertIn("sourceURL: nil", validation_failures)
+        retry = source.split("private func retryLastFailedMP4Batch()", 1)[1].split(
+            "private func batchProgress", 1
+        )[0]
+        self.assertIn("importMP4s(batch.sourceURLs, for: batch.state)", retry)
+        self.assertNotIn("startConversionBatch", retry)
+
+    def test_portable_import_uses_secure_budgeted_regular_file_copy(self) -> None:
+        coordinator = ALPHA_COORDINATOR.read_text(encoding="utf-8")
+        source = PET_APP_DELEGATE.read_text(encoding="utf-8")
+        copy_body = source.split("private func copyVerifiedMovieAndReport", 1)[1].split(
+            "private func copyIntoMediaDirectory", 1
+        )[0]
+        self.assertIn("PortableMediaSecureCopier", coordinator)
+        self.assertIn("O_NOFOLLOW", coordinator)
+        self.assertIn("S_IFREG", coordinator)
+        self.assertIn("maxReportBytes: UInt64 = 1_048_576", coordinator)
+        self.assertIn("fsync", coordinator)
+        self.assertIn("fstat", coordinator)
+        self.assertIn("availableDiskBytes", coordinator)
+        self.assertIn("PortableMediaSecureCopier", copy_body)
+        self.assertNotIn("copyItem", copy_body)
+        portable_loop = source.split("for (index, sourceURL) in sourceURLs.enumerated()", 1)[1].split(
+            "mediaMutationInProgress = false", 1
+        )[0]
+        prepare = source.split("private func prepareVerifiedMovie", 1)[1].split(
+            "private func validatePortableMovie", 1
+        )[0]
+        validate = source.split("private func validatePortableMovie", 1)[1].split(
+            "private func playOnce", 1
+        )[0]
+        self.assertEqual(prepare.count("validatePortableMovie"), 1)
+        self.assertNotIn("validatePortableMovie", portable_loop)
+        self.assertIn("digestAfterPlayback == report.outputSHA256", validate)
+        self.assertIn("reportDataAfterPlayback == reportData", validate)
+        self.assertIn("movieIdentityAfterPlayback == movieIdentity", validate)
+        self.assertIn("reportIdentityAfterPlayback == reportIdentity", validate)
+        self.assertIn("directoryStatusAfterPlayback.st_ino == directoryStatus.st_ino", validate)
+        self.assertIn("directoryStatus.st_mode & 0o077 == 0", validate)
+        self.assertIn("PortableMediaOperationRunner.run", source)
+        self.assertIn("portableCopyTimeoutSeconds", source)
+        self.assertIn("portableValidationTimeoutSeconds", source)
+        portable_batch = source.split("private func importVerifiedMovies", 1)[1].split(
+            "private func prepareVerifiedMovie", 1
+        )[0]
+        self.assertIn("reason: String(error.localizedDescription.prefix(300))", portable_batch)
+        self.assertIn("summarizedImportFailures(failures)", portable_batch)
+        self.assertIn("mediaMutationInProgress = false", portable_batch)
+
+    def test_local_and_recovery_reports_use_bounded_nofollow_reader_and_post_playback_recheck(self) -> None:
+        coordinator = ALPHA_COORDINATOR.read_text(encoding="utf-8")
+        source = PET_APP_DELEGATE.read_text(encoding="utf-8")
+        coordinator_completion = coordinator.split("if progressProtocol.hasFailed", 1)[1].split(
+            "private func boundedEnvironment", 1
+        )[0]
+        self.assertIn("PortableMediaSecureCopier.readRegularFile", coordinator_completion)
+        self.assertNotIn("Data(contentsOf: reportURL)", coordinator_completion)
+        recovery = source.split("private func recoverInterruptedConversionIfPresent", 1)[1].split(
+            "private static func isValidInvocationChallenge", 1
+        )[0]
+        self.assertGreaterEqual(recovery.count("PortableMediaSecureCopier.readRegularFile"), 1)
+        self.assertNotIn("Data(contentsOf:", recovery)
+        local_validation = source.split("private static func validateLocallyAttestedMovie", 1)[1].split(
+            "private func validatePortableMovie", 1
+        )[0]
+        self.assertIn("AlphaPlaybackProcessValidator.validate", local_validation)
+        self.assertIn("reportDataAfterPlayback == reportData", local_validation)
+        self.assertIn("digestAfterPlayback == report.outputSHA256", local_validation)
+        self.assertIn("movieIdentityAfterPlayback == movieIdentity", local_validation)
+        self.assertIn("reportIdentityAfterPlayback == reportIdentity", local_validation)
+        self.assertNotIn("AlphaPlaybackAcceptanceValidator.validate(\n                url:", source)
+
+    def test_structured_conversion_failures_feed_sanitized_diagnostics(self) -> None:
+        progress = (PACKAGE / "Sources" / "CodexPetCore" / "AlphaConversionProgress.swift").read_text(
+            encoding="utf-8"
+        )
+        coordinator = ALPHA_COORDINATOR.read_text(encoding="utf-8")
+        source = PET_APP_DELEGATE.read_text(encoding="utf-8")
+        diagnostics = (PACKAGE / "Sources" / "CodexPetMac" / "PetDiagnostics.swift").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("allowedFailureCodes", progress)
+        self.assertIn("safeMessage = \"safe_message\"", progress)
+        self.assertIn("maximumUTF8Bytes: 256", progress)
+        self.assertIn("My Videos/foo.mp4", tests_source := Path(__file__).read_text(encoding="utf-8"))
+        self.assertIn("LockedTerminalConversionFailure", coordinator)
+        self.assertIn("terminalFailure.record(event)", coordinator)
+        self.assertIn("structuredConverterFailed", coordinator)
+        protocol_branch = coordinator.split("if progressProtocol.hasFailed", 1)[1].split(
+            "guard FileManager.default.isReadableFile", 1
+        )[0]
+        self.assertLess(
+            protocol_branch.index("terminalFailure.failure"),
+            protocol_branch.index("process.terminationStatus != 0"),
+        )
+        self.assertIn("lastConversionFailureDiagnostic", source)
+        self.assertIn("conversionFailureCategory: lastConversionFailureDiagnostic?.code", source)
+        self.assertIn("conversionFailureStage: lastConversionFailureDiagnostic?.stage", source)
+        self.assertIn("conversion.failure_category", diagnostics)
+        self.assertIn("conversion.failure_stage", diagnostics)
+
+    def test_failure_path_sanitizer_handles_paths_with_spaces(self) -> None:
+        source = ALPHA_COORDINATOR.read_text(encoding="utf-8")
+        self.assertIn("My Videos", tests_source := Path(__file__).read_text(encoding="utf-8"))
+        self.assertIn("My Folder/tool", tests_source)
+        self.assertIn("mediaPathRedacted", source)
+        self.assertIn("<local-file>", source)
+
+    def test_app_shutdown_boundedly_reaps_conversion_process_group(self) -> None:
+        coordinator = ALPHA_COORDINATOR.read_text(encoding="utf-8")
+        source = PET_APP_DELEGATE.read_text(encoding="utf-8")
+        shutdown = source.split("func applicationWillTerminate", 1)[1].split(
+            "func windowDidMove", 1
+        )[0]
+        self.assertIn("terminateAndWait", shutdown)
+        self.assertIn("func terminateAndWait", coordinator)
+        self.assertIn("SIGTERM", coordinator)
+        self.assertIn("SIGKILL", coordinator)
+
+    def test_conversion_journal_is_private_path_free_and_attested_before_recovery(self) -> None:
+        source = PET_APP_DELEGATE.read_text(encoding="utf-8")
+        journal = source.split("private struct ActiveConversionJournal", 1)[1].split("}", 1)[0]
+        self.assertNotIn("sourceURL", journal)
+        self.assertIn("outputBasename", journal)
+        self.assertIn("reportBasename", journal)
+        self.assertIn("invocationChallenge", journal)
+        self.assertIn(".posixPermissions: NSNumber(value: Int16(0o600))", source)
+        self.assertIn("SecRandomCopyBytes", source)
+        self.assertIn("invocationChallenge: journal.invocationChallenge", source)
+        local_validation = source.split("private static func validateLocallyAttestedMovie", 1)[1].split(
+            "private func validatePortableMovie", 1
+        )[0]
+        self.assertIn("expectedLocalProvenanceChallenge: invocationChallenge", local_validation)
+        self.assertIn("AlphaPlaybackProcessValidator.validate", local_validation)
+        self.assertIn("recoverInterruptedConversionIfPresent()", source)
+        self.assertIn("AlphaRecoveryArtifactPolicy.accepts(", source)
+        recovery = source.split("private func recoverInterruptedConversionIfPresent()", 1)[1].split(
+            "private static func isValidInvocationChallenge", 1
+        )[0]
+        self.assertIn("mediaMutationInProgress = true", recovery)
+        self.assertIn("self.mediaMutationInProgress = false", recovery)
+        failure_branch = recovery.split("case .failure:", 1)[1].split("case .success:", 1)[0]
+        self.assertNotIn("removeItem(at: outputURL)", failure_branch)
+        self.assertNotIn("removeItem(at: reportURL)", failure_branch)
+        self.assertIn("animation_recovery_quarantined", failure_branch)
+        self.assertIn("outputReferenced = self.isMediaPathReferenced(outputURL)", failure_branch)
+        self.assertIn("reportReferenced = self.isMediaPathReferenced(reportURL)", failure_branch)
+        self.assertIn("AlphaRecoveryArtifactPolicy.shouldQuarantine", failure_branch)
+        self.assertIn("quarantineFailedRecoveryArtifacts", failure_branch)
+        self.assertIn("pendingRecoveryNotice", failure_branch)
+        quarantine = source.split("private func quarantineFailedRecoveryArtifacts", 1)[1].split(
+            "private func chooseTransparentMovie", 1
+        )[0]
+        self.assertIn("for sourceURL in [outputURL, reportURL]", quarantine)
+        self.assertIn("O_NOFOLLOW", quarantine)
+        self.assertIn("Darwin.renameat", quarantine)
+        self.assertIn("Darwin.fsync", quarantine)
+        self.assertNotIn("removeItem(at: outputURL)", quarantine)
+        self.assertNotIn("removeItem(at: reportURL)", quarantine)
+
+    def test_portable_movs_require_explicit_user_trust_and_playback_acceptance(self) -> None:
+        source = PET_APP_DELEGATE.read_text(encoding="utf-8")
+        self.assertIn("Trust portable verification for this batch?", source)
+        self.assertIn("case .portableClaim where allowPortableClaim", source)
+        self.assertIn("case .legacyPortableClaim", source)
+        self.assertIn("Import the source MP4 instead for local attestation.", source)
+
+    def test_mp4_conversion_profile_is_wired_without_changing_delivery_canvas(self) -> None:
+        coordinator = ALPHA_COORDINATOR.read_text(encoding="utf-8")
+        source = PET_APP_DELEGATE.read_text(encoding="utf-8")
+        settings = SETTINGS_CONTROLLER.read_text(encoding="utf-8")
+        self.assertIn("enum AlphaConversionProfile", coordinator)
+        self.assertIn('static let defaultsKey = "CodexPetAlphaConversionProfile"', coordinator)
+        self.assertIn("static func restored(from defaults: UserDefaults = .standard)", coordinator)
+        self.assertIn("func persist(to defaults: UserDefaults = .standard)", coordinator)
+        self.assertIn('"--profile", profile.commandProfile', coordinator)
+        self.assertIn('"--resize-mode", profile.resizeMode', coordinator)
+        self.assertIn("conversionProfile = AlphaConversionProfile.restored()", source)
+        self.assertIn("profile.persist()", source)
+        self.assertIn("controller.update(conversionProfile: conversionProfile)", source)
+        self.assertIn("func update(conversionProfile: AlphaConversionProfile)", settings)
+        self.assertIn("profile: conversionProfile", source)
+        self.assertIn("width: AlphaAuthoringCanvas.width", source)
+        self.assertIn("height: AlphaAuthoringCanvas.height", source)
 
     def test_cancelled_import_retains_failures_collected_before_cancel(self) -> None:
         source = PET_APP_DELEGATE.read_text(encoding="utf-8")

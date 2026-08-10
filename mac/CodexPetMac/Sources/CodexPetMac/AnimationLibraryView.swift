@@ -8,8 +8,13 @@ private enum AnimationLibraryLayout {
 }
 
 enum MP4ImportURLValidation {
-    case accepted([URL])
+    case accepted([URL], rejected: [MP4ImportRejection])
     case rejected(String)
+}
+
+struct MP4ImportRejection: Equatable {
+    let sourceURL: URL
+    let reason: String
 }
 
 enum MP4ImportURLValidator {
@@ -19,26 +24,38 @@ enum MP4ImportURLValidator {
         }
         var seenPaths: Set<String> = []
         var accepted: [URL] = []
+        var rejections: [MP4ImportRejection] = []
         for sourceURL in sourceURLs {
             guard sourceURL.isFileURL, sourceURL.host.map({ $0.isEmpty || $0 == "localhost" }) ?? true else {
-                return .rejected("Only local MP4 files can be imported.")
+                rejections.append(
+                    MP4ImportRejection(
+                        sourceURL: sourceURL,
+                        reason: "Only local MP4 files can be imported."
+                    )
+                )
+                continue
             }
             let url = sourceURL.standardizedFileURL
             let name = url.lastPathComponent.isEmpty ? "That item" : url.lastPathComponent
             guard url.pathExtension.caseInsensitiveCompare("mp4") == .orderedSame else {
-                return .rejected("\(name) is not an MP4 file.")
+                rejections.append(
+                    MP4ImportRejection(sourceURL: url, reason: "\(name) is not an MP4 file.")
+                )
+                continue
             }
             if let rejectionReason = rejectionReason(for: url, name: name) {
-                return .rejected(rejectionReason)
+                rejections.append(MP4ImportRejection(sourceURL: url, reason: rejectionReason))
+                continue
             }
             if seenPaths.insert(url.path).inserted {
                 accepted.append(url)
             }
         }
         guard !accepted.isEmpty else {
-            return .rejected("No new MP4 files were provided.")
+            let reason = rejections.first?.reason ?? "No new MP4 files were provided."
+            return .rejected(reason)
         }
-        return .accepted(accepted)
+        return .accepted(accepted, rejected: rejections)
     }
 
     private static func rejectionReason(for url: URL, name: String) -> String? {
@@ -375,8 +392,9 @@ private final class MP4DropZoneView: NSView {
         }
         isDragHighlighted = true
         switch MP4ImportURLValidator.validate(urls) {
-        case let .accepted(accepted):
-            setDetailMessage("Release to import \(accepted.count) MP4\(accepted.count == 1 ? "" : "s") into \(selectedState.displayName).")
+        case let .accepted(accepted, rejected):
+            let skipped = rejected.isEmpty ? "" : " · Skipped \(rejected.count) unsupported item\(rejected.count == 1 ? "" : "s")"
+            setDetailMessage("Release to import \(accepted.count) MP4\(accepted.count == 1 ? "" : "s") into \(selectedState.displayName)\(skipped).")
             return .copy
         case let .rejected(reason):
             setDetailMessage("Nothing will be imported: \(reason)")
@@ -400,9 +418,13 @@ private final class MP4DropZoneView: NSView {
             return false
         }
         switch MP4ImportURLValidator.validate(urls) {
-        case let .accepted(accepted):
-            setDetailMessage("Starting import of \(accepted.count) MP4\(accepted.count == 1 ? "" : "s") into \(selectedState.displayName)…")
-            onImport?(accepted)
+        case let .accepted(accepted, rejected):
+            let skipped = rejected.isEmpty ? "" : " · Skipped \(rejected.count) unsupported item\(rejected.count == 1 ? "" : "s")"
+            setDetailMessage("Starting import of \(accepted.count) MP4\(accepted.count == 1 ? "" : "s") into \(selectedState.displayName)…\(skipped)")
+            // Preserve the complete batch so the delegate can surface a
+            // sanitized reason for every skipped item while still converting
+            // the accepted MP4s.
+            onImport?(urls)
             return true
         case let .rejected(reason):
             setDetailMessage("Nothing imported: \(reason)")
@@ -489,7 +511,7 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
         addClip.addItem(withTitle: "Import MP4s…")
         addClip.lastItem?.target = self
         addClip.lastItem?.action = #selector(importMP4)
-        addClip.addItem(withTitle: "Verified MOVs…")
+        addClip.addItem(withTitle: "Portable MOVs…")
         addClip.lastItem?.target = self
         addClip.lastItem?.action = #selector(useMovie)
         addClip.setAccessibilityLabel("Add animation clip")

@@ -1,5 +1,6 @@
 import CodexPetCore
 import CoreGraphics
+import Dispatch
 import Foundation
 
 private enum SelfTestFailure: Error, CustomStringConvertible {
@@ -34,11 +35,18 @@ private func hasReachableArea(_ frame: CGRect, displays: [CGRect]) -> Bool {
 
 private let sourceHash = String(repeating: "a", count: 64)
 private let outputHash = String(repeating: "b", count: 64)
+private let provenanceChallenge = String(repeating: "c", count: 64)
 
 private func validAlphaReportJSON() -> String {
     """
     {
+      "report_schema_version":1,
       "status":"converted",
+      "toolchain":{"converter_version":"1","ffmpeg_version":"ffmpeg version 8.0","ffprobe_version":"ffprobe version 8.0","avconvert_version":"avconvert help","macos_build":"23G93"},
+      "tool_capabilities":{"ffmpeg_encoder":"prores_ks","ffmpeg_filters":["scale","crop","pad"],"avconvert_presets":["PresetHEVCHighestQualityWithAlpha","PresetAppleProRes4444LPCM"],"passed":true},
+      "profile":{"name":"standard","framing":"fill","keying":"green-screen-continuous-alpha"},
+      "normalization":{"applied":["strip-audio","square-pixel-output"],"warnings":["rotation-sar-vfr-hdr-interlace-rejected-before-decode"]},
+      "provenance":{"method":"invocation-challenge-v1","producer":"statelet","challenge":"\(provenanceChallenge)"},
       "source":{"audio":{"stream_count":1,"codecs":["aac"],"policy":"stripped"}},
       "geometry":{"width":320,"height":486,"pixel_format":"straight-rgba"},
       "geometry_alignment":{"requested_width":321,"requested_height":487,"policy":"floor_to_even","adjusted":true},
@@ -88,6 +96,16 @@ private func runSelfTest() throws {
         delimitedProgress.message == #"source=<local-file> home=<local-file> ("<local-file>") Frame 3/24"#,
         "delimited progress paths were not redacted"
     )
+    let extensionlessProgress = try AlphaConversionProgress(
+        percent: 25,
+        stage: "decode",
+        message: #"failed /Users/leoho/My Folder/tool and '/Users/leoho/My Folder/tool'"#
+    )
+    try require(
+        !extensionlessProgress.message.contains("/Users/")
+            && !extensionlessProgress.message.contains("My Folder"),
+        "extensionless spaced progress path leaked"
+    )
     try requiresError("regressing progress was accepted") {
         _ = try progressParser.parseLine(
             #"{"event":"progress","percent":24,"stage":"decode","message":"Reading frames"}"#
@@ -100,6 +118,31 @@ private func runSelfTest() throws {
         resumedProgress?.percent == 30,
         "valid progress after a rejected event was lost"
     )
+    let terminalFailure = try progressParser.parseLine(
+        #"{"event":"progress","status":"failed","percent":30,"stage":"verify","message":"Failed /Users/leoho/My Videos/foo.mp4","code":"QUALITY_GATE_FAILED","safe_message":"Failed '/Users/leoho/My Videos/foo.mp4'"}"#
+    )
+    try require(terminalFailure?.isTerminalFailure == true, "terminal failure was not retained")
+    try require(terminalFailure?.code == "QUALITY_GATE_FAILED", "failure category changed")
+    try require(terminalFailure?.stage == "verify", "failure stage changed")
+    try require(terminalFailure?.message == "Failed <local-file>", "failure progress path leaked")
+    try require(terminalFailure?.safeMessage == "Failed '<local-file>'", "failure detail path leaked")
+    for malformedFailure in [
+        #"{"event":"progress","status":"failed","percent":30,"stage":"verify","message":"Failed","code":"UNKNOWN","safe_message":"Failed"}"#,
+        #"{"event":"progress","status":"failed","percent":30,"stage":"/Users/private","message":"Failed","code":"CONVERSION_FAILED","safe_message":"Failed"}"#,
+        #"{"event":"progress","status":"failed","percent":30,"stage":"verify","message":"Failed","code":"CONVERSION_FAILED"}"#,
+        #"{"event":"progress","status":"running","percent":30,"stage":"verify","message":"Working","code":"CONVERSION_FAILED","safe_message":"Failed"}"#,
+    ] {
+        try requiresError("malformed terminal progress failure was accepted") {
+            var malformedParser = AlphaConversionProgressParser()
+            _ = try malformedParser.parseLine(malformedFailure)
+        }
+    }
+    try requiresError("oversized terminal safe message was accepted") {
+        var malformedParser = AlphaConversionProgressParser()
+        _ = try malformedParser.parseLine(
+            #"{"event":"progress","status":"failed","percent":30,"stage":"verify","message":"Failed","code":"CONVERSION_FAILED","safe_message":"\#(String(repeating: "x", count: 257))"}"#
+        )
+    }
 
     let removalRoot = FileManager.default.temporaryDirectory
         .appendingPathComponent("codex-pet-removal-self-test-\(UUID().uuidString)", isDirectory: true)
@@ -287,6 +330,19 @@ private func runSelfTest() throws {
     try require(validated.sourceSHA256 == sourceHash, "validated source hash changed")
     try require(validated.frames == 241, "validated frame count changed")
     try require(validated.width == 320 && validated.height == 486, "validated geometry changed")
+    try require(validated.reportSchemaVersion == 1, "report schema version changed")
+    try require(validated.trust == .portableClaim, "portable report gained local trust")
+    try require(validated.toolchain?.converterVersion == "1", "toolchain metadata changed")
+    try require(validated.toolchain?.macOSBuild == "23G93", "macOS build metadata changed")
+    try require(
+        validated.toolCapabilities?.ffmpegFilters == ["scale", "crop", "pad"],
+        "tool capability metadata changed"
+    )
+    try require(validated.profile?.name == "standard", "profile metadata changed")
+    try require(
+        validated.normalization?.applied == ["strip-audio", "square-pixel-output"],
+        "normalization metadata changed"
+    )
     try require(
         validated.notices == [
             .audioStripped(streamCount: 1),
@@ -300,6 +356,53 @@ private func runSelfTest() throws {
         ],
         "validated conversion notices changed"
     )
+    let playbackProbe = try AlphaPlaybackAcceptanceValidator.validate(
+        probe: AlphaPlaybackProbe(
+            isPlayable: true,
+            videoTrackCount: 1,
+            audioTrackCount: 0,
+            codec: "hevc",
+            width: 320,
+            height: 486,
+            nominalFrameRate: 24,
+            durationSeconds: 241.0 / 24.0,
+            decodedFirstFrame: true
+        ),
+        expected: validated
+    )
+    try require(playbackProbe.decodedFirstFrame, "playback smoke probe lost decode evidence")
+    try requiresError("wrong playback geometry was accepted") {
+        _ = try AlphaPlaybackAcceptanceValidator.validate(
+            probe: AlphaPlaybackProbe(
+                isPlayable: true,
+                videoTrackCount: 1,
+                audioTrackCount: 0,
+                codec: "hevc",
+                width: 320,
+                height: 480,
+                nominalFrameRate: 24,
+                durationSeconds: 241.0 / 24.0,
+                decodedFirstFrame: true
+            ),
+            expected: validated
+        )
+    }
+    try requiresError("playback delivery with audio was accepted") {
+        _ = try AlphaPlaybackAcceptanceValidator.validate(
+            probe: AlphaPlaybackProbe(
+                isPlayable: true,
+                videoTrackCount: 1,
+                audioTrackCount: 1,
+                codec: "hevc",
+                width: 320,
+                height: 486,
+                nominalFrameRate: 24,
+                durationSeconds: 241.0 / 24.0,
+                decodedFirstFrame: true
+            ),
+            expected: validated
+        )
+    }
     guard var legacyReport = try JSONSerialization.jsonObject(
         with: Data(validAlphaReportJSON().utf8)
     ) as? [String: Any] else {
@@ -308,6 +411,12 @@ private func runSelfTest() throws {
     legacyReport.removeValue(forKey: "source")
     legacyReport.removeValue(forKey: "geometry_alignment")
     legacyReport.removeValue(forKey: "quality")
+    legacyReport.removeValue(forKey: "report_schema_version")
+    legacyReport.removeValue(forKey: "toolchain")
+    legacyReport.removeValue(forKey: "tool_capabilities")
+    legacyReport.removeValue(forKey: "profile")
+    legacyReport.removeValue(forKey: "normalization")
+    legacyReport.removeValue(forKey: "provenance")
     let legacyValidated = try AlphaConversionReportValidator.validate(
         data: try JSONSerialization.data(withJSONObject: legacyReport),
         expectedOutputBasename: "idle.mov",
@@ -317,6 +426,140 @@ private func runSelfTest() throws {
         legacyValidated.notices.isEmpty,
         "legacy report gained informational notices"
     )
+    try require(legacyValidated.trust == .legacyPortableClaim, "legacy report gained trust")
+    let locallyAttested = try AlphaConversionReportValidator.validate(
+        data: Data(validAlphaReportJSON().utf8),
+        expectedOutputBasename: "idle.mov",
+        actualOutputSHA256: outputHash,
+        expectedLocalProvenanceChallenge: provenanceChallenge.uppercased()
+    )
+    try require(locallyAttested.trust == .locallyAttested, "matching local challenge was not attested")
+    try requiresError("future report schema was accepted") {
+        let report = validAlphaReportJSON().replacingOccurrences(
+            of: "\"report_schema_version\":1",
+            with: "\"report_schema_version\":2"
+        )
+        _ = try AlphaConversionReportValidator.validate(
+            data: Data(report.utf8),
+            expectedOutputBasename: "idle.mov",
+            actualOutputSHA256: outputHash
+        )
+    }
+    try requiresError("explicit legacy schema was accepted") {
+        let report = validAlphaReportJSON().replacingOccurrences(
+            of: "\"report_schema_version\":1",
+            with: "\"report_schema_version\":0"
+        )
+        _ = try AlphaConversionReportValidator.validate(
+            data: Data(report.utf8),
+            expectedOutputBasename: "idle.mov",
+            actualOutputSHA256: outputHash
+        )
+    }
+    try requiresError("mismatched local challenge was accepted") {
+        _ = try AlphaConversionReportValidator.validate(
+            data: Data(validAlphaReportJSON().utf8),
+            expectedOutputBasename: "idle.mov",
+            actualOutputSHA256: outputHash,
+            expectedLocalProvenanceChallenge: String(repeating: "d", count: 64)
+        )
+    }
+    try requiresError("portable report with malformed provenance method was accepted") {
+        let report = validAlphaReportJSON().replacingOccurrences(
+            of: "\"method\":\"invocation-challenge-v1\"",
+            with: "\"method\":\"self-asserted\""
+        )
+        _ = try AlphaConversionReportValidator.validate(
+            data: Data(report.utf8),
+            expectedOutputBasename: "idle.mov",
+            actualOutputSHA256: outputHash
+        )
+    }
+    try requiresError("portable report with malformed provenance producer was accepted") {
+        let report = validAlphaReportJSON().replacingOccurrences(
+            of: "\"producer\":\"statelet\"",
+            with: "\"producer\":\"external\""
+        )
+        _ = try AlphaConversionReportValidator.validate(
+            data: Data(report.utf8),
+            expectedOutputBasename: "idle.mov",
+            actualOutputSHA256: outputHash
+        )
+    }
+    try requiresError("portable report with noncanonical provenance challenge was accepted") {
+        let report = validAlphaReportJSON().replacingOccurrences(
+            of: "\"challenge\":\"\(provenanceChallenge)\"",
+            with: "\"challenge\":\"\(provenanceChallenge.uppercased())\""
+        )
+        _ = try AlphaConversionReportValidator.validate(
+            data: Data(report.utf8),
+            expectedOutputBasename: "idle.mov",
+            actualOutputSHA256: outputHash
+        )
+    }
+    try requiresError("schema-v1 report without macOS build was accepted") {
+        let report = validAlphaReportJSON().replacingOccurrences(
+            of: ",\"macos_build\":\"23G93\"",
+            with: ""
+        )
+        _ = try AlphaConversionReportValidator.validate(
+            data: Data(report.utf8),
+            expectedOutputBasename: "idle.mov",
+            actualOutputSHA256: outputHash
+        )
+    }
+    try requiresError("schema-v1 report with oversized macOS build was accepted") {
+        let report = validAlphaReportJSON().replacingOccurrences(
+            of: "\"macos_build\":\"23G93\"",
+            with: "\"macos_build\":\"\(String(repeating: "A", count: 257))\""
+        )
+        _ = try AlphaConversionReportValidator.validate(
+            data: Data(report.utf8),
+            expectedOutputBasename: "idle.mov",
+            actualOutputSHA256: outputHash
+        )
+    }
+    try requiresError("schema-v1 report without tool capabilities was accepted") {
+        guard var report = try JSONSerialization.jsonObject(
+            with: Data(validAlphaReportJSON().utf8)
+        ) as? [String: Any] else {
+            throw SelfTestFailure.assertion("valid report fixture is not a JSON object")
+        }
+        report.removeValue(forKey: "tool_capabilities")
+        _ = try AlphaConversionReportValidator.validate(
+            data: try JSONSerialization.data(withJSONObject: report),
+            expectedOutputBasename: "idle.mov",
+            actualOutputSHA256: outputHash
+        )
+    }
+    for invalidCapability in [
+        ("\"ffmpeg_encoder\":\"prores_ks\"", "\"ffmpeg_encoder\":\"prores_aw\""),
+        ("[\"scale\",\"crop\",\"pad\"]", "[\"scale\",\"pad\"]"),
+        ("[\"PresetHEVCHighestQualityWithAlpha\",\"PresetAppleProRes4444LPCM\"]", "[\"PresetHEVCHighestQualityWithAlpha\"]"),
+        ("\"passed\":true", "\"passed\":false"),
+    ] {
+        try requiresError("malformed schema-v1 tool capability contract was accepted") {
+            let report = validAlphaReportJSON().replacingOccurrences(
+                of: invalidCapability.0,
+                with: invalidCapability.1
+            )
+            _ = try AlphaConversionReportValidator.validate(
+                data: Data(report.utf8),
+                expectedOutputBasename: "idle.mov",
+                actualOutputSHA256: outputHash
+            )
+        }
+    }
+    try requiresError("oversized conversion report was accepted") {
+        _ = try AlphaConversionReportValidator.validate(
+            data: Data(
+                repeating: 0x20,
+                count: AlphaConversionReportValidator.maximumReportBytes + 1
+            ),
+            expectedOutputBasename: "idle.mov",
+            actualOutputSHA256: outputHash
+        )
+    }
     try requiresError("unsafe conversion report was accepted") {
         let report = validAlphaReportJSON().replacingOccurrences(of: "\"unsafe\":false", with: "\"unsafe\":true")
         _ = try AlphaConversionReportValidator.validate(
@@ -640,9 +883,73 @@ private func runSelfTest() throws {
     try require(hasReachableArea(oversized, displays: displays), "oversized frame did not retain a 48-point handle")
 }
 
+private func runPlaybackSmoke(arguments: [String]) throws {
+    guard arguments.count == 5,
+          let expectedWidth = Int(arguments[2]),
+          let expectedHeight = Int(arguments[3]),
+          let expectedFPS = Double(arguments[4]),
+          expectedWidth > 0,
+          expectedHeight > 0,
+          expectedFPS.isFinite,
+          expectedFPS > 0 else {
+        throw SelfTestFailure.assertion(
+            "usage: codex-pet-core-self-test --playback-smoke MOV WIDTH HEIGHT FPS"
+        )
+    }
+    let semaphore = DispatchSemaphore(value: 0)
+    let result = LockedPlaybackSmokeResult()
+    Task {
+        do {
+            result.store(.success(try await AlphaPlaybackAcceptanceValidator.probe(
+                url: URL(fileURLWithPath: arguments[1])
+            )))
+        } catch {
+            result.store(.failure(error))
+        }
+        semaphore.signal()
+    }
+    semaphore.wait()
+    let probe = try result.load().get()
+    try require(probe.isPlayable, "AVFoundation did not mark the movie playable")
+    try require(probe.videoTrackCount == 1, "AVFoundation did not find exactly one video track")
+    try require(probe.audioTrackCount == 0, "AVFoundation found an unexpected audio track")
+    try require(probe.codec == "hevc", "AVFoundation did not report HEVC")
+    try require(
+        probe.width == expectedWidth && probe.height == expectedHeight,
+        "AVFoundation playback geometry did not match"
+    )
+    try require(
+        abs(probe.nominalFrameRate - expectedFPS) <= 0.05,
+        "AVFoundation nominal frame rate did not match"
+    )
+    try require(probe.decodedFirstFrame, "AVFoundation could not decode the first frame")
+}
+
+private final class LockedPlaybackSmokeResult: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Result<AlphaPlaybackProbe, Error>?
+
+    func store(_ result: Result<AlphaPlaybackProbe, Error>) {
+        lock.lock()
+        value = result
+        lock.unlock()
+    }
+
+    func load() -> Result<AlphaPlaybackProbe, Error> {
+        lock.lock()
+        defer { lock.unlock() }
+        return value ?? .failure(SelfTestFailure.assertion("playback smoke produced no result"))
+    }
+}
+
 do {
-    try runSelfTest()
-    print("CodexPetCore self-test passed")
+    if CommandLine.arguments.dropFirst().first == "--playback-smoke" {
+        try runPlaybackSmoke(arguments: Array(CommandLine.arguments.dropFirst()))
+        print("CodexPetCore AVFoundation playback smoke passed")
+    } else {
+        try runSelfTest()
+        print("CodexPetCore self-test passed")
+    }
 } catch {
     FileHandle.standardError.write(Data("CodexPetCore self-test failed: \(error)\n".utf8))
     exit(EXIT_FAILURE)

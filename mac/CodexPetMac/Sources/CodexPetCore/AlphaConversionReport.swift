@@ -1,6 +1,45 @@
+import AVFoundation
+import CoreMedia
 import Foundation
 
+public enum AlphaConversionReportTrust: Equatable, Sendable {
+    case legacyPortableClaim
+    case portableClaim
+    case locallyAttested
+}
+
+public struct AlphaConversionToolchainMetadata: Equatable, Sendable {
+    public let converterVersion: String
+    public let ffmpegVersion: String
+    public let ffprobeVersion: String
+    public let avconvertVersion: String
+    public let macOSBuild: String
+}
+
+public struct AlphaConversionToolCapabilitiesMetadata: Equatable, Sendable {
+    public let ffmpegEncoder: String
+    public let ffmpegFilters: [String]
+    public let avconvertPresets: [String]
+}
+
+public struct AlphaConversionProfileMetadata: Equatable, Sendable {
+    public let name: String
+    public let framing: String
+    public let keying: String
+}
+
+public struct AlphaConversionNormalizationMetadata: Equatable, Sendable {
+    public let applied: [String]
+    public let warnings: [String]
+}
+
 public struct ValidatedAlphaConversionReport: Equatable, Sendable {
+    public let reportSchemaVersion: Int
+    public let trust: AlphaConversionReportTrust
+    public let toolchain: AlphaConversionToolchainMetadata?
+    public let toolCapabilities: AlphaConversionToolCapabilitiesMetadata?
+    public let profile: AlphaConversionProfileMetadata?
+    public let normalization: AlphaConversionNormalizationMetadata?
     public let outputBasename: String
     public let outputSHA256: String
     public let sourceSHA256: String
@@ -35,6 +74,11 @@ public enum AlphaConversionNotice: Equatable, Sendable {
 
 public enum AlphaConversionReportValidationError: Error, Equatable, LocalizedError {
     case malformedReport
+    case reportTooLarge
+    case unsupportedSchemaVersion(Int)
+    case invalidMetadata
+    case provenanceRequired
+    case provenanceMismatch
     case invalidHash(String)
     case outputBasenameMismatch
     case outputHashMismatch
@@ -48,6 +92,12 @@ public enum AlphaConversionReportValidationError: Error, Equatable, LocalizedErr
     public var errorDescription: String? {
         switch self {
         case .malformedReport: return "Conversion report is malformed"
+        case .reportTooLarge: return "Conversion report exceeds the supported size limit"
+        case let .unsupportedSchemaVersion(version):
+            return "Conversion report schema version \(version) is not supported"
+        case .invalidMetadata: return "Conversion report metadata is invalid"
+        case .provenanceRequired: return "Conversion report is not bound to this local conversion"
+        case .provenanceMismatch: return "Conversion report local provenance does not match"
         case let .invalidHash(name): return "Conversion report contains an invalid \(name) hash"
         case .outputBasenameMismatch: return "Conversion report output name does not match"
         case .outputHashMismatch: return "Converted output hash does not match the report"
@@ -62,17 +112,43 @@ public enum AlphaConversionReportValidationError: Error, Equatable, LocalizedErr
 }
 
 public enum AlphaConversionReportValidator {
+    public static let maximumReportBytes = 1_048_576
+
     public static func validate(
         data: Data,
         expectedOutputBasename: String,
-        actualOutputSHA256: String
+        actualOutputSHA256: String,
+        expectedLocalProvenanceChallenge: String? = nil
     ) throws -> ValidatedAlphaConversionReport {
+        guard data.count <= maximumReportBytes else {
+            throw AlphaConversionReportValidationError.reportTooLarge
+        }
         let report: AlphaConversionReport
         do {
             report = try JSONDecoder().decode(AlphaConversionReport.self, from: data)
         } catch {
             throw AlphaConversionReportValidationError.malformedReport
         }
+
+        let schemaVersion = report.reportSchemaVersion ?? 0
+        guard !report.hasReportSchemaVersion || schemaVersion == 1 else {
+            throw AlphaConversionReportValidationError.unsupportedSchemaVersion(schemaVersion)
+        }
+        if schemaVersion == 1,
+           (report.toolchain == nil || report.profile == nil
+               || report.toolCapabilities == nil || report.normalization == nil
+               || report.provenance == nil) {
+            throw AlphaConversionReportValidationError.invalidMetadata
+        }
+        let trust = try validatedTrust(
+            report: report,
+            schemaVersion: schemaVersion,
+            expectedChallenge: expectedLocalProvenanceChallenge
+        )
+        let toolchain = try validatedToolchain(report.toolchain)
+        let toolCapabilities = try validatedToolCapabilities(report.toolCapabilities)
+        let profile = try validatedProfile(report.profile)
+        let normalization = try validatedNormalization(report.normalization)
 
         guard isBasename(expectedOutputBasename),
               isBasename(report.artifacts.outputName),
@@ -200,6 +276,12 @@ public enum AlphaConversionReportValidator {
         }
 
         return ValidatedAlphaConversionReport(
+            reportSchemaVersion: schemaVersion,
+            trust: trust,
+            toolchain: toolchain,
+            toolCapabilities: toolCapabilities,
+            profile: profile,
+            normalization: normalization,
             outputBasename: report.artifacts.outputName,
             outputSHA256: reportedOutputHash,
             sourceSHA256: sourceHash,
@@ -234,10 +316,324 @@ public enum AlphaConversionReportValidator {
     private static func isWithin(_ value: Double, _ limit: Double) -> Bool {
         value.isFinite && limit.isFinite && value >= 0 && limit >= 0 && value <= limit
     }
+
+    private static func validatedTrust(
+        report: AlphaConversionReport,
+        schemaVersion: Int,
+        expectedChallenge: String?
+    ) throws -> AlphaConversionReportTrust {
+        if schemaVersion == 1 {
+            guard let provenance = report.provenance,
+                  provenance.method == "invocation-challenge-v1",
+                  provenance.producer == "statelet" else {
+                throw AlphaConversionReportValidationError.invalidMetadata
+            }
+            _ = try normalizedLowercaseHash(
+                provenance.challenge,
+                name: "provenance challenge"
+            )
+        }
+        guard let expectedChallenge else {
+            return schemaVersion == 0 ? .legacyPortableClaim : .portableClaim
+        }
+        guard schemaVersion == 1, let provenance = report.provenance else {
+            throw AlphaConversionReportValidationError.provenanceRequired
+        }
+        guard provenance.method == "invocation-challenge-v1",
+              provenance.producer == "statelet" else {
+            throw AlphaConversionReportValidationError.provenanceMismatch
+        }
+        let expected = try normalizedHash(expectedChallenge, name: "provenance challenge")
+        let actual = try normalizedLowercaseHash(
+            provenance.challenge,
+            name: "provenance challenge"
+        )
+        guard constantTimeEqual(expected, actual) else {
+            throw AlphaConversionReportValidationError.provenanceMismatch
+        }
+        return .locallyAttested
+    }
+
+    private static func validatedToolchain(
+        _ value: AlphaConversionReport.Toolchain?
+    ) throws -> AlphaConversionToolchainMetadata? {
+        guard let value else { return nil }
+        return AlphaConversionToolchainMetadata(
+            converterVersion: try safeMetadata(value.converterVersion, required: true)!,
+            ffmpegVersion: try safeMetadata(value.ffmpegVersion, required: true)!,
+            ffprobeVersion: try safeMetadata(value.ffprobeVersion, required: true)!,
+            avconvertVersion: try safeMetadata(value.avconvertVersion, required: true)!,
+            macOSBuild: try safeMetadata(value.macOSBuild, required: true)!
+        )
+    }
+
+    private static func validatedToolCapabilities(
+        _ value: AlphaConversionReport.ToolCapabilities?
+    ) throws -> AlphaConversionToolCapabilitiesMetadata? {
+        guard let value else { return nil }
+        let expectedFilters = ["scale", "crop", "pad"]
+        let expectedPresets = [
+            "PresetHEVCHighestQualityWithAlpha",
+            "PresetAppleProRes4444LPCM",
+        ]
+        guard value.passed,
+              value.ffmpegEncoder == "prores_ks",
+              value.ffmpegFilters == expectedFilters,
+              value.avconvertPresets == expectedPresets else {
+            throw AlphaConversionReportValidationError.invalidMetadata
+        }
+        return AlphaConversionToolCapabilitiesMetadata(
+            ffmpegEncoder: value.ffmpegEncoder,
+            ffmpegFilters: value.ffmpegFilters,
+            avconvertPresets: value.avconvertPresets
+        )
+    }
+
+    private static func validatedProfile(
+        _ value: AlphaConversionReport.Profile?
+    ) throws -> AlphaConversionProfileMetadata? {
+        guard let value else { return nil }
+        return AlphaConversionProfileMetadata(
+            name: try safeMetadata(value.name, required: true)!,
+            framing: try safeMetadata(value.framing, required: true)!,
+            keying: try safeMetadata(value.keying, required: true)!
+        )
+    }
+
+    private static func validatedNormalization(
+        _ value: AlphaConversionReport.Normalization?
+    ) throws -> AlphaConversionNormalizationMetadata? {
+        guard let value else { return nil }
+        guard value.applied.count <= 32, value.warnings.count <= 32 else {
+            throw AlphaConversionReportValidationError.invalidMetadata
+        }
+        return AlphaConversionNormalizationMetadata(
+            applied: try value.applied.map { try safeMetadata($0, required: true)! },
+            warnings: try value.warnings.map { try safeMetadata($0, required: true)! }
+        )
+    }
+
+    private static func safeMetadata(
+        _ value: String?,
+        required: Bool = false
+    ) throws -> String? {
+        guard let value else {
+            if required { throw AlphaConversionReportValidationError.invalidMetadata }
+            return nil
+        }
+        guard !value.isEmpty,
+              value.utf8.count <= 256,
+              !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+              !value.contains("/"),
+              !value.contains("\\") else {
+            throw AlphaConversionReportValidationError.invalidMetadata
+        }
+        return value
+    }
+
+    private static func constantTimeEqual(_ lhs: String, _ rhs: String) -> Bool {
+        let left = Array(lhs.utf8)
+        let right = Array(rhs.utf8)
+        guard left.count == right.count else { return false }
+        var difference: UInt8 = 0
+        for index in left.indices {
+            difference |= left[index] ^ right[index]
+        }
+        return difference == 0
+    }
+
+    private static func normalizedLowercaseHash(
+        _ value: String,
+        name: String
+    ) throws -> String {
+        guard value == value.lowercased() else {
+            throw AlphaConversionReportValidationError.invalidHash(name)
+        }
+        return try normalizedHash(value, name: name)
+    }
+}
+
+public struct AlphaPlaybackProbe: Codable, Equatable, Sendable {
+    public let isPlayable: Bool
+    public let videoTrackCount: Int
+    public let audioTrackCount: Int
+    public let codec: String
+    public let width: Int
+    public let height: Int
+    public let nominalFrameRate: Double
+    public let durationSeconds: Double
+    public let decodedFirstFrame: Bool
+
+    public init(
+        isPlayable: Bool,
+        videoTrackCount: Int,
+        audioTrackCount: Int,
+        codec: String,
+        width: Int,
+        height: Int,
+        nominalFrameRate: Double,
+        durationSeconds: Double,
+        decodedFirstFrame: Bool
+    ) {
+        self.isPlayable = isPlayable
+        self.videoTrackCount = videoTrackCount
+        self.audioTrackCount = audioTrackCount
+        self.codec = codec
+        self.width = width
+        self.height = height
+        self.nominalFrameRate = nominalFrameRate
+        self.durationSeconds = durationSeconds
+        self.decodedFirstFrame = decodedFirstFrame
+    }
+}
+
+public enum AlphaPlaybackAcceptanceError: Error, Equatable, LocalizedError {
+    case notPlayable
+    case invalidVideoTrack
+    case audioPresent
+    case wrongCodec
+    case geometryMismatch
+    case frameRateMismatch
+    case durationMismatch
+    case decodeFailed
+
+    public var errorDescription: String? {
+        switch self {
+        case .notPlayable: return "Converted movie is not playable"
+        case .invalidVideoTrack: return "Converted movie does not contain one playable video track"
+        case .audioPresent: return "Converted movie contains audio; Statelet animations must be silent"
+        case .wrongCodec: return "Converted movie is not HEVC"
+        case .geometryMismatch: return "Converted movie playback geometry does not match its report"
+        case .frameRateMismatch: return "Converted movie playback frame rate does not match its report"
+        case .durationMismatch: return "Converted movie playback duration does not match its report"
+        case .decodeFailed: return "Converted movie could not decode its first frame"
+        }
+    }
+}
+
+public enum AlphaPlaybackAcceptanceValidator {
+    /// Runs a macOS AVFoundation smoke probe and compares it with the already
+    /// gate-validated report. This proves the installed bytes are playable by
+    /// the runtime media stack; it does not replace the converter's all-frame
+    /// Apple round-trip, alpha, or composite verification.
+    public static func validate(
+        url: URL,
+        expected report: ValidatedAlphaConversionReport
+    ) async throws -> AlphaPlaybackProbe {
+        let probe = try await probe(url: url)
+        return try validate(probe: probe, expected: report)
+    }
+
+    public static func validate(
+        probe: AlphaPlaybackProbe,
+        expected report: ValidatedAlphaConversionReport
+    ) throws -> AlphaPlaybackProbe {
+        guard probe.isPlayable else { throw AlphaPlaybackAcceptanceError.notPlayable }
+        guard probe.videoTrackCount == 1 else {
+            throw AlphaPlaybackAcceptanceError.invalidVideoTrack
+        }
+        guard probe.audioTrackCount == 0 else {
+            throw AlphaPlaybackAcceptanceError.audioPresent
+        }
+        guard probe.codec.caseInsensitiveCompare("hevc") == .orderedSame else {
+            throw AlphaPlaybackAcceptanceError.wrongCodec
+        }
+        guard probe.width == report.width, probe.height == report.height else {
+            throw AlphaPlaybackAcceptanceError.geometryMismatch
+        }
+        guard let expectedFPS = rationalValue(report.fps),
+              probe.nominalFrameRate.isFinite,
+              abs(probe.nominalFrameRate - expectedFPS) <= 0.05 else {
+            throw AlphaPlaybackAcceptanceError.frameRateMismatch
+        }
+        let expectedDuration = Double(report.frames) / expectedFPS
+        let oneFrame = 1 / expectedFPS
+        guard probe.durationSeconds.isFinite,
+              abs(probe.durationSeconds - expectedDuration) <= oneFrame else {
+            throw AlphaPlaybackAcceptanceError.durationMismatch
+        }
+        guard probe.decodedFirstFrame else { throw AlphaPlaybackAcceptanceError.decodeFailed }
+        return probe
+    }
+
+    public static func probe(url: URL) async throws -> AlphaPlaybackProbe {
+        let asset = AVURLAsset(url: url)
+        let isPlayable = try await asset.load(.isPlayable)
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        let audioTracks = try await asset.loadTracks(withMediaType: .audio)
+        guard let track = tracks.first else {
+            return AlphaPlaybackProbe(
+                isPlayable: isPlayable,
+                videoTrackCount: tracks.count,
+                audioTrackCount: audioTracks.count,
+                codec: "",
+                width: 0,
+                height: 0,
+                nominalFrameRate: 0,
+                durationSeconds: 0,
+                decodedFirstFrame: false
+            )
+        }
+        async let naturalSize = track.load(.naturalSize)
+        async let preferredTransform = track.load(.preferredTransform)
+        async let nominalFrameRate = track.load(.nominalFrameRate)
+        async let formatDescriptions = track.load(.formatDescriptions)
+        async let duration = asset.load(.duration)
+        async let timeRange = track.load(.timeRange)
+
+        let transformedRect = CGRect(origin: .zero, size: try await naturalSize)
+            .applying(try await preferredTransform)
+        let descriptions = try await formatDescriptions
+        let codec = descriptions.first.map(codecName) ?? ""
+        let range = try await timeRange
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        let decodedFirstFrame = (try? generator.copyCGImage(at: range.start, actualTime: nil)) != nil
+
+        return AlphaPlaybackProbe(
+            isPlayable: isPlayable,
+            videoTrackCount: tracks.count,
+            audioTrackCount: audioTracks.count,
+            codec: codec,
+            width: Int(abs(transformedRect.width).rounded()),
+            height: Int(abs(transformedRect.height).rounded()),
+            nominalFrameRate: Double(try await nominalFrameRate),
+            durationSeconds: CMTimeGetSeconds(try await duration),
+            decodedFirstFrame: decodedFirstFrame
+        )
+    }
+
+    private static func codecName(_ description: CMFormatDescription) -> String {
+        switch CMFormatDescriptionGetMediaSubType(description) {
+        case kCMVideoCodecType_HEVC: return "hevc"
+        default: return "other"
+        }
+    }
+
+    private static func rationalValue(_ value: String) -> Double? {
+        let parts = value.split(separator: "/", omittingEmptySubsequences: false)
+        guard parts.count == 2,
+              let numerator = Double(parts[0]),
+              let denominator = Double(parts[1]),
+              numerator.isFinite,
+              denominator.isFinite,
+              numerator > 0,
+              denominator > 0 else {
+            return nil
+        }
+        return numerator / denominator
+    }
 }
 
 private struct AlphaConversionReport: Decodable {
+    let hasReportSchemaVersion: Bool
+    let reportSchemaVersion: Int?
     let status: String
+    let toolchain: Toolchain?
+    let toolCapabilities: ToolCapabilities?
+    let profile: Profile?
+    let normalization: Normalization?
+    let provenance: Provenance?
     let source: Source?
     let geometry: Geometry
     let geometryAlignment: GeometryAlignment?
@@ -247,7 +643,13 @@ private struct AlphaConversionReport: Decodable {
     let artifacts: Artifacts
 
     enum CodingKeys: String, CodingKey {
+        case reportSchemaVersion = "report_schema_version"
         case status
+        case toolchain
+        case toolCapabilities = "tool_capabilities"
+        case profile
+        case normalization
+        case provenance
         case source
         case geometry
         case geometryAlignment = "geometry_alignment"
@@ -255,6 +657,80 @@ private struct AlphaConversionReport: Decodable {
         case codec
         case verification
         case artifacts
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        hasReportSchemaVersion = container.contains(.reportSchemaVersion)
+        reportSchemaVersion = hasReportSchemaVersion
+            ? try container.decode(Int.self, forKey: .reportSchemaVersion)
+            : nil
+        status = try container.decode(String.self, forKey: .status)
+        toolchain = try container.decodeIfPresent(Toolchain.self, forKey: .toolchain)
+        toolCapabilities = try container.decodeIfPresent(
+            ToolCapabilities.self,
+            forKey: .toolCapabilities
+        )
+        profile = try container.decodeIfPresent(Profile.self, forKey: .profile)
+        normalization = try container.decodeIfPresent(Normalization.self, forKey: .normalization)
+        provenance = try container.decodeIfPresent(Provenance.self, forKey: .provenance)
+        source = try container.decodeIfPresent(Source.self, forKey: .source)
+        geometry = try container.decode(Geometry.self, forKey: .geometry)
+        geometryAlignment = try container.decodeIfPresent(
+            GeometryAlignment.self,
+            forKey: .geometryAlignment
+        )
+        quality = try container.decodeIfPresent(Quality.self, forKey: .quality)
+        codec = try container.decode(Codec.self, forKey: .codec)
+        verification = try container.decode(Verification.self, forKey: .verification)
+        artifacts = try container.decode(Artifacts.self, forKey: .artifacts)
+    }
+
+    struct Toolchain: Decodable {
+        let converterVersion: String
+        let ffmpegVersion: String
+        let ffprobeVersion: String
+        let avconvertVersion: String
+        let macOSBuild: String?
+
+        enum CodingKeys: String, CodingKey {
+            case converterVersion = "converter_version"
+            case ffmpegVersion = "ffmpeg_version"
+            case ffprobeVersion = "ffprobe_version"
+            case avconvertVersion = "avconvert_version"
+            case macOSBuild = "macos_build"
+        }
+    }
+
+    struct ToolCapabilities: Decodable {
+        let ffmpegEncoder: String
+        let ffmpegFilters: [String]
+        let avconvertPresets: [String]
+        let passed: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case ffmpegEncoder = "ffmpeg_encoder"
+            case ffmpegFilters = "ffmpeg_filters"
+            case avconvertPresets = "avconvert_presets"
+            case passed
+        }
+    }
+
+    struct Profile: Decodable {
+        let name: String
+        let framing: String
+        let keying: String
+    }
+
+    struct Normalization: Decodable {
+        let applied: [String]
+        let warnings: [String]
+    }
+
+    struct Provenance: Decodable {
+        let method: String
+        let producer: String
+        let challenge: String
     }
 
     struct Source: Decodable {

@@ -58,6 +58,13 @@ enum SettingsActivity: Equatable {
             return message
         }
     }
+
+    var isBusy: Bool {
+        switch self {
+        case .converting, .working, .applying: return true
+        case .idle, .succeeded, .failed: return false
+        }
+    }
 }
 
 struct WindowSettingsUpdate {
@@ -93,6 +100,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     var onCheckTools: (() -> Void)?
     var onChoosePython: (() -> Void)?
     var onCancelConversion: (() -> Void)?
+    var onRetryFailedMP4s: (() -> Void)?
+    var onConversionProfileChange: ((AlphaConversionProfile) -> Void)?
     var onWindowSettingsChange: ((WindowSettingsUpdate) -> Void)?
     var onResetPosition: (() -> Void)?
     var onRefreshDiagnostics: (() -> Void)?
@@ -113,13 +122,15 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let checkToolsButton = NSButton(title: "Check Again", target: nil, action: nil)
     private let setupButton = NSButton(title: "Setup Guide", target: nil, action: nil)
     private let cancelButton = NSButton(title: "Cancel Conversion", target: nil, action: nil)
+    private let retryFailedButton = NSButton(title: "Retry Failed", target: nil, action: nil)
+    private let conversionProfilePopup = NSPopUpButton()
     private let progress = NSProgressIndicator()
     private let progressPercentLabel = NSTextField(labelWithString: "0%")
     private let activityLabel = NSTextField(wrappingLabelWithString: "")
     private let activityRow = NSStackView()
     private let sizeSlider = NSSlider(value: 320, minValue: 160, maxValue: 640, target: nil, action: nil)
     private let sizeLabel = NSTextField(labelWithString: "320 × 480 pt")
-    private let alwaysOnTopCheckbox = NSButton(checkboxWithTitle: "Keep pet above other windows", target: nil, action: nil)
+    private let alwaysOnTopCheckbox = NSButton(checkboxWithTitle: "Keep Statelet on Top", target: nil, action: nil)
     private let clickThroughCheckbox = NSButton(checkboxWithTitle: "Let clicks pass through the pet", target: nil, action: nil)
     private let fullScreenCheckbox = NSButton(checkboxWithTitle: "Show pet over full-screen apps", target: nil, action: nil)
     private let backgroundEnabledCheckbox = NSButton(checkboxWithTitle: "Show translucent background", target: nil, action: nil)
@@ -231,10 +242,25 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             checkToolsButton.isEnabled = true
             setupButton.isHidden = false
         }
+        conversionProfilePopup.isEnabled = toolchainState.isReady && !activity.isBusy
         refreshRows()
     }
 
-    func update(activity: SettingsActivity, progressValue: Double? = nil) {
+    func update(conversionProfile: AlphaConversionProfile) {
+        if let index = conversionProfilePopup.itemArray.firstIndex(where: {
+            ($0.representedObject as? String) == conversionProfile.rawValue
+        }) {
+            conversionProfilePopup.selectItem(at: index)
+        } else {
+            conversionProfilePopup.selectItem(at: 0)
+        }
+    }
+
+    func update(
+        activity: SettingsActivity,
+        progressValue: Double? = nil,
+        retryFailedAvailable: Bool = false
+    ) {
         self.activity = activity
         let isConverting: Bool
         let isCancelable: Bool
@@ -256,6 +282,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         progress.isHidden = !isConverting
         progressPercentLabel.isHidden = true
         cancelButton.isHidden = !isCancelable
+        retryFailedButton.isHidden = !retryFailedAvailable || isConverting
+        conversionProfilePopup.isEnabled = toolchainState.isReady && !isConverting
         if isConverting {
             if let progressValue, progressValue.isFinite {
                 progress.isIndeterminate = false
@@ -405,6 +433,19 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         cancelButton.action = #selector(cancelConversion)
         cancelButton.controlSize = .small
         cancelButton.isHidden = true
+        retryFailedButton.target = self
+        retryFailedButton.action = #selector(retryFailedMP4s)
+        retryFailedButton.controlSize = .small
+        retryFailedButton.isHidden = true
+        for profile in AlphaConversionProfile.allCases {
+            conversionProfilePopup.addItem(withTitle: profile.displayName)
+            conversionProfilePopup.lastItem?.representedObject = profile.rawValue
+        }
+        conversionProfilePopup.target = self
+        conversionProfilePopup.action = #selector(conversionProfileChanged)
+        conversionProfilePopup.controlSize = .small
+        conversionProfilePopup.setAccessibilityLabel("MP4 framing profile")
+        conversionProfilePopup.toolTip = "Choose whether MP4s crop to the 320 × 480 canvas or fit inside it with transparent padding."
         progress.style = .bar
         progress.minValue = 0
         progress.maxValue = 100
@@ -427,11 +468,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         activityLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let showFolder = NSButton(title: "Show Media Folder", target: self, action: #selector(revealMediaFolder))
         showFolder.controlSize = .small
-        let toolsRow = NSStackView(views: [showFolder, toolsLabel, setupButton, checkToolsButton])
+        let toolsRow = NSStackView(views: [showFolder, toolsLabel, conversionProfilePopup, setupButton, checkToolsButton])
         toolsRow.orientation = .horizontal
         toolsRow.alignment = .centerY
         toolsRow.spacing = 8
-        for view in [progress, progressPercentLabel, activityLabel, cancelButton] {
+        for view in [progress, progressPercentLabel, activityLabel, cancelButton, retryFailedButton] {
             activityRow.addArrangedSubview(view)
         }
         activityRow.orientation = .horizontal
@@ -635,13 +676,20 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             checkbox.target = self
             checkbox.action = #selector(windowOptionChanged)
         }
+        alwaysOnTopCheckbox.toolTip = "Turn this off to let other app windows cover Statelet."
+        alwaysOnTopCheckbox.setAccessibilityHelp("Turn this off to let other app windows cover Statelet.")
+        let alwaysOnTopHelp = NSTextField(
+            wrappingLabelWithString: "When off, other app windows can cover Statelet. You can also change this from the pet's right-click menu or the menu-bar icon."
+        )
+        alwaysOnTopHelp.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        alwaysOnTopHelp.textColor = .secondaryLabelColor
         let clickHelp = NSTextField(wrappingLabelWithString: "Right-click the pet for its menu. When click-through is on, use the Statelet menu-bar icon to turn it off again.")
         clickHelp.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         clickHelp.textColor = .secondaryLabelColor
         let resetPosition = NSButton(title: "Reset Position", target: self, action: #selector(resetPositionAction))
         resetPosition.alignment = .left
 
-        let petWindowStack = NSStackView(views: [sizeTitle, sizeControls, alwaysOnTopCheckbox, clickThroughCheckbox, clickHelp, fullScreenCheckbox, resetPosition])
+        let petWindowStack = NSStackView(views: [sizeTitle, sizeControls, alwaysOnTopCheckbox, alwaysOnTopHelp, clickThroughCheckbox, clickHelp, fullScreenCheckbox, resetPosition])
         petWindowStack.orientation = .vertical
         petWindowStack.alignment = .leading
         petWindowStack.spacing = 9
@@ -1176,6 +1224,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     @objc private func checkTools() { onCheckTools?() }
     @objc private func cancelConversion() { onCancelConversion?() }
+
+    @objc private func retryFailedMP4s() { onRetryFailedMP4s?() }
+
+    @objc private func conversionProfileChanged() {
+        guard let value = conversionProfilePopup.selectedItem?.representedObject as? String,
+              let profile = AlphaConversionProfile(rawValue: value) else { return }
+        onConversionProfileChange?(profile)
+    }
     @objc private func revealMediaFolder() { onRevealMediaFolder?() }
     @objc private func revealMap() { onRevealMap?() }
     @objc private func revealLogs() { onRevealLogs?() }
