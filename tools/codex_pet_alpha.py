@@ -757,6 +757,7 @@ def build_ffprobe_cadence_command(
         "error",
         "-select_streams",
         str(stream_index),
+        "-show_frames",
         "-show_entries",
         "frame=best_effort_timestamp_time",
         "-of",
@@ -826,11 +827,12 @@ def verify_video_cadence(
 
     timestamps: list[float] = []
     for line in output.decode("utf-8", errors="replace").splitlines():
-        text = line.strip().rstrip(",")
-        if not text or text == "N/A":
+        text = line.strip()
+        timestamp_text = text.split(",", 1)[0].strip()
+        if not timestamp_text or timestamp_text == "N/A":
             raise ProbeError("video frame timestamp metadata is missing")
         try:
-            timestamps.append(float(text))
+            timestamps.append(float(timestamp_text))
         except ValueError as exc:
             raise ProbeError("video frame timestamp metadata is invalid") from exc
     tolerance = _validate_video_timestamps(

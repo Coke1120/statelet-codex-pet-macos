@@ -1828,9 +1828,13 @@ class MacOSAlphaCommandTests(unittest.TestCase):
             required_by_device = {
                 device: item["required_bytes"]
                 for device, item in zip(
-                    sorted(set(locations.values())), measured["volumes"], strict=True
+                    sorted(set(locations.values())), measured["volumes"]
                 )
             }
+            self.assertEqual(
+                len(required_by_device),
+                len(set(locations.values())),
+            )
 
             def exact_disk_usage(path):
                 return mock.Mock(free=required_by_device[locations[Path(path)]])
@@ -2165,6 +2169,46 @@ class MacOSAlphaCommandTests(unittest.TestCase):
                 ):
                     converter.convert_video(args)
             cadence.assert_not_called()
+
+    def test_compact_cadence_probe_explicitly_enables_frame_sections(self):
+        command = alpha.build_ffprobe_cadence_command(
+            "source.mp4",
+            stream_index=2,
+            ffprobe="ffprobe",
+        )
+
+        self.assertIn("-show_frames", command)
+        self.assertEqual(command[command.index("-select_streams") + 1], "2")
+
+    def test_compact_cadence_probe_ignores_ffprobe_side_data_columns(self):
+        process = mock.Mock()
+        process.stdout = io.BytesIO(
+            b"0.000000,H.264 User Data Unregistered SEI message\n0.041667\n"
+        )
+        process.stdin = None
+        process.stderr = None
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        info = alpha.VideoInfo(
+            width=4,
+            height=4,
+            frame_count=2,
+            fps=Fraction(24, 1),
+            duration_seconds=2 / 24,
+            codec_name="h264",
+            pixel_format="yuv420p",
+        )
+
+        with mock.patch.object(alpha, "require_tool", return_value="ffprobe"):
+            report = alpha.verify_video_cadence(
+                "source.mp4",
+                info,
+                ffprobe="ffprobe",
+                process_factory=lambda *_args, **_kwargs: process,
+            )
+
+        self.assertEqual(report["frames_checked"], 2)
+        self.assertTrue(report["quality_passed"])
 
     def test_compact_cadence_probe_terminates_when_output_cap_is_exceeded(self):
         process = mock.Mock()
