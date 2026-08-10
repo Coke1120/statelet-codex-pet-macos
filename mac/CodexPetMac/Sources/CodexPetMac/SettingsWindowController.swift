@@ -12,6 +12,8 @@ struct SettingsSnapshot {
     let launchAtLoginEnabled: Bool
     let launchAtLoginSummary: String
     let repairAvailable: Bool
+    let characterProfiles: [CharacterProfileSummary]
+    let activeCharacterID: String
 
     init(
         mediaMap: MediaMap,
@@ -23,7 +25,11 @@ struct SettingsSnapshot {
         diagnosticsReport: String = "Checking…",
         launchAtLoginEnabled: Bool = false,
         launchAtLoginSummary: String = "Checking…",
-        repairAvailable: Bool = false
+        repairAvailable: Bool = false,
+        characterProfiles: [CharacterProfileSummary] = [
+            CharacterProfileSummary(id: "default", name: "Default", clipCount: 0)
+        ],
+        activeCharacterID: String = "default"
     ) {
         self.mediaMap = mediaMap
         self.mediaMapURL = mediaMapURL
@@ -35,6 +41,8 @@ struct SettingsSnapshot {
         self.launchAtLoginEnabled = launchAtLoginEnabled
         self.launchAtLoginSummary = launchAtLoginSummary
         self.repairAvailable = repairAvailable
+        self.characterProfiles = characterProfiles
+        self.activeCharacterID = activeCharacterID
     }
 }
 
@@ -45,6 +53,8 @@ enum SettingsActivity: Equatable {
     case applying(PetState)
     case succeeded(PetState, String)
     case failed(PetState?, String)
+    case characterWorking(String)
+    case characterSucceeded(String)
 
     var message: String? {
         switch self {
@@ -54,15 +64,16 @@ enum SettingsActivity: Equatable {
             return message
         case let .applying(state):
             return "Applying \(state.displayName) animation…"
-        case let .succeeded(_, message), let .failed(_, message):
+        case let .succeeded(_, message), let .failed(_, message),
+             let .characterWorking(message), let .characterSucceeded(message):
             return message
         }
     }
 
     var isBusy: Bool {
         switch self {
-        case .converting, .working, .applying: return true
-        case .idle, .succeeded, .failed: return false
+        case .converting, .working, .applying, .characterWorking: return true
+        case .idle, .succeeded, .failed, .characterSucceeded: return false
         }
     }
 }
@@ -108,6 +119,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     var onRepairInstallation: (() -> Void)?
     var onLaunchAtLoginChange: ((Bool) -> Void)?
     var onCleanUnusedMedia: (() -> Void)?
+    var onCharacterSelection: ((String) -> Void)?
+    var onCreateCharacter: ((String) -> Void)?
+    var onRenameCharacter: ((String, String) -> Void)?
+    var onDuplicateCharacter: ((String, String) -> Void)?
+    var onDeleteCharacter: ((String) -> Void)?
+    var onImportCharacterBundle: (() -> Void)?
+    var onExportCharacterBundle: ((String) -> Void)?
 
     private let tabs = NSSegmentedControl(labels: ["Animations", "Appearance", "General", "Diagnostics", "Prompts", "Recommendation"], trackingMode: .selectOne, target: nil, action: nil)
     private let paneHost = NSView()
@@ -118,6 +136,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let helpPane = NSView()
     private let recommendationPane = NSView()
     private let publisherLabel = NSTextField(labelWithString: "Lifecycle status: Checking")
+    private let characterSelector = CharacterProfileSelectorView()
     private let toolsLabel = NSTextField(labelWithString: "Checking conversion tools…")
     private let checkToolsButton = NSButton(title: "Check Again", target: nil, action: nil)
     private let setupButton = NSButton(title: "Setup Guide", target: nil, action: nil)
@@ -225,6 +244,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         launchAtLoginCheckbox.state = snapshot.launchAtLoginEnabled ? .on : .off
         launchAtLoginLabel.stringValue = snapshot.launchAtLoginSummary
         repairButton.isEnabled = snapshot.repairAvailable
+        updateCharacterSelector()
     }
 
     func update(toolchainState: AlphaToolchainState) {
@@ -272,10 +292,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         case .converting:
             isConverting = true
             isCancelable = true
-        case .working, .applying:
+        case .working, .applying, .characterWorking:
             isConverting = true
             isCancelable = false
-        case .idle, .succeeded, .failed:
+        case .idle, .succeeded, .failed, .characterSucceeded:
             isConverting = false
             isCancelable = false
         }
@@ -307,11 +327,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         switch activity {
         case .failed:
             activityLabel.textColor = .systemRed
-        case .succeeded:
+        case .succeeded, .characterSucceeded:
             activityLabel.textColor = .systemGreen
-        case .idle, .converting, .working, .applying:
+        case .idle, .converting, .working, .applying, .characterWorking:
             activityLabel.textColor = .secondaryLabelColor
         }
+        updateCharacterSelector()
         refreshRows()
     }
 
@@ -373,12 +394,39 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         statusBox.cornerRadius = 8
         statusBox.borderColor = .separatorColor
         statusBox.fillColor = .controlBackgroundColor
-        statusBox.contentView?.addSubview(publisherLabel)
+        let characterLabel = NSTextField(labelWithString: "ACTIVE CHARACTER")
+        characterLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
+        characterLabel.textColor = .secondaryLabelColor
+        characterLabel.setContentHuggingPriority(.required, for: .horizontal)
+        characterSelector.onSelectProfile = { [weak self] id in self?.onCharacterSelection?(id) }
+        characterSelector.onNewCharacter = { [weak self] in self?.promptForNewCharacter() }
+        characterSelector.onRenameActive = { [weak self] in self?.promptForCharacterRename() }
+        characterSelector.onDuplicateActive = { [weak self] in self?.promptForCharacterDuplicate() }
+        characterSelector.onDeleteActive = { [weak self] in self?.confirmCharacterDeletion() }
+        characterSelector.onImportBundle = { [weak self] in self?.onImportCharacterBundle?() }
+        characterSelector.onExportActive = { [weak self] in
+            guard let id = self?.snapshot?.activeCharacterID else { return }
+            self?.onExportCharacterBundle?(id)
+        }
+        let characterStack = NSStackView(views: [characterLabel, characterSelector])
+        characterStack.orientation = .horizontal
+        characterStack.alignment = .centerY
+        characterStack.spacing = 7
+        characterStack.translatesAutoresizingMaskIntoConstraints = false
+        publisherLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let statusRow = NSStackView(views: [characterStack, publisherLabel])
+        statusRow.orientation = .horizontal
+        statusRow.alignment = .centerY
+        statusRow.distribution = .fill
+        statusRow.spacing = 12
+        statusRow.translatesAutoresizingMaskIntoConstraints = false
+        statusBox.contentView?.addSubview(statusRow)
         if let content = statusBox.contentView {
             NSLayoutConstraint.activate([
-                publisherLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
-                publisherLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
-                publisherLabel.centerYAnchor.constraint(equalTo: content.centerYAnchor),
+                statusRow.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+                statusRow.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+                statusRow.centerYAnchor.constraint(equalTo: content.centerYAnchor),
+                characterSelector.widthAnchor.constraint(greaterThanOrEqualToConstant: 214),
             ])
         }
         statusBox.heightAnchor.constraint(equalToConstant: 42).isActive = true
@@ -1041,8 +1089,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         guard let snapshot else { return }
         let globallyBusy: Bool
         switch activity {
-        case .converting, .working, .applying: globallyBusy = true
-        case .idle, .succeeded, .failed: globallyBusy = false
+        case .converting, .working, .applying, .characterWorking: globallyBusy = true
+        case .idle, .succeeded, .failed, .characterSucceeded: globallyBusy = false
         }
         let counts = Dictionary(uniqueKeysWithValues: PetState.allCases.map {
             ($0, snapshot.mediaMap.playlist(for: $0)?.entries.count ?? 0)
@@ -1057,8 +1105,111 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             preview: snapshot.preview,
             reduceMotion: snapshot.reduceMotion,
             busy: globallyBusy,
-            importEnabled: toolchainState.isReady
+            importEnabled: toolchainState.isReady,
+            characterName: activeCharacterName
         )
+    }
+
+    private var activeCharacterName: String {
+        guard let snapshot else { return "Default" }
+        return snapshot.characterProfiles.first(where: { $0.id == snapshot.activeCharacterID })?.name
+            ?? snapshot.characterProfiles.first?.name
+            ?? "Default"
+    }
+
+    private func updateCharacterSelector() {
+        guard let snapshot else { return }
+        characterSelector.update(
+            profiles: snapshot.characterProfiles,
+            activeID: snapshot.activeCharacterID,
+            busy: activity.isBusy
+        )
+    }
+
+    private func promptForNewCharacter() {
+        promptForCharacterName(
+            title: "New Character",
+            message: "Create a separate animation profile for this character.",
+            initialValue: ""
+        ) { [weak self] name in
+            self?.onCreateCharacter?(name)
+        }
+    }
+
+    private func promptForCharacterRename() {
+        guard let snapshot else { return }
+        promptForCharacterName(
+            title: "Rename Character",
+            message: "Change the display name without changing its animation library.",
+            initialValue: activeCharacterName
+        ) { [weak self] name in
+            self?.onRenameCharacter?(snapshot.activeCharacterID, name)
+        }
+    }
+
+    private func promptForCharacterDuplicate() {
+        guard let snapshot else { return }
+        promptForCharacterName(
+            title: "Duplicate Character",
+            message: "Copy the animation assignments and reuse their verified media files.",
+            initialValue: "\(activeCharacterName) Copy"
+        ) { [weak self] name in
+            self?.onDuplicateCharacter?(snapshot.activeCharacterID, name)
+        }
+    }
+
+    private func promptForCharacterName(
+        title: String,
+        message: String,
+        initialValue: String,
+        completion: @escaping (String) -> Void
+    ) {
+        guard let window else { return }
+        let field = NSTextField(string: initialValue)
+        field.placeholderString = "Character name"
+        field.frame = NSRect(x: 0, y: 0, width: 300, height: 24)
+        field.setAccessibilityLabel("Character name")
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.accessoryView = field
+        let confirmTitle = switch title {
+        case "New Character": "Create"
+        case "Duplicate Character": "Duplicate"
+        default: "Save"
+        }
+        alert.addButton(withTitle: confirmTitle)
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            let name = field.stringValue
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .precomposedStringWithCanonicalMapping
+            guard !name.isEmpty, name.count <= 80,
+                  !name.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
+                self?.update(activity: .failed(nil, "Character name must be 1–80 visible characters."))
+                return
+            }
+            completion(name)
+        }
+        DispatchQueue.main.async {
+            field.selectText(nil)
+            window.makeFirstResponder(field)
+        }
+    }
+
+    private func confirmCharacterDeletion() {
+        guard let window, let snapshot, snapshot.characterProfiles.count > 1 else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Delete \u{201c}\(activeCharacterName)\u{201d}?"
+        alert.informativeText = "This removes the character from the selector. Its map and all media files remain untouched; Clean Unused Media can review unreferenced files later."
+        alert.addButton(withTitle: "Delete Character")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.onDeleteCharacter?(snapshot.activeCharacterID)
+        }
     }
 
     private func startLibraryRevisionTimer() {

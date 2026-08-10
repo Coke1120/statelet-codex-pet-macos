@@ -632,6 +632,157 @@ private func runSelfTest() throws {
     try require(defaultAppearance.fpsColor == "#00FF00", "legacy media map did not use the default FPS color")
     try require(defaultAppearance.fpsLabelSize == .small, "legacy media map did not use the default FPS size")
 
+    let legacyLibrary = CharacterLibrary.legacy
+    try require(legacyLibrary.activeCharacterID == "default", "legacy character id changed")
+    try require(legacyLibrary.activeCharacter.name == "Default", "legacy character name changed")
+    try require(legacyLibrary.activeCharacter.mapPath == "media-map.json", "legacy map path changed")
+    let customRootLibrary = try CharacterLibrary.legacy(mapPath: "custom.json")
+    try require(customRootLibrary.activeCharacter.mapPath == "custom.json", "custom root map did not bootstrap")
+    try requiresError("nested custom root map was accepted") {
+        _ = try CharacterLibrary.legacy(mapPath: "nested/custom.json")
+    }
+    let libraryRoundTrip = try JSONDecoder().decode(
+        CharacterLibrary.self,
+        from: JSONEncoder().encode(legacyLibrary)
+    )
+    try require(libraryRoundTrip == legacyLibrary, "character library did not round-trip")
+    let addedLibrary = try legacyLibrary.addingCharacter(id: "chloe", name: "Chloe")
+    try require(
+        addedLibrary.character(id: "default")?.mapPath == "media-map.json",
+        "adding a character changed the default profile map"
+    )
+    try require(
+        addedLibrary.character(id: "chloe")?.mapPath == ".character-chloe.media-map.json",
+        "new character did not receive an isolated profile map"
+    )
+    let renamedLibrary = try addedLibrary.renamingCharacter(id: "chloe", to: "Chloe Prime")
+    try require(addedLibrary.character(id: "chloe")?.name == "Chloe", "rename mutated original library")
+    let duplicatedLibrary = try renamedLibrary.duplicatingCharacter(
+        id: "chloe",
+        as: "chloe-copy",
+        name: "Chloe Copy"
+    )
+    let selectedLibrary = try duplicatedLibrary.selectingCharacter(id: "chloe")
+    try require(selectedLibrary.activeCharacterID == "chloe", "character selection failed")
+    let removedActiveLibrary = try selectedLibrary.removingCharacter(id: "chloe")
+    try require(removedActiveLibrary.activeCharacterID == "default", "active removal did not fall back to default")
+    try requiresError("last character removal was accepted") {
+        _ = try legacyLibrary.removingCharacter(id: "default")
+    }
+
+    let bundleHash = String(repeating: "d", count: 64)
+    let bundleMap = try MediaMap(states: [
+        .idle: MediaEntry(path: "movies/idle.mov", posterPath: "posters/idle.png"),
+    ])
+    let bundle = try CharacterBundleManifest(
+        characterID: "chloe",
+        characterName: "Chloe",
+        mediaMap: bundleMap,
+        assets: [
+            CharacterBundleAsset(role: .movie, path: "movies/idle.mov", size: 100, sha256: bundleHash),
+            CharacterBundleAsset(role: .poster, path: "posters/idle.png", size: 50, sha256: bundleHash),
+            CharacterBundleAsset(
+                role: .report,
+                path: "reports/idle.json",
+                size: 25,
+                sha256: bundleHash,
+                moviePath: "movies/idle.mov"
+            ),
+        ]
+    )
+    let bundleRoundTrip = try CharacterBundleManifest.decode(JSONEncoder().encode(bundle))
+    try require(bundleRoundTrip == bundle, "character bundle did not round-trip")
+    let rewrittenBundleMap = try bundle.mediaMap { "imports/\($0)" }
+    try require(
+        rewrittenBundleMap.entry(for: .idle)?.path == "imports/movies/idle.mov",
+        "bundle movie path was not rewritten"
+    )
+    try require(
+        rewrittenBundleMap.entry(for: .idle)?.posterPath == "imports/posters/idle.png",
+        "bundle poster path was not rewritten"
+    )
+    try requiresError("bundle traversal path was accepted") {
+        _ = try CharacterBundleManifest(
+            characterID: "chloe",
+            characterName: "Chloe",
+            mediaMap: MediaMap(states: [.idle: MediaEntry(path: "../idle.mov")]),
+            assets: [
+                CharacterBundleAsset(role: .movie, path: "../idle.mov", size: 1, sha256: bundleHash),
+            ]
+        )
+    }
+    try requiresError("bundle control-character path was accepted") {
+        _ = try CharacterLibrary.legacy(mapPath: "bad\nmap.json")
+    }
+    try requiresError("bundle case-colliding paths were accepted") {
+        _ = try CharacterBundleManifest(
+            characterID: "chloe",
+            characterName: "Chloe",
+            mediaMap: MediaMap(states: [.idle: MediaEntry(path: "movies/idle.mov")]),
+            assets: [
+                CharacterBundleAsset(role: .movie, path: "movies/idle.mov", size: 1, sha256: bundleHash),
+                CharacterBundleAsset(role: .movie, path: "movies/IDLE.mov", size: 1, sha256: bundleHash),
+            ]
+        )
+    }
+    try requiresError("bundle wrong-role reference was accepted") {
+        _ = try CharacterBundleManifest(
+            characterID: "chloe",
+            characterName: "Chloe",
+            mediaMap: MediaMap(states: [.idle: MediaEntry(path: "movies/idle.mov")]),
+            assets: [
+                CharacterBundleAsset(role: .poster, path: "movies/idle.mov", size: 1, sha256: bundleHash),
+            ]
+        )
+    }
+    try requiresError("bundle report without movie_path was accepted") {
+        _ = try CharacterBundleManifest(
+            characterID: "chloe",
+            characterName: "Chloe",
+            mediaMap: MediaMap(states: [:] as [PetState: StateMediaPlaylist]),
+            assets: [
+                CharacterBundleAsset(role: .report, path: "reports/idle.json", size: 1, sha256: bundleHash),
+            ]
+        )
+    }
+    try requiresError("bundle unreferenced movie was accepted") {
+        _ = try CharacterBundleManifest(
+            characterID: "chloe",
+            characterName: "Chloe",
+            mediaMap: bundleMap,
+            assets: [
+                CharacterBundleAsset(role: .movie, path: "movies/idle.mov", size: 1, sha256: bundleHash),
+                CharacterBundleAsset(role: .movie, path: "movies/unused.mov", size: 1, sha256: bundleHash),
+                CharacterBundleAsset(role: .poster, path: "posters/idle.png", size: 1, sha256: bundleHash),
+            ]
+        )
+    }
+    try requiresError("bundle duplicate reports were accepted") {
+        _ = try CharacterBundleManifest(
+            characterID: "chloe",
+            characterName: "Chloe",
+            mediaMap: bundleMap,
+            assets: [
+                CharacterBundleAsset(role: .movie, path: "movies/idle.mov", size: 1, sha256: bundleHash),
+                CharacterBundleAsset(role: .poster, path: "posters/idle.png", size: 1, sha256: bundleHash),
+                CharacterBundleAsset(
+                    role: .report,
+                    path: "reports/first.json",
+                    size: 1,
+                    sha256: bundleHash,
+                    moviePath: "movies/idle.mov"
+                ),
+                CharacterBundleAsset(
+                    role: .report,
+                    path: "reports/second.json",
+                    size: 1,
+                    sha256: bundleHash,
+                    moviePath: "movies/idle.mov"
+                ),
+            ]
+        )
+    }
+
     let appearanceJSON = Data(##"{"background_color":"#a1b2c3","border_color":"#dEf012","border_enabled":false,"border_width":4.5,"corner_radius":31,"show_state_label":false,"state_label_position":"bottom_right","state_label_size":"large","state_label_color":"#1a2B3c","show_fps":false,"fps_color":"#00eE77","fps_label_size":"regular"}"##.utf8)
     let appearance = try JSONDecoder.codexPet.decode(PetAppearanceConfiguration.self, from: appearanceJSON)
     try require(appearance.backgroundColor == "#A1B2C3", "background color was not normalized")

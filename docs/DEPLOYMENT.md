@@ -106,7 +106,8 @@ The installer:
 - creates marked state-aggregator and player LaunchAgents;
 - merges Statelet's commands into `~/.codex/hooks.json` without replacing
   unrelated commands; and
-- preserves an existing `media-map.json` and user media during upgrades.
+- preserves an existing `media-map.json`, `character-library.json`, hidden
+  per-character maps/assets, and user media during upgrades.
 
 A managed legacy `~/Applications/CodexPetMac.app` is migrated to
 `~/Applications/Statelet.app`. An unmanaged app or LaunchAgent at a managed
@@ -218,7 +219,9 @@ bash mac/CodexPetMac/scripts/install.sh
 ```
 
 Do not uninstall first. A managed upgrade preserves media, the media map, and
-the current start-at-login choice.
+the current start-at-login choice. Multi-character installations also preserve
+the authoritative catalog sidecar and every profile map; the installer does not
+merge profile data into the legacy root map.
 
 The public name is Statelet, while compatibility identifiers remain unchanged:
 
@@ -234,6 +237,9 @@ The public name is Statelet, while compatibility identifiers remain unchanged:
 ```text
 ~/Applications/Statelet.app
 ~/Library/Application Support/CodexPet/media/media-map.json
+~/Library/Application Support/CodexPet/media/character-library.json
+~/Library/Application Support/CodexPet/media/.character-<id>.media-map.json
+~/Library/Application Support/CodexPet/media/.character-<id>.assets/
 ~/Library/Application Support/CodexPet/runtime/current_state.json
 ~/Library/Application Support/CodexPet/sessions/
 ~/Library/Application Support/CodexPet/logs/
@@ -244,7 +250,20 @@ The public name is Statelet, while compatibility identifiers remain unchanged:
 ```
 
 Statelet does not install animation media. Imported media stays under the
-current account's Application Support directory.
+current account's Application Support directory. On an existing or custom
+`--media-map` installation, absence of `character-library.json` bootstraps one
+`Default` profile that points at that configured same-directory root basename.
+Additional profiles keep independent hidden same-directory maps so relative
+media paths and older root-map readers remain compatible.
+
+Exported `.statelet-character` items are user-chosen directory packages, not
+installed application components. Each contains a bounded `manifest.json`, one
+ordinary Statelet media map, and declared assets. Import verifies safe relative
+paths, declared sizes and lowercase SHA-256 hashes, report-to-movie references,
+and AVFoundation playback before committing a new hidden map and asset tree.
+Reports may be absent only for legacy portability; the app requires an explicit
+trust confirmation and still performs playback checks. It does not represent a
+reportless import as locally attested.
 
 ## Uninstall
 
@@ -263,6 +282,8 @@ It intentionally preserves:
 - animation movies and posters;
 - converter reports;
 - `media-map.json`;
+- `character-library.json`;
+- hidden `.character-<id>.media-map.json` files and imported asset trees;
 - aggregate state and per-session records; and
 - local logs.
 

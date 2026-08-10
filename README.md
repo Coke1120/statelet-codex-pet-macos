@@ -26,6 +26,8 @@ use, not a Developer ID-signed or notarized public binary.
   `waiting > review > running > idle` priority.
 - Provides a movable, border-and-corner-resizable transparent AppKit panel.
 - Keeps recovery controls in the menu bar when the panel is click-through.
+- Keeps several named characters in one local library and switches each
+  character's complete four-state animation map from the Animations pane.
 - Supports Fixed, Random, and Sequential animation libraries for every state.
 - Imports one or more MP4 files through an offline, verified HEVC-with-alpha
   conversion pipeline.
@@ -134,6 +136,31 @@ advancing a playlist.
 
 ## Animation libraries
 
+The character selector at the top of **Settings → Animations** chooses which
+character owns the four state libraries shown below it. **New Character…**
+starts with an empty map that copies the current map's window/default-format
+settings; the actions menu can rename, duplicate, export, or delete the active
+character.
+Duplicate copies the character's map, while Delete removes only its catalog
+entry and keeps its map and media files. The last character cannot be deleted.
+
+Existing installations remain the `Default` character backed by the configured
+root map—normally `media-map.json`; no migration rewrites that file. Statelet
+stores the catalog beside it as `character-library.json`. Additional characters
+use separate hidden `.character-<id>.media-map.json` files in that same
+directory, so legacy relative media paths keep the same base directory and older
+Statelet builds can continue editing the default map without deleting other
+characters.
+
+**Import Bundle…** and **Export…** use a directory package ending in
+`.statelet-character`. A package contains one schema-compatible Statelet
+`MediaMap`, a bounded manifest, and declared assets. Import rejects unsafe paths,
+size or hash mismatches, invalid report references, and movies that fail
+AVFoundation playback checks. Reports are validated when present. Reportless
+legacy clips are accepted only after the import confirmation explicitly grants
+legacy trust; they still receive playback checks and are not described as
+locally attested.
+
 Each state has an independent library:
 
 - **Fixed** uses the configured fixed clip for automatic state entry.
@@ -177,6 +204,9 @@ Statelet is designed for local operation:
   paths, clip names, session identifiers, logs, or tool output. Review copied
   diagnostics before sharing them.
 - Media removal is fail-closed and uses recoverable macOS Trash when eligible.
+- Character packages are verified locally from their manifest and lowercase
+  SHA-256 declarations before installation; package reports never silently gain
+  local-attestation status.
 
 Statelet is not sandboxed. Its local installer manages LaunchAgents and merges
 commands into `~/.codex/hooks.json`, and the app reads user-selected media and
@@ -225,9 +255,10 @@ bash mac/CodexPetMac/scripts/uninstall.sh
 
 The uninstaller removes only the marked Statelet app, component directory,
 LaunchAgents, and exact widget hook commands. It preserves animation media,
-`media-map.json`, state, session records, and logs so reinstall and recovery do
-not discard user data. Use Finder if you later choose to move that preserved
-Application Support data to Trash.
+`media-map.json`, `character-library.json`, hidden character maps and assets,
+state, session records, and logs so reinstall and recovery do not discard user
+data. Use Finder if you later choose to move that preserved Application Support
+data to Trash.
 
 ## Development
 
