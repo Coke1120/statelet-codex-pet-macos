@@ -45,8 +45,9 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         override func stopLoading() {}
 
         private static func pcmWAV() -> Data {
+            let sampleBytes = 32_000
             var data = Data("RIFF".utf8)
-            appendUInt32(38, to: &data)
+            appendUInt32(UInt32(36 + sampleBytes), to: &data)
             data.append(Data("WAVEfmt ".utf8))
             appendUInt32(16, to: &data)
             appendUInt16(1, to: &data)
@@ -56,8 +57,8 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             appendUInt16(2, to: &data)
             appendUInt16(16, to: &data)
             data.append(Data("data".utf8))
-            appendUInt32(2, to: &data)
-            appendUInt16(0, to: &data)
+            appendUInt32(UInt32(sampleBytes), to: &data)
+            data.append(Data(repeating: 0, count: sampleBytes))
             return data
         }
 
@@ -379,8 +380,9 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
     }
 
     private func pcmWAV() -> Data {
+        let sampleBytes = 32_000
         var data = Data("RIFF".utf8)
-        appendUInt32(38, to: &data)
+        appendUInt32(UInt32(36 + sampleBytes), to: &data)
         data.append(Data("WAVEfmt ".utf8))
         appendUInt32(16, to: &data)
         appendUInt16(1, to: &data)
@@ -390,8 +392,8 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         appendUInt16(2, to: &data)
         appendUInt16(16, to: &data)
         data.append(Data("data".utf8))
-        appendUInt32(2, to: &data)
-        appendUInt16(0, to: &data)
+        appendUInt32(UInt32(sampleBytes), to: &data)
+        data.append(Data(repeating: 0, count: sampleBytes))
         return data
     }
 
