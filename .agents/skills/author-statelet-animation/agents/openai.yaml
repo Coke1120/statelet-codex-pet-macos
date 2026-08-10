@@ -1,0 +1,4 @@
+interface:
+  display_name: "Author Statelet Animation"
+  short_description: "Create verified Codex Pet animation for macOS"
+  default_prompt: "Use $author-statelet-animation to prepare a verified local animation for Statelet."

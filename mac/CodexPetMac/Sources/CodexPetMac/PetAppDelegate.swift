@@ -1,0 +1,2488 @@
+import AppKit
+import AVFoundation
+import CodexPetCore
+import CryptoKit
+import Darwin
+import OSLog
+import UniformTypeIdentifiers
+
+private struct LaunchOptions {
+    var mediaMapURL: URL
+    var stateURL: URL
+    var forcedState: PetState?
+    var clickThroughOverride: Bool?
+    var alwaysOnTopOverride: Bool?
+    var openSettings: Bool
+
+    static func parse(arguments: [String], fileManager: FileManager = .default) -> LaunchOptions {
+        let support = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/CodexPet", isDirectory: true)
+        let defaultMap = support.appendingPathComponent("media/media-map.json")
+        let defaultState = support.appendingPathComponent("runtime/current_state.json")
+        var options = LaunchOptions(
+            mediaMapURL: defaultMap,
+            stateURL: defaultState,
+            forcedState: nil,
+            clickThroughOverride: nil,
+            alwaysOnTopOverride: nil,
+            openSettings: false
+        )
+
+        var index = 1
+        while index < arguments.count {
+            let argument = arguments[index]
+            switch argument {
+            case "--media-map", "--state":
+                guard index + 1 < arguments.count else { break }
+                let url = URL(fileURLWithPath: arguments[index + 1]).standardizedFileURL
+                if argument == "--media-map" { options.mediaMapURL = url } else { options.stateURL = url }
+                index += 1
+            case "--force-state":
+                guard index + 1 < arguments.count else { break }
+                options.forcedState = PetState(rawValue: arguments[index + 1])
+                index += 1
+            case "--click-through":
+                options.clickThroughOverride = true
+            case "--no-click-through":
+                options.clickThroughOverride = false
+            case "--always-on-top":
+                options.alwaysOnTopOverride = true
+            case "--no-always-on-top":
+                options.alwaysOnTopOverride = false
+            case "--settings":
+                options.openSettings = true
+            default:
+                break
+            }
+            index += 1
+        }
+        return options
+    }
+}
+
+private enum PublisherHealth: String, Equatable {
+    case unknown
+    case live
+    case stale
+    case missing
+    case corrupt
+    case futureSkew = "future_skew"
+    case manual
+
+    var menuTitle: String {
+        switch self {
+        case .unknown: return "Publisher: Checking"
+        case .live: return "Publisher: Live"
+        case .stale: return "Publisher: Stale — showing idle"
+        case .missing: return "Publisher: Missing — showing idle"
+        case .corrupt: return "Publisher: Invalid — showing idle"
+        case .futureSkew: return "Publisher: Clock skew — showing idle"
+        case .manual: return "Publisher: Manual state"
+        }
+    }
+
+    var accessibilitySummary: String {
+        switch self {
+        case .unknown: return "publisher status checking"
+        case .live: return "publisher live"
+        case .stale: return "publisher stale, safe idle fallback"
+        case .missing: return "publisher missing, safe idle fallback"
+        case .corrupt: return "publisher state invalid, safe idle fallback"
+        case .futureSkew: return "publisher clock invalid, safe idle fallback"
+        case .manual: return "manual state override"
+        }
+    }
+
+    func menuTitle(temporaryPreviewActive: Bool) -> String {
+        guard temporaryPreviewActive else { return menuTitle }
+        switch self {
+        case .stale: return "Publisher: Stale — temporary preview active"
+        case .missing: return "Publisher: Missing — temporary preview active"
+        case .corrupt: return "Publisher: Invalid — temporary preview active"
+        case .futureSkew: return "Publisher: Clock skew — temporary preview active"
+        case .unknown, .live, .manual: return menuTitle
+        }
+    }
+
+    func accessibilitySummary(temporaryPreviewActive: Bool) -> String {
+        guard temporaryPreviewActive else { return accessibilitySummary }
+        switch self {
+        case .stale: return "publisher stale, temporary preview active"
+        case .missing: return "publisher missing, temporary preview active"
+        case .corrupt: return "publisher state invalid, temporary preview active"
+        case .futureSkew: return "publisher clock invalid, temporary preview active"
+        case .unknown, .live, .manual: return accessibilitySummary
+        }
+    }
+
+    var usesIdleFallback: Bool {
+        switch self {
+        case .stale, .missing, .corrupt, .futureSkew: return true
+        case .unknown, .live, .manual: return false
+        }
+    }
+
+    var badgeVisualStatus: PublisherBadgeVisualStatus {
+        switch self {
+        case .unknown: return .checking
+        case .live: return .live
+        case .manual: return .manual
+        case .stale, .missing, .corrupt, .futureSkew: return .unavailable
+        }
+    }
+}
+
+private enum MediaMapLoadResult: Equatable {
+    case playbackChanged
+    case windowChanged
+    case unchanged
+    case failed
+
+    var didChange: Bool {
+        self == .playbackChanged || self == .windowChanged
+    }
+}
+
+private struct VerifiedMovieInstall {
+    let directory: URL
+    let movieURL: URL
+    let reportURL: URL
+    let relativePath: String
+}
+
+private struct MP4ImportFailure {
+    let name: String
+    let reason: String
+}
+
+private struct ActiveOneShotPreview {
+    let playback: OneShotPlayback
+    let libraryState: PetState
+    let transitionID: UInt64
+}
+
+private enum StatusMenuTag: Int {
+    case state = 1
+    case clickThrough = 2
+    case publisherHealth = 3
+    case stopOneShot = 4
+    case nextClip = 5
+    case temporaryState = 6
+    case followCodex = 7
+}
+
+final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @unchecked Sendable {
+    private static let healthCheckIntervalSeconds = 30
+    private static let positionSaveDebounceMilliseconds = 300
+
+    private let logger = Logger(subsystem: "com.coke1120.CodexPetMac", category: "app")
+    private let freshnessPolicy = StateFreshnessPolicy.production
+    private var options: LaunchOptions!
+    private var mediaMap = try! MediaMap()
+    private var mediaMapURL: URL!
+    private var panel: PetPanel!
+    private var player: PetPlayerController!
+    private var stateWatcher: StateDirectoryWatcher!
+    private var mapWatcher: StateDirectoryWatcher!
+    private var healthCheckTimer: DispatchSourceTimer?
+    private var positionSaveWorkItem: DispatchWorkItem?
+    private var positionSaveGeneration: UInt64 = 0
+    private var positionStore = PositionStore()
+    private var statusItem: NSStatusItem!
+    private var clickThrough = false
+    private var currentState: PetState = .idle
+    private var lastPublishedSnapshot: CurrentState?
+    private var lastLifecycleStateForSelection: PetState?
+    private var lastPresentedState: PetState?
+    private var pendingPresentationState: PetState?
+    private var publisherHealth: PublisherHealth = .unknown
+    private var mapReadFailureReported = false
+    private var reduceMotion = false
+    private var transitionSequence: UInt64 = 0
+    private var mediaSelectionCursor = MediaSelectionCursor()
+    private var manualPreviewSelectionCursor = MediaSelectionCursor()
+    private var temporaryStatePreviewPolicy = TemporaryStatePreviewPolicy()
+    private var oneShotArbiter = OneShotPlaybackArbiter()
+    private var activeOneShotPreview: ActiveOneShotPreview?
+    private var settingsController: SettingsWindowController?
+    private let toolchainDiscovery = AlphaToolchainDiscovery()
+    private var toolchainState: AlphaToolchainState = .checking
+    private let conversionCoordinator = AlphaConversionCoordinator()
+    private let launchAtLoginManager = LaunchAtLoginManager()
+    private let diagnostics = PetDiagnostics()
+    private var cachedLaunchAtLoginStatus: LaunchAtLoginManager.Status?
+    private var cachedDiagnosticsReport = "Open Diagnostics and choose Refresh to inspect this Mac."
+    private var activeMP4BatchID: UUID?
+    private var mp4BatchCancellationRequested = false
+    private var mediaMapReloadDeferred = false
+    private var mediaMutationInProgress = false {
+        didSet {
+            if oldValue, !mediaMutationInProgress {
+                applyDeferredMediaMapReloadIfNeeded()
+            }
+        }
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        options = LaunchOptions.parse(arguments: CommandLine.arguments)
+        mediaMapURL = options.mediaMapURL
+        loadMediaMap()
+
+        let configuredWindow = mediaMap.window
+        let size = NSSize(width: configuredWindow.width, height: configuredWindow.height)
+        let initialFrame: NSRect
+        if let storedFrame = positionStore.frame(for: NSScreen.main) {
+            initialFrame = WindowFramePolicy.applyingConfiguredSize(size, to: storedFrame)
+        } else {
+            initialFrame = WindowFramePolicy.centeredFrame(
+                in: NSScreen.main?.visibleFrame ?? .zero,
+                size: size
+            )
+        }
+        panel = PetPanel(
+            contentRect: positionStore.clampedFrame(initialFrame),
+            alwaysOnTop: options.alwaysOnTopOverride ?? configuredWindow.alwaysOnTop,
+            fullScreenAuxiliary: configuredWindow.fullScreenAuxiliary
+        )
+        panel.delegate = self
+        panel.contentView = PetPlayerView(frame: panel.contentRect(forFrameRect: panel.frame))
+        player = PetPlayerController(view: panel.contentView as! PetPlayerView)
+        player.view.applyAppearance(configuredWindow.appearance)
+        player.onPresentationEvent = { [weak self] transitionID, state, event in
+            self?.handlePresentationEvent(transitionID: transitionID, state: state, event: event)
+        }
+        player.onOneShotEnded = { [weak self] transitionID in
+            self?.finishOneShotPreview(transitionID: transitionID, reason: "completed")
+        }
+        player.onPlaylistClipEnded = { [weak self] transitionID, state in
+            self?.advancePlaylistAfterClipEnd(transitionID: transitionID, state: state)
+        }
+        player.view.onAdvanceClip = { [weak self] in
+            self?.advanceCurrentClip(reason: "pet_button")
+        }
+        player.view.onPetClick = { [weak self] in
+            self?.advanceCurrentClip(reason: "pet_click")
+        }
+        player.view.onResizeEnded = { [weak self] size in
+            self?.persistUserResizedWindow(size: size)
+        }
+        player.view.onTemporaryStateSelection = { [weak self] state in
+            self?.selectTemporaryState(state, reason: "pet_button")
+        }
+        reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        player.setReduceMotion(reduceMotion)
+        clickThrough = options.clickThroughOverride ?? configuredWindow.clickThrough
+        panel.ignoresMouseEvents = clickThrough
+        panel.orderFrontRegardless()
+
+        installStatusItem()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(screenParametersChanged),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(accessibilityDisplayOptionsChanged),
+            name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+            object: nil
+        )
+        if let forcedState = options.forcedState {
+            setPublisherHealth(.manual)
+            apply(state: forcedState)
+        } else {
+            installWatchers()
+            // Close the startup race between the pre-window load and each
+            // watcher's initial identity snapshot.
+            if loadMediaMap().didChange {
+                applyConfiguredWindowSize()
+            }
+            readState(from: options.stateURL)
+            installHealthCheckTimer()
+        }
+        if options.openSettings {
+            DispatchQueue.main.async { [weak self] in self?.showSettings() }
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        stateWatcher?.stop()
+        mapWatcher?.stop()
+        healthCheckTimer?.cancel()
+        healthCheckTimer = nil
+        positionSaveGeneration &+= 1
+        positionSaveWorkItem?.cancel()
+        positionSaveWorkItem = nil
+        conversionCoordinator.cancel()
+        savePanelFrame()
+        NotificationCenter.default.removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+    }
+
+    func windowDidMove(_ notification: Notification) { schedulePositionSave() }
+    func windowDidResize(_ notification: Notification) { schedulePositionSave() }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showSettings()
+        return true
+    }
+
+    @objc private func screenParametersChanged() {
+        guard let panel else { return }
+        panel.setFrame(positionStore.clampedFrame(panel.frame), display: false)
+        savePanelFrame()
+    }
+
+    @objc private func accessibilityDisplayOptionsChanged() {
+        let newValue = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let motionChanged = newValue != reduceMotion
+        if motionChanged {
+            reduceMotion = newValue
+            player?.setReduceMotion(reduceMotion)
+            apply(state: currentState, forceRefresh: true)
+        }
+        player?.view.applyAppearance(mediaMap.window.appearance)
+        refreshSettings()
+    }
+
+    private func installWatchers() {
+        guard options.forcedState == nil else { return }
+        stateWatcher = StateDirectoryWatcher(fileURL: options.stateURL)
+        stateWatcher.start(emitInitial: false) { [weak self] url in self?.readState(from: url) }
+        mapWatcher = StateDirectoryWatcher(fileURL: mediaMapURL)
+        mapWatcher.start(emitInitial: false) { [weak self] _ in
+            self?.handleMediaMapReloadRequest()
+        }
+    }
+
+    private func installHealthCheckTimer() {
+        guard healthCheckTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(
+            deadline: .now() + .seconds(Self.healthCheckIntervalSeconds),
+            repeating: .seconds(Self.healthCheckIntervalSeconds),
+            leeway: .seconds(5)
+        )
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            // The same low-frequency timer covers in-place map edits that may
+            // not produce a containing-directory event.
+            self.handleMediaMapReloadRequest()
+            self.readState(from: self.options.stateURL)
+        }
+        healthCheckTimer = timer
+        timer.resume()
+    }
+
+    private func handleMediaMapReloadRequest() {
+        guard !mediaMutationInProgress else {
+            mediaMapReloadDeferred = true
+            return
+        }
+        let result = loadMediaMap()
+        guard result != .failed else { return }
+        if result.didChange {
+            applyConfiguredWindowSize()
+        }
+        if result == .playbackChanged {
+            apply(state: currentState, forceRefresh: true)
+        }
+    }
+
+    private func applyDeferredMediaMapReloadIfNeeded() {
+        guard mediaMapReloadDeferred else { return }
+        mediaMapReloadDeferred = false
+        handleMediaMapReloadRequest()
+    }
+
+    @discardableResult
+    private func loadMediaMap() -> MediaMapLoadResult {
+        do {
+            let data = try Data(contentsOf: mediaMapURL)
+            let decoded = try JSONDecoder.codexPet.decode(MediaMap.self, from: data)
+            let impact = MediaMapChangeImpact.decide(previous: mediaMap, incoming: decoded)
+            mediaMap = decoded
+            mapReadFailureReported = false
+            refreshSettings()
+            switch impact {
+            case .unchanged: return .unchanged
+            case .windowOnly: return .windowChanged
+            case .playback: return .playbackChanged
+            }
+        } catch {
+            if !mapReadFailureReported {
+                logger.error("event=media_map_load_failed action=retain_previous_or_defaults")
+                mapReadFailureReported = true
+            }
+            return .failed
+        }
+    }
+
+    private func applyConfiguredWindowSize() {
+        guard let panel else { return }
+        let size = NSSize(width: mediaMap.window.width, height: mediaMap.window.height)
+        let resized = WindowFramePolicy.applyingConfiguredSize(size, to: panel.frame)
+        panel.setFrame(positionStore.clampedFrame(resized), display: true)
+        panel.apply(
+            alwaysOnTop: options.alwaysOnTopOverride ?? mediaMap.window.alwaysOnTop,
+            fullScreenAuxiliary: mediaMap.window.fullScreenAuxiliary
+        )
+        player?.view.applyAppearance(mediaMap.window.appearance)
+    }
+
+    private func readState(from url: URL) {
+        guard FileManager.default.isReadableFile(atPath: url.path) else {
+            lastPublishedSnapshot = nil
+            rejectPublisher(.missing)
+            return
+        }
+        let state: CurrentState
+        do {
+            state = try JSONDecoder.codexPet.decode(CurrentState.self, from: Data(contentsOf: url))
+        } catch {
+            lastPublishedSnapshot = nil
+            rejectPublisher(.corrupt)
+            return
+        }
+        lastPublishedSnapshot = state
+        switch freshnessPolicy.freshness(of: state, now: Date().timeIntervalSince1970) {
+        case .fresh:
+            let previousPreview = temporaryStatePreviewPolicy.previewState
+            let outcome = temporaryStatePreviewPolicy.receiveLifecycleState(state.state)
+            if previousPreview != nil,
+               case .presentingLifecycle = outcome {
+                relinquishTemporaryStatePreview(
+                    previousPreview: previousPreview,
+                    reason: "lifecycle_changed"
+                )
+            }
+            setPublisherHealth(.live)
+            apply(state: state.state)
+        case .stale:
+            rejectPublisher(.stale)
+        case .futureSkew:
+            rejectPublisher(.futureSkew)
+        }
+    }
+
+    private func rejectPublisher(_ health: PublisherHealth) {
+        setPublisherHealth(health)
+        apply(state: .idle)
+    }
+
+    private func setPublisherHealth(_ health: PublisherHealth) {
+        guard publisherHealth != health else { return }
+        publisherHealth = health
+        updateStatusMenu()
+        refreshSettings()
+        logger.info("event=publisher_health health=\(health.rawValue, privacy: .public) idle_fallback=\(health.usesIdleFallback, privacy: .public)")
+    }
+
+    private func apply(state: PetState, forceRefresh: Bool = false) {
+        let shouldAdvanceSelection = MediaSelectionAdvancePolicy.shouldAdvance(
+            previousLifecycleState: lastLifecycleStateForSelection,
+            incomingState: state,
+            forceRefresh: forceRefresh
+        )
+        lastLifecycleStateForSelection = state
+        if forceRefresh {
+            cancelActiveOneShotWithoutRestore(reason: "forced_refresh")
+        } else if activeOneShotPreview != nil {
+            switch oneShotArbiter.heartbeat(state: state) {
+            case .inactive:
+                activeOneShotPreview = nil
+                player.clearTransientPresentation()
+                lastPresentedState = nil
+                pendingPresentationState = nil
+            case .continuing:
+                break
+            case let .preempted(preview):
+                activeOneShotPreview = nil
+                player.clearTransientPresentation()
+                lastPresentedState = nil
+                pendingPresentationState = nil
+                logger.info("event=one_shot_preempted token=\(preview.token.rawValue, privacy: .public) lifecycle_state=\(state.rawValue, privacy: .public)")
+            }
+        }
+        let presentationState = temporaryStatePreviewPolicy.previewState ?? state
+        let decision = StatePresentationDecision.decide(
+            lastPresentedState: lastPresentedState,
+            pendingState: pendingPresentationState,
+            incomingState: presentationState,
+            forceRefresh: forceRefresh
+        )
+        currentState = state
+        updateStatusMenu()
+        refreshSettings()
+        guard decision.shouldRefresh else { return }
+
+        startLifecyclePresentation(
+            state: presentationState,
+            advanceSelection: temporaryStatePreviewPolicy.previewState == nil
+                ? shouldAdvanceSelection
+                : false,
+            refreshReason: decision.rawValue,
+            useManualPreviewCursor: temporaryStatePreviewPolicy.previewState != nil
+        )
+    }
+
+    private func startLifecyclePresentation(
+        state: PetState,
+        advanceSelection: Bool,
+        refreshReason: String,
+        useManualPreviewCursor: Bool = false,
+        explicitUserAdvance: Bool = false
+    ) {
+
+        let started = DispatchTime.now().uptimeNanoseconds
+        transitionSequence &+= 1
+        let transitionID = transitionSequence
+        let entry = selectedEntry(
+            for: state,
+            advance: advanceSelection,
+            useManualPreviewCursor: useManualPreviewCursor,
+            explicitUserAdvance: explicitUserAdvance
+        )
+        let url = entry.map { mediaMap.resolvedURL(for: $0, relativeTo: mediaMapURL) }
+        let posterURL = entry.flatMap { mediaMap.resolvedPosterURL(for: $0, relativeTo: mediaMapURL) }
+        let continuousRotation = mediaMap.playlist(for: state)?.isContinuousRotationEffective == true
+        let startResult = player?.show(
+            state: state,
+            entry: entry,
+            url: url,
+            posterURL: posterURL,
+            transitionID: transitionID,
+            startedAt: started,
+            advancePlaylistWhenEnded: continuousRotation
+        ) ?? .failed
+        switch startResult {
+        case .presented:
+            lastPresentedState = state
+            pendingPresentationState = nil
+        case .preparing:
+            lastPresentedState = nil
+            pendingPresentationState = state
+        case .failed:
+            lastPresentedState = nil
+            pendingPresentationState = nil
+        }
+        updateStatusMenu()
+        refreshSettings()
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+        logger.info("event=state_transition_setup transition_id=\(transitionID, privacy: .public) state=\(state.rawValue, privacy: .public) refresh_reason=\(refreshReason, privacy: .public) start_result=\(startResult.rawValue, privacy: .public) reduce_motion=\(self.reduceMotion, privacy: .public) continuous_rotation=\(continuousRotation, privacy: .public) setup_duration_ms=\(elapsed, format: .fixed(precision: 3), privacy: .public)")
+    }
+
+    private func advancePlaylistAfterClipEnd(transitionID: UInt64, state: PetState) {
+        guard transitionID == transitionSequence,
+              state == effectivePresentationState,
+              activeOneShotPreview == nil,
+              mediaMap.playlist(for: state)?.isContinuousRotationEffective == true else { return }
+        pendingPresentationState = nil
+        logger.info("event=playlist_advance_triggered transition_id=\(transitionID, privacy: .public) state=\(state.rawValue, privacy: .public) reason=clip_end")
+        startLifecyclePresentation(
+            state: state,
+            advanceSelection: true,
+            refreshReason: "clip_end",
+            useManualPreviewCursor: temporaryStatePreviewPolicy.previewState != nil
+        )
+    }
+
+    private func handlePresentationEvent(
+        transitionID: UInt64,
+        state: PetState,
+        event: PlaybackPresentationEvent
+    ) {
+        guard transitionID == transitionSequence, state == effectivePresentationState else { return }
+        pendingPresentationState = nil
+        if activeOneShotPreview?.transitionID == transitionID {
+            switch event {
+            case .ready:
+                lastPresentedState = state
+                logger.info("event=one_shot_ready transition_id=\(transitionID, privacy: .public) lifecycle_state=\(state.rawValue, privacy: .public)")
+                updateStatusMenu()
+                refreshSettings()
+            case .failed:
+                logger.error("event=one_shot_failed transition_id=\(transitionID, privacy: .public) lifecycle_state=\(state.rawValue, privacy: .public)")
+                finishOneShotPreview(transitionID: transitionID, reason: "failed")
+            }
+            return
+        }
+        switch event {
+        case .ready:
+            lastPresentedState = state
+            logger.info("event=presentation_committed transition_id=\(transitionID, privacy: .public) state=\(state.rawValue, privacy: .public)")
+        case .failed:
+            lastPresentedState = nil
+            logger.error("event=presentation_revoked transition_id=\(transitionID, privacy: .public) state=\(state.rawValue, privacy: .public)")
+        }
+        updateStatusMenu()
+    }
+
+    private func selectedEntry(
+        for state: PetState,
+        advance: Bool,
+        useManualPreviewCursor: Bool,
+        explicitUserAdvance: Bool = false
+    ) -> MediaEntry? {
+        guard let playlist = mediaMap.playlist(for: state) else {
+            if useManualPreviewCursor {
+                manualPreviewSelectionCursor.reset(state: state)
+            } else {
+                mediaSelectionCursor.reset(state: state)
+            }
+            return nil
+        }
+        let eligibility: (MediaEntry) -> Bool = { [mediaMap, mediaMapURL] entry in
+            guard let mediaMapURL else { return false }
+            let url = mediaMap.resolvedURL(for: entry, relativeTo: mediaMapURL)
+            return FileManager.default.isReadableFile(atPath: url.path)
+        }
+        let selected: MediaEntry?
+        if useManualPreviewCursor {
+            if explicitUserAdvance {
+                selected = manualPreviewSelectionCursor.selectNextExplicitly(
+                    for: state,
+                    from: playlist,
+                    isEligible: eligibility
+                )
+            } else {
+                selected = manualPreviewSelectionCursor.select(
+                    for: state,
+                    from: playlist,
+                    advance: advance,
+                    isEligible: eligibility
+                )
+            }
+        } else {
+            if explicitUserAdvance {
+                selected = mediaSelectionCursor.selectNextExplicitly(
+                    for: state,
+                    from: playlist,
+                    isEligible: eligibility
+                )
+            } else {
+                selected = mediaSelectionCursor.select(
+                    for: state,
+                    from: playlist,
+                    advance: advance,
+                    isEligible: eligibility
+                )
+            }
+        }
+        if let selected,
+           let index = playlist.entries.firstIndex(where: { $0.path == selected.path }) {
+            let selectionScope = useManualPreviewCursor ? "manual_preview" : "lifecycle"
+            logger.info("event=media_selected state=\(state.rawValue, privacy: .public) mode=\(playlist.mode.rawValue, privacy: .public) index=\(index, privacy: .public) count=\(playlist.entries.count, privacy: .public) advanced=\(advance, privacy: .public) explicit_user_advance=\(explicitUserAdvance, privacy: .public) selection_scope=\(selectionScope, privacy: .public)")
+        } else {
+            logger.error("event=media_selection_unavailable state=\(state.rawValue, privacy: .public) mode=\(playlist.mode.rawValue, privacy: .public) count=\(playlist.entries.count, privacy: .public)")
+        }
+        return selected
+    }
+
+    private var effectivePresentationState: PetState {
+        temporaryStatePreviewPolicy.previewState ?? currentState
+    }
+
+    private var reportedProducerState: PetState {
+        temporaryStatePreviewPolicy.realState ?? currentState
+    }
+
+    private func canAdvanceClip(for state: PetState) -> Bool {
+        guard let playlist = mediaMap.playlist(for: state) else { return false }
+        let cursor = temporaryStatePreviewPolicy.previewState == nil
+            ? mediaSelectionCursor
+            : manualPreviewSelectionCursor
+        return MediaSelectionCursor.canSelectNextExplicitly(
+            currentPath: cursor.selectedPath(for: state),
+            from: playlist
+        ) { [mediaMap, mediaMapURL] entry in
+            guard let mediaMapURL else { return false }
+            let url = mediaMap.resolvedURL(for: entry, relativeTo: mediaMapURL)
+            return FileManager.default.isReadableFile(atPath: url.path)
+        }
+    }
+
+    private func advanceCurrentClip(reason: String) {
+        let state = effectivePresentationState
+        guard canAdvanceClip(for: state) else {
+            updateStatusMenu()
+            return
+        }
+        cancelActiveOneShotWithoutRestore(reason: "next_clip")
+        pendingPresentationState = nil
+        logger.info("event=playlist_advance_triggered state=\(state.rawValue, privacy: .public) reason=\(reason, privacy: .public)")
+        startLifecyclePresentation(
+            state: state,
+            advanceSelection: true,
+            refreshReason: reason,
+            useManualPreviewCursor: temporaryStatePreviewPolicy.previewState != nil,
+            explicitUserAdvance: true
+        )
+    }
+
+    private func selectTemporaryState(_ state: PetState?, reason: String) {
+        guard let state else {
+            stopTemporaryStatePreview(reason: reason)
+            return
+        }
+        if temporaryStatePreviewPolicy.previewState == state {
+            updateStatusMenu()
+            return
+        }
+        if temporaryStatePreviewPolicy.previewState == nil, state == currentState {
+            updateStatusMenu()
+            return
+        }
+
+        cancelActiveOneShotWithoutRestore(reason: "temporary_state_changed")
+        if temporaryStatePreviewPolicy.previewState == nil {
+            manualPreviewSelectionCursor = mediaSelectionCursor
+        }
+        player.clearTransientPresentation()
+        lastPresentedState = nil
+        pendingPresentationState = nil
+        _ = temporaryStatePreviewPolicy.begin(
+            previewState: state,
+            baselineRealState: temporaryStatePreviewPolicy.realState
+        )
+        logger.info("event=temporary_state_preview_started preview_state=\(state.rawValue, privacy: .public) reason=\(reason, privacy: .public)")
+        startLifecyclePresentation(
+            state: state,
+            advanceSelection: true,
+            refreshReason: "temporary_state_preview",
+            useManualPreviewCursor: true
+        )
+    }
+
+    private func stopTemporaryStatePreview(reason: String) {
+        guard let preview = temporaryStatePreviewPolicy.previewState else {
+            updateStatusMenu()
+            return
+        }
+        _ = temporaryStatePreviewPolicy.cancel()
+        relinquishTemporaryStatePreview(previousPreview: preview, reason: reason)
+        startLifecyclePresentation(
+            state: currentState,
+            advanceSelection: false,
+            refreshReason: "follow_codex",
+            useManualPreviewCursor: false
+        )
+    }
+
+    private func relinquishTemporaryStatePreview(
+        previousPreview: PetState?,
+        reason: String
+    ) {
+        cancelActiveOneShotWithoutRestore(reason: "temporary_state_relinquished")
+        player.clearTransientPresentation()
+        lastPresentedState = nil
+        pendingPresentationState = nil
+        if let previousPreview {
+            logger.info("event=temporary_state_preview_stopped preview_state=\(previousPreview.rawValue, privacy: .public) reason=\(reason, privacy: .public)")
+        }
+    }
+
+    private func installStatusItem() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        let brandedImage = Bundle.main.url(
+            forResource: "StateletMenuBarTemplate",
+            withExtension: "pdf"
+        ).flatMap(NSImage.init(contentsOf:))
+        brandedImage?.isTemplate = true
+        brandedImage?.size = NSSize(width: 18, height: 18)
+        statusItem.button?.image = brandedImage ?? NSImage(
+            systemSymbolName: "sparkles",
+            accessibilityDescription: "Statelet"
+        )
+        statusItem.button?.setAccessibilityLabel("Statelet")
+        statusItem.menu = makeMenu()
+        player?.view.contextMenuProvider = { [weak self] in self?.statusItem?.menu }
+    }
+
+    private func makeMenu() -> NSMenu {
+        let menu = NSMenu()
+        let stateItem = NSMenuItem(title: "State: \(currentState.rawValue)", action: nil, keyEquivalent: "")
+        stateItem.tag = StatusMenuTag.state.rawValue
+        stateItem.isEnabled = false
+        menu.addItem(stateItem)
+        let healthItem = NSMenuItem(title: publisherHealth.menuTitle, action: nil, keyEquivalent: "")
+        healthItem.tag = StatusMenuTag.publisherHealth.rawValue
+        healthItem.isEnabled = false
+        menu.addItem(healthItem)
+        let stopPreviewItem = NSMenuItem(
+            title: "Stop Play Once",
+            action: #selector(stopOneShotPreviewFromMenu),
+            keyEquivalent: ""
+        )
+        stopPreviewItem.target = self
+        stopPreviewItem.tag = StatusMenuTag.stopOneShot.rawValue
+        stopPreviewItem.isHidden = true
+        menu.addItem(stopPreviewItem)
+        let nextClipItem = NSMenuItem(
+            title: "Next Clip",
+            action: #selector(advanceCurrentClipFromMenu),
+            keyEquivalent: "]"
+        )
+        nextClipItem.target = self
+        nextClipItem.tag = StatusMenuTag.nextClip.rawValue
+        menu.addItem(nextClipItem)
+        let temporaryStateItem = NSMenuItem(title: "Temporary State", action: nil, keyEquivalent: "")
+        temporaryStateItem.tag = StatusMenuTag.temporaryState.rawValue
+        temporaryStateItem.submenu = makeTemporaryStateMenu()
+        menu.addItem(temporaryStateItem)
+        menu.addItem(.separator())
+        let clickItem = NSMenuItem(title: "Click-through", action: #selector(toggleClickThrough), keyEquivalent: "")
+        clickItem.target = self
+        clickItem.tag = StatusMenuTag.clickThrough.rawValue
+        menu.addItem(clickItem)
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(showSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+        menu.addItem(NSMenuItem(title: "Reveal media folder", action: #selector(revealMediaFolder), keyEquivalent: ""))
+        menu.items.last?.target = self
+        menu.addItem(.separator())
+        let quitItem = NSMenuItem(title: "Quit Statelet", action: #selector(quit), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
+        return menu
+    }
+
+    private func makeTemporaryStateMenu() -> NSMenu {
+        let menu = NSMenu(title: "Temporary State")
+        for state in PetState.allCases {
+            let item = NSMenuItem(
+                title: state.rawValue.capitalized,
+                action: #selector(selectTemporaryStateFromMenu(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = state.rawValue
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        let followItem = NSMenuItem(
+            title: "Follow Codex",
+            action: #selector(followCodexFromMenu),
+            keyEquivalent: "0"
+        )
+        followItem.target = self
+        followItem.tag = StatusMenuTag.followCodex.rawValue
+        menu.addItem(followItem)
+        return menu
+    }
+
+    private func updateStatusMenu() {
+        let stateTitle = statusMenuStateTitle
+        let targetState = effectivePresentationState
+        let canAdvance = canAdvanceClip(for: targetState)
+        let manualPreview = temporaryStatePreviewPolicy.previewState
+        let reportedLiveState = manualPreview == nil ? currentState : reportedProducerState
+        let healthTitle = publisherHealth.menuTitle(temporaryPreviewActive: manualPreview != nil)
+        let menu = statusItem?.menu
+        if let stateItem = menu?.item(withTag: StatusMenuTag.state.rawValue) {
+            stateItem.title = stateTitle
+        }
+        if let healthItem = menu?.item(withTag: StatusMenuTag.publisherHealth.rawValue) {
+            healthItem.title = healthTitle
+        }
+        if let clickItem = menu?.item(withTag: StatusMenuTag.clickThrough.rawValue) {
+            clickItem.state = clickThrough ? .on : .off
+        }
+        if let stopPreviewItem = menu?.item(withTag: StatusMenuTag.stopOneShot.rawValue) {
+            stopPreviewItem.isHidden = activeOneShotPreview == nil
+            stopPreviewItem.isEnabled = activeOneShotPreview != nil
+        }
+        if let nextClipItem = menu?.item(withTag: StatusMenuTag.nextClip.rawValue) {
+            nextClipItem.isEnabled = canAdvance
+            nextClipItem.toolTip = canAdvance
+                ? "Immediately show another playable \(targetState.rawValue) clip"
+                : "No different readable \(targetState.rawValue) clip is available"
+        }
+        if let temporaryStateItem = menu?.item(withTag: StatusMenuTag.temporaryState.rawValue) {
+            temporaryStateItem.title = manualPreview.map {
+                "Temporary State: \($0.rawValue.capitalized)"
+            } ?? "Temporary State: Follow Codex"
+            for item in temporaryStateItem.submenu?.items ?? [] {
+                if let rawValue = item.representedObject as? String,
+                   let state = PetState(rawValue: rawValue) {
+                    item.state = manualPreview == state ? .on : .off
+                }
+            }
+            if let followItem = temporaryStateItem.submenu?.item(
+                withTag: StatusMenuTag.followCodex.rawValue
+            ) {
+                followItem.state = manualPreview == nil ? .on : .off
+                followItem.isEnabled = manualPreview != nil
+            }
+        }
+        let tooltip = "Statelet — \(stateTitle) — \(healthTitle)"
+        statusItem.button?.toolTip = tooltip
+        player?.view.toolTip = tooltip
+        player?.updatePublisherHealth(
+            publisherHealth.accessibilitySummary(temporaryPreviewActive: manualPreview != nil)
+        )
+        player?.view.updateStateBadge(
+            state: targetState,
+            publisherStatus: publisherHealth.badgeVisualStatus
+        )
+        player?.view.updateQuickControls(
+            canAdvanceClip: canAdvance,
+            liveState: reportedLiveState,
+            displayedState: player?.currentState ?? targetState,
+            manualPreview: manualPreview
+        )
+    }
+
+    private var statusMenuStateTitle: String {
+        guard let manualPreview = temporaryStatePreviewPolicy.previewState else {
+            return player?.presentationStatus.menuTitle(requestedState: currentState)
+                ?? "State: \(currentState.rawValue)"
+        }
+        let prefix = "Codex: \(reportedProducerState.rawValue) · Preview: \(manualPreview.rawValue)"
+        guard let status = player?.presentationStatus else { return prefix }
+        switch status {
+        case .awaiting, .presented:
+            return prefix
+        case .preparing:
+            return "\(prefix) — preparing"
+        case let .previewing(_, clipName):
+            return "\(prefix) — playing \(clipName) once"
+        case .placeholder:
+            return "\(prefix) — media unavailable"
+        case let .retained(_, displayed):
+            return "\(prefix) — showing \(displayed.rawValue)"
+        }
+    }
+
+    @objc private func advanceCurrentClipFromMenu() {
+        advanceCurrentClip(reason: "menu")
+    }
+
+    @objc private func selectTemporaryStateFromMenu(_ sender: NSMenuItem) {
+        guard let rawValue = sender.representedObject as? String,
+              let state = PetState(rawValue: rawValue) else { return }
+        selectTemporaryState(state, reason: "menu")
+    }
+
+    @objc private func followCodexFromMenu() {
+        selectTemporaryState(nil, reason: "menu")
+    }
+
+    @objc private func toggleClickThrough() {
+        clickThrough.toggle()
+        panel.ignoresMouseEvents = clickThrough
+        updateStatusMenu()
+        persistRuntimeClickThrough()
+        refreshSettings()
+    }
+
+    @objc private func showSettings() {
+        if settingsController == nil {
+            settingsController = makeSettingsController()
+            checkConversionTools()
+        }
+        refreshDiagnosticsSnapshot()
+        refreshSettings()
+        settingsController?.show()
+    }
+
+    private func makeSettingsController() -> SettingsWindowController {
+        let controller = SettingsWindowController()
+        controller.onImportMP4 = { [weak self] state in self?.chooseMP4(for: state) }
+        controller.onDropMP4s = { [weak self] state, urls in self?.importMP4s(urls, for: state) }
+        controller.onUseMovie = { [weak self] state in self?.chooseTransparentMovie(for: state) }
+        controller.onPlaybackModeChange = { [weak self] state, mode in
+            self?.changePlaybackMode(for: state, to: mode)
+        }
+        controller.onAdvanceTriggerChange = { [weak self] state, policy in
+            self?.changeAdvancePolicy(for: state, to: policy)
+        }
+        controller.onMoveMedia = { [weak self] state, path, destinationIndex in
+            self?.moveMedia(for: state, path: path, to: destinationIndex)
+        }
+        controller.onRelinkMedia = { [weak self] state, path in
+            self?.relinkMedia(for: state, path: path)
+        }
+        controller.onPlayOnce = { [weak self] state, path in self?.playOnce(state: state, path: path) }
+        controller.onStopPreview = { [weak self] in self?.stopOneShotPreview(reason: "settings") }
+        controller.onSetFixed = { [weak self] state, path in self?.setFixedEntry(for: state, path: path) }
+        controller.onChoosePoster = { [weak self] state, path in self?.choosePoster(for: state, path: path) }
+        controller.onRemovePoster = { [weak self] state, path in self?.removePoster(for: state, path: path) }
+        controller.onRevealMedia = { [weak self] state, path in self?.revealMedia(for: state, path: path) }
+        controller.onRemoveMedia = { [weak self] state, path, mode in
+            self?.removeMedia(for: state, path: path, mode: mode)
+        }
+        controller.onRevealMediaFolder = { [weak self] in self?.revealMediaFolder() }
+        controller.onRevealMap = { [weak self] in self?.revealMediaMap() }
+        controller.onRevealLogs = { [weak self] in self?.revealLogsFolder() }
+        controller.onRevealApp = { [weak self] in self?.revealApp() }
+        controller.onCheckTools = { [weak self] in self?.checkConversionTools() }
+        controller.onChoosePython = { [weak self] in self?.choosePythonRuntime() }
+        controller.onCancelConversion = { [weak self] in self?.cancelMP4ImportBatch() }
+        controller.onWindowSettingsChange = { [weak self] update in self?.applyWindowSettings(update) }
+        controller.onResetPosition = { [weak self] in self?.resetPanelPosition() }
+        controller.onRefreshDiagnostics = { [weak self] in self?.refreshDiagnosticsSnapshot() }
+        controller.onRepairInstallation = { [weak self] in self?.repairStartupInstallation() }
+        controller.onLaunchAtLoginChange = { [weak self] enabled in self?.setLaunchAtLogin(enabled) }
+        controller.onCleanUnusedMedia = { [weak self] in self?.cleanUnusedMedia() }
+        controller.update(toolchainState: toolchainState)
+        return controller
+    }
+
+    private func refreshSettings() {
+        guard let settingsController else { return }
+        let effectiveMap: MediaMap
+        do {
+            let effectiveWindow = try mediaMap.window.replacing(
+                alwaysOnTop: options?.alwaysOnTopOverride,
+                clickThrough: options?.clickThroughOverride
+            )
+            effectiveMap = try mediaMap.replacingWindow(effectiveWindow)
+        } catch {
+            effectiveMap = mediaMap
+        }
+        settingsController.update(
+            snapshot: SettingsSnapshot(
+                mediaMap: effectiveMap,
+                mediaMapURL: mediaMapURL,
+                publisherSummary: publisherSettingsSummary,
+                reduceMotion: reduceMotion,
+                currentState: currentState,
+                preview: activeOneShotPreview.map {
+                    SettingsPreviewMetadata(state: $0.libraryState, path: $0.playback.path)
+                },
+                diagnosticsReport: cachedDiagnosticsReport,
+                launchAtLoginEnabled: cachedLaunchAtLoginStatus?.isEnabled ?? false,
+                launchAtLoginSummary: cachedLaunchAtLoginStatus?.summary ?? "Choose Refresh to inspect startup.",
+                repairAvailable: cachedLaunchAtLoginStatus?.canRepair ?? false
+            )
+        )
+        settingsController.update(toolchainState: toolchainState)
+    }
+
+    private var publisherSettingsSummary: String {
+        let stateName = currentState.rawValue.capitalized
+        if let manualPreview = temporaryStatePreviewPolicy.previewState {
+            return "\(publisherHealth.menuTitle(temporaryPreviewActive: true)) · Codex state: \(reportedProducerState.rawValue.capitalized) · Temporary preview: \(manualPreview.rawValue.capitalized)"
+        }
+        switch publisherHealth {
+        case .live:
+            return "Lifecycle connected · Current state: \(stateName)"
+        case .manual:
+            return "Manual preview · Current state: \(stateName)"
+        case .unknown:
+            return "Lifecycle status is being checked"
+        case .stale:
+            return "Lifecycle updates are stale · Showing Idle"
+        case .missing:
+            return "Lifecycle publisher unavailable · Showing Idle"
+        case .corrupt:
+            return "Lifecycle data is invalid · Showing Idle"
+        case .futureSkew:
+            return "Lifecycle clock is invalid · Showing Idle"
+        }
+    }
+
+    private func checkConversionTools() {
+        toolchainState = .checking
+        settingsController?.update(toolchainState: .checking)
+        toolchainDiscovery.discover { [weak self] state in
+            guard let self else { return }
+            self.toolchainState = state
+            self.settingsController?.update(toolchainState: state)
+        }
+    }
+
+    private func choosePythonRuntime() {
+        guard let settingsWindow = settingsController?.window else { return }
+        let openPanel = NSOpenPanel()
+        openPanel.title = "Choose Python 3"
+        openPanel.message = "Choose a Python executable that can import NumPy and Pillow. Statelet stores this local path in its preferences."
+        openPanel.prompt = "Use Python"
+        openPanel.canChooseDirectories = false
+        openPanel.allowsMultipleSelection = false
+        openPanel.beginSheetModal(for: settingsWindow) { [weak self] response in
+            guard response == .OK, let url = openPanel.url else { return }
+            UserDefaults.standard.set(
+                url.standardizedFileURL.path,
+                forKey: AlphaToolchainDiscovery.configuredPythonDefaultsKey
+            )
+            self?.checkConversionTools()
+        }
+    }
+
+    private func chooseMP4(for state: PetState) {
+        guard !mediaMutationInProgress else { return }
+        guard let settingsWindow = settingsController?.window else { return }
+        guard toolchainState.isReady else {
+            presentSettingsError("Conversion tools aren’t ready. Use Setup Guide, then Check Again.")
+            return
+        }
+        let openPanel = NSOpenPanel()
+        openPanel.title = "Import MP4s for \(state.rawValue.capitalized)"
+        openPanel.message = "Background removal, encoding, and verification run entirely on this Mac. Only use media you own or are authorized to use."
+        openPanel.prompt = "Import MP4s"
+        openPanel.allowedContentTypes = [.mpeg4Movie]
+        openPanel.allowsMultipleSelection = true
+        openPanel.canChooseDirectories = false
+        openPanel.beginSheetModal(for: settingsWindow) { [weak self] response in
+            guard response == .OK, !openPanel.urls.isEmpty else { return }
+            self?.importMP4s(openPanel.urls, for: state)
+        }
+    }
+
+    private func importMP4s(_ sourceURLs: [URL], for state: PetState) {
+        guard !mediaMutationInProgress else {
+            settingsController?.update(activity: .failed(state, "Nothing imported · wait for the current media operation to finish"))
+            return
+        }
+        guard case let .ready(toolchain) = toolchainState else {
+            settingsController?.update(activity: .failed(state, "Nothing imported · conversion tools aren’t ready"))
+            return
+        }
+        switch MP4ImportURLValidator.validate(sourceURLs) {
+        case let .rejected(reason):
+            settingsController?.update(activity: .failed(state, "Nothing imported · \(reason)"))
+        case let .accepted(orderedURLs):
+            startConversionBatch(sourceURLs: orderedURLs, state: state, toolchain: toolchain)
+        }
+    }
+
+    private func startConversionBatch(
+        sourceURLs: [URL],
+        state: PetState,
+        toolchain: AlphaToolchain
+    ) {
+        guard !sourceURLs.isEmpty else { return }
+        do {
+            try prepareMediaDirectory()
+        } catch {
+            presentSettingsError("Statelet couldn’t prepare the Media folder.")
+            return
+        }
+        mediaMutationInProgress = true
+        let batchID = UUID()
+        activeMP4BatchID = batchID
+        mp4BatchCancellationRequested = false
+        convertNextMP4(
+            sourceURLs: sourceURLs,
+            index: 0,
+            state: state,
+            toolchain: toolchain,
+            imported: 0,
+            failures: [],
+            batchID: batchID
+        )
+    }
+
+    private func convertNextMP4(
+        sourceURLs: [URL],
+        index: Int,
+        state: PetState,
+        toolchain: AlphaToolchain,
+        imported: Int,
+        failures: [MP4ImportFailure],
+        batchID: UUID
+    ) {
+        guard activeMP4BatchID == batchID else { return }
+        if mp4BatchCancellationRequested {
+            finishMP4Batch(
+                state: state,
+                total: sourceURLs.count,
+                imported: imported,
+                failures: failures,
+                cancelled: true,
+                batchID: batchID
+            )
+            return
+        }
+        guard index < sourceURLs.count else {
+            finishMP4Batch(
+                state: state,
+                total: sourceURLs.count,
+                imported: imported,
+                failures: failures,
+                cancelled: false,
+                batchID: batchID
+            )
+            return
+        }
+        let sourceURL = sourceURLs[index]
+        let token = versionToken()
+        let outputURL = mediaMapURL.deletingLastPathComponent()
+            .appendingPathComponent("\(state.rawValue)-\(token).mov")
+        let reportURL = mediaMapURL.deletingLastPathComponent()
+            .appendingPathComponent("\(state.rawValue)-\(token).report.json")
+        let position = index + 1
+        settingsController?.update(
+            activity: .converting(
+                state,
+                "Clip \(position) of \(sourceURLs.count): checking source and conversion tools…"
+            ),
+            progressValue: batchProgress(index: index, total: sourceURLs.count, clipPercent: 0)
+        )
+        conversionCoordinator.convert(
+            sourceURL: sourceURL,
+            outputURL: outputURL,
+            reportURL: reportURL,
+            width: Int(mediaMap.window.width.rounded()),
+            height: Int(mediaMap.window.height.rounded()),
+            toolchain: toolchain,
+            phase: { [weak self] phase in
+                guard let self else { return }
+                self.settingsController?.update(
+                    activity: .converting(state, "Clip \(position) of \(sourceURLs.count): \(phase)"),
+                    progressValue: self.batchProgress(
+                        index: index,
+                        total: sourceURLs.count,
+                        clipPercent: 0
+                    )
+                )
+            },
+            progress: { [weak self] progress in
+                guard let self, self.activeMP4BatchID == batchID else { return }
+                let clipPercent = min(96, progress.percent * 0.96)
+                self.settingsController?.update(
+                    activity: .converting(
+                        state,
+                        "Clip \(position) of \(sourceURLs.count): \(progress.message)"
+                    ),
+                    progressValue: self.batchProgress(
+                        index: index,
+                        total: sourceURLs.count,
+                        clipPercent: clipPercent
+                    )
+                )
+            },
+            completion: { [weak self] result in
+                guard let self else { return }
+                switch result {
+                case let .failure(error):
+                    try? FileManager.default.removeItem(at: outputURL)
+                    try? FileManager.default.removeItem(at: reportURL)
+                    if self.mp4BatchCancellationRequested
+                        || (error as? AlphaConversionFailure).map({
+                            if case .cancelled = $0 { return true }
+                            return false
+                        }) == true {
+                        self.finishMP4Batch(
+                            state: state,
+                            total: sourceURLs.count,
+                            imported: imported,
+                            failures: failures,
+                            cancelled: true,
+                            batchID: batchID
+                        )
+                    } else {
+                        let failure = MP4ImportFailure(
+                            name: self.safeMediaDisplayName(sourceURL),
+                            reason: String(error.localizedDescription.prefix(300))
+                        )
+                        self.logger.error("event=animation_import_failed state=\(state.rawValue, privacy: .public) batch_index=\(position, privacy: .public) batch_count=\(sourceURLs.count, privacy: .public) stage=converter")
+                        self.convertNextMP4(
+                            sourceURLs: sourceURLs,
+                            index: index + 1,
+                            state: state,
+                            toolchain: toolchain,
+                            imported: imported,
+                            failures: failures + [failure],
+                            batchID: batchID
+                        )
+                    }
+                case let .success(conversion):
+                    self.settingsController?.update(
+                        activity: .converting(state, "Clip \(position) of \(sourceURLs.count): validating transparency…"),
+                        progressValue: self.batchProgress(
+                            index: index,
+                            total: sourceURLs.count,
+                            clipPercent: 97
+                        )
+                    )
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        let validation = Result {
+                            let digest = try Self.sha256Hex(of: conversion.outputURL)
+                            return try AlphaConversionReportValidator.validate(
+                                data: conversion.reportData,
+                                expectedOutputBasename: conversion.outputURL.lastPathComponent,
+                                actualOutputSHA256: digest
+                            )
+                        }
+                        DispatchQueue.main.async {
+                            guard self.activeMP4BatchID == batchID else {
+                                try? FileManager.default.removeItem(at: conversion.outputURL)
+                                try? FileManager.default.removeItem(at: conversion.reportURL)
+                                return
+                            }
+                            if self.mp4BatchCancellationRequested {
+                                try? FileManager.default.removeItem(at: conversion.outputURL)
+                                try? FileManager.default.removeItem(at: conversion.reportURL)
+                                self.finishMP4Batch(
+                                    state: state,
+                                    total: sourceURLs.count,
+                                    imported: imported,
+                                    failures: failures,
+                                    cancelled: true,
+                                    batchID: batchID
+                                )
+                                return
+                            }
+                            var nextImported = imported
+                            var nextFailures = failures
+                            switch validation {
+                            case let .failure(error):
+                                try? FileManager.default.removeItem(at: conversion.outputURL)
+                                try? FileManager.default.removeItem(at: conversion.reportURL)
+                                nextFailures.append(
+                                    MP4ImportFailure(
+                                        name: self.safeMediaDisplayName(sourceURL),
+                                        reason: String(error.localizedDescription.prefix(300))
+                                    )
+                                )
+                                self.logger.error("event=animation_import_failed state=\(state.rawValue, privacy: .public) batch_index=\(position, privacy: .public) batch_count=\(sourceURLs.count, privacy: .public) stage=report_validation")
+                            case let .success(report):
+                                do {
+                                    self.settingsController?.update(
+                                        activity: .converting(
+                                            state,
+                                            "Clip \(position) of \(sourceURLs.count): adding verified movie…"
+                                        ),
+                                        progressValue: self.batchProgress(
+                                            index: index,
+                                            total: sourceURLs.count,
+                                            clipPercent: 99
+                                        )
+                                    )
+                                    try self.installMediaEntry(
+                                        for: state,
+                                        path: conversion.outputURL.lastPathComponent
+                                    )
+                                    nextImported += 1
+                                    self.logger.info("event=animation_imported state=\(state.rawValue, privacy: .public) frames=\(report.frames, privacy: .public) batch_index=\(position, privacy: .public) batch_count=\(sourceURLs.count, privacy: .public)")
+                                } catch {
+                                    try? FileManager.default.removeItem(at: conversion.outputURL)
+                                    try? FileManager.default.removeItem(at: conversion.reportURL)
+                                    nextFailures.append(
+                                        MP4ImportFailure(
+                                            name: self.safeMediaDisplayName(sourceURL),
+                                            reason: "The verified movie could not be added to the library."
+                                        )
+                                    )
+                                    self.logger.error("event=animation_import_failed state=\(state.rawValue, privacy: .public) batch_index=\(position, privacy: .public) batch_count=\(sourceURLs.count, privacy: .public) stage=library_install")
+                                }
+                            }
+                            self.convertNextMP4(
+                                sourceURLs: sourceURLs,
+                                index: index + 1,
+                                state: state,
+                                toolchain: toolchain,
+                                imported: nextImported,
+                                failures: nextFailures,
+                                batchID: batchID
+                            )
+                        }
+                    }
+                }
+            }
+        )
+    }
+
+    private func finishMP4Batch(
+        state: PetState,
+        total: Int,
+        imported: Int,
+        failures: [MP4ImportFailure],
+        cancelled: Bool,
+        batchID: UUID
+    ) {
+        guard activeMP4BatchID == batchID else { return }
+        activeMP4BatchID = nil
+        mp4BatchCancellationRequested = false
+        mediaMutationInProgress = false
+        if cancelled {
+            let priorFailures = summarizedImportFailures(failures)
+            settingsController?.update(
+                activity: .failed(
+                    state,
+                    "Import cancelled · \(imported) of \(total) clips were added"
+                        + (priorFailures.map { " · Earlier failures: \($0)" } ?? "")
+                )
+            )
+        } else if failures.isEmpty {
+            settingsController?.update(
+                activity: .succeeded(state, "Imported \(imported) clip\(imported == 1 ? "" : "s")")
+            )
+        } else {
+            settingsController?.update(
+                activity: .failed(
+                    state,
+                    "Imported \(imported) of \(total) · "
+                        + (summarizedImportFailures(failures) ?? "Conversion failed")
+                )
+            )
+        }
+        refreshSettings()
+    }
+
+    private func summarizedImportFailures(_ failures: [MP4ImportFailure]) -> String? {
+        guard !failures.isEmpty else { return nil }
+        let visible = failures.prefix(2)
+            .map { "\($0.name): \($0.reason)" }
+            .joined(separator: " · ")
+        let suffix = failures.count > 2 ? " · and \(failures.count - 2) more" : ""
+        return visible + suffix
+    }
+
+    private func cancelMP4ImportBatch() {
+        guard activeMP4BatchID != nil else { return }
+        mp4BatchCancellationRequested = true
+        conversionCoordinator.cancel()
+    }
+
+    private func batchProgress(index: Int, total: Int, clipPercent: Double) -> Double {
+        guard total > 0 else { return 0 }
+        let boundedClip = min(100, max(0, clipPercent)) / 100
+        return min(100, max(0, (Double(index) + boundedClip) / Double(total) * 100))
+    }
+
+    private func safeMediaDisplayName(_ url: URL) -> String {
+        let flattened = url.lastPathComponent
+            .components(separatedBy: .controlCharacters)
+            .joined(separator: " ")
+            .split(whereSeparator: \Character.isWhitespace)
+            .joined(separator: " ")
+        return String((flattened.isEmpty ? "MP4" : flattened).prefix(100))
+    }
+
+    private func chooseTransparentMovie(for state: PetState) {
+        guard !mediaMutationInProgress else { return }
+        guard let settingsWindow = settingsController?.window else { return }
+        let openPanel = NSOpenPanel()
+        openPanel.title = "Choose Verified MOVs for \(state.rawValue.capitalized)"
+        openPanel.message = "Choose a HEVC-with-alpha MOV beside its converter-generated .report.json file. Unverified movies are not accepted."
+        openPanel.prompt = "Import MOVs"
+        openPanel.allowedContentTypes = [.quickTimeMovie]
+        openPanel.allowsMultipleSelection = true
+        openPanel.canChooseDirectories = false
+        openPanel.beginSheetModal(for: settingsWindow) { [weak self] response in
+            guard response == .OK, !openPanel.urls.isEmpty else { return }
+            self?.importVerifiedMovies(openPanel.urls, for: state)
+        }
+    }
+
+    private func importVerifiedMovies(
+        _ sourceURLs: [URL],
+        for state: PetState,
+        replacingPath: String? = nil
+    ) {
+        guard !sourceURLs.isEmpty else { return }
+        mediaMutationInProgress = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            var imported = 0
+            var failedNames: [String] = []
+            for (index, sourceURL) in sourceURLs.enumerated() {
+                self.settingsController?.update(
+                    activity: .working(
+                        state,
+                        "Verified MOV \(index + 1) of \(sourceURLs.count): copying and validating…"
+                    )
+                )
+                do {
+                    let installed = try await self.prepareVerifiedMovie(sourceURL)
+                    do {
+                        if let replacingPath {
+                            try self.installRelinkedMediaEntry(
+                                for: state,
+                                replacingPath: replacingPath,
+                                with: installed.relativePath
+                            )
+                        } else {
+                            try self.installMediaEntry(for: state, path: installed.relativePath)
+                        }
+                        imported += 1
+                        self.logger.info("event=verified_animation_imported state=\(state.rawValue, privacy: .public) batch_index=\(index + 1, privacy: .public) batch_count=\(sourceURLs.count, privacy: .public) relink=\(replacingPath != nil, privacy: .public)")
+                    } catch {
+                        try? FileManager.default.removeItem(at: installed.directory)
+                        throw error
+                    }
+                } catch {
+                    failedNames.append(sourceURL.lastPathComponent)
+                }
+            }
+            mediaMutationInProgress = false
+            if replacingPath != nil {
+                if imported == 1 {
+                    settingsController?.update(activity: .succeeded(state, "Missing clip relinked"))
+                } else {
+                    settingsController?.update(
+                        activity: .failed(state, "The missing clip could not be relinked with a verified MOV.")
+                    )
+                }
+            } else if failedNames.isEmpty {
+                settingsController?.update(
+                    activity: .succeeded(state, "Imported \(imported) verified MOV\(imported == 1 ? "" : "s")")
+                )
+            } else {
+                let failed = failedNames.prefix(3).joined(separator: ", ")
+                let suffix = failedNames.count > 3 ? " and \(failedNames.count - 3) more" : ""
+                settingsController?.update(
+                    activity: .failed(
+                        state,
+                        "Imported \(imported) of \(sourceURLs.count); could not import \(failed)\(suffix)"
+                    )
+                )
+            }
+            refreshSettings()
+        }
+    }
+
+    private func prepareVerifiedMovie(_ sourceURL: URL) async throws -> VerifiedMovieInstall {
+        let reportURL = sourceURL.deletingPathExtension().appendingPathExtension("report.json")
+        guard FileManager.default.isReadableFile(atPath: reportURL.path) else {
+            throw AlphaConversionFailure.converterFailed(
+                "A matching converter-generated .report.json file is required."
+            )
+        }
+        let installed = try await Task.detached(priority: .userInitiated) { [self] in
+            let copied = try copyVerifiedMovieAndReport(sourceURL, reportURL: reportURL)
+            do {
+                let reportData = try Data(contentsOf: copied.reportURL)
+                let digest = try Self.sha256Hex(of: copied.movieURL)
+                _ = try AlphaConversionReportValidator.validate(
+                    data: reportData,
+                    expectedOutputBasename: copied.movieURL.lastPathComponent,
+                    actualOutputSHA256: digest
+                )
+                return copied
+            } catch {
+                try? FileManager.default.removeItem(at: copied.directory)
+                throw error
+            }
+        }.value
+
+        do {
+            let asset = AVURLAsset(url: installed.movieURL)
+            let playable = try await asset.load(.isPlayable)
+            let tracks = try await asset.loadTracks(withMediaType: .video)
+            guard playable, !tracks.isEmpty else {
+                throw AlphaConversionFailure.converterFailed("The selected MOV is not a playable video.")
+            }
+            return installed
+        } catch {
+            try? FileManager.default.removeItem(at: installed.directory)
+            throw error
+        }
+    }
+
+    private func playOnce(state libraryState: PetState, path: String) {
+        guard !reduceMotion else {
+            presentSettingsError("Play Once is unavailable while macOS Reduce Motion is on.")
+            return
+        }
+        guard let entry = mediaMap.playlist(for: libraryState)?.entry(path: path) else {
+            presentSettingsError("That animation is no longer in the selected state.")
+            refreshSettings()
+            return
+        }
+        let url = mediaMap.resolvedURL(for: entry, relativeTo: mediaMapURL)
+        guard FileManager.default.isReadableFile(atPath: url.path) else {
+            presentSettingsError("The selected movie is missing or unreadable.")
+            refreshSettings()
+            return
+        }
+
+        cancelActiveOneShotWithoutRestore(reason: "superseded")
+        do {
+            let presentationState = effectivePresentationState
+            let oneShotEntry = try MediaEntry(
+                path: entry.path,
+                posterPath: entry.posterPath,
+                loop: false,
+                playbackRate: entry.playbackRate.value
+            )
+            let playback = try oneShotArbiter.start(state: currentState, path: entry.path)
+            transitionSequence &+= 1
+            let transitionID = transitionSequence
+            activeOneShotPreview = ActiveOneShotPreview(
+                playback: playback,
+                libraryState: libraryState,
+                transitionID: transitionID
+            )
+            let started = DispatchTime.now().uptimeNanoseconds
+            let startResult = player.show(
+                state: presentationState,
+                entry: oneShotEntry,
+                url: url,
+                posterURL: mediaMap.resolvedPosterURL(for: entry, relativeTo: mediaMapURL),
+                transitionID: transitionID,
+                startedAt: started,
+                previewName: url.lastPathComponent,
+                notifyWhenEnded: true
+            )
+            switch startResult {
+            case .preparing:
+                pendingPresentationState = presentationState
+            case .presented:
+                lastPresentedState = presentationState
+                pendingPresentationState = nil
+            case .failed:
+                pendingPresentationState = nil
+                stopOneShotPreview(reason: "start_failed")
+                presentSettingsError("The selected movie could not be played.")
+                return
+            }
+            logger.info("event=one_shot_started token=\(playback.token.rawValue, privacy: .public) transition_id=\(transitionID, privacy: .public) lifecycle_state=\(self.currentState.rawValue, privacy: .public) presentation_state=\(presentationState.rawValue, privacy: .public) library_state=\(libraryState.rawValue, privacy: .public)")
+            updateStatusMenu()
+            refreshSettings()
+        } catch {
+            presentSettingsError("The selected movie could not be prepared for one-time playback.")
+            refreshSettings()
+        }
+    }
+
+    private func finishOneShotPreview(transitionID: UInt64, reason: String) {
+        guard let active = activeOneShotPreview,
+              active.transitionID == transitionID,
+              oneShotArbiter.complete(token: active.playback.token) != nil else { return }
+        activeOneShotPreview = nil
+        pendingPresentationState = nil
+        player.clearOneShotPresentation()
+        logger.info("event=one_shot_finished token=\(active.playback.token.rawValue, privacy: .public) reason=\(reason, privacy: .public)")
+        updateStatusMenu()
+        refreshSettings()
+        apply(state: currentState, forceRefresh: true)
+    }
+
+    private func stopOneShotPreview(reason: String) {
+        guard let active = activeOneShotPreview,
+              oneShotArbiter.cancel(token: active.playback.token) != nil else { return }
+        activeOneShotPreview = nil
+        pendingPresentationState = nil
+        player.clearOneShotPresentation()
+        logger.info("event=one_shot_stopped token=\(active.playback.token.rawValue, privacy: .public) reason=\(reason, privacy: .public)")
+        updateStatusMenu()
+        refreshSettings()
+        apply(state: currentState, forceRefresh: true)
+    }
+
+    private func cancelActiveOneShotWithoutRestore(reason: String) {
+        guard let active = activeOneShotPreview else { return }
+        _ = oneShotArbiter.cancel(token: active.playback.token)
+        activeOneShotPreview = nil
+        pendingPresentationState = nil
+        player.clearOneShotPresentation()
+        logger.info("event=one_shot_cancelled token=\(active.playback.token.rawValue, privacy: .public) reason=\(reason, privacy: .public)")
+    }
+
+    @objc private func stopOneShotPreviewFromMenu() {
+        stopOneShotPreview(reason: "menu")
+    }
+
+    private func changePlaybackMode(for state: PetState, to mode: MediaPlaybackMode) {
+        do {
+            let updated = try mediaMap.changingPlaybackMode(for: state, to: mode)
+            try publishMediaMap(updated)
+            applyPublishedMediaMap(updated)
+            settingsController?.update(activity: .succeeded(state, "Playback mode set to \(mode.rawValue.capitalized)"))
+        } catch {
+            settingsController?.update(activity: .failed(state, "The playback mode could not be changed."))
+        }
+    }
+
+    private func changeAdvancePolicy(
+        for state: PetState,
+        to policy: MediaPlaylistAdvancePolicy
+    ) {
+        do {
+            let updated = try mediaMap.settingAdvanceOn(for: state, to: policy)
+            try publishMediaMap(updated)
+            applyPublishedMediaMap(updated)
+            let message = policy == .clipEnd
+                ? "Continuous rotation enabled"
+                : "Rotation occurs when the state begins"
+            settingsController?.update(activity: .succeeded(state, message))
+        } catch {
+            settingsController?.update(activity: .failed(state, "The rotation setting could not be changed."))
+        }
+    }
+
+    private func moveMedia(
+        for state: PetState,
+        path: String,
+        to destinationIndex: Int
+    ) {
+        do {
+            let updated = try mediaMap.movingEntry(
+                for: state,
+                path: path,
+                to: destinationIndex
+            )
+            try publishMediaMap(updated)
+            applyPublishedMediaMap(updated)
+            settingsController?.update(activity: .succeeded(state, "Clip order updated"))
+        } catch {
+            settingsController?.update(activity: .failed(state, "The clip order could not be changed."))
+        }
+    }
+
+    private func relinkMedia(for state: PetState, path: String) {
+        guard !mediaMutationInProgress else { return }
+        guard let settingsWindow = settingsController?.window,
+              let entry = mediaMap.playlist(for: state)?.entry(path: path) else { return }
+        let currentURL = mediaMap.resolvedURL(for: entry, relativeTo: mediaMapURL)
+        guard !FileManager.default.isReadableFile(atPath: currentURL.path) else {
+            presentSettingsError("Relink is only needed when the current movie is missing or unreadable.")
+            return
+        }
+        let openPanel = NSOpenPanel()
+        openPanel.title = "Relink Missing Verified MOV"
+        openPanel.message = "Choose a verified HEVC-with-alpha MOV beside its matching .report.json file."
+        openPanel.prompt = "Relink"
+        openPanel.allowedContentTypes = [.quickTimeMovie]
+        openPanel.allowsMultipleSelection = false
+        openPanel.canChooseDirectories = false
+        openPanel.beginSheetModal(for: settingsWindow) { [weak self] response in
+            guard response == .OK, let sourceURL = openPanel.url else { return }
+            self?.importVerifiedMovies([sourceURL], for: state, replacingPath: path)
+        }
+    }
+
+    private func setFixedEntry(for state: PetState, path: String) {
+        do {
+            let updated = try mediaMap.settingFixedEntry(for: state, path: path)
+            try publishMediaMap(updated)
+            mediaSelectionCursor.reset(state: state)
+            applyPublishedMediaMap(updated)
+            settingsController?.update(activity: .succeeded(state, "Fixed clip updated"))
+        } catch {
+            settingsController?.update(activity: .failed(state, "The fixed clip could not be changed."))
+        }
+    }
+
+    private func choosePoster(for state: PetState, path: String) {
+        guard !mediaMutationInProgress else { return }
+        guard let settingsWindow = settingsController?.window else { return }
+        guard mediaMap.playlist(for: state)?.entry(path: path) != nil else {
+            presentSettingsError("That animation is no longer in the selected state.")
+            return
+        }
+        let openPanel = NSOpenPanel()
+        openPanel.title = "Choose Reduce Motion Poster"
+        openPanel.message = "This still image is shown when macOS Reduce Motion is enabled."
+        openPanel.prompt = "Use Poster"
+        openPanel.allowedContentTypes = [.png, .jpeg, .heic]
+        openPanel.allowsMultipleSelection = false
+        openPanel.beginSheetModal(for: settingsWindow) { [weak self] response in
+            guard response == .OK, let sourceURL = openPanel.url, let self else { return }
+            self.mediaMutationInProgress = true
+            self.settingsController?.update(activity: .working(state, "Copying Reduce Motion poster…"))
+            DispatchQueue.global(qos: .userInitiated).async {
+                let copied = Result { try self.copyIntoMediaDirectory(sourceURL, subdirectory: "posters") }
+                DispatchQueue.main.async {
+                    switch copied {
+                    case let .success(installed):
+                        do {
+                            try self.installPoster(for: state, path: path, relativePath: installed.relativePath)
+                            self.mediaMutationInProgress = false
+                            self.settingsController?.update(activity: .succeeded(state, "Reduce Motion poster is ready"))
+                        } catch {
+                            self.mediaMutationInProgress = false
+                            try? FileManager.default.removeItem(at: installed.url)
+                            self.settingsController?.update(activity: .failed(state, "The poster could not be applied."))
+                        }
+                    case .failure:
+                        self.mediaMutationInProgress = false
+                        self.settingsController?.update(activity: .failed(state, "The poster could not be copied."))
+                    }
+                }
+            }
+        }
+    }
+
+    private func removePoster(for state: PetState, path: String) {
+        guard !mediaMutationInProgress,
+              let entry = mediaMap.playlist(for: state)?.entry(path: path) else { return }
+        do {
+            let replacement = try MediaEntry(
+                path: entry.path,
+                posterPath: nil,
+                loop: entry.loop,
+                playbackRate: entry.playbackRate.value
+            )
+            let updated = try mediaMap.replacingEntry(for: state, path: path, with: replacement)
+            try publishMediaMap(updated)
+            applyPublishedMediaMap(updated)
+            settingsController?.update(activity: .succeeded(state, "Reduce Motion poster removed"))
+        } catch {
+            settingsController?.update(activity: .failed(state, "The poster setting could not be changed."))
+        }
+    }
+
+    private func installMediaEntry(for state: PetState, path: String) throws {
+        let entry = try MediaEntry(
+            path: path,
+            posterPath: nil,
+            loop: true,
+            playbackRate: 1
+        )
+        let updated = try mediaMap.appendingEntry(entry, for: state)
+        try publishMediaMap(updated)
+        applyPublishedMediaMap(updated)
+    }
+
+    private func installRelinkedMediaEntry(
+        for state: PetState,
+        replacingPath: String,
+        with relativePath: String
+    ) throws {
+        guard let previous = mediaMap.playlist(for: state)?.entry(path: replacingPath) else {
+            throw PetContractError.invalidMediaPath
+        }
+        let replacement = try MediaEntry(
+            path: relativePath,
+            posterPath: previous.posterPath,
+            loop: previous.loop,
+            playbackRate: previous.playbackRate.value
+        )
+        let updated = try mediaMap.replacingEntry(
+            for: state,
+            path: replacingPath,
+            with: replacement
+        )
+        try publishMediaMap(updated)
+        mediaSelectionCursor.reset(state: state)
+        applyPublishedMediaMap(updated)
+    }
+
+    private func installPoster(for state: PetState, path: String, relativePath: String) throws {
+        guard let previous = mediaMap.playlist(for: state)?.entry(path: path) else {
+            throw PetContractError.invalidMediaPath
+        }
+        let replacement = try MediaEntry(
+            path: previous.path,
+            posterPath: relativePath,
+            loop: previous.loop,
+            playbackRate: previous.playbackRate.value
+        )
+        let updated = try mediaMap.replacingEntry(for: state, path: path, with: replacement)
+        try publishMediaMap(updated)
+        applyPublishedMediaMap(updated)
+    }
+
+    private func removeMedia(
+        for state: PetState,
+        path: String,
+        mode: ManagedMediaRemovalMode
+    ) {
+        guard !mediaMutationInProgress else { return }
+        switch mode {
+        case .libraryOnly:
+            do {
+                let updated = try mediaMap.removingEntry(for: state, path: path)
+                try publishMediaMap(updated)
+                if activeOneShotPreview?.libraryState == state,
+                   activeOneShotPreview?.playback.path == path {
+                    cancelActiveOneShotWithoutRestore(reason: "media_removed")
+                }
+                applyPublishedMediaMap(updated)
+                settingsController?.update(
+                    activity: .succeeded(state, "Clip removed from state; files kept on disk")
+                )
+            } catch {
+                settingsController?.update(
+                    activity: .failed(state, "The clip could not be removed from this state.")
+                )
+            }
+        case .moveManagedFilesToTrash:
+            let plan: ManagedMediaRemovalPlan
+            let trashSnapshot: ManagedMediaTrashSnapshot
+            do {
+                plan = try ManagedMediaRemovalPlanner.plan(
+                    mediaMap: mediaMap,
+                    mapURL: mediaMapURL,
+                    state: state,
+                    path: path,
+                    canonicalRoot: canonicalManagedMediaRoot
+                )
+                trashSnapshot = try ManagedMediaTrashRevalidator.capture(
+                    targetURLs: plan.trashURLs,
+                    plannedMediaMap: mediaMap,
+                    mapURL: mediaMapURL,
+                    canonicalRoot: canonicalManagedMediaRoot
+                )
+            } catch {
+                settingsController?.update(activity: .failed(state, error.localizedDescription))
+                return
+            }
+            mediaMutationInProgress = true
+            settingsController?.update(
+                activity: .working(
+                    state,
+                    "Removing clip and moving \(plan.trashURLs.count) managed file\(plan.trashURLs.count == 1 ? "" : "s") to Trash…"
+                )
+            )
+            do {
+                try ManagedMediaTrashRevalidator.validateMapUnchanged(
+                    snapshot: trashSnapshot,
+                    mapURL: mediaMapURL,
+                    canonicalRoot: canonicalManagedMediaRoot
+                )
+                try publishMediaMap(plan.updatedMap)
+                if activeOneShotPreview?.libraryState == state,
+                   activeOneShotPreview?.playback.path == path {
+                    cancelActiveOneShotWithoutRestore(reason: "media_trashed")
+                }
+                applyPublishedMediaMap(plan.updatedMap)
+            } catch {
+                mediaMutationInProgress = false
+                handleMediaMapReloadRequest()
+                settingsController?.update(
+                    activity: .failed(state, "The library could not be updated; no files were moved.")
+                )
+                return
+            }
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self else { return }
+                let targets: [URL]
+                do {
+                    targets = try ManagedMediaTrashRevalidator.revalidate(
+                        snapshot: trashSnapshot,
+                        mapURL: self.mediaMapURL,
+                        canonicalRoot: self.canonicalManagedMediaRoot
+                    )
+                } catch {
+                    DispatchQueue.main.async {
+                        self.mediaMutationInProgress = false
+                        self.handleMediaMapReloadRequest()
+                        self.settingsController?.update(
+                            activity: .failed(state, error.localizedDescription)
+                        )
+                        self.refreshDiagnosticsSnapshot()
+                        self.refreshSettings()
+                    }
+                    return
+                }
+                var moved = 0
+                var failed = 0
+                for target in targets {
+                    do {
+                        try FileManager.default.trashItem(at: target, resultingItemURL: nil)
+                        moved += 1
+                    } catch {
+                        failed += 1
+                    }
+                }
+                DispatchQueue.main.async {
+                    self.mediaMutationInProgress = false
+                    self.handleMediaMapReloadRequest()
+                    if failed == 0 {
+                        self.settingsController?.update(
+                            activity: .succeeded(
+                                state,
+                                "Clip removed; moved \(moved) managed file\(moved == 1 ? "" : "s") to Trash"
+                            )
+                        )
+                    } else {
+                        self.settingsController?.update(
+                            activity: .failed(
+                                state,
+                                "Clip removed; moved \(moved) file\(moved == 1 ? "" : "s"), but \(failed) could not be moved"
+                            )
+                        )
+                    }
+                    self.refreshDiagnosticsSnapshot()
+                    self.refreshSettings()
+                }
+            }
+        }
+    }
+
+    private var canonicalManagedMediaRoot: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(
+                "Library/Application Support/CodexPet/media",
+                isDirectory: true
+            )
+            .standardizedFileURL
+    }
+
+    private func copyVerifiedMovieAndReport(
+        _ sourceURL: URL,
+        reportURL: URL
+    ) throws -> VerifiedMovieInstall {
+        let root = mediaMapURL.deletingLastPathComponent()
+        let relativeDirectory = "imports/\(versionToken())"
+        let destinationDirectory = root.appendingPathComponent(relativeDirectory, isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(
+                at: destinationDirectory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            let movieDestination = destinationDirectory.appendingPathComponent(sourceURL.lastPathComponent)
+            let reportDestination = destinationDirectory.appendingPathComponent(reportURL.lastPathComponent)
+            try FileManager.default.copyItem(at: sourceURL, to: movieDestination)
+            try FileManager.default.copyItem(at: reportURL, to: reportDestination)
+            for path in [movieDestination, reportDestination] {
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
+            }
+            return VerifiedMovieInstall(
+                directory: destinationDirectory,
+                movieURL: movieDestination,
+                reportURL: reportDestination,
+                relativePath: "\(relativeDirectory)/\(sourceURL.lastPathComponent)"
+            )
+        } catch {
+            try? FileManager.default.removeItem(at: destinationDirectory)
+            throw error
+        }
+    }
+
+    private func copyIntoMediaDirectory(_ sourceURL: URL, subdirectory: String?) throws -> (url: URL, relativePath: String) {
+        let root = mediaMapURL.deletingLastPathComponent()
+        let destinationDirectory = subdirectory.map { root.appendingPathComponent($0, isDirectory: true) } ?? root
+        try FileManager.default.createDirectory(
+            at: destinationDirectory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let sourceExtension = sourceURL.pathExtension.lowercased()
+        let filename = "\(sourceURL.deletingPathExtension().lastPathComponent.prefix(40))-\(versionToken()).\(sourceExtension)"
+        let destination = destinationDirectory.appendingPathComponent(filename)
+        let temporary = destinationDirectory.appendingPathComponent(".\(filename).partial-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        try FileManager.default.copyItem(at: sourceURL, to: temporary)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
+        try FileManager.default.moveItem(at: temporary, to: destination)
+        let relativePath = subdirectory.map { "\($0)/\(filename)" } ?? filename
+        return (destination, relativePath)
+    }
+
+    private func publishMediaMap(_ updated: MediaMap) throws {
+        let directory = mediaMapURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        let data = try encoder.encode(updated)
+        _ = try JSONDecoder.codexPet.decode(MediaMap.self, from: data)
+        let temporary = directory.appendingPathComponent(".media-map.\(UUID().uuidString).tmp")
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        try data.write(to: temporary, options: .withoutOverwriting)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
+        guard Darwin.rename(temporary.path, mediaMapURL.path) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+    }
+
+    private func applyPublishedMediaMap(_ updated: MediaMap, refreshPlayback: Bool = true) {
+        mediaMap = updated
+        applyConfiguredWindowSize()
+        if refreshPlayback {
+            apply(state: currentState, forceRefresh: true)
+        } else {
+            updateStatusMenu()
+        }
+        refreshSettings()
+    }
+
+    private func applyWindowSettings(_ update: WindowSettingsUpdate) {
+        do {
+            let window = try mediaMap.window.replacing(
+                width: update.width,
+                height: update.height,
+                alwaysOnTop: update.alwaysOnTop,
+                clickThrough: update.clickThrough,
+                fullScreenAuxiliary: update.fullScreenAuxiliary,
+                appearance: update.appearance
+            )
+            let updated = try mediaMap.replacingWindow(window)
+            try publishMediaMap(updated)
+            options.alwaysOnTopOverride = nil
+            options.clickThroughOverride = nil
+            clickThrough = update.clickThrough
+            panel.ignoresMouseEvents = clickThrough
+            applyPublishedMediaMap(updated, refreshPlayback: false)
+            updateStatusMenu()
+        } catch {
+            presentSettingsError("The window setting could not be saved.")
+            refreshSettings()
+        }
+    }
+
+    private func persistUserResizedWindow(size: NSSize) {
+        do {
+            let window = try mediaMap.window.replacing(
+                width: size.width,
+                height: size.height
+            )
+            let updated = try mediaMap.replacingWindow(window)
+            try publishMediaMap(updated)
+            applyPublishedMediaMap(updated, refreshPlayback: false)
+            savePanelFrame()
+            logger.info(
+                "event=window_resized width=\(size.width, format: .fixed(precision: 1), privacy: .public) height=\(size.height, format: .fixed(precision: 1), privacy: .public)"
+            )
+        } catch {
+            logger.error("event=window_setting_save_failed setting=user_resize")
+            applyConfiguredWindowSize()
+            refreshSettings()
+        }
+    }
+
+    private func persistRuntimeClickThrough() {
+        do {
+            let window = try mediaMap.window.replacing(clickThrough: clickThrough)
+            let updated = try mediaMap.replacingWindow(window)
+            try publishMediaMap(updated)
+            mediaMap = updated
+        } catch {
+            logger.error("event=window_setting_save_failed setting=click_through")
+        }
+    }
+
+    private func resetPanelPosition() {
+        let size = NSSize(width: mediaMap.window.width, height: mediaMap.window.height)
+        let frame = WindowFramePolicy.centeredFrame(in: NSScreen.main?.visibleFrame ?? .zero, size: size)
+        panel.setFrame(positionStore.clampedFrame(frame), display: true, animate: true)
+        savePanelFrame()
+    }
+
+    private func revealMedia(for state: PetState, path: String) {
+        if let entry = mediaMap.playlist(for: state)?.entry(path: path) {
+            let url = mediaMap.resolvedURL(for: entry, relativeTo: mediaMapURL)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                revealMediaFolder()
+                return
+            }
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } else {
+            revealMediaFolder()
+        }
+    }
+
+    private func revealMediaMap() {
+        if FileManager.default.fileExists(atPath: mediaMapURL.path) {
+            NSWorkspace.shared.activateFileViewerSelecting([mediaMapURL])
+        } else {
+            revealMediaFolder()
+        }
+    }
+
+    private func revealApp() {
+        NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
+    }
+
+    private func revealLogsFolder() {
+        let logs = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/CodexPet/logs", isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: logs,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        NSWorkspace.shared.activateFileViewerSelecting([logs])
+    }
+
+    private func refreshDiagnosticsSnapshot() {
+        let startup = launchAtLoginManager.status()
+        cachedLaunchAtLoginStatus = startup
+        let now = Date().timeIntervalSince1970
+        let published = lastPublishedSnapshot
+        let emittedAge = published.map { max(0, now - $0.emittedAt) }
+        let sourceAge = published?.sourceUpdatedAt.map { max(0, now - $0) }
+        let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+            ?? "developer"
+        let appBuild = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+            ?? "developer"
+        let playbackMode = mediaMap.playlist(for: currentState)?.mode.rawValue ?? "unmapped"
+        let input = PetDiagnosticsInput(
+            appVersion: appVersion,
+            appBuild: appBuild,
+            lifecycleState: currentState.rawValue,
+            publisherHealth: publisherHealth.rawValue,
+            publisherSource: published?.source ?? "unavailable",
+            emittedAgeSeconds: emittedAge,
+            observedAgeSeconds: sourceAge,
+            activeSessionCount: published?.activeSessions,
+            playbackMode: playbackMode,
+            selectedClipName: player?.currentURL?.lastPathComponent,
+            previewStatus: diagnosticsPresentationStatus,
+            toolchainStatus: diagnosticsToolchainStatus,
+            lastFailureCategory: publisherHealth.usesIdleFallback ? publisherHealth.rawValue : nil
+        )
+        cachedDiagnosticsReport = diagnostics.build(input: input)
+        refreshSettings()
+    }
+
+    private var diagnosticsPresentationStatus: String {
+        guard let player else { return "unavailable" }
+        switch player.presentationStatus {
+        case .awaiting: return "awaiting"
+        case .preparing: return "preparing"
+        case .presented: return "presented"
+        case .previewing: return "play-once"
+        case .placeholder: return "placeholder"
+        case .retained: return "retained-fallback"
+        }
+    }
+
+    private var diagnosticsToolchainStatus: String {
+        switch toolchainState {
+        case .checking: return "checking"
+        case .ready: return "ready"
+        case .unavailable: return "unavailable"
+        }
+    }
+
+    private func setLaunchAtLogin(_ enabled: Bool) {
+        do {
+            cachedLaunchAtLoginStatus = try launchAtLoginManager.setEnabled(enabled)
+            refreshDiagnosticsSnapshot()
+        } catch {
+            presentSettingsError(error.localizedDescription)
+            refreshDiagnosticsSnapshot()
+        }
+    }
+
+    private func repairStartupInstallation() {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Repair Statelet Startup?"
+        alert.informativeText = "This recreates only Statelet’s managed player startup item. It does not change Codex hooks, the lifecycle publisher, or any Serial service."
+        alert.addButton(withTitle: "Repair Startup")
+        alert.addButton(withTitle: "Cancel")
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .alertFirstButtonReturn, let self else { return }
+            do {
+                self.cachedLaunchAtLoginStatus = try self.launchAtLoginManager.repairStartup()
+                self.refreshDiagnosticsSnapshot()
+            } catch {
+                self.presentSettingsError(error.localizedDescription)
+                self.refreshDiagnosticsSnapshot()
+            }
+        }
+        if let window = settingsController?.window {
+            alert.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(alert.runModal())
+        }
+    }
+
+    private func cleanUnusedMedia() {
+        guard !mediaMutationInProgress else { return }
+        let candidates: [URL]
+        do {
+            candidates = try unusedMediaCandidates()
+        } catch {
+            presentSettingsError("Statelet could not safely inspect the Media folder.")
+            return
+        }
+        guard !candidates.isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = "No Unused Media"
+            alert.informativeText = "Every managed media file is currently referenced, or no safe cleanup candidates were found."
+            alert.addButton(withTitle: "OK")
+            if let window = settingsController?.window {
+                alert.beginSheetModal(for: window)
+            } else {
+                alert.runModal()
+            }
+            return
+        }
+
+        let totalBytes = candidates.reduce(Int64(0)) { total, url in
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            return total + Int64(size)
+        }
+        let names = candidates.prefix(8).map(\.lastPathComponent).joined(separator: "\n")
+        let extra = candidates.count > 8 ? "\n…and \(candidates.count - 8) more" : ""
+        let formattedSize = ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Move \(candidates.count) Unused File\(candidates.count == 1 ? "" : "s") to Trash?"
+        alert.informativeText = "Only unreferenced media inside Statelet’s managed Media folder will be moved. This can be recovered from Trash.\n\n\(names)\(extra)\n\nApproximate size: \(formattedSize)"
+        alert.addButton(withTitle: "Move to Trash")
+        alert.addButton(withTitle: "Cancel")
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .alertFirstButtonReturn, let self else { return }
+            let currentCandidates = (try? self.unusedMediaCandidates()) ?? []
+            let approved = Set(candidates.map { $0.standardizedFileURL.path })
+            let targets = currentCandidates.filter { approved.contains($0.standardizedFileURL.path) }
+            guard !targets.isEmpty else {
+                self.refreshDiagnosticsSnapshot()
+                return
+            }
+            self.mediaMutationInProgress = true
+            self.settingsController?.update(
+                activity: .working(self.currentState, "Moving \(targets.count) unused media file\(targets.count == 1 ? "" : "s") to Trash…")
+            )
+            DispatchQueue.global(qos: .utility).async {
+                var moved = 0
+                var failed = 0
+                for target in targets {
+                    do {
+                        try FileManager.default.trashItem(at: target, resultingItemURL: nil)
+                        moved += 1
+                    } catch {
+                        failed += 1
+                    }
+                }
+                DispatchQueue.main.async {
+                    self.mediaMutationInProgress = false
+                    if failed == 0 {
+                        self.settingsController?.update(
+                            activity: .succeeded(self.currentState, "Moved \(moved) unused file\(moved == 1 ? "" : "s") to Trash")
+                        )
+                    } else {
+                        self.settingsController?.update(
+                            activity: .failed(self.currentState, "Moved \(moved); \(failed) file\(failed == 1 ? "" : "s") could not be moved")
+                        )
+                    }
+                    self.refreshDiagnosticsSnapshot()
+                }
+            }
+        }
+        if let window = settingsController?.window {
+            alert.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(alert.runModal())
+        }
+    }
+
+    private func unusedMediaCandidates() throws -> [URL] {
+        let canonicalRoot = canonicalManagedMediaRoot
+        let canonicalMap = canonicalRoot.appendingPathComponent("media-map.json").standardizedFileURL
+        let configuredMap = mediaMapURL.standardizedFileURL
+        let rootValues = try canonicalRoot.resourceValues(forKeys: [.isSymbolicLinkKey])
+        guard configuredMap.path == canonicalMap.path,
+              configuredMap.resolvingSymlinksInPath().path == canonicalMap.path,
+              rootValues.isSymbolicLink != true,
+              canonicalRoot.resolvingSymlinksInPath().path == canonicalRoot.path else {
+            throw PetContractError.invalidValue(
+                "unused-media cleanup requires the canonical managed media map"
+            )
+        }
+        let root = canonicalRoot
+        var referenced = Set<String>()
+        referenced.insert(mediaMapURL.resolvingSymlinksInPath().standardizedFileURL.path)
+        for playlist in mediaMap.states.values {
+            for entry in playlist.entries {
+                let movie = mediaMap.resolvedURL(for: entry, relativeTo: mediaMapURL)
+                    .resolvingSymlinksInPath().standardizedFileURL
+                if isInsideManagedMedia(movie, root: root) {
+                    referenced.insert(movie.path)
+                    referenced.insert(
+                        movie.deletingPathExtension()
+                            .appendingPathExtension("report.json")
+                            .standardizedFileURL.path
+                    )
+                }
+                if let poster = mediaMap.resolvedPosterURL(for: entry, relativeTo: mediaMapURL)?
+                    .resolvingSymlinksInPath().standardizedFileURL,
+                   isInsideManagedMedia(poster, root: root) {
+                    referenced.insert(poster.path)
+                }
+            }
+        }
+
+        let keys: [URLResourceKey] = [.isRegularFileKey, .isSymbolicLinkKey]
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: keys,
+            options: [.skipsPackageDescendants],
+            errorHandler: { _, _ in false }
+        ) else { return [] }
+        var candidates: [URL] = []
+        for case let rawURL as URL in enumerator {
+            let values = try rawURL.resourceValues(forKeys: Set(keys))
+            guard values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+            let url = rawURL.resolvingSymlinksInPath().standardizedFileURL
+            guard isInsideManagedMedia(url, root: root), !referenced.contains(url.path) else { continue }
+            let lowercaseName = url.lastPathComponent.lowercased()
+            let allowedExtension = ["mov", "mp4", "m4v", "png", "jpg", "jpeg", "heic"]
+                .contains(url.pathExtension.lowercased())
+            guard allowedExtension || lowercaseName.hasSuffix(".report.json") else { continue }
+            candidates.append(url)
+        }
+        return candidates.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+    }
+
+    private func isInsideManagedMedia(_ url: URL, root: URL) -> Bool {
+        url.path.hasPrefix(root.path + "/")
+    }
+
+    private func prepareMediaDirectory() throws {
+        try FileManager.default.createDirectory(
+            at: mediaMapURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+    }
+
+    private func versionToken() -> String {
+        let timestamp = Int(Date().timeIntervalSince1970)
+        return "\(timestamp)-\(UUID().uuidString.prefix(8).lowercased())"
+    }
+
+    private func presentSettingsError(_ message: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Statelet"
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        if let settingsWindow = settingsController?.window {
+            alert.beginSheetModal(for: settingsWindow)
+        } else {
+            alert.runModal()
+        }
+    }
+
+    private static func sha256Hex(of url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while let chunk = try handle.read(upToCount: 1_048_576), !chunk.isEmpty {
+            hasher.update(data: chunk)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    @objc private func revealMediaFolder() {
+        NSWorkspace.shared.activateFileViewerSelecting([mediaMapURL.deletingLastPathComponent()])
+    }
+
+    @objc private func quit() { NSApp.terminate(nil) }
+
+    private func savePanelFrame() {
+        guard let panel else { return }
+        let screen = NSScreen.screens.max {
+            $0.visibleFrame.intersection(panel.frame).area < $1.visibleFrame.intersection(panel.frame).area
+        }
+        positionStore.save(frame: panel.frame, on: screen ?? NSScreen.main)
+    }
+
+    private func schedulePositionSave() {
+        positionSaveWorkItem?.cancel()
+        positionSaveGeneration &+= 1
+        let generation = positionSaveGeneration
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, generation == self.positionSaveGeneration else { return }
+            self.positionSaveWorkItem = nil
+            self.savePanelFrame()
+        }
+        positionSaveWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .milliseconds(Self.positionSaveDebounceMilliseconds),
+            execute: workItem
+        )
+    }
+}
+
+private extension NSRect {
+    var area: CGFloat { max(0, width) * max(0, height) }
+}

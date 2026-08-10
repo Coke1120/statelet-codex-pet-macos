@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "schema_version": 1,
+  "state": "running",
+  "source": "aggregate",
+  "priority": 1,
+  "active_sessions": 2,
+  "updated_at": 1710000000.25,
+  "forced": false,
+  "source_updated_at": 1710000000.0,
+  "emitted_at": 1710000000.25
+}

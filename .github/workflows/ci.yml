@@ -1,0 +1,79 @@
+name: macOS CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-build-sign:
+    name: Python, Swift, build, and codesign
+    runs-on: macos-14
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out Codex Pet companion
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1f2 # v6
+        with:
+          python-version: "3.9"
+          cache: pip
+          cache-dependency-path: mac/requirements-alpha.txt
+
+      - name: Install locked alpha dependencies
+        run: python -m pip install --require-hashes -r mac/requirements-alpha.txt
+
+      - name: Install FFmpeg
+        run: brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
+
+      - name: Run alpha conversion tests without skips
+        run: |
+          python - <<'PY'
+          import unittest
+
+          suite = unittest.defaultTestLoader.loadTestsFromName(
+              "tests.test_macos_alpha_video"
+          )
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          if result.skipped:
+              raise SystemExit(f"alpha tests skipped: {result.skipped}")
+          if not result.wasSuccessful():
+              raise SystemExit(1)
+          PY
+
+      - name: Run lifecycle and packaging tests
+        run: |
+          python -m unittest \
+            tests.test_codex_hook \
+            tests.test_codex_pet_state \
+            tests.test_macos_pet_packaging \
+            tests.test_macos_pet_startup -v
+
+      - name: Reject excluded public-release content
+        run: |
+          if git ls-files | grep -E '^(private-assets|private-media|prompts|esp32-p4|vendor)/|\.(mp4|mov|m4v|webm|mkv|avi)$'; then
+            echo "Excluded private, hardware, or media content is tracked." >&2
+            exit 1
+          fi
+
+      - name: Run Swift tests
+        run: swift test -c release --package-path mac/CodexPetMac
+
+      - name: Run Swift core self-test
+        run: swift run --package-path mac/CodexPetMac -c release codex-pet-core-self-test
+
+      - name: Build and ad-hoc sign Statelet
+        run: bash mac/CodexPetMac/scripts/build_app.sh
+
+      - name: Verify app signature
+        run: |
+          codesign --verify --deep --strict --verbose=2 mac/CodexPetMac/dist/Statelet.app
+          codesign -dv --verbose=2 mac/CodexPetMac/dist/Statelet.app

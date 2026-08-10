@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "default_format": "mov",
+  "window": {
+    "width": 320,
+    "height": 480,
+    "always_on_top": true,
+    "appearance": {
+      "background_color": "#20242A",
+      "background_enabled": true,
+      "background_opacity": 0.28,
+      "border_color": "#FFFFFF",
+      "border_enabled": true,
+      "border_opacity": 0.24,
+      "border_width": 1.0,
+      "corner_radius": 22.0,
+      "show_state_label": true,
+      "state_label_color": null,
+      "state_label_position": "top_left",
+      "state_label_size": "regular",
+      "show_fps": true,
+      "fps_color": "#00FF00",
+      "fps_label_size": "small"
+    },
+    "click_through": false,
+    "full_screen_auxiliary": false
+  },
+  "states": {
+    "idle": {
+      "advance_on": "clip_end",
+      "mode": "random",
+      "fixed_path": "idle/quiet.mov",
+      "entries": [
+        {
+          "path": "idle/quiet.mov",
+          "poster_path": "posters/idle-quiet.png",
+          "loop": true,
+          "playback_rate": 1.0
+        },
+        {
+          "path": "idle/blink.mov",
+          "poster_path": "posters/idle-blink.png",
+          "loop": true,
+          "playback_rate": 1.0
+        }
+      ]
+    },
+    "running": {
+      "advance_on": "clip_end",
+      "mode": "sequential",
+      "fixed_path": "running/focused.mov",
+      "entries": [
+        {
+          "path": "running/focused.mov",
+          "poster_path": "posters/running-focused.png",
+          "loop": true,
+          "playback_rate": 1.0
+        },
+        {
+          "path": "running/typing.mov",
+          "poster_path": "posters/running-typing.png",
+          "loop": true,
+          "playback_rate": 0.9583333333
+        }
+      ]
+    },
+    "waiting": {
+      "advance_on": "state_entry",
+      "mode": "fixed",
+      "fixed_path": "waiting/patient.mov",
+      "entries": [
+        {
+          "path": "waiting/patient.mov",
+          "poster_path": "posters/waiting-patient.png",
+          "loop": true,
+          "playback_rate": 1.0
+        },
+        {
+          "path": "waiting/look-around.mov",
+          "poster_path": "posters/waiting-look-around.png",
+          "loop": true,
+          "playback_rate": 1.0
+        }
+      ]
+    },
+    "review": {
+      "advance_on": "state_entry",
+      "mode": "fixed",
+      "fixed_path": "review/thoughtful.mov",
+      "entries": [
+        {
+          "path": "review/thoughtful.mov",
+          "poster_path": "posters/review-thoughtful.png",
+          "loop": true,
+          "playback_rate": 1.0
+        }
+      ]
+    }
+  }
+}

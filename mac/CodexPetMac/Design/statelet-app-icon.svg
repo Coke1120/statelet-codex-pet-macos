@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title description">
+  <title id="title">Statelet app icon</title>
+  <description id="description">A living developer sprite with a cursor pair and an open lifecycle orbit.</description>
+  <defs>
+    <linearGradient id="background" x1="180" y1="120" x2="840" y2="910" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#242C35"/>
+      <stop offset="0.52" stop-color="#171D24"/>
+      <stop offset="1" stop-color="#0D1116"/>
+    </linearGradient>
+    <radialGradient id="ambient" cx="0" cy="0" r="1" gradientTransform="translate(512 500) rotate(90) scale(390)" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#48F0AE" stop-opacity="0.17"/>
+      <stop offset="0.62" stop-color="#48F0AE" stop-opacity="0.045"/>
+      <stop offset="1" stop-color="#48F0AE" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="tile" x1="338" y1="292" x2="704" y2="744" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#394551"/>
+      <stop offset="0.38" stop-color="#2A333D"/>
+      <stop offset="1" stop-color="#1C232B"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="180%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="32" stdDeviation="36" flood-color="#000000" flood-opacity="0.48"/>
+    </filter>
+    <clipPath id="squircleClip">
+      <rect x="48" y="48" width="928" height="928" rx="214"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#squircleClip)">
+    <rect x="48" y="48" width="928" height="928" rx="214" fill="url(#background)"/>
+    <rect x="48" y="48" width="928" height="928" rx="214" fill="url(#ambient)"/>
+
+    <path d="M278 690C208 608 193 489 240 392C286 297 386 230 498 226C640 220 766 310 809 440C850 565 805 703 700 780"
+          fill="none" stroke="#44E8AA" stroke-width="24" stroke-linecap="round" opacity="0.86"/>
+    <path d="M278 690C208 608 193 489 240 392C286 297 386 230 498 226C640 220 766 310 809 440C850 565 805 703 700 780"
+          fill="none" stroke="#A4FFE0" stroke-width="5" stroke-linecap="round" opacity="0.42"/>
+
+    <g filter="url(#shadow)">
+      <path d="M370 276H654C675 276 692 293 692 314V336H714C735 336 752 353 752 374V650C752 671 735 688 714 688H692V710C692 731 675 748 654 748H370C349 748 332 731 332 710V688H310C289 688 272 671 272 650V374C272 353 289 336 310 336H332V314C332 293 349 276 370 276Z"
+            fill="url(#tile)" stroke="#EFF6F8" stroke-opacity="0.2" stroke-width="6"/>
+      <path d="M370 294H654C665 294 674 303 674 314V354H714C725 354 734 363 734 374V650C734 661 725 670 714 670H674V710C674 721 665 730 654 730H370C359 730 350 721 350 710V670H310C299 670 290 661 290 650V374C290 363 299 354 310 354H350V314C350 303 359 294 370 294Z"
+            fill="none" stroke="#FFFFFF" stroke-opacity="0.055" stroke-width="4"/>
+    </g>
+
+    <path d="M413 408L505 512L413 616" fill="none" stroke="#F3F7F5" stroke-width="42" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M546 614H642" fill="none" stroke="#3EE6A8" stroke-width="42" stroke-linecap="round"/>
+
+    <g fill="#171D24" stroke="#171D24" stroke-width="8">
+      <circle cx="246" cy="394" r="19"/>
+      <circle cx="801" cy="440" r="19"/>
+      <circle cx="813" cy="628" r="19"/>
+      <circle cx="700" cy="780" r="19"/>
+    </g>
+    <circle cx="801" cy="440" r="26" fill="#3EE6A8"/>
+    <circle cx="793" cy="432" r="8" fill="#DFFFF3" opacity="0.86"/>
+
+    <path d="M196 122C350 74 574 70 782 118" fill="none" stroke="#FFFFFF" stroke-width="9" stroke-linecap="round" opacity="0.045"/>
+  </g>
+
+  <rect x="51" y="51" width="922" height="922" rx="211" fill="none" stroke="#FFFFFF" stroke-opacity="0.13" stroke-width="6"/>
+</svg>

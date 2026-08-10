@@ -1,0 +1,75 @@
+# macOS and editors
+.DS_Store
+.AppleDouble
+.LSOverride
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.codebase-memory/
+.omx/
+.venv/
+venv/
+
+# Swift and Xcode
+.build/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcuserstate
+
+# Build and release output
+dist/
+build/
+release/
+artifacts/
+*.app/
+*.app.dSYM/
+*.dSYM/
+*.xcarchive/
+*.dmg
+*.pkg
+*.zip
+*.tar.gz
+
+# Local runtime state and reports
+runtime/
+logs/
+reports/
+*.report.json
+current_state.json
+media-map.json
+!mac/CodexPetMac/Examples/media-map.json
+*.log
+
+# Private or generated animation media
+private-assets/
+private-media/
+media/
+*.mp4
+*.mov
+*.m4v
+*.webm
+*.mkv
+*.avi
+*.gif
+*.hevc
+*.prores*
+
+# Local configuration, credentials, and signing material
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.mobileprovision
