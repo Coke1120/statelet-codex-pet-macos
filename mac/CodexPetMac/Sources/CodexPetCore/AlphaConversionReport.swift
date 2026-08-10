@@ -135,6 +135,11 @@ public enum AlphaConversionReportValidator {
             throw AlphaConversionReportValidationError.unsupportedSchemaVersion(schemaVersion)
         }
         if schemaVersion == 1,
+           report.provenance == nil,
+           expectedLocalProvenanceChallenge != nil {
+            throw AlphaConversionReportValidationError.provenanceRequired
+        }
+        if schemaVersion == 1,
            (report.toolchain == nil || report.profile == nil
                || report.toolCapabilities == nil || report.normalization == nil
                || report.provenance == nil) {

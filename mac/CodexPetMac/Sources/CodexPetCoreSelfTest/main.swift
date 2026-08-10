@@ -434,6 +434,23 @@ private func runSelfTest() throws {
         expectedLocalProvenanceChallenge: provenanceChallenge.uppercased()
     )
     try require(locallyAttested.trust == .locallyAttested, "matching local challenge was not attested")
+    guard var missingProvenanceReport = try JSONSerialization.jsonObject(
+        with: Data(validAlphaReportJSON().utf8)
+    ) as? [String: Any] else {
+        throw SelfTestFailure.assertion("valid report was not a JSON object")
+    }
+    missingProvenanceReport.removeValue(forKey: "provenance")
+    do {
+        _ = try AlphaConversionReportValidator.validate(
+            data: try JSONSerialization.data(withJSONObject: missingProvenanceReport),
+            expectedOutputBasename: "idle.mov",
+            actualOutputSHA256: outputHash,
+            expectedLocalProvenanceChallenge: provenanceChallenge
+        )
+        throw SelfTestFailure.assertion("local report without provenance was accepted")
+    } catch let error as AlphaConversionReportValidationError {
+        try require(error == .provenanceRequired, "missing local provenance reported the wrong error")
+    }
     try requiresError("future report schema was accepted") {
         let report = validAlphaReportJSON().replacingOccurrences(
             of: "\"report_schema_version\":1",
