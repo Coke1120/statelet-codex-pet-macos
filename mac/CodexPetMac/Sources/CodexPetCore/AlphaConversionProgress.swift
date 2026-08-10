@@ -152,12 +152,12 @@ public struct AlphaConversionProgress: Decodable, Equatable, Sendable {
             .components(separatedBy: .controlCharacters)
             .joined(separator: " ")
             .replacingOccurrences(
-                of: #"(?i)/(?:Users|Volumes|private|tmp|var|Applications|Library)/[^\r\n\"']*?\.(?:mp4|mov|m4v|json|py|png|jpe?g|heic|webm|mkv)"#,
+                of: #"(?i)(?:file://)?/(?:Users|Volumes|private|tmp|var|Applications|Library)/[^\r\n\"']*?\.(?:mp4|mov|m4v|json|py|png|jpe?g|heic|webm|mkv)"#,
                 with: "<local-file>",
                 options: .regularExpression
             )
             .replacingOccurrences(
-                of: #"(?i)/(?:Users|Volumes|private|tmp|var|Applications|Library)/[^\r\n\"']+"#,
+                of: #"(?i)(?:file://)?/(?:Users|Volumes|private|tmp|var|Applications|Library)/[^\r\n\"']+"#,
                 with: "<local-file>",
                 options: .regularExpression
             )

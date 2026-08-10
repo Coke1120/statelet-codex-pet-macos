@@ -12,7 +12,8 @@ private func validAlphaReportJSON() -> String {
     {
       "report_schema_version":1,
       "status":"converted",
-      "toolchain":{"converter_version":"1","ffmpeg_version":"ffmpeg version 8.0","ffprobe_version":"ffprobe version 8.0","avconvert_version":"avconvert help"},
+      "toolchain":{"converter_version":"1","ffmpeg_version":"ffmpeg version 8.0","ffprobe_version":"ffprobe version 8.0","avconvert_version":"avconvert help","macos_build":"23G93"},
+      "tool_capabilities":{"ffmpeg_encoder":"prores_ks","ffmpeg_filters":["scale","crop","pad"],"avconvert_presets":["PresetHEVCHighestQualityWithAlpha","PresetAppleProRes4444LPCM"],"passed":true},
       "profile":{"name":"standard","framing":"fill","keying":"green-screen-continuous-alpha"},
       "normalization":{"applied":["strip-audio","square-pixel-output"],"warnings":["rotation-sar-vfr-hdr-interlace-rejected-before-decode"]},
       "provenance":{"method":"invocation-challenge-v1","producer":"statelet","challenge":"\(reportProvenanceChallenge)"},
@@ -401,6 +402,8 @@ final class CodexPetCoreTests: XCTestCase {
         XCTAssertEqual(validated.trust, .portableClaim)
         XCTAssertEqual(validated.toolchain?.converterVersion, "1")
         XCTAssertEqual(validated.toolchain?.ffmpegVersion, "ffmpeg version 8.0")
+        XCTAssertEqual(validated.toolchain?.macOSBuild, "23G93")
+        XCTAssertEqual(validated.toolCapabilities?.ffmpegEncoder, "prores_ks")
         XCTAssertEqual(validated.profile?.name, "standard")
         XCTAssertEqual(validated.profile?.framing, "fill")
         XCTAssertEqual(validated.normalization?.applied, ["strip-audio", "square-pixel-output"])
@@ -490,7 +493,7 @@ final class CodexPetCoreTests: XCTestCase {
         )
         assertReportError(
             validAlphaReportJSON().replacingOccurrences(
-                of: "\"toolchain\":{\"converter_version\":\"1\",\"ffmpeg_version\":\"ffmpeg version 8.0\",\"ffprobe_version\":\"ffprobe version 8.0\",\"avconvert_version\":\"avconvert help\"},",
+                of: "\"toolchain\":{\"converter_version\":\"1\",\"ffmpeg_version\":\"ffmpeg version 8.0\",\"ffprobe_version\":\"ffprobe version 8.0\",\"avconvert_version\":\"avconvert help\",\"macos_build\":\"23G93\"},",
                 with: ""
             ),
             actualOutputSHA256: reportOutputHash,
