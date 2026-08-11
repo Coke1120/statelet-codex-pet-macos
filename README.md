@@ -187,12 +187,36 @@ The Animations pane also provides:
 Read [Using Statelet](docs/USAGE.md) for the full interaction, animation,
 appearance, resize, FPS, prompts, deletion, and recovery behavior.
 
+## Dialogue and local GPT-SoVITS voice
+
+The **Voice** Settings pane manages one local character voice profile and a
+library of dialogue lines. Statelet accepts separate user-selected GPT `.ckpt`
+and SoVITS `.pth` weights plus reference audio, reference text, and the language
+identifiers required by GPT-SoVITS API v2. Imported assets are copied into
+private Application Support storage; they are never added to the repository or
+release bundle. A persisted content fingerprint covers the model bytes,
+reference inputs, endpoint, and language settings and is revalidated at launch.
+Reference audio must decode locally, and a profile becomes ready only after its
+user-managed API accepts both weight files.
+
+Statelet connects only to an explicit loopback HTTP endpoint such as
+`http://127.0.0.1:9880`. Adding or editing a line persists it immediately and
+queues background synthesis. Successful WAV output is validated and published
+atomically before it becomes available to **Preview**. Playback never starts
+synchronous inference, and failed or stale lines remain editable and retryable.
+
+Statelet does not install or train GPT-SoVITS. Start its API v2 locally before
+generating speech, import only model files you trust, and use voices and
+reference recordings you are authorized to use. See
+[Using Statelet](docs/USAGE.md#dialogue-and-local-voice) for setup and recovery.
+
 ## Privacy and security
 
 Statelet is designed for local operation:
 
 - The application and lifecycle publisher contain no telemetry or automatic
-  crash upload and make no runtime network requests.
+  crash upload. Optional voice generation permits HTTP only to loopback; it
+  rejects remote hosts and redirects.
 - Package managers may use the network when you install optional build or media
   conversion dependencies.
 - Lifecycle files exclude prompts, tool output, transcript paths, working
@@ -223,6 +247,9 @@ a public report.
 - The first public release is source-only. The generated app is ad-hoc signed,
   is not notarized, and is not offered as a public binary or DMG.
 - No animation media is bundled; users supply authorized media.
+- No GPT-SoVITS runtime, model weights, reference recordings, dialogue, or
+  generated speech is bundled. Voice generation requires a user-managed local
+  GPT-SoVITS API v2 service.
 - MP4 conversion needs additional local tools and can take several minutes
   because every accepted delivery passes Apple round-trip and all-frame checks.
 - Statelet exposes four lifecycle states and one active decoder.

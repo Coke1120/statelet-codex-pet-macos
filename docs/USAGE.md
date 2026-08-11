@@ -333,6 +333,59 @@ movie, poster, or report files that remain eligible to Trash. Files retained by
 Delete become cleanup candidates only when no remaining profile references
 them.
 
+## Dialogue and local voice
+
+Open **Settings → Voice** to configure one local GPT-SoVITS voice profile and
+its dialogue library.
+
+1. Start GPT-SoVITS API v2 on this Mac. The default endpoint is
+   `http://127.0.0.1:9880`.
+2. Enter a profile name, prompt language, default dialogue language, and the
+   exact transcript of the reference recording.
+3. Import the trained GPT `.ckpt` weight, SoVITS `.pth` weight, and reference
+   audio separately. Import only files you trust and recordings you are
+   authorized to use.
+4. Save the profile. Statelet rejects non-loopback endpoints, missing managed
+   assets, unsafe paths, symbolic links, and unsupported import extensions.
+5. Enter a dialogue line and its GPT-SoVITS language identifier, then choose
+   **Add**. The line is saved before background generation begins.
+
+The profile reports `Not configured`, `Validating`, `Ready`, `Invalid`, or
+`Local service unavailable`; Statelet fingerprints the model bytes, reference
+audio, transcript, endpoint, and language inputs and revalidates them after
+restart and before generation if file identity changes. Reference audio must be
+decodable by macOS, and the profile becomes `Ready` only after the local API
+accepts both weight files. The table reports `Draft`, `Queued`, `Generating`,
+`Ready`, `Failed`, or `Stale`. **Preview** is enabled only for validated `Ready`
+output. **Retry**
+reuses the same line after a failed request, while **Regenerate** invalidates
+the old result and queues a new revision. Editing a line or saving a changed
+profile also invalidates prior output. A late result cannot replace a newer
+revision or recreate a deleted line.
+
+Statelet calls GPT-SoVITS API v2's local `/set_gpt_weights`,
+`/set_sovits_weights`, and `/tts` endpoints. It does not start, install, train,
+download, or update GPT-SoVITS. The service must be reachable through plain
+HTTP on numeric IPv4 or IPv6 loopback; hostnames, proxies, redirects, and remote
+hosts are refused so sensitive request data cannot leave the local transport.
+Dialogue uses a separate speech player; accepted Statelet animation deliveries
+remain silent, so preview or runtime speech does not pause lifecycle animation.
+
+Managed voice data lives below:
+
+```text
+~/Library/Application Support/CodexPet/voice/
+```
+
+Directories and files are owner-only. Metadata and generated WAV files use
+temporary writes plus atomic publication. Logs record line identifiers, state,
+and bounded error codes—not dialogue text, reference text, model paths, or
+audio. Reopening Statelet safely requeues interrupted work; missing ready audio
+is treated as stale. Removing a profile deletes Statelet's managed model,
+reference, and generated-audio copies while retaining dialogue text as drafts.
+If a private managed file cannot be removed safely, Statelet persists a bounded
+cleanup record, reports the deferred cleanup, and retries it at next launch.
+
 ## Appearance, resizing, and FPS
 
 Open **Settings → Appearance** to configure:
@@ -474,10 +527,11 @@ core self-test, but may not include the XCTest module.
 ## Privacy reminder
 
 Statelet's lifecycle records do not include prompts, tool output, transcripts,
-or working directories. Logs and animation media remain local. The application
-does not send telemetry or upload crashes. Review any diagnostic excerpt before
-sharing it, and never publish private media, reports, credentials, or complete
-local logs.
+or working directories. Logs, animation media, voice models, reference audio,
+dialogue, and generated speech remain local. The application does not send
+telemetry or upload crashes; the optional voice adapter permits only loopback
+HTTP. Review any diagnostic excerpt before sharing it, and never publish
+private media, models, speech, reports, credentials, or complete local logs.
 
 Statelet is an independent community project and is not affiliated with or
 endorsed by OpenAI.

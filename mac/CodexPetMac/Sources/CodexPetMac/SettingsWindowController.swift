@@ -119,6 +119,15 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     var onRepairInstallation: (() -> Void)?
     var onLaunchAtLoginChange: ((Bool) -> Void)?
     var onCleanUnusedMedia: (() -> Void)?
+    var onImportVoiceAsset: ((DialogueVoiceAssetKind, DialogueVoiceProfileDraft) -> Void)?
+    var onSaveVoiceProfile: ((DialogueVoiceProfileDraft) -> Void)?
+    var onRemoveVoiceProfile: ((GPTSoVITSVoiceProfile) -> Void)?
+    var onAddDialogueLine: ((String, String) -> Void)?
+    var onUpdateDialogueLine: ((DialogueLine, String, String) -> Void)?
+    var onDeleteDialogueLine: ((DialogueLine) -> Void)?
+    var onPreviewDialogueLine: ((DialogueLine) -> Void)?
+    var onRetryDialogueLine: ((DialogueLine) -> Void)?
+    var onRegenerateDialogueLine: ((DialogueLine) -> Void)?
     var onCharacterSelection: ((String) -> Void)?
     var onCreateCharacter: ((String) -> Void)?
     var onRenameCharacter: ((String, String) -> Void)?
@@ -127,9 +136,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     var onImportCharacterBundle: (() -> Void)?
     var onExportCharacterBundle: ((String) -> Void)?
 
-    private let tabs = NSSegmentedControl(labels: ["Animations", "Appearance", "General", "Diagnostics", "Prompts", "Recommendation"], trackingMode: .selectOne, target: nil, action: nil)
+    private let tabs = NSSegmentedControl(labels: ["Animations", "Voice", "Appearance", "General", "Diagnostics", "Prompts", "Recommendation"], trackingMode: .selectOne, target: nil, action: nil)
     private let paneHost = NSView()
     private let animationsPane = NSView()
+    private let dialogueVoiceView = DialogueVoiceSettingsView()
     private let appearancePane = NSView()
     private let generalPane = NSView()
     private let diagnosticsPane = NSView()
@@ -280,6 +290,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
+    func update(dialogueVoice snapshot: DialogueVoiceCoordinatorSnapshot) {
+        dialogueVoiceView.update(snapshot: snapshot)
+    }
+
     func update(
         activity: SettingsActivity,
         progressValue: Double? = nil,
@@ -346,6 +360,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         tabs.setAccessibilityLabel("Settings section")
         paneHost.translatesAutoresizingMaskIntoConstraints = false
         animationsPane.translatesAutoresizingMaskIntoConstraints = false
+        dialogueVoiceView.translatesAutoresizingMaskIntoConstraints = false
         appearancePane.translatesAutoresizingMaskIntoConstraints = false
         generalPane.translatesAutoresizingMaskIntoConstraints = false
         diagnosticsPane.translatesAutoresizingMaskIntoConstraints = false
@@ -354,12 +369,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         contentView.addSubview(tabs)
         contentView.addSubview(paneHost)
         paneHost.addSubview(animationsPane)
+        paneHost.addSubview(dialogueVoiceView)
         paneHost.addSubview(appearancePane)
         paneHost.addSubview(generalPane)
         paneHost.addSubview(diagnosticsPane)
         paneHost.addSubview(helpPane)
         paneHost.addSubview(recommendationPane)
-        for pane in [animationsPane, appearancePane, generalPane, diagnosticsPane, helpPane, recommendationPane] {
+        for pane in [animationsPane, dialogueVoiceView, appearancePane, generalPane, diagnosticsPane, helpPane, recommendationPane] {
             NSLayoutConstraint.activate([
                 pane.leadingAnchor.constraint(equalTo: paneHost.leadingAnchor),
                 pane.trailingAnchor.constraint(equalTo: paneHost.trailingAnchor),
@@ -377,6 +393,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             paneHost.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -18),
         ])
         buildAnimationsPane()
+        configureDialogueVoicePane()
         buildAppearancePane()
         buildGeneralPane()
         buildDiagnosticsPane()
@@ -554,6 +571,42 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             footer.trailingAnchor.constraint(equalTo: animationsPane.trailingAnchor),
             footer.bottomAnchor.constraint(equalTo: animationsPane.bottomAnchor),
         ])
+    }
+
+    private func configureDialogueVoicePane() {
+        dialogueVoiceView.onImportGPTWeight = { [weak self] draft in
+            self?.onImportVoiceAsset?(.gptWeight, draft)
+        }
+        dialogueVoiceView.onImportSoVITSWeight = { [weak self] draft in
+            self?.onImportVoiceAsset?(.sovitsWeight, draft)
+        }
+        dialogueVoiceView.onImportReferenceAudio = { [weak self] draft in
+            self?.onImportVoiceAsset?(.referenceAudio, draft)
+        }
+        dialogueVoiceView.onSaveProfile = { [weak self] draft in
+            self?.onSaveVoiceProfile?(draft)
+        }
+        dialogueVoiceView.onRemoveProfile = { [weak self] profile in
+            self?.onRemoveVoiceProfile?(profile)
+        }
+        dialogueVoiceView.onAddLine = { [weak self] text, language in
+            self?.onAddDialogueLine?(text, language)
+        }
+        dialogueVoiceView.onUpdateLine = { [weak self] line, text, language in
+            self?.onUpdateDialogueLine?(line, text, language)
+        }
+        dialogueVoiceView.onDeleteLine = { [weak self] line in
+            self?.onDeleteDialogueLine?(line)
+        }
+        dialogueVoiceView.onPreviewLine = { [weak self] line in
+            self?.onPreviewDialogueLine?(line)
+        }
+        dialogueVoiceView.onRetryLine = { [weak self] line in
+            self?.onRetryDialogueLine?(line)
+        }
+        dialogueVoiceView.onRegenerateLine = { [weak self] line in
+            self?.onRegenerateDialogueLine?(line)
+        }
     }
 
     private func buildAppearancePane() {
@@ -1229,11 +1282,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     @objc private func changePane() {
         animationsPane.isHidden = tabs.selectedSegment != 0
-        appearancePane.isHidden = tabs.selectedSegment != 1
-        generalPane.isHidden = tabs.selectedSegment != 2
-        diagnosticsPane.isHidden = tabs.selectedSegment != 3
-        helpPane.isHidden = tabs.selectedSegment != 4
-        recommendationPane.isHidden = tabs.selectedSegment != 5
+        dialogueVoiceView.isHidden = tabs.selectedSegment != 1
+        appearancePane.isHidden = tabs.selectedSegment != 2
+        generalPane.isHidden = tabs.selectedSegment != 3
+        diagnosticsPane.isHidden = tabs.selectedSegment != 4
+        helpPane.isHidden = tabs.selectedSegment != 5
+        recommendationPane.isHidden = tabs.selectedSegment != 6
     }
 
     @objc private func helpStateChanged() { updateHelpPrompt() }

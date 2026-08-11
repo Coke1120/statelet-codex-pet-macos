@@ -242,6 +242,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var oneShotArbiter = OneShotPlaybackArbiter()
     private var activeOneShotPreview: ActiveOneShotPreview?
     private var settingsController: SettingsWindowController?
+    private var dialogueVoiceCoordinator: DialogueVoiceCoordinator!
     private let toolchainDiscovery = AlphaToolchainDiscovery()
     private var toolchainState: AlphaToolchainState = .checking
     private let conversionCoordinator = AlphaConversionCoordinator()
@@ -274,6 +275,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         configuredMediaMapURL = options.mediaMapURL
         configureCharacterLibrary()
         loadMediaMap()
+        dialogueVoiceCoordinator = DialogueVoiceCoordinator()
+        dialogueVoiceCoordinator.onChange = { [weak self] snapshot in
+            self?.settingsController?.update(dialogueVoice: snapshot)
+        }
+        dialogueVoiceCoordinator.start()
         refreshCharacterClipCounts()
 
         let configuredWindow = mediaMap.window
@@ -399,6 +405,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         positionSaveWorkItem?.cancel()
         positionSaveWorkItem = nil
         _ = conversionCoordinator.terminateAndWait()
+        dialogueVoiceCoordinator?.shutdown()
         savePanelFrame()
         NotificationCenter.default.removeObserver(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
@@ -1361,6 +1368,21 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         controller.onRepairInstallation = { [weak self] in self?.repairStartupInstallation() }
         controller.onLaunchAtLoginChange = { [weak self] enabled in self?.setLaunchAtLogin(enabled) }
         controller.onCleanUnusedMedia = { [weak self] in self?.cleanUnusedMedia() }
+        controller.onImportVoiceAsset = { [weak self] kind, draft in
+            self?.chooseVoiceAsset(kind: kind, preserving: draft)
+        }
+        controller.onSaveVoiceProfile = { [weak self] draft in self?.saveVoiceProfile(draft) }
+        controller.onRemoveVoiceProfile = { [weak self] profile in self?.confirmVoiceProfileRemoval(profile) }
+        controller.onAddDialogueLine = { [weak self] text, language in
+            self?.addDialogueLine(text: text, language: language)
+        }
+        controller.onUpdateDialogueLine = { [weak self] line, text, language in
+            self?.updateDialogueLine(line, text: text, language: language)
+        }
+        controller.onDeleteDialogueLine = { [weak self] line in self?.confirmDialogueLineDeletion(line) }
+        controller.onPreviewDialogueLine = { [weak self] line in self?.previewDialogueLine(line) }
+        controller.onRetryDialogueLine = { [weak self] line in self?.retryDialogueLine(line) }
+        controller.onRegenerateDialogueLine = { [weak self] line in self?.regenerateDialogueLine(line) }
         controller.onCharacterSelection = { [weak self] id in self?.selectCharacter(id: id) }
         controller.onCreateCharacter = { [weak self] name in self?.createCharacter(name: name) }
         controller.onRenameCharacter = { [weak self] id, name in
@@ -1374,6 +1396,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         controller.onExportCharacterBundle = { [weak self] id in self?.exportCharacterBundle(id: id) }
         controller.update(toolchainState: toolchainState)
         controller.update(conversionProfile: conversionProfile)
+        controller.update(dialogueVoice: dialogueVoiceCoordinator.snapshot)
         if let pendingRecoveryNotice {
             controller.update(activity: .failed(pendingRecoveryNotice.0, pendingRecoveryNotice.1))
         }
@@ -1416,6 +1439,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 activeCharacterID: characterLibrary.activeCharacterID
             )
         )
+        settingsController.update(toolchainState: toolchainState)
+        settingsController.update(dialogueVoice: dialogueVoiceCoordinator.snapshot)
     }
 
     private func persistCharacterLibrary(_ updated: CharacterLibrary) throws {
@@ -1787,6 +1812,143 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 forKey: AlphaToolchainDiscovery.configuredPythonDefaultsKey
             )
             self?.checkConversionTools()
+        }
+    }
+
+    private func chooseVoiceAsset(
+        kind: DialogueVoiceAssetKind,
+        preserving draft: DialogueVoiceProfileDraft
+    ) {
+        guard let settingsWindow = settingsController?.window else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        switch kind {
+        case .gptWeight:
+            panel.title = "Import GPT Weight"
+            panel.message = "Choose a trusted GPT-SoVITS .ckpt file. Model files can execute code when loaded by their runtime; only import files you trust."
+            panel.prompt = "Import GPT Weight"
+            panel.allowedContentTypes = [UTType(filenameExtension: "ckpt") ?? .data]
+        case .sovitsWeight:
+            panel.title = "Import SoVITS Weight"
+            panel.message = "Choose a trusted GPT-SoVITS .pth file. Model files can execute code when loaded by their runtime; only import files you trust."
+            panel.prompt = "Import SoVITS Weight"
+            panel.allowedContentTypes = [UTType(filenameExtension: "pth") ?? .data]
+        case .referenceAudio:
+            panel.title = "Import Reference Audio"
+            panel.message = "Choose reference audio that you own or are authorized to use. Statelet keeps a private local copy."
+            panel.prompt = "Import Reference Audio"
+            panel.allowedContentTypes = [.audio]
+        }
+        panel.beginSheetModal(for: settingsWindow) { [weak self] response in
+            guard response == .OK, let sourceURL = panel.url else { return }
+            self?.dialogueVoiceCoordinator.importAsset(
+                sourceURL: sourceURL,
+                kind: kind,
+                preserving: draft
+            )
+        }
+    }
+
+    private func saveVoiceProfile(_ draft: DialogueVoiceProfileDraft) {
+        guard dialogueVoiceCoordinator.library.profile != nil,
+              let settingsWindow = settingsController?.window else {
+            persistVoiceProfile(draft)
+            return
+        }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Replace the active voice profile?"
+        alert.informativeText = "Saving this profile invalidates all generated dialogue audio. Statelet keeps the dialogue text, validates the replacement profile, then queues fresh background generation."
+        alert.addButton(withTitle: "Save and Regenerate")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: settingsWindow) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.persistVoiceProfile(draft)
+        }
+    }
+
+    private func persistVoiceProfile(_ draft: DialogueVoiceProfileDraft) {
+        do {
+            try dialogueVoiceCoordinator.saveProfile(draft)
+        } catch {
+            presentSettingsError(error.localizedDescription)
+        }
+    }
+
+    private func confirmVoiceProfileRemoval(_ profile: GPTSoVITSVoiceProfile) {
+        guard let settingsWindow = settingsController?.window else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Remove \(profile.name)?"
+        alert.informativeText = "Statelet will remove its managed model files, reference audio, and generated speech. Dialogue text will be kept as drafts."
+        alert.addButton(withTitle: "Remove Voice Profile")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: settingsWindow) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            do {
+                try self?.dialogueVoiceCoordinator.removeProfile()
+            } catch {
+                self?.presentSettingsError(error.localizedDescription)
+            }
+        }
+    }
+
+    private func addDialogueLine(text: String, language: String) {
+        do {
+            try dialogueVoiceCoordinator.addLine(text: text, language: language)
+        } catch {
+            presentSettingsError(error.localizedDescription)
+        }
+    }
+
+    private func updateDialogueLine(_ line: DialogueLine, text: String, language: String) {
+        do {
+            try dialogueVoiceCoordinator.updateLine(id: line.id, text: text, language: language)
+        } catch {
+            presentSettingsError(error.localizedDescription)
+        }
+    }
+
+    private func confirmDialogueLineDeletion(_ line: DialogueLine) {
+        guard let settingsWindow = settingsController?.window else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Delete this dialogue line?"
+        alert.informativeText = "The saved text and generated audio will be removed."
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: settingsWindow) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            do {
+                try self?.dialogueVoiceCoordinator.deleteLine(id: line.id)
+            } catch {
+                self?.presentSettingsError(error.localizedDescription)
+            }
+        }
+    }
+
+    private func previewDialogueLine(_ line: DialogueLine) {
+        do {
+            try dialogueVoiceCoordinator.previewLine(id: line.id)
+        } catch {
+            presentSettingsError(error.localizedDescription)
+        }
+    }
+
+    private func retryDialogueLine(_ line: DialogueLine) {
+        do {
+            try dialogueVoiceCoordinator.retryLine(id: line.id)
+        } catch {
+            presentSettingsError(error.localizedDescription)
+        }
+    }
+
+    private func regenerateDialogueLine(_ line: DialogueLine) {
+        do {
+            try dialogueVoiceCoordinator.regenerateLine(id: line.id)
+        } catch {
+            presentSettingsError(error.localizedDescription)
         }
     }
 
