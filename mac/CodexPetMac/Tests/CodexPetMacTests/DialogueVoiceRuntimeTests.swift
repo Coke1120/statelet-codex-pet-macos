@@ -25,31 +25,11 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
     }
 
     private final class SuccessfulGPTSoVITSURLProtocol: URLProtocol {
-        private static let captureLock = NSLock()
-        private static var capturedTTSBody: Data?
-
-        static func resetCapture() {
-            captureLock.lock()
-            capturedTTSBody = nil
-            captureLock.unlock()
-        }
-
-        static func ttsBody() -> Data? {
-            captureLock.lock()
-            defer { captureLock.unlock() }
-            return capturedTTSBody
-        }
-
         override class func canInit(with request: URLRequest) -> Bool { true }
         override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
         override func startLoading() {
             let isTTSRequest = request.url?.lastPathComponent == "tts"
-            if isTTSRequest {
-                Self.captureLock.lock()
-                Self.capturedTTSBody = request.httpBody
-                Self.captureLock.unlock()
-            }
             let data = isTTSRequest ? Self.pcmWAV() : Data("{}".utf8)
             let response = HTTPURLResponse(
                 url: request.url!,
@@ -767,7 +747,6 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
 
     @MainActor
     func testCoordinatorRestoresQueuedLineGeneratesPublishesAndPlaysReadyAudio() async throws {
-        SuccessfulGPTSoVITSURLProtocol.resetCapture()
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("dialogue-coordinator-tests-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -867,10 +846,18 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             coordinator.library.lines.first(where: { $0.id == runningLineID })?.outputRelativePath
         )
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(outputPath).path))
-        let ttsBody = try XCTUnwrap(SuccessfulGPTSoVITSURLProtocol.ttsBody())
+        let ttsBody = try GPTSoVITSAPIClient.encodedTTSRequestBody(
+            text: readyLine.text,
+            textLanguage: "JA",
+            referenceAudioPath: root.appendingPathComponent(paths.reference).path,
+            promptText: profile.referenceText,
+            promptLanguage: "JA"
+        )
         let ttsJSON = try XCTUnwrap(
             JSONSerialization.jsonObject(with: ttsBody) as? [String: Any]
         )
+        XCTAssertEqual(ttsJSON["text_lang"] as? String, "ja")
+        XCTAssertEqual(ttsJSON["prompt_lang"] as? String, "ja")
         XCTAssertEqual(ttsJSON["text_split_method"] as? String, "cut0")
         try assertJSONBoolean(ttsJSON["streaming_mode"], equals: false)
         try assertJSONNumber(ttsJSON["batch_size"], equals: 1)

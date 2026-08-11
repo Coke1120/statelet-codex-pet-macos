@@ -862,6 +862,22 @@ actor GPTSoVITSAPIClient {
         self.configuration = configuration
     }
 
+    static func encodedTTSRequestBody(
+        text: String,
+        textLanguage: String,
+        referenceAudioPath: String,
+        promptText: String,
+        promptLanguage: String
+    ) throws -> Data {
+        try JSONEncoder().encode(TTSBody(
+            text: text,
+            textLanguage: textLanguage.lowercased(),
+            referenceAudioPath: referenceAudioPath,
+            promptText: promptText,
+            promptLanguage: promptLanguage.lowercased()
+        ))
+    }
+
     func synthesize(
         profile: GPTSoVITSVoiceProfile,
         line: DialogueLine,
@@ -878,13 +894,13 @@ actor GPTSoVITSAPIClient {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("audio/wav", forHTTPHeaderField: "Accept")
-        request.httpBody = try JSONEncoder().encode(TTSBody(
+        request.httpBody = try Self.encodedTTSRequestBody(
             text: line.text,
-            textLanguage: line.textLanguage.lowercased(),
+            textLanguage: line.textLanguage,
             referenceAudioPath: referenceAudioURL.path,
             promptText: profile.referenceText,
-            promptLanguage: profile.promptLanguage.lowercased()
-        ))
+            promptLanguage: profile.promptLanguage
+        )
         let (data, response) = try await perform(
             request,
             maximumBytes: Self.maximumAudioResponseBytes
