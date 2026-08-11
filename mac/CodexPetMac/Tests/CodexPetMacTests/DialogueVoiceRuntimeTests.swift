@@ -144,6 +144,7 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
     private final class FakePlayer: DialogueAudioPlaying {
         var playedPaths: [String] = []
         var error: Error?
+        var isPlaying = false
 
         func play(relativePath: String, applicationSupportRoot: URL) throws {
             if let error { throw error }
@@ -441,8 +442,9 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
 
         let coordinator = DialogueVoiceCoordinator(applicationSupportRoot: root)
         coordinator.start()
-        try coordinator.addLine(text: "Before", language: "en")
+        try coordinator.addLine(text: "Before", language: "en", state: .running)
         let lineID = try XCTUnwrap(coordinator.library.lines.first?.id)
+        XCTAssertEqual(coordinator.library.lines.first?.state, .running)
         let imported = expectation(description: "asset is imported")
         coordinator.onChange = { snapshot in
             if snapshot.importedAssets.gptWeightRelativePath != nil {
@@ -458,7 +460,13 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         coordinator.onChange = nil
         let relativePath = try XCTUnwrap(coordinator.importedAssets.gptWeightRelativePath)
 
-        try coordinator.updateLine(id: lineID, text: "After", language: "en")
+        try coordinator.updateLine(
+            id: lineID,
+            text: "After",
+            language: "en",
+            state: .review
+        )
+        XCTAssertEqual(coordinator.library.lines.first?.state, .review)
 
         let store = DialogueVoiceStore(rootURL: root.appendingPathComponent("voice", isDirectory: true))
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(relativePath).path))
@@ -632,6 +640,112 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
     }
 
     @MainActor
+    func testSavingReplacementProfileWithReadyOutputCleansPreviousWAV() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dialogue-profile-replacement-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = (
+            gpt: "voice/assets/gpt/test.ckpt",
+            sovits: "voice/assets/sovits/test.pth",
+            reference: "voice/assets/reference/test.wav",
+            output: "voice/generated/previous.wav"
+        )
+        for relativeDirectory in [
+            "voice/assets/gpt",
+            "voice/assets/sovits",
+            "voice/assets/reference",
+            "voice/generated",
+        ] {
+            try FileManager.default.createDirectory(
+                at: root.appendingPathComponent(relativeDirectory, isDirectory: true),
+                withIntermediateDirectories: true
+            )
+        }
+        try Data("gpt".utf8).write(to: root.appendingPathComponent(paths.gpt))
+        try Data("sovits".utf8).write(to: root.appendingPathComponent(paths.sovits))
+        try pcmWAV().write(to: root.appendingPathComponent(paths.reference))
+        try pcmWAV().write(to: root.appendingPathComponent(paths.output))
+
+        let endpoint = try XCTUnwrap(URL(string: "http://127.0.0.1:9880"))
+        let provisionalProfile = try GPTSoVITSVoiceProfile(
+            id: UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!,
+            name: "Original voice",
+            apiBaseURL: endpoint,
+            gptWeightRelativePath: paths.gpt,
+            sovitsWeightRelativePath: paths.sovits,
+            referenceAudioRelativePath: paths.reference,
+            referenceText: "Reference",
+            promptLanguage: "en",
+            defaultTextLanguage: "en",
+            inputFingerprint: String(repeating: "0", count: 64)
+        )
+        let validated = try DialogueVoiceProfileFingerprint.validateAssets(
+            profile: provisionalProfile,
+            applicationSupportRoot: root
+        )
+        let profile = try GPTSoVITSVoiceProfile(
+            id: provisionalProfile.id,
+            name: provisionalProfile.name,
+            apiBaseURL: endpoint,
+            gptWeightRelativePath: paths.gpt,
+            sovitsWeightRelativePath: paths.sovits,
+            referenceAudioRelativePath: paths.reference,
+            referenceText: provisionalProfile.referenceText,
+            promptLanguage: provisionalProfile.promptLanguage,
+            defaultTextLanguage: provisionalProfile.defaultTextLanguage,
+            inputFingerprint: DialogueVoiceProfileFingerprint.compute(
+                apiBaseURL: endpoint,
+                referenceText: provisionalProfile.referenceText,
+                promptLanguage: provisionalProfile.promptLanguage,
+                defaultTextLanguage: provisionalProfile.defaultTextLanguage,
+                assetDigests: validated.digests
+            )
+        )
+        var library = try DialogueVoiceLibrary(profile: profile)
+        _ = try library.addLine(text: "Existing generated line", id: lineID)
+        let ticket = try library.beginGeneration(for: lineID)
+        _ = try library.completeGeneration(ticket: ticket, outputPath: paths.output)
+        let store = DialogueVoiceStore(
+            rootURL: root.appendingPathComponent("voice", isDirectory: true)
+        )
+        try store.save(library)
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [SuccessfulGPTSoVITSURLProtocol.self]
+        let coordinator = DialogueVoiceCoordinator(
+            applicationSupportRoot: root,
+            client: GPTSoVITSAPIClient(configuration: configuration),
+            audioPlayer: FakePlayer()
+        )
+        defer { coordinator.shutdown() }
+        let validatedProfile = expectation(description: "saved profile validates")
+        var fulfilled = false
+        coordinator.onChange = { snapshot in
+            guard !fulfilled,
+                  snapshot.library.profileStatus == .ready,
+                  snapshot.library.lines.first?.status == .ready else { return }
+            fulfilled = true
+            validatedProfile.fulfill()
+        }
+        coordinator.start()
+        await fulfillment(of: [validatedProfile], timeout: 5)
+
+        XCTAssertNoThrow(try coordinator.saveProfile(DialogueVoiceProfileDraft(
+            name: "Replacement voice",
+            apiBaseURL: endpoint.absoluteString,
+            promptLanguage: "en",
+            defaultTextLanguage: "en",
+            referenceText: "Reference"
+        )))
+        XCTAssertEqual(coordinator.library.profile?.revision, 2)
+        XCTAssertEqual(coordinator.library.profileStatus, .validating)
+        XCTAssertEqual(coordinator.library.lines.first?.status, .queued)
+        XCTAssertNil(coordinator.library.lines.first?.outputRelativePath)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent(paths.output).path))
+        XCTAssertFalse(try store.load().pendingCleanupPaths.contains(paths.output))
+    }
+
+    @MainActor
     func testCoordinatorRestoresQueuedLineGeneratesPublishesAndPlaysReadyAudio() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("dialogue-coordinator-tests-\(UUID().uuidString)", isDirectory: true)
@@ -692,6 +806,8 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         )
         var library = try DialogueVoiceLibrary(profile: profile)
         _ = try library.addLine(text: "Hello from the queue", id: lineID)
+        let runningLineID = UUID(uuidString: "66666666-7777-8888-9999-AAAAAAAAAAAA")!
+        _ = try library.addLine(text: "Running now", state: .running, id: runningLineID)
         let store = DialogueVoiceStore(
             rootURL: root.appendingPathComponent("voice", isDirectory: true)
         )
@@ -710,7 +826,8 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         var fulfilled = false
         coordinator.onChange = { snapshot in
             guard !fulfilled,
-                  snapshot.library.lines.first(where: { $0.id == self.lineID })?.status == .ready else {
+                  snapshot.library.lines.count == 2,
+                  snapshot.library.lines.allSatisfy({ $0.status == .ready }) else {
                 return
             }
             fulfilled = true
@@ -725,9 +842,99 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         )
         XCTAssertEqual(readyLine.status, .ready)
         let outputPath = try XCTUnwrap(readyLine.outputRelativePath)
+        let runningOutputPath = try XCTUnwrap(
+            coordinator.library.lines.first(where: { $0.id == runningLineID })?.outputRelativePath
+        )
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(outputPath).path))
-        XCTAssertEqual(coordinator.playReadyLine(id: lineID), .played)
+        let ttsBody = try GPTSoVITSAPIClient.encodedTTSRequestBody(
+            text: readyLine.text,
+            textLanguage: "JA",
+            referenceAudioPath: root.appendingPathComponent(paths.reference).path,
+            promptText: profile.referenceText,
+            promptLanguage: "JA"
+        )
+        let ttsJSON = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: ttsBody) as? [String: Any]
+        )
+        XCTAssertEqual(ttsJSON["text_lang"] as? String, "ja")
+        XCTAssertEqual(ttsJSON["prompt_lang"] as? String, "ja")
+        XCTAssertEqual(ttsJSON["text_split_method"] as? String, "cut0")
+        try assertJSONBoolean(ttsJSON["streaming_mode"], equals: false)
+        try assertJSONNumber(ttsJSON["batch_size"], equals: 1)
+        try assertJSONBoolean(ttsJSON["parallel_infer"], equals: false)
+        try assertJSONBoolean(ttsJSON["split_bucket"], equals: false)
+        try assertJSONNumber(ttsJSON["fragment_interval"], equals: 0)
+        try assertJSONNumber(ttsJSON["top_k"], equals: 5)
+        try assertJSONNumber(ttsJSON["top_p"], equals: 0.8)
+        try assertJSONNumber(ttsJSON["temperature"], equals: 0.6)
+        try assertJSONNumber(ttsJSON["repetition_penalty"], equals: 1.35)
+
+        player.isPlaying = true
+        let firstIdleRequest = UUID()
+        let runningRequest = UUID()
+        let latestIdleRequest = UUID()
+        XCTAssertEqual(
+            coordinator.playReadyLineAutomatically(id: lineID, requestID: firstIdleRequest),
+            .deferred
+        )
+        XCTAssertEqual(
+            coordinator.playReadyLineAutomatically(id: runningLineID, requestID: runningRequest),
+            .deferred
+        )
+        XCTAssertEqual(
+            coordinator.playReadyLineAutomatically(id: lineID, requestID: latestIdleRequest),
+            .deferred
+        )
+        XCTAssertTrue(player.playedPaths.isEmpty)
+        XCTAssertEqual(coordinator.preferredLine(for: .idle)?.id, lineID)
+
+        let deferredStarted = expectation(description: "latest deferred state voice starts")
+        coordinator.onAutomaticPlaybackStarted = { requestID, startedLineID in
+            XCTAssertEqual(requestID, latestIdleRequest)
+            XCTAssertEqual(startedLineID, self.lineID)
+            deferredStarted.fulfill()
+        }
+        player.isPlaying = false
+        await fulfillment(of: [deferredStarted], timeout: 2)
         XCTAssertEqual(player.playedPaths, [outputPath])
+        XCTAssertFalse(player.playedPaths.contains(runningOutputPath))
+
+        XCTAssertEqual(coordinator.playReadyLine(id: lineID), .played)
+        XCTAssertEqual(player.playedPaths, [outputPath, outputPath])
+    }
+
+    private func assertJSONBoolean(
+        _ value: Any?,
+        equals expected: Bool,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let number = try XCTUnwrap(value as? NSNumber, file: file, line: line)
+        XCTAssertEqual(
+            CFGetTypeID(number as CFTypeRef),
+            CFBooleanGetTypeID(),
+            "Expected a JSON boolean",
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(number.boolValue, expected, file: file, line: line)
+    }
+
+    private func assertJSONNumber(
+        _ value: Any?,
+        equals expected: Double,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let number = try XCTUnwrap(value as? NSNumber, file: file, line: line)
+        XCTAssertNotEqual(
+            CFGetTypeID(number as CFTypeRef),
+            CFBooleanGetTypeID(),
+            "Expected a JSON number, not a boolean",
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(number.doubleValue, expected, accuracy: 0.000_001, file: file, line: line)
     }
 
     private func pcmWAV() -> Data {

@@ -182,6 +182,21 @@ private struct ActiveOneShotPreview {
     let transitionID: UInt64
 }
 
+enum StateDialogueAudioDisposition: Equatable {
+    case pending
+    case deferred
+    case delivered
+}
+
+struct StateDialoguePresentation: Equatable {
+    let id: UUID
+    let state: PetState
+    let lineID: UUID?
+    var lineRevision: Int?
+    var text: String?
+    var audioDisposition: StateDialogueAudioDisposition
+}
+
 private enum StatusMenuTag: Int {
     case state = 1
     case clickThrough = 2
@@ -232,6 +247,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var lastLifecycleStateForSelection: PetState?
     private var lastPresentedState: PetState?
     private var pendingPresentationState: PetState?
+    private var stateDialoguePresentation: StateDialoguePresentation?
     private var publisherHealth: PublisherHealth = .unknown
     private var mapReadFailureReported = false
     private var reduceMotion = false
@@ -277,7 +293,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         loadMediaMap()
         dialogueVoiceCoordinator = DialogueVoiceCoordinator()
         dialogueVoiceCoordinator.onChange = { [weak self] snapshot in
-            self?.settingsController?.update(dialogueVoice: snapshot)
+            guard let self else { return }
+            self.settingsController?.update(dialogueVoice: snapshot)
+            self.refreshStateOwnedDialogue(using: snapshot)
+        }
+        dialogueVoiceCoordinator.onAutomaticPlaybackStarted = { [weak self] requestID, lineID in
+            self?.markStateOwnedDialogueAudioDelivered(requestID: requestID, lineID: lineID)
         }
         dialogueVoiceCoordinator.start()
         refreshCharacterClipCounts()
@@ -798,7 +819,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         useManualPreviewCursor: Bool = false,
         explicitUserAdvance: Bool = false
     ) {
-
+        if stateDialoguePresentation?.state != state {
+            dialogueVoiceCoordinator.cancelPendingAutomaticPlayback()
+            stateDialoguePresentation = nil
+            player?.view.showDialogueMessage(nil)
+        }
         let started = DispatchTime.now().uptimeNanoseconds
         transitionSequence &+= 1
         let transitionID = transitionSequence
@@ -824,6 +849,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         case .presented:
             lastPresentedState = state
             pendingPresentationState = nil
+            presentStateOwnedDialogueIfNeeded(for: state)
         case .preparing:
             lastPresentedState = nil
             pendingPresentationState = state
@@ -875,12 +901,102 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         switch event {
         case .ready:
             lastPresentedState = state
+            presentStateOwnedDialogueIfNeeded(for: state)
             logger.info("event=presentation_committed transition_id=\(transitionID, privacy: .public) state=\(state.rawValue, privacy: .public)")
         case .failed:
             lastPresentedState = nil
             logger.error("event=presentation_revoked transition_id=\(transitionID, privacy: .public) state=\(state.rawValue, privacy: .public)")
         }
         updateStatusMenu()
+    }
+
+    private func presentStateOwnedDialogueIfNeeded(for state: PetState) {
+        if stateDialoguePresentation?.state == state {
+            retryStateOwnedDialogueAudioIfReady()
+            return
+        }
+        dialogueVoiceCoordinator.cancelPendingAutomaticPlayback()
+        let line = dialogueVoiceCoordinator.preferredLine(for: state)
+        stateDialoguePresentation = StateDialoguePresentation(
+            id: UUID(),
+            state: state,
+            lineID: line?.id,
+            lineRevision: line?.revision,
+            text: line?.text,
+            audioDisposition: .pending
+        )
+        player?.view.showDialogueMessage(line?.text)
+        retryStateOwnedDialogueAudioIfReady()
+    }
+
+    private func refreshStateOwnedDialogue(using snapshot: DialogueVoiceCoordinatorSnapshot) {
+        guard player != nil,
+              var presentation = stateDialoguePresentation,
+              presentation.state == effectivePresentationState,
+              let lineID = presentation.lineID else {
+            return
+        }
+        guard let line = snapshot.library.lines.first(where: { $0.id == lineID }),
+              line.state == presentation.state else {
+            dialogueVoiceCoordinator.cancelPendingAutomaticPlayback()
+            stateDialoguePresentation = nil
+            player.view.showDialogueMessage(nil)
+            return
+        }
+
+        if presentation.lineRevision != line.revision {
+            dialogueVoiceCoordinator.cancelPendingAutomaticPlayback()
+            presentation.lineRevision = line.revision
+            presentation.audioDisposition = .pending
+        } else if line.status != .ready, presentation.audioDisposition == .deferred {
+            dialogueVoiceCoordinator.cancelPendingAutomaticPlayback()
+            presentation.audioDisposition = .pending
+        }
+        presentation.text = line.text
+        stateDialoguePresentation = presentation
+        player.view.showDialogueMessage(line.text)
+        retryStateOwnedDialogueAudioIfReady()
+    }
+
+    private func retryStateOwnedDialogueAudioIfReady() {
+        guard var presentation = stateDialoguePresentation,
+              presentation.state == effectivePresentationState,
+              presentation.audioDisposition == .pending,
+              let lineID = presentation.lineID,
+              let line = dialogueVoiceCoordinator.library.lines.first(where: { $0.id == lineID }),
+              line.revision == presentation.lineRevision,
+              line.state == presentation.state,
+              line.status == .ready else {
+            return
+        }
+
+        switch dialogueVoiceCoordinator.playReadyLineAutomatically(
+            id: lineID,
+            requestID: presentation.id
+        ) {
+        case .played:
+            // The coordinator's start callback records delivery synchronously.
+            break
+        case .deferred:
+            presentation.audioDisposition = .deferred
+            stateDialoguePresentation = presentation
+            logger.info("event=state_dialogue_deferred state=\(presentation.state.rawValue, privacy: .public)")
+        case .unavailable:
+            break
+        }
+    }
+
+    private func markStateOwnedDialogueAudioDelivered(requestID: UUID, lineID: UUID) {
+        guard var presentation = stateDialoguePresentation,
+              presentation.id == requestID,
+              presentation.state == effectivePresentationState,
+              presentation.lineID == lineID,
+              presentation.audioDisposition != .delivered else {
+            return
+        }
+        presentation.audioDisposition = .delivered
+        stateDialoguePresentation = presentation
+        logger.info("event=state_dialogue_started state=\(presentation.state.rawValue, privacy: .public)")
     }
 
     private func selectedEntry(
@@ -1373,11 +1489,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
         controller.onSaveVoiceProfile = { [weak self] draft in self?.saveVoiceProfile(draft) }
         controller.onRemoveVoiceProfile = { [weak self] profile in self?.confirmVoiceProfileRemoval(profile) }
-        controller.onAddDialogueLine = { [weak self] text, language in
-            self?.addDialogueLine(text: text, language: language)
+        controller.onAddDialogueLine = { [weak self] text, language, state in
+            self?.addDialogueLine(text: text, language: language, state: state)
         }
-        controller.onUpdateDialogueLine = { [weak self] line, text, language in
-            self?.updateDialogueLine(line, text: text, language: language)
+        controller.onUpdateDialogueLine = { [weak self] line, text, language, state in
+            self?.updateDialogueLine(line, text: text, language: language, state: state)
         }
         controller.onDeleteDialogueLine = { [weak self] line in self?.confirmDialogueLineDeletion(line) }
         controller.onPreviewDialogueLine = { [weak self] line in self?.previewDialogueLine(line) }
@@ -1577,7 +1693,10 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func deleteCharacter(id: String) {
-        guard !mediaMutationInProgress else { return }
+        guard !mediaMutationInProgress,
+              characterLibrary.characters.count > 1,
+              characterLibrary.activeCharacterID == id,
+              characterLibrary.character(id: id) != nil else { return }
         do {
             let updated = try characterLibrary.removingCharacter(id: id)
             let activeChanged = updated.activeCharacterID != characterLibrary.activeCharacterID
@@ -1894,17 +2013,27 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
     }
 
-    private func addDialogueLine(text: String, language: String) {
+    private func addDialogueLine(text: String, language: String, state: PetState) {
         do {
-            try dialogueVoiceCoordinator.addLine(text: text, language: language)
+            try dialogueVoiceCoordinator.addLine(text: text, language: language, state: state)
         } catch {
             presentSettingsError(error.localizedDescription)
         }
     }
 
-    private func updateDialogueLine(_ line: DialogueLine, text: String, language: String) {
+    private func updateDialogueLine(
+        _ line: DialogueLine,
+        text: String,
+        language: String,
+        state: PetState
+    ) {
         do {
-            try dialogueVoiceCoordinator.updateLine(id: line.id, text: text, language: language)
+            try dialogueVoiceCoordinator.updateLine(
+                id: line.id,
+                text: text,
+                language: language,
+                state: state
+            )
         } catch {
             presentSettingsError(error.localizedDescription)
         }

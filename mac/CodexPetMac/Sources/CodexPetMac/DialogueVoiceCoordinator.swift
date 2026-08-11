@@ -88,6 +88,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     private(set) var activityMessage: String?
 
     private var activeGenerationTask: Task<Void, Never>?
+    private var pendingAutomaticPlaybackTask: Task<Void, Never>?
+    private var automaticPlaybackSequence: UInt64 = 0
     private var activeTicket: DialogueGenerationTicket?
     private var activeImportTask: Task<Void, Never>?
     private var profileValidationTask: Task<Void, Never>?
@@ -98,6 +100,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     private var started = false
 
     var onChange: ((DialogueVoiceCoordinatorSnapshot) -> Void)?
+    var onAutomaticPlaybackStarted: ((UUID, UUID) -> Void)?
 
     init(
         applicationSupportRoot: URL = FileManager.default.homeDirectoryForCurrentUser
@@ -167,6 +170,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             if recoveredLibrary.profile != nil {
                 try recoveredLibrary.setProfileStatus(.validating)
             }
+            let migratedOutputs = try recoveredLibrary.migrateOutdatedSynthesisOutputs()
             let recovered = try recoveredLibrary.recoverInterruptedGenerations()
             var missingOutputs = 0
             for line in recoveredLibrary.lines where line.status == .ready {
@@ -180,12 +184,15 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                     missingOutputs += 1
                 }
             }
-            if recoveredLibrary != library || recovered > 0 || missingOutputs > 0 {
+            if recoveredLibrary != library || recovered > 0 || missingOutputs > 0 || migratedOutputs > 0 {
                 try store.save(recoveredLibrary)
                 library = recoveredLibrary
                 activityMessage = library.profile == nil
                     ? "Recovered \(recovered + missingOutputs) dialogue generation task(s)."
                     : "Validating the saved voice profile before generation and playback…"
+                if migratedOutputs > 0 {
+                    activityMessage = "Refreshing \(migratedOutputs) dialogue clip(s) for the current synthesis recipe…"
+                }
             }
         } catch {
             persistenceBlocked = true
@@ -222,6 +229,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         activeGenerationTask?.cancel()
         activeGenerationTask = nil
         activeTicket = nil
+        cancelPendingAutomaticPlayback()
         audioPlayer.stop()
         if !persistenceBlocked {
             _ = retryPendingCleanup(preserving: [])
@@ -401,6 +409,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         let resetLines = try library.lines.map { line in
             try DialogueLine(
                 id: line.id,
+                state: line.state,
                 text: line.text,
                 textLanguage: line.textLanguage,
                 revision: line.revision,
@@ -432,10 +441,10 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         notify()
     }
 
-    func addLine(text: String, language: String) throws {
+    func addLine(text: String, language: String, state: PetState = .idle) throws {
         assertMainThread()
         guard !persistenceBlocked else { throw DialogueVoiceError.storeFailure }
-        _ = try commit { try $0.addLine(text: text, language: language) }
+        _ = try commit { try $0.addLine(text: text, language: language, state: state) }
         activityMessage = library.profileStatus == .ready
             ? "Dialogue queued for voice generation."
             : library.profile == nil
@@ -445,13 +454,13 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         processNextQueuedLine()
     }
 
-    func updateLine(id: UUID, text: String, language: String) throws {
+    func updateLine(id: UUID, text: String, language: String, state: PetState? = nil) throws {
         assertMainThread()
         guard !persistenceBlocked else { throw DialogueVoiceError.storeFailure }
         let oldOutput = library.lines.first(where: { $0.id == id })?.outputRelativePath
         if activeTicket?.lineID == id { activeGenerationTask?.cancel() }
         _ = try commit {
-            let line = try $0.editLine(id: id, text: text, language: language)
+            let line = try $0.editLine(id: id, text: text, language: language, state: state)
             try $0.enqueueCleanup(paths: oldOutput.map { [$0] } ?? [])
             return line
         }
@@ -502,7 +511,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         guard let line = library.lines.first(where: { $0.id == id }) else {
             throw DialogueVoiceError.lineNotFound
         }
-        try updateLine(id: id, text: line.text, language: line.textLanguage)
+        try updateLine(id: id, text: line.text, language: line.textLanguage, state: line.state)
     }
 
     func deleteLine(id: UUID) throws {
@@ -538,6 +547,78 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     func playReadyLine(id: UUID) -> DialoguePlaybackResult {
         assertMainThread()
         return playbackService.playReadyLine(id: id, in: library)
+    }
+
+    func preferredLine(for state: PetState) -> DialogueLine? {
+        assertMainThread()
+        return library.preferredLine(for: state)
+    }
+
+    /// Automatic lifecycle playback never interrupts an existing preview or
+    /// lifecycle clip. If audio is busy, only the latest state-entry request is
+    /// retained and played when the current clip finishes. Manual preview
+    /// continues to use `playReadyLine(id:)`.
+    @discardableResult
+    func playPreferredReadyLine(for state: PetState) -> DialoguePlaybackResult {
+        assertMainThread()
+        guard let line = library.preferredLine(for: state) else {
+            cancelPendingAutomaticPlayback()
+            return .unavailable(.notReady)
+        }
+        return playReadyLineAutomatically(id: line.id)
+    }
+
+    @discardableResult
+    func playReadyLineAutomatically(
+        id: UUID,
+        requestID: UUID = UUID()
+    ) -> DialoguePlaybackResult {
+        assertMainThread()
+        cancelPendingAutomaticPlayback()
+        guard let line = library.lines.first(where: { $0.id == id }),
+              line.status == .ready else {
+            return .unavailable(.notReady)
+        }
+        guard audioPlayer.isPlaying else {
+            let result = playbackService.playReadyLine(id: id, in: library)
+            if result == .played {
+                onAutomaticPlaybackStarted?(requestID, id)
+            }
+            return result
+        }
+
+        automaticPlaybackSequence &+= 1
+        let sequence = automaticPlaybackSequence
+        pendingAutomaticPlaybackTask = Task { @MainActor [weak self] in
+            while let self, !Task.isCancelled {
+                guard sequence == self.automaticPlaybackSequence else { return }
+                if !self.audioPlayer.isPlaying {
+                    self.pendingAutomaticPlaybackTask = nil
+                    guard let current = self.library.lines.first(where: { $0.id == id }),
+                          current.status == .ready else {
+                        return
+                    }
+                    let result = self.playbackService.playReadyLine(id: id, in: self.library)
+                    if result == .played {
+                        self.onAutomaticPlaybackStarted?(requestID, id)
+                    }
+                    return
+                }
+                do {
+                    try await Task.sleep(nanoseconds: 50_000_000)
+                } catch {
+                    return
+                }
+            }
+        }
+        return .deferred
+    }
+
+    func cancelPendingAutomaticPlayback() {
+        assertMainThread()
+        automaticPlaybackSequence &+= 1
+        pendingAutomaticPlaybackTask?.cancel()
+        pendingAutomaticPlaybackTask = nil
     }
 
     private func validatePersistedProfile(_ profile: GPTSoVITSVoiceProfile) {
@@ -785,9 +866,21 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         switch result {
         case let .success(outputPath, identities):
             do {
-                _ = try commit { try $0.completeGeneration(ticket: ticket, outputPath: outputPath) }
+                let replacedOutput = library.lines.first(where: { $0.id == ticket.lineID })?
+                    .outputRelativePath
+                _ = try commit {
+                    let completed = try $0.completeGeneration(ticket: ticket, outputPath: outputPath)
+                    if let replacedOutput, replacedOutput != outputPath {
+                        try $0.enqueueCleanup(paths: [replacedOutput])
+                    }
+                    return completed
+                }
                 validatedAssetIdentities = identities
-                activityMessage = "Dialogue audio is ready."
+                let cleanup = retryPendingCleanup()
+                activityMessage = cleanupAwareMessage(
+                    "Dialogue audio is ready.",
+                    outcome: cleanup
+                )
                 logger.info("event=generation_ready line_id=\(ticket.lineID.uuidString, privacy: .public) revision=\(ticket.lineRevision, privacy: .public)")
             } catch {
                 let cleanup = deferCleanup(paths: [outputPath])

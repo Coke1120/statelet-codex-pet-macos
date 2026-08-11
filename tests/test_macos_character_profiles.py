@@ -119,8 +119,39 @@ class CharacterProfileAppSourceTests(unittest.TestCase):
             self.assertLess(body.index("saveMediaMap("), body.index("persistCharacterLibrary(selected)"))
             self.assertIn("FileManager.default.removeItem(", body)
         deletion = swift_function(self.delegate, "private func deleteCharacter(id: String)")
+        for guard in (
+            "!mediaMutationInProgress",
+            "characterLibrary.characters.count > 1",
+            "characterLibrary.activeCharacterID == id",
+            "characterLibrary.character(id: id) != nil",
+        ):
+            self.assertIn(guard, deletion)
         self.assertIn("characterLibrary.removingCharacter(id: id)", deletion)
         self.assertIn("action=retain_current", deletion)
+
+    def test_profile_delete_routes_through_one_confirmation_and_revalidates(self) -> None:
+        self.assertIn(
+            "characterSelector.onDeleteActive = { [weak self] id in self?.confirmCharacterDeletion(id: id) }",
+            self.settings,
+        )
+        confirmation = swift_function(
+            self.settings,
+            "private func confirmCharacterDeletion(id: String)",
+        )
+        for contract in (
+            "CharacterProfileDeletionRequest(",
+            "requestedProfileID: id",
+            "alert.addButton(withTitle: \"Delete Character\")",
+            "alert.addButton(withTitle: \"Cancel\")",
+            "request.confirmedProfileID(",
+            "response: response",
+            "profiles: snapshot.characterProfiles",
+            "activeProfileID: snapshot.activeCharacterID",
+            "busy: self.activity.isBusy",
+            "self.onDeleteCharacter?(confirmedID)",
+        ):
+            self.assertIn(contract, confirmation)
+        self.assertEqual(confirmation.count("NSAlert()"), 1)
 
     def test_bundle_type_and_panels_use_the_registered_package_uti(self) -> None:
         with INFO_PLIST.open("rb") as handle:

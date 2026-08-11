@@ -6,17 +6,51 @@ struct CharacterProfileSummary: Equatable {
     let clipCount: Int
 }
 
+struct CharacterProfileDeletionRequest: Equatable {
+    let profileID: String
+    let profileName: String
+
+    init?(
+        requestedProfileID: String,
+        profiles: [CharacterProfileSummary],
+        activeProfileID: String,
+        busy: Bool
+    ) {
+        guard !busy,
+              profiles.count > 1,
+              requestedProfileID == activeProfileID,
+              let profile = profiles.first(where: { $0.id == requestedProfileID }) else { return nil }
+        profileID = profile.id
+        profileName = profile.name
+    }
+
+    func confirmedProfileID(
+        response: NSApplication.ModalResponse,
+        profiles: [CharacterProfileSummary],
+        activeProfileID: String,
+        busy: Bool
+    ) -> String? {
+        guard response == .alertFirstButtonReturn,
+              !busy,
+              profiles.count > 1,
+              activeProfileID == profileID,
+              profiles.contains(where: { $0.id == profileID }) else { return nil }
+        return profileID
+    }
+}
+
 final class CharacterProfileSelectorView: NSView {
     var onSelectProfile: ((String) -> Void)?
     var onNewCharacter: (() -> Void)?
     var onRenameActive: (() -> Void)?
     var onDuplicateActive: (() -> Void)?
-    var onDeleteActive: (() -> Void)?
+    var onDeleteActive: ((String) -> Void)?
     var onImportBundle: (() -> Void)?
     var onExportActive: (() -> Void)?
 
     private let profilePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let actionsButton = NSButton()
+    private let deleteProfileButton = NSButton(title: "Delete Profile…", target: nil, action: nil)
     private let actionsMenu = NSMenu(title: "Character actions")
     private var profiles: [CharacterProfileSummary] = []
     private var activeID: String?
@@ -40,6 +74,10 @@ final class CharacterProfileSelectorView: NSView {
         rebuildActionsMenu()
         profilePopup.isEnabled = !busy
         actionsButton.isEnabled = !busy && self.activeID != nil
+        deleteProfileButton.isEnabled = !busy && self.activeID != nil && profiles.count > 1
+        deleteProfileButton.toolTip = profiles.count <= 1
+            ? "The last character cannot be deleted."
+            : "Delete the active character profile."
     }
 
     private func build() {
@@ -62,20 +100,31 @@ final class CharacterProfileSelectorView: NSView {
         actionsButton.toolTip = "Active character actions"
         actionsButton.menu = actionsMenu
 
+        deleteProfileButton.bezelStyle = .rounded
+        deleteProfileButton.controlSize = .small
+        deleteProfileButton.target = self
+        deleteProfileButton.action = #selector(deleteActive)
+        deleteProfileButton.translatesAutoresizingMaskIntoConstraints = false
+        deleteProfileButton.setAccessibilityLabel("Delete active character profile")
+        deleteProfileButton.setAccessibilityHelp("Delete the active character profile after confirmation. The last profile cannot be deleted.")
+
         addSubview(profilePopup)
         addSubview(actionsButton)
+        addSubview(deleteProfileButton)
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: 28),
             profilePopup.leadingAnchor.constraint(equalTo: leadingAnchor),
             profilePopup.topAnchor.constraint(equalTo: topAnchor),
             profilePopup.bottomAnchor.constraint(equalTo: bottomAnchor),
-            profilePopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 180),
+            profilePopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 140),
             profilePopup.widthAnchor.constraint(lessThanOrEqualToConstant: 280),
             actionsButton.leadingAnchor.constraint(equalTo: profilePopup.trailingAnchor, constant: 6),
-            actionsButton.trailingAnchor.constraint(equalTo: trailingAnchor),
             actionsButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             actionsButton.widthAnchor.constraint(equalToConstant: 28),
             actionsButton.heightAnchor.constraint(equalToConstant: 28),
+            deleteProfileButton.leadingAnchor.constraint(equalTo: actionsButton.trailingAnchor, constant: 6),
+            deleteProfileButton.trailingAnchor.constraint(equalTo: trailingAnchor),
+            deleteProfileButton.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
     }
 
@@ -178,7 +227,10 @@ final class CharacterProfileSelectorView: NSView {
     @objc private func duplicateActive() { onDuplicateActive?() }
     @objc private func exportActive() { onExportActive?() }
     @objc private func deleteActive() {
-        guard profiles.count > 1 else { return }
-        onDeleteActive?()
+        guard !busy,
+              profiles.count > 1,
+              let activeID,
+              profiles.contains(where: { $0.id == activeID }) else { return }
+        onDeleteActive?(activeID)
     }
 }

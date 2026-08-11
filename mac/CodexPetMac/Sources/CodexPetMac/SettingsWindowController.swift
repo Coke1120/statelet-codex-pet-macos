@@ -122,8 +122,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     var onImportVoiceAsset: ((DialogueVoiceAssetKind, DialogueVoiceProfileDraft) -> Void)?
     var onSaveVoiceProfile: ((DialogueVoiceProfileDraft) -> Void)?
     var onRemoveVoiceProfile: ((GPTSoVITSVoiceProfile) -> Void)?
-    var onAddDialogueLine: ((String, String) -> Void)?
-    var onUpdateDialogueLine: ((DialogueLine, String, String) -> Void)?
+    var onAddDialogueLine: ((String, String, PetState) -> Void)?
+    var onUpdateDialogueLine: ((DialogueLine, String, String, PetState) -> Void)?
     var onDeleteDialogueLine: ((DialogueLine) -> Void)?
     var onPreviewDialogueLine: ((DialogueLine) -> Void)?
     var onRetryDialogueLine: ((DialogueLine) -> Void)?
@@ -419,7 +419,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         characterSelector.onNewCharacter = { [weak self] in self?.promptForNewCharacter() }
         characterSelector.onRenameActive = { [weak self] in self?.promptForCharacterRename() }
         characterSelector.onDuplicateActive = { [weak self] in self?.promptForCharacterDuplicate() }
-        characterSelector.onDeleteActive = { [weak self] in self?.confirmCharacterDeletion() }
+        characterSelector.onDeleteActive = { [weak self] id in self?.confirmCharacterDeletion(id: id) }
         characterSelector.onImportBundle = { [weak self] in self?.onImportCharacterBundle?() }
         characterSelector.onExportActive = { [weak self] in
             guard let id = self?.snapshot?.activeCharacterID else { return }
@@ -589,11 +589,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         dialogueVoiceView.onRemoveProfile = { [weak self] profile in
             self?.onRemoveVoiceProfile?(profile)
         }
-        dialogueVoiceView.onAddLine = { [weak self] text, language in
-            self?.onAddDialogueLine?(text, language)
+        dialogueVoiceView.onAddLine = { [weak self] text, language, state in
+            self?.onAddDialogueLine?(text, language, state)
         }
-        dialogueVoiceView.onUpdateLine = { [weak self] line, text, language in
-            self?.onUpdateDialogueLine?(line, text, language)
+        dialogueVoiceView.onUpdateLine = { [weak self] line, text, language, state in
+            self?.onUpdateDialogueLine?(line, text, language, state)
         }
         dialogueVoiceView.onDeleteLine = { [weak self] line in
             self?.onDeleteDialogueLine?(line)
@@ -1251,17 +1251,29 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
-    private func confirmCharacterDeletion() {
-        guard let window, let snapshot, snapshot.characterProfiles.count > 1 else { return }
+    private func confirmCharacterDeletion(id: String) {
+        guard let window, let snapshot,
+              let request = CharacterProfileDeletionRequest(
+                  requestedProfileID: id,
+                  profiles: snapshot.characterProfiles,
+                  activeProfileID: snapshot.activeCharacterID,
+                  busy: activity.isBusy
+              ) else { return }
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "Delete \u{201c}\(activeCharacterName)\u{201d}?"
+        alert.messageText = "Delete \u{201c}\(request.profileName)\u{201d}?"
         alert.informativeText = "This removes the character from the selector. Its map and all media files remain untouched; Clean Unused Media can review unreferenced files later."
         alert.addButton(withTitle: "Delete Character")
         alert.addButton(withTitle: "Cancel")
         alert.beginSheetModal(for: window) { [weak self] response in
-            guard response == .alertFirstButtonReturn else { return }
-            self?.onDeleteCharacter?(snapshot.activeCharacterID)
+            guard let self, let snapshot = self.snapshot,
+                  let confirmedID = request.confirmedProfileID(
+                      response: response,
+                      profiles: snapshot.characterProfiles,
+                      activeProfileID: snapshot.activeCharacterID,
+                      busy: self.activity.isBusy
+                  ) else { return }
+            self.onDeleteCharacter?(confirmedID)
         }
     }
 

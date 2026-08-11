@@ -129,7 +129,8 @@ character's name and clip count, followed by:
   directory package, then activates the imported character.
 
 Use the adjacent actions button for **Rename…**, **Duplicate…**, **Export…**,
-and **Delete…**. Names must be unique. Duplicate copies the selected character's
+and **Delete…**, or use the directly visible **Delete Profile…** button. Names
+must be unique. Duplicate copies the selected character's
 entire map and activates the copy; media paths may remain shared. Delete removes
 the character from the selector but deliberately keeps its map, movies, posters,
 reports, and imported asset directory. This avoids irreversible data loss. The
@@ -349,8 +350,9 @@ on Dialogue and remembers subsequent page changes while Settings remains open.
    recordings you are authorized to use.
 4. Save the profile. Statelet rejects non-loopback endpoints, missing managed
    assets, unsafe paths, symbolic links, and unsupported import extensions.
-5. Switch to **Dialogue**, enter a line and its GPT-SoVITS language identifier,
-   then choose **Add**. The line is saved before background generation begins.
+5. Switch to **Dialogue**, choose the owning Idle, Running, Waiting, or Review
+   state, enter a line and its GPT-SoVITS language identifier, then choose
+   **Add**. The line is saved before background generation begins.
 
 Dialogue text can be saved as a draft before Voice Setup is ready. The page
 shows that generation will begin only after a valid profile and local service
@@ -370,6 +372,13 @@ the old result and queues a new revision. Editing a line or saving a changed
 profile also invalidates prior output. A late result cannot replace a newer
 revision or recreate a deleted line.
 
+When Statelet commits a newly entered lifecycle state, it displays that state's
+preferred message on the pet. If the preferred line has ready generated audio
+Statelet plays it without interrupting a preview or state voice already in
+progress. Only the latest state-entry voice remains queued while audio is busy.
+Same-state heartbeats and clip rotation do not replay the message. Legacy
+dialogue saved before state ownership existed is assigned to Idle.
+
 Statelet calls GPT-SoVITS API v2's local `/set_gpt_weights`,
 `/set_sovits_weights`, and `/tts` endpoints. It does not start, install, train,
 download, or update GPT-SoVITS. The service must be reachable through plain
@@ -377,6 +386,11 @@ HTTP on numeric IPv4 or IPv6 loopback; hostnames, proxies, redirects, and remote
 hosts are refused so sensitive request data cannot leave the local transport.
 Dialogue uses a separate speech player; accepted Statelet animation deliveries
 remain silent, so preview or runtime speech does not pause lifecycle animation.
+TTS requests use `cut0`, batch size `1`, disabled parallel/bucket inference,
+zero fragment interval, and the bounded sampling values documented in the
+source so short messages remain contiguous. Statelet versions generated output
+independently from the model fingerprint; after this recipe changes, legacy WAV
+files remain protected until their replacements generate successfully.
 
 Managed voice data lives below:
 

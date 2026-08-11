@@ -816,6 +816,15 @@ actor GPTSoVITSAPIClient {
         let promptLanguage: String
         let mediaType = "wav"
         let streamingMode = false
+        let textSplitMethod = "cut0"
+        let batchSize = 1
+        let parallelInfer = false
+        let splitBucket = false
+        let fragmentInterval = 0.0
+        let topK = 5
+        let topP = 0.8
+        let temperature = 0.6
+        let repetitionPenalty = 1.35
 
         enum CodingKeys: String, CodingKey {
             case text
@@ -825,6 +834,15 @@ actor GPTSoVITSAPIClient {
             case promptLanguage = "prompt_lang"
             case mediaType = "media_type"
             case streamingMode = "streaming_mode"
+            case textSplitMethod = "text_split_method"
+            case batchSize = "batch_size"
+            case parallelInfer = "parallel_infer"
+            case splitBucket = "split_bucket"
+            case fragmentInterval = "fragment_interval"
+            case topK = "top_k"
+            case topP = "top_p"
+            case temperature
+            case repetitionPenalty = "repetition_penalty"
         }
     }
 
@@ -844,6 +862,22 @@ actor GPTSoVITSAPIClient {
         self.configuration = configuration
     }
 
+    static func encodedTTSRequestBody(
+        text: String,
+        textLanguage: String,
+        referenceAudioPath: String,
+        promptText: String,
+        promptLanguage: String
+    ) throws -> Data {
+        try JSONEncoder().encode(TTSBody(
+            text: text,
+            textLanguage: textLanguage.lowercased(),
+            referenceAudioPath: referenceAudioPath,
+            promptText: promptText,
+            promptLanguage: promptLanguage.lowercased()
+        ))
+    }
+
     func synthesize(
         profile: GPTSoVITSVoiceProfile,
         line: DialogueLine,
@@ -860,13 +894,13 @@ actor GPTSoVITSAPIClient {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("audio/wav", forHTTPHeaderField: "Accept")
-        request.httpBody = try JSONEncoder().encode(TTSBody(
+        request.httpBody = try Self.encodedTTSRequestBody(
             text: line.text,
-            textLanguage: line.textLanguage.lowercased(),
+            textLanguage: line.textLanguage,
             referenceAudioPath: referenceAudioURL.path,
             promptText: profile.referenceText,
-            promptLanguage: profile.promptLanguage.lowercased()
-        ))
+            promptLanguage: profile.promptLanguage
+        )
         let (data, response) = try await perform(
             request,
             maximumBytes: Self.maximumAudioResponseBytes
@@ -1162,16 +1196,20 @@ enum DialoguePlaybackUnavailableReason: Equatable, Sendable {
 
 enum DialoguePlaybackResult: Equatable, Sendable {
     case played
+    case deferred
     case unavailable(DialoguePlaybackUnavailableReason)
 }
 
 protocol DialogueAudioPlaying: AnyObject {
+    var isPlaying: Bool { get }
     func play(relativePath: String, applicationSupportRoot: URL) throws
     func stop()
 }
 
 final class DialogueAudioPlayer: DialogueAudioPlaying {
     private var player: AVAudioPlayer?
+
+    var isPlaying: Bool { player?.isPlaying == true }
 
     func play(relativePath: String, applicationSupportRoot: URL) throws {
         let data = try DialogueVoiceAssetInstaller.readManagedFile(
