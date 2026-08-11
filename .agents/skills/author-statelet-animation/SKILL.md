@@ -1,6 +1,6 @@
 ---
 name: author-statelet-animation
-description: Author, convert, and verify local animation media for Statelet, the macOS lifecycle companion for Codex. Use when preparing a Statelet lifecycle MP4, producing HEVC-with-alpha MOV output, validating conversion reports, or importing verified media into the macOS app.
+description: Author, convert, import, and runtime-verify local animation media for Statelet, the macOS lifecycle companion for Codex. Use when preparing a lifecycle MP4, producing HEVC-with-alpha MOV output, validating conversion reports, importing verified media, diagnosing an animation frozen on its first frame, or verifying playback after a Statelet upgrade.
 ---
 
 # Author Statelet animation
@@ -29,6 +29,17 @@ Use only media the user owns or is authorized to adapt and distribute.
 7. Import the verified MOV together with its sibling `.report.json` through
    Statelet Settings. Do not hand-edit the report or claim visual success from an
    encode exit code alone.
+8. Prove runtime motion separately. Confirm the installed asset has multiple
+   differing decoded frames, then observe the installed app for at least two
+   loop durations. Static screenshots from one instant are not motion evidence.
+9. If the asset frames differ but Statelet remains on frame one, inspect player
+   time, rate, suspension state, and `AVQueuePlayer.currentItem`. An
+   `AVPlayerLooper` may populate its first item asynchronously; retain the
+   intended rate until that item arrives and cancel deferred resume on pause,
+   replacement, or suspension.
+10. Require a full-Xcode integration test that generates a small multi-frame
+    MOV, calls the real player controller, and asserts nonzero rate plus advancing
+    playback time. Source-string or helper-only tests are insufficient.
 
 Use default quality thresholds unless a repository change explicitly updates
 the contract and tests. Never weaken a gate merely to make a candidate pass.

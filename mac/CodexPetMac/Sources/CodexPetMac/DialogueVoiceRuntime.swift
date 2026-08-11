@@ -825,6 +825,7 @@ actor GPTSoVITSAPIClient {
         let topP = 0.8
         let temperature = 0.6
         let repetitionPenalty = 1.35
+        let seed: Int = 24_681
 
         enum CodingKeys: String, CodingKey {
             case text
@@ -843,6 +844,7 @@ actor GPTSoVITSAPIClient {
             case topP = "top_p"
             case temperature
             case repetitionPenalty = "repetition_penalty"
+            case seed
         }
     }
 

@@ -868,6 +868,7 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         try assertJSONNumber(ttsJSON["top_p"], equals: 0.8)
         try assertJSONNumber(ttsJSON["temperature"], equals: 0.6)
         try assertJSONNumber(ttsJSON["repetition_penalty"], equals: 1.35)
+        try assertJSONNumber(ttsJSON["seed"], equals: 24_681)
 
         player.isPlaying = true
         let firstIdleRequest = UUID()

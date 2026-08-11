@@ -1,0 +1,4 @@
+interface:
+  display_name: "Operate Statelet Local Voice"
+  short_description: "Configure and verify private Statelet speech"
+  default_prompt: "Use $operate-statelet-local-voice to configure and verify state-owned local speech in Statelet."
