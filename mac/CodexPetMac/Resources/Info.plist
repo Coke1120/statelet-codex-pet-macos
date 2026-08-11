@@ -16,6 +16,23 @@
 	<string>com.coke1120.CodexPetMac</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Statelet Character Bundle</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSHandlerRank</key>
+			<string>Owner</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.coke1120.statelet.character-bundle</string>
+			</array>
+			<key>LSTypeIsPackage</key>
+			<true/>
+		</dict>
+	</array>
 	<key>CFBundleName</key>
 	<string>CodexPetMac</string>
 	<key>CFBundlePackageType</key>
@@ -36,5 +53,25 @@
 	<string>Copyright © 2026 Statelet contributors. MIT licensed.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>com.apple.package</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>Statelet Character Bundle</string>
+			<key>UTTypeIdentifier</key>
+			<string>com.coke1120.statelet.character-bundle</string>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>statelet-character</string>
+				</array>
+			</dict>
+		</dict>
+	</array>
 </dict>
 </plist>

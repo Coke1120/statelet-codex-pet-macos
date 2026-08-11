@@ -112,6 +112,8 @@ final class PetPlayerView: NSView {
     var onResizeEnded: ((NSSize) -> Void)?
     var onTemporaryStateSelection: ((PetState?) -> Void)?
 
+    var isFPSBadgeEnabled: Bool { fpsBadgeIsEnabled }
+
     // Keep AppKit from consuming the gesture as background movement. The
     // explicit delta-based fallback below works for real and synthesized drag
     // sequences while preserving the nonactivating panel's focus behavior.
@@ -744,6 +746,7 @@ final class PetPlayerView: NSView {
 
 final class PetPlayerController {
     private static let readinessTimeout: DispatchTimeInterval = .seconds(8)
+    private static let maximumCachedFrameRates = 32
 
     private struct ActiveTransition {
         let id: UInt64
@@ -765,6 +768,9 @@ final class PetPlayerController {
     private var didPlayToEndObserver: NSObjectProtocol?
     private var readinessTimeoutWorkItem: DispatchWorkItem?
     private var fpsLoadingTask: Task<Void, Never>?
+    private var fpsCache = BoundedLRUCache<LocalFileRevision, Double>(
+        capacity: maximumCachedFrameRates
+    )
     private var activeTransition: ActiveTransition?
     private var itemReadyLoggedTransitionID: UInt64?
     private var displayResetTransitionID: UInt64?
@@ -778,6 +784,7 @@ final class PetPlayerController {
     private var currentPresentationIsOneShot = false
     private(set) var presentationStatus: PlaybackPresentationStatus = .awaiting
     private var reduceMotion = false
+    private var suspensionPolicy = PlaybackSuspensionPolicy()
 
     var onPresentationEvent: ((UInt64, PetState, PlaybackPresentationEvent) -> Void)?
     var onOneShotEnded: ((UInt64) -> Void)?
@@ -888,11 +895,6 @@ final class PetPlayerController {
         oneShotEndTransitionID = notifyWhenEnded ? transitionID : nil
         playlistEndTransitionID = advancePlaylistWhenEnded ? transitionID : nil
         view.hideFPSBadge()
-        loadFPS(
-            for: url,
-            playbackRate: entry.playbackRate.value,
-            transitionID: transitionID
-        )
 
         // Detaching the layer invalidates readiness inherited from the prior
         // item. A new transition cannot pass the display gate until the layer
@@ -909,6 +911,13 @@ final class PetPlayerController {
         } else {
             queuePlayer.insert(item, after: nil)
         }
+        let playbackRate = entry.playbackRate.value
+        loadFPSIfNeeded(
+            for: url,
+            asset: queuePlayer.currentItem?.asset ?? item.asset,
+            playbackRate: playbackRate,
+            transitionID: transitionID
+        )
         observeCurrentItem(queuePlayer.currentItem)
         presentationStatus = .preparing(state)
         view.showPoster(nil)
@@ -920,12 +929,53 @@ final class PetPlayerController {
                 ?? "preparing media"
         )
         scheduleReadinessTimeout(transitionID: transitionID)
-        queuePlayer.playImmediately(atRate: Float(entry.playbackRate.value))
+        applyPlaybackDirective(suspensionPolicy.replacePlayback(rate: playbackRate))
         return .preparing
     }
 
     func setReduceMotion(_ enabled: Bool) {
         reduceMotion = enabled
+    }
+
+    func applyAppearance(_ configuration: PetAppearanceConfiguration) {
+        let wasEnabled = view.isFPSBadgeEnabled
+        view.applyAppearance(configuration)
+        if !view.isFPSBadgeEnabled {
+            fpsLoadingTask?.cancel()
+            fpsLoadingTask = nil
+            view.hideFPSBadge()
+        } else if !wasEnabled,
+                  let transition = activeTransition,
+                  let asset = queuePlayer.currentItem?.asset,
+                  let rate = suspensionPolicy.intendedPlaybackRate {
+            loadFPSIfNeeded(
+                for: transition.url,
+                asset: asset,
+                playbackRate: rate,
+                transitionID: transition.id
+            )
+        }
+    }
+
+    /// Independent reasons compose: playback resumes only after every active
+    /// system suspension has cleared. Replacing media while suspended updates
+    /// the intended rate without losing the new item or its current time.
+    func setSuspended(_ suspended: Bool, for reason: PlaybackSuspensionReason) {
+        let directive = suspensionPolicy.setSuspended(suspended, for: reason)
+        guard directive != .none else { return }
+        applyPlaybackDirective(directive)
+        if suspensionPolicy.reasons.isEmpty {
+            if let transition = activeTransition,
+               transition.readiness.state == .preparing {
+                scheduleReadinessTimeout(transitionID: transition.id)
+            }
+            logger.info("event=playback_resumed cleared_reason=\(reason.rawValue, privacy: .public)")
+        } else {
+            queuePlayer.pause()
+            readinessTimeoutWorkItem?.cancel()
+            readinessTimeoutWorkItem = nil
+            logger.info("event=playback_suspended reason=\(reason.rawValue, privacy: .public) active_reason_count=\(self.suspensionPolicy.reasons.count, privacy: .public)")
+        }
     }
 
     func updatePublisherHealth(_ summary: String) {
@@ -1094,6 +1144,8 @@ final class PetPlayerController {
     }
 
     private func scheduleReadinessTimeout(transitionID: UInt64) {
+        guard suspensionPolicy.canStartReadinessDeadline else { return }
+        readinessTimeoutWorkItem?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
             guard let self,
                   self.activeTransition?.id == transitionID,
@@ -1122,16 +1174,47 @@ final class PetPlayerController {
     private func stopQueuePlayback() {
         view.playerLayer.player = nil
         queuePlayer.pause()
+        suspensionPolicy.clearPlayback()
         looper = nil
         queuePlayer.removeAllItems()
         view.playerLayer.player = queuePlayer
     }
 
-    private func loadFPS(for url: URL, playbackRate: Double, transitionID: UInt64) {
+    private func applyPlaybackDirective(_ directive: PlaybackControlDirective) {
+        switch directive {
+        case .none:
+            break
+        case .pause:
+            queuePlayer.pause()
+        case let .resume(rate):
+            guard queuePlayer.currentItem != nil else { return }
+            queuePlayer.playImmediately(atRate: Float(rate))
+        }
+    }
+
+    private func loadFPSIfNeeded(
+        for url: URL,
+        asset: AVAsset,
+        playbackRate: Double,
+        transitionID: UInt64
+    ) {
         fpsLoadingTask?.cancel()
+        guard view.isFPSBadgeEnabled else {
+            fpsLoadingTask = nil
+            return
+        }
+        let cacheKey = LocalFileRevision(url: url)
+        if let cacheKey, let nominal = fpsCache.value(for: cacheKey) {
+            view.updateFPSBadge(
+                nominalFramesPerSecond: nominal,
+                intendedFramesPerSecond: nominal * playbackRate,
+                reducedMotion: false
+            )
+            fpsLoadingTask = nil
+            return
+        }
         fpsLoadingTask = Task { @MainActor [weak self] in
             do {
-                let asset = AVURLAsset(url: url)
                 guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
                     guard !Task.isCancelled, self?.activeTransition?.id == transitionID else { return }
                     self?.view.hideFPSBadge()
@@ -1141,6 +1224,9 @@ final class PetPlayerController {
                 let nominal = Double(try await videoTrack.load(.nominalFrameRate))
                 try Task.checkCancellation()
                 guard let self, self.activeTransition?.id == transitionID else { return }
+                if let cacheKey, nominal.isFinite, nominal > 0 {
+                    self.fpsCache.insert(nominal, for: cacheKey)
+                }
                 let intended = nominal * playbackRate
                 self.view.updateFPSBadge(
                     nominalFramesPerSecond: nominal,

@@ -57,6 +57,15 @@ Open the Statelet menu-bar icon and choose **Settings…** (`Command-,`) for the
 local workflow. The **Animations** pane manages Idle, Running, Waiting, and
 Review as separate clip libraries:
 
+- The character selector owns the complete four-state map shown in the pane.
+  **New Character…** creates and activates an empty map with a copy of the
+  current map's window/default-format settings. The adjacent actions menu can rename,
+  duplicate, export, or delete the active character. Duplicate copies the map;
+  Delete removes only the catalog record and keeps its map and media files. The
+  last character cannot be deleted.
+- **Import Bundle…** installs a verified `.statelet-character` directory
+  package and activates it. **Export…** writes the active character as that
+  package type without changing its live map.
 - The state-named drop zone accepts one or more local `.mp4` files dragged from
   Finder and sends them directly through the same verified sequential batch
   importer. It preserves dropped order, removes exact duplicate paths, and
@@ -158,9 +167,9 @@ Conversion** cancels the active MP4 conversion, skips all remaining sources,
 removes incomplete artifacts, and keeps clips already appended. Verified MOV
 copy/validation remains sequential and indeterminate and does not expose a
 cancel button. The current animation stays active on failure, and
-`media-map.json` is replaced atomically only after each new delivery report and
-SHA-256 pass validation. Successful imports append; they do not discard
-previously configured clips.
+the active character's map is replaced atomically only after each new delivery
+report and SHA-256 pass validation. Successful imports append; they do not
+discard previously configured clips.
 
 File-moving removal fails closed. **Remove & Move Files to Trash** appears only
 when `media-map.json` is in the canonical managed media folder and the selected
@@ -172,6 +181,41 @@ the app moves the MOV and an existing sibling `.report.json` to recoverable
 Trash and deliberately keeps posters. Removing the current or fixed clip uses
 the existing playlist selection contract to choose a remaining clip; removing
 the last entry removes that state's mapping and falls back normally.
+
+### Character catalog and packages
+
+The character catalog is deliberately separate from `MediaMap`. With the
+normal managed root, the installed layout is:
+
+```text
+media-map.json                         # Default/legacy character map
+character-library.json                 # authoritative catalog and active id
+.character-<id>.media-map.json         # one ordinary map per added character
+.character-<id>.assets/                # assets installed from a package
+```
+
+For `--media-map /path/custom.json`, absence of the sidecar bootstraps the
+`Default` character against `custom.json`; the sidecar and hidden maps remain in
+that same directory. This preserves the base directory for all existing
+relative media paths. The root map stays wire-compatible with older builds, and
+selecting another character loads its hidden map directly—there is no
+compatibility mirror or dual-write into the root map.
+
+Export creates a directory package ending in `.statelet-character`. It contains
+`manifest.json`, one ordinary Statelet media map whose media references are
+rewritten to bundle-relative paths, and declared movies/posters/reports. Import
+opens package content without following symbolic links, enforces manifest and
+asset-count/size bounds, rejects unsafe or colliding paths, verifies declared
+sizes and lowercase SHA-256 hashes, validates report references, and runs
+AVFoundation playback checks before committing the map, asset tree, and catalog
+selection. Partial installation is rolled back.
+
+Reports are validated when available, but they are optional in the package for
+legacy portability. A reportless movie requires the explicit import trust
+confirmation and still must pass playback validation. That choice does not
+create an attestation or claim that all-frame alpha/composite gates ran.
+Deleting a character removes only its catalog entry; its hidden map and files
+remain for recovery.
 
 The app bundle includes the maintained converter source, but not a private
 Python runtime or Homebrew binaries. Settings therefore reports conversion-tool
@@ -319,9 +363,11 @@ media. Settings imports authorized media into:
 ~/Library/Application Support/CodexPet/media/
 ```
 
-You can still manage `media-map.json` directly for developer workflows.
-Relative paths resolve beside the map. `Examples/media-map.json` documents all
-three playback modes across the four lifecycle states. Each state contains:
+The installer preserves `media-map.json`, `character-library.json`, hidden
+per-character maps/assets, and user media on upgrade. You can still manage the
+root `media-map.json` directly for legacy/default developer workflows. Relative
+paths resolve beside each character's map. `Examples/media-map.json` documents
+all three playback modes across the four lifecycle states. Each state contains:
 
 - `mode`: `fixed`, `random`, or `sequential`;
 - `advance_on`: `state_entry` or `clip_end`; omitted values decode as
@@ -389,9 +435,12 @@ beats a newer Running session. When that Waiting session emits Stop, only its
 record becomes Idle, so another active Review or Running session can win. With
 no active record, the result is Idle with no `source_updated_at`.
 
-The aggregator polls every 250 ms, publishes a changed result on the next poll,
-and refreshes an unchanged result once per minute so writer liveness remains
-visible without multi-Hz disk writes. `current_state.json` preserves the winning
+The aggregator normally uses macOS `kqueue` directory events to publish a
+changed result immediately. Session TTL, temporary-force, and once-per-minute
+liveness-heartbeat deadlines wake it without file activity. If event watching
+is unsupported or fails, bounded 250 ms polling preserves correctness. A
+path-free log diagnostic reports `mode=event_driven` or `mode=poll_fallback`
+with a sanitized reason category. `current_state.json` preserves the winning
 session clock as `source_updated_at`, writes the publication clock as
 `emitted_at`, and includes the active-session count. The player checks the
 publication clock every 30 seconds. Swift `CurrentState` uses legacy
@@ -503,11 +552,13 @@ unmarked or malformed destination and never edits lifecycle hooks, the state
 aggregator, or the board/Serial service. If the stale player job is already
 loaded, the repaired on-disk settings take effect at the next login so the
 current app is not terminated. **Clean Unused Media…** scans the
-managed media directory, shows a confirmation list and size, rescans after
-confirmation, and moves only still-unreferenced recognized regular media,
-poster, or `.report.json` files inside that directory to Trash. It does not
-select symbolic-link files, and any resolved path outside the managed media
-directory is rejected.
+managed media directory, loads every character map, shows a confirmation list
+and size, rescans after confirmation, and moves only still-unreferenced
+recognized regular media, poster, or `.report.json` files inside that directory
+to Trash. The catalog and profile maps are retained. A missing or corrupt
+inactive map makes cleanup fail closed, because its references cannot be proved
+unused. Cleanup does not select symbolic-link files, and any resolved path
+outside the managed media directory is rejected.
 
 Logs are kept outside the installed code:
 
@@ -537,9 +588,10 @@ Uninstall preflights ownership before staging or changing launchd. It removes a
 managed `Statelet.app` and any managed legacy
 `CodexPetMac.app`, and preserves an unmanaged bundle at either path. It removes
 modules and LaunchAgents only when they carry the `mac-widget-v1` marker, and
-preserves user media, media-map configuration, aggregate state, session records,
-logs, and the board daemon/runtime. Unmarked component or LaunchAgent targets
-cause a fail-closed refusal instead of deletion.
+preserves user media, `media-map.json`, `character-library.json`, hidden
+per-character maps/assets, aggregate state, session records, logs, and the board
+daemon/runtime. Unmarked component or LaunchAgent targets cause a fail-closed
+refusal instead of deletion.
 Uninstall removes only exact commands pointing at the deleted `mac-widget`
 hook. If a valid shared board-runtime hook exists, it migrates lifecycle events
 to that command; existing board hooks are otherwise left untouched. Unrelated

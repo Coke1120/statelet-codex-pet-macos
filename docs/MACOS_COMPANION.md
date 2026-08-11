@@ -66,9 +66,13 @@ Each valid session record remains active for 900 seconds after `updated_at`.
 Records that are malformed, non-finite, expired, or more than 60 seconds in the
 future are rejected or pruned. Equal-priority records use the newest timestamp.
 
-The aggregator polls every 250 ms. A changed result is published on the next
-poll; an unchanged result is republished once per minute for liveness. The
-aggregate contains separate clocks:
+The aggregator normally uses macOS `kqueue` directory events, so changed
+session records wake it immediately. It also wakes at session TTL,
+temporary-force, and once-per-minute liveness-heartbeat deadlines. If event
+watching is unsupported or fails, bounded 250 ms polling preserves the same
+behavior. Its path-free log diagnostic reports `mode=event_driven` or
+`mode=poll_fallback` with a sanitized reason category. The aggregate contains
+separate clocks:
 
 - `source_updated_at` identifies the winning session event; and
 - `emitted_at` identifies the aggregator publication time.

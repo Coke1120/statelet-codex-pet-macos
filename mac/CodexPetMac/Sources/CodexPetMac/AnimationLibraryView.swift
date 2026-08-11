@@ -266,6 +266,7 @@ private final class MP4DropZoneView: NSView {
     private let titleLabel = NSTextField(labelWithString: "")
     private let detailLabel = NSTextField(wrappingLabelWithString: "")
     private var selectedState: PetState = .idle
+    private var characterName = "Default"
     private var importEnabled = false
     private var busy = false
     private var isDragHighlighted = false {
@@ -334,18 +335,20 @@ private final class MP4DropZoneView: NSView {
         path.stroke()
     }
 
-    func update(selectedState: PetState, importEnabled: Bool, busy: Bool) {
+    func update(selectedState: PetState, characterName: String, importEnabled: Bool, busy: Bool) {
         let shouldReset = self.selectedState != selectedState
+            || self.characterName != characterName
             || self.importEnabled != importEnabled
             || self.busy != busy
         self.selectedState = selectedState
+        self.characterName = characterName
         self.importEnabled = importEnabled
         self.busy = busy
         updatePresentation(resetMessage: shouldReset)
     }
 
     private func updatePresentation(resetMessage: Bool) {
-        titleLabel.stringValue = "Drop MP4s into \(selectedState.displayName)"
+        titleLabel.stringValue = "Drop MP4s into \(characterName) · \(selectedState.displayName)"
         if resetMessage {
             if busy {
                 setDetailMessage("Import is disabled while the current media operation finishes.")
@@ -358,7 +361,7 @@ private final class MP4DropZoneView: NSView {
                 )
             }
         }
-        setAccessibilityLabel("Drop MP4s for \(selectedState.displayName) animations")
+        setAccessibilityLabel("Drop MP4s for \(characterName), \(selectedState.displayName) animations")
         alphaValue = importEnabled && !busy ? 1 : 0.65
         needsDisplay = true
     }
@@ -394,7 +397,7 @@ private final class MP4DropZoneView: NSView {
         switch MP4ImportURLValidator.validate(urls) {
         case let .accepted(accepted, rejected):
             let skipped = rejected.isEmpty ? "" : " · Skipped \(rejected.count) unsupported item\(rejected.count == 1 ? "" : "s")"
-            setDetailMessage("Release to import \(accepted.count) MP4\(accepted.count == 1 ? "" : "s") into \(selectedState.displayName)\(skipped).")
+            setDetailMessage("Release to import \(accepted.count) MP4\(accepted.count == 1 ? "" : "s") into \(characterName) · \(selectedState.displayName)\(skipped).")
             return .copy
         case let .rejected(reason):
             setDetailMessage("Nothing will be imported: \(reason)")
@@ -420,7 +423,7 @@ private final class MP4DropZoneView: NSView {
         switch MP4ImportURLValidator.validate(urls) {
         case let .accepted(accepted, rejected):
             let skipped = rejected.isEmpty ? "" : " · Skipped \(rejected.count) unsupported item\(rejected.count == 1 ? "" : "s")"
-            setDetailMessage("Starting import of \(accepted.count) MP4\(accepted.count == 1 ? "" : "s") into \(selectedState.displayName)…\(skipped)")
+            setDetailMessage("Starting import of \(accepted.count) MP4\(accepted.count == 1 ? "" : "s") into \(characterName) · \(selectedState.displayName)…\(skipped)")
             // Preserve the complete batch so the delegate can surface a
             // sanitized reason for every skipped item while still converting
             // the accepted MP4s.
@@ -434,6 +437,16 @@ private final class MP4DropZoneView: NSView {
 }
 
 final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDelegate {
+    private struct RowUpdateKey: Equatable {
+        let selectedState: PetState
+        let characterName: String
+        let playlist: StateMediaPlaylist?
+        let mapURL: URL
+        let selectedPreviewPath: String?
+        let reduceMotion: Bool
+        let busy: Bool
+        let fileRevisions: [LocalFileRevision?]
+    }
     var onStateSelection: ((PetState) -> Void)?
     var onModeChange: ((MediaPlaybackMode) -> Void)?
     var onAdvanceTriggerChange: ((MediaPlaylistAdvancePolicy) -> Void)?
@@ -463,6 +476,7 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
     private let emptyLabel = NSTextField(wrappingLabelWithString: "No clips for this state. Add an MP4 to convert, or add a verified transparent MOV.")
     private let emptyAddButton = NSButton(title: "Add Clip…", target: nil, action: nil)
     private var clipRows: [LibraryClipRowModel] = []
+    private var lastRowUpdateKey: RowUpdateKey?
 
     override init(frame frameRect: NSRect) {
         stateButtons = PetState.allCases.map { LibraryStateButton(state: $0, target: nil, action: #selector(selectState(_:))) }
@@ -479,6 +493,10 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
         resizeFlexibleClipColumn()
     }
 
+    func invalidateRowCache() {
+        lastRowUpdateKey = nil
+    }
+
     private func build() {
         for button in stateButtons { button.target = self }
         let sidebarTitle = NSTextField(labelWithString: "STATES")
@@ -491,6 +509,9 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
         sidebar.translatesAutoresizingMaskIntoConstraints = false
 
         stateTitle.font = .systemFont(ofSize: 18, weight: .semibold)
+        stateTitle.maximumNumberOfLines = 1
+        stateTitle.lineBreakMode = .byTruncatingTail
+        stateTitle.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         stateDescription.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         stateDescription.textColor = .secondaryLabelColor
         modeControl.target = self
@@ -681,13 +702,14 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
         preview: SettingsPreviewMetadata?,
         reduceMotion: Bool,
         busy: Bool,
-        importEnabled: Bool
+        importEnabled: Bool,
+        characterName: String = "Default"
     ) {
         for button in stateButtons {
             button.update(count: counts[button.petState, default: 0], isEditing: button.petState == selectedState, isCurrent: button.petState == currentState)
         }
-        stateTitle.stringValue = "\(selectedState.displayName) Animations"
-        stateTitle.setAccessibilityLabel("Editing \(selectedState.displayName) animations")
+        stateTitle.stringValue = "\(characterName) · \(selectedState.displayName) Animations"
+        stateTitle.setAccessibilityLabel("Editing \(characterName), \(selectedState.displayName) animations")
         stateDescription.stringValue = selectedState.explanation
         switch playlist?.mode ?? .fixed {
         case .fixed:
@@ -716,12 +738,47 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
         addClip.isEnabled = !busy
         emptyAddButton.isEnabled = !busy
         addClip.item(at: 2)?.isEnabled = importEnabled && !busy
-        dropZone.update(selectedState: selectedState, importEnabled: importEnabled, busy: busy)
+        dropZone.update(
+            selectedState: selectedState,
+            characterName: characterName,
+            importEnabled: importEnabled,
+            busy: busy
+        )
+        clipsSectionTitle.stringValue = "CLIPS"
+        clipsSectionTitle.setAccessibilityLabel("Clips for \(characterName), \(selectedState.displayName)")
+        emptyLabel.stringValue = "No \(selectedState.displayName.lowercased()) clips for \(characterName). Add an MP4 to convert, or add a verified transparent MOV."
+
+        let resolvedEntries = (playlist?.entries ?? []).map { entry in
+            (
+                entry,
+                mediaMap.resolvedURL(for: entry, relativeTo: mapURL),
+                mediaMap.resolvedPosterURL(for: entry, relativeTo: mapURL)
+            )
+        }
+        let watchedURLs = resolvedEntries.flatMap { _, movieURL, posterURL in
+            [movieURL] + (posterURL.map { [$0] } ?? [])
+        }
+        let fileRevisions = watchedURLs.map(LocalFileRevision.init(url:))
+
+        let rowUpdateKey = RowUpdateKey(
+            selectedState: selectedState,
+            characterName: characterName,
+            playlist: playlist,
+            mapURL: mapURL.standardizedFileURL,
+            selectedPreviewPath: preview?.state == selectedState ? preview?.path : nil,
+            reduceMotion: reduceMotion,
+            busy: busy,
+            fileRevisions: fileRevisions
+        )
+        guard LibraryRowRefreshPolicy.shouldRefresh(
+            previous: lastRowUpdateKey,
+            incoming: rowUpdateKey
+        ) else { return }
+        lastRowUpdateKey = rowUpdateKey
 
         let selectedPath = selectedRowModel()?.entry.path
-        clipRows = (playlist?.entries ?? []).enumerated().map { index, entry in
-            let resolvedURL = mediaMap.resolvedURL(for: entry, relativeTo: mapURL)
-            let resolvedPosterURL = mediaMap.resolvedPosterURL(for: entry, relativeTo: mapURL)
+        clipRows = resolvedEntries.enumerated().map { index, resolvedEntry in
+            let (entry, resolvedURL, resolvedPosterURL) = resolvedEntry
             let posterExists = resolvedPosterURL.map { FileManager.default.isReadableFile(atPath: $0.path) } ?? false
             return LibraryClipRowModel(
                 position: index + 1,
@@ -738,8 +795,8 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
         }
         let clipNoun = clipRows.count == 1 ? "clip" : "clips"
         clipsCountLabel.stringValue = "\(clipRows.count) \(clipNoun)"
-        clipsCountLabel.setAccessibilityLabel("\(clipRows.count) \(clipNoun) for \(selectedState.displayName)")
-        tableView.setAccessibilityLabel("\(selectedState.displayName) animation clips")
+        clipsCountLabel.setAccessibilityLabel("\(clipRows.count) \(clipNoun) for \(characterName), \(selectedState.displayName)")
+        tableView.setAccessibilityLabel("\(characterName), \(selectedState.displayName) animation clips")
         tableView.reloadData()
         if let selectedPath, let selectedIndex = clipRows.firstIndex(where: { $0.entry.path == selectedPath }) {
             tableView.selectRowIndexes(IndexSet(integer: selectedIndex), byExtendingSelection: false)
@@ -749,8 +806,8 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
         emptyLabel.superview?.isHidden = !(playlist?.entries.isEmpty ?? true)
         tableView.setAccessibilityHelp(
             clipRows.isEmpty
-                ? "No clips are available for this state."
-                : "\(clipRows.count) clips. Use the arrow keys to select a clip, or double-click a row to preview it."
+                ? "No clips are available for \(characterName), \(selectedState.displayName)."
+                : "\(clipRows.count) clips for \(characterName), \(selectedState.displayName). Use the arrow keys to select a clip, or double-click a row to preview it."
         )
         resizeFlexibleClipColumn()
     }
