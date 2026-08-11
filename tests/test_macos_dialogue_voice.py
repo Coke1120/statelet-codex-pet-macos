@@ -185,6 +185,21 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         self.assertIn("previewButton.isEnabled = line?.status == .ready", self.voice_view)
         self.assertIn("profileStatus == .ready || profileStatus == .unavailable", self.voice_view)
 
+    def test_retry_accepts_failed_and_stale_lines_when_profile_allows_it(self) -> None:
+        enablement = method_body(self.voice_view, "    private func refreshButtonEnablement")
+        self.assertIn(
+            "retryButton.isEnabled = (line?.status == .failed || line?.status == .stale)",
+            enablement,
+        )
+        self.assertIn(
+            "profileStatus == .ready || profileStatus == .unavailable",
+            enablement,
+        )
+
+        retry_action = method_body(self.voice_view, "    @objc private func retryLine()")
+        self.assertIn("line.status == .failed || line.status == .stale", retry_action)
+        self.assertIn("onRetryLine?(line)", retry_action)
+
     def test_background_refresh_preserves_dirty_settings_editors(self) -> None:
         update = method_body(self.voice_view, "    func update")
         self.assertIn("let preserveProfileEdits = profileEditorIsDirty", update)
