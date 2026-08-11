@@ -29,6 +29,8 @@ class CharacterProfileUISourceTests(unittest.TestCase):
         self.assertIn("heightAnchor.constraint(equalToConstant: 28)", self.selector)
         self.assertIn('setAccessibilityLabel("Active character")', self.selector)
         self.assertIn('setAccessibilityLabel("Active character actions")', self.selector)
+        self.assertIn('NSButton(title: "Delete Profile…"', self.selector)
+        self.assertIn('setAccessibilityLabel("Delete active character profile")', self.selector)
         for title in (
             "New Character…",
             "Import Bundle…",
@@ -128,7 +130,7 @@ class CharacterProfileUIHarnessTests(unittest.TestCase):
                     selector.onNewCharacter = { events.append("new") }
                     selector.onRenameActive = { events.append("rename") }
                     selector.onDuplicateActive = { events.append("duplicate") }
-                    selector.onDeleteActive = { events.append("delete") }
+                    selector.onDeleteActive = { events.append("delete:\($0)") }
                     selector.onImportBundle = { events.append("import") }
                     selector.onExportActive = { events.append("export") }
 
@@ -162,14 +164,22 @@ class CharacterProfileUIHarnessTests(unittest.TestCase):
                     }), let actionsMenu = actionsButton.menu else {
                         throw HarnessFailure.failed("actions button or menu not found")
                     }
+                    guard let deleteProfileButton = controls.compactMap({ $0 as? NSButton }).first(where: {
+                        $0.accessibilityLabel() == "Delete active character profile"
+                    }) else {
+                        throw HarnessFailure.failed("visible delete profile button not found")
+                    }
 
                     try require(selector.frame.height <= 32, "selector exceeds the status strip height")
                     try require(!selector.hasAmbiguousLayout, "selector layout is ambiguous")
                     try require(!popup.hasAmbiguousLayout, "profile popup layout is ambiguous")
                     try require(!actionsButton.hasAmbiguousLayout, "actions button layout is ambiguous")
+                    try require(!deleteProfileButton.hasAmbiguousLayout, "delete profile button layout is ambiguous")
                     try require(popup.accessibilityLabel() == "Active character", "popup label missing")
                     try require(popup.accessibilityHelp() != nil, "popup help missing")
                     try require(actionsButton.accessibilityHelp() != nil, "actions help missing")
+                    try require(deleteProfileButton.accessibilityHelp() != nil, "delete profile help missing")
+                    try require(deleteProfileButton.isEnabled, "visible delete profile button should be enabled")
                     try require(popup.titleOfSelectedItem?.hasPrefix("Default") == true, "initial profile is wrong")
 
                     guard let chloeItem = popup.itemArray.first(where: {
@@ -197,7 +207,7 @@ class CharacterProfileUIHarnessTests(unittest.TestCase):
                         ("Rename…", "rename"),
                         ("Duplicate…", "duplicate"),
                         ("Export…", "export"),
-                        ("Delete…", "delete"),
+                        ("Delete…", "delete:default"),
                     ] {
                         guard let item = actionsMenu.item(withTitle: title) else {
                             throw HarnessFailure.failed("\(title) action is missing")
@@ -210,20 +220,92 @@ class CharacterProfileUIHarnessTests(unittest.TestCase):
                     try require(events.filter { $0 == "new" }.count == 1, "new callback was not exactly once")
                     try require(events.filter { $0 == "import" }.count == 1, "import callback was not exactly once")
 
+                    let visibleDeleteDelivered = NSApplication.shared.sendAction(
+                        deleteProfileButton.action!,
+                        to: deleteProfileButton.target,
+                        from: deleteProfileButton
+                    )
+                    try require(visibleDeleteDelivered, "visible delete profile action was not delivered")
+                    try require(events.filter { $0 == "delete:default" }.count == 2, "visible delete did not reuse the exact-ID callback")
+
+                    let request = CharacterProfileDeletionRequest(
+                        requestedProfileID: "default",
+                        profiles: profiles,
+                        activeProfileID: "default",
+                        busy: false
+                    )
+                    try require(request?.profileID == "default", "deletion request did not capture the exact profile ID")
+                    try require(
+                        request?.confirmedProfileID(
+                            response: .alertFirstButtonReturn,
+                            profiles: profiles,
+                            activeProfileID: "default",
+                            busy: false
+                        ) == "default",
+                        "confirmed deletion did not preserve the requested profile ID"
+                    )
+                    try require(
+                        request?.confirmedProfileID(
+                            response: .alertSecondButtonReturn,
+                            profiles: profiles,
+                            activeProfileID: "default",
+                            busy: false
+                        ) == nil,
+                        "cancelled deletion was accepted"
+                    )
+                    try require(
+                        request?.confirmedProfileID(
+                            response: .alertFirstButtonReturn,
+                            profiles: [profiles[0]],
+                            activeProfileID: "default",
+                            busy: false
+                        ) == nil,
+                        "last-profile deletion was accepted"
+                    )
+                    try require(
+                        request?.confirmedProfileID(
+                            response: .alertFirstButtonReturn,
+                            profiles: profiles,
+                            activeProfileID: "default",
+                            busy: true
+                        ) == nil,
+                        "busy-state deletion was accepted"
+                    )
+                    try require(
+                        request?.confirmedProfileID(
+                            response: .alertFirstButtonReturn,
+                            profiles: profiles,
+                            activeProfileID: "chloe",
+                            busy: false
+                        ) == nil,
+                        "selection-change deletion was accepted"
+                    )
+                    try require(
+                        CharacterProfileDeletionRequest(
+                            requestedProfileID: "default",
+                            profiles: profiles,
+                            activeProfileID: "default",
+                            busy: true
+                        ) == nil,
+                        "busy-state deletion request was created"
+                    )
+
                     selector.update(profiles: [profiles[0]], activeID: "default", busy: false)
                     guard let deleteItem = actionsButton.menu?.item(withTitle: "Delete…") else {
                         throw HarnessFailure.failed("delete action disappeared")
                     }
                     try require(!deleteItem.isEnabled, "last-character delete is enabled")
+                    try require(!deleteProfileButton.isEnabled, "last-character visible delete is enabled")
 
                     selector.update(profiles: profiles, activeID: "chloe", busy: true)
                     try require(!popup.isEnabled, "busy popup is enabled")
                     try require(!actionsButton.isEnabled, "busy actions button is enabled")
+                    try require(!deleteProfileButton.isEnabled, "busy visible delete button is enabled")
                     try require(
                         actionsButton.menu?.items.filter({ !$0.isSeparatorItem }).allSatisfy({ !$0.isEnabled }) == true,
                         "busy action menu contains an enabled command"
                     )
-                    try require(events.count == 7, "busy/external updates fired callbacks")
+                    try require(events.count == 8, "busy/external updates fired callbacks")
 
                     let mediaDirectory = URL(fileURLWithPath: NSTemporaryDirectory())
                         .appendingPathComponent("statelet-character-copy-\(UUID().uuidString)", isDirectory: true)

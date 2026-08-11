@@ -25,14 +25,14 @@ final class DialogueVoiceTests: XCTestCase {
         )
     }
 
-    private func libraryWithQueuedLine() throws -> DialogueVoiceLibrary {
+    private func libraryWithQueuedLine(state: PetState = .idle) throws -> DialogueVoiceLibrary {
         var library = try DialogueVoiceLibrary(profile: profile())
-        try library.addLine(text: "你好", id: lineID)
+        try library.addLine(text: "你好", state: state, id: lineID)
         return library
     }
 
     func testRoundTripAndStoreUsesPrivatePermissions() throws {
-        var library = try libraryWithQueuedLine()
+        var library = try libraryWithQueuedLine(state: .review)
         let ticket = try library.beginGeneration(for: lineID)
         try library.completeGeneration(ticket: ticket, outputPath: "audio/line.wav")
 
@@ -54,6 +54,123 @@ final class DialogueVoiceTests: XCTestCase {
         ).intValue & 0o777
         XCTAssertEqual(rootMode, 0o700)
         XCTAssertEqual(fileMode, 0o600)
+    }
+
+    func testDialogueStateRoundTripsAndLegacyLinesMigrateToIdle() throws {
+        let line = try DialogueLine(
+            id: lineID,
+            state: .waiting,
+            text: "Please confirm",
+            textLanguage: "en"
+        )
+        let encoded = try JSONEncoder().encode(line)
+        XCTAssertEqual(try JSONDecoder().decode(DialogueLine.self, from: encoded).state, .waiting)
+
+        var legacyObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        legacyObject.removeValue(forKey: "state")
+        let legacyData = try JSONSerialization.data(withJSONObject: legacyObject)
+        XCTAssertEqual(try JSONDecoder().decode(DialogueLine.self, from: legacyData).state, .idle)
+    }
+
+    func testLegacySynthesisOutputMigratesAndIsRetainedUntilReplacementSucceeds() throws {
+        var original = try libraryWithQueuedLine()
+        let firstTicket = try original.beginGeneration(for: lineID)
+        _ = try original.completeGeneration(
+            ticket: firstTicket,
+            outputPath: "voice/generated/legacy.wav"
+        )
+
+        var legacyObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(original)) as? [String: Any]
+        )
+        var legacyLines = try XCTUnwrap(legacyObject["lines"] as? [[String: Any]])
+        legacyLines[0].removeValue(forKey: "generated_synthesis_policy_version")
+        legacyObject["lines"] = legacyLines
+        let legacyData = try JSONSerialization.data(withJSONObject: legacyObject)
+        var migrated = try JSONDecoder().decode(DialogueVoiceLibrary.self, from: legacyData)
+
+        XCTAssertEqual(
+            migrated.lines[0].generatedSynthesisPolicyVersion,
+            DialogueSynthesisPolicy.legacyVersion
+        )
+        try migrated.setProfileStatus(.validating)
+        XCTAssertEqual(try migrated.migrateOutdatedSynthesisOutputs(), 1)
+        XCTAssertEqual(migrated.lines[0].status, .stale)
+        XCTAssertEqual(migrated.lines[0].outputRelativePath, "voice/generated/legacy.wav")
+        XCTAssertTrue(migrated.referencedManagedPaths.contains("voice/generated/legacy.wav"))
+
+        XCTAssertEqual(try migrated.activateValidatedProfile(), 1)
+        XCTAssertEqual(migrated.lines[0].status, .queued)
+        XCTAssertEqual(migrated.lines[0].outputRelativePath, "voice/generated/legacy.wav")
+        let replacementTicket = try migrated.beginGeneration(for: lineID)
+        XCTAssertEqual(migrated.lines[0].status, .generating)
+        XCTAssertEqual(migrated.lines[0].outputRelativePath, "voice/generated/legacy.wav")
+
+        _ = try migrated.failGeneration(ticket: replacementTicket, failureCode: "INFERENCE_UNAVAILABLE")
+        XCTAssertEqual(migrated.lines[0].status, .stale)
+        XCTAssertEqual(migrated.lines[0].outputRelativePath, "voice/generated/legacy.wav")
+
+        _ = try migrated.retryLine(id: lineID)
+        let successfulTicket = try migrated.beginGeneration(for: lineID)
+        _ = try migrated.completeGeneration(
+            ticket: successfulTicket,
+            outputPath: "voice/generated/current.wav"
+        )
+        XCTAssertEqual(migrated.lines[0].status, .ready)
+        XCTAssertEqual(
+            migrated.lines[0].generatedSynthesisPolicyVersion,
+            DialogueSynthesisPolicy.currentVersion
+        )
+        XCTAssertEqual(migrated.lines[0].outputRelativePath, "voice/generated/current.wav")
+    }
+
+    func testInvalidationKeepsQueuedAndGeneratingMigrationOutputsReferenced() throws {
+        let queuedID = UUID(uuidString: "10000000-0000-0000-0000-000000000010")!
+        let generatingID = UUID(uuidString: "10000000-0000-0000-0000-000000000011")!
+        let queuedPath = "voice/generated/legacy-queued.wav"
+        let generatingPath = "voice/generated/legacy-generating.wav"
+        var library = try DialogueVoiceLibrary(
+            profile: profile(),
+            lines: [
+                try DialogueLine(
+                    id: queuedID,
+                    text: "Queued migration",
+                    textLanguage: "en",
+                    status: .stale,
+                    generatedProfileRevision: 1,
+                    generatedSynthesisPolicyVersion: DialogueSynthesisPolicy.legacyVersion,
+                    outputRelativePath: queuedPath
+                ),
+                try DialogueLine(
+                    id: generatingID,
+                    text: "Generating migration",
+                    textLanguage: "en",
+                    status: .stale,
+                    generatedProfileRevision: 1,
+                    generatedSynthesisPolicyVersion: DialogueSynthesisPolicy.legacyVersion,
+                    outputRelativePath: generatingPath
+                ),
+            ]
+        )
+        library = try JSONDecoder().decode(
+            DialogueVoiceLibrary.self,
+            from: JSONEncoder().encode(library)
+        )
+
+        XCTAssertEqual(try library.activateValidatedProfile(), 2)
+        _ = try library.beginGeneration(for: generatingID)
+        XCTAssertEqual(library.lines.first(where: { $0.id == queuedID })?.status, .queued)
+        XCTAssertEqual(library.lines.first(where: { $0.id == generatingID })?.status, .generating)
+
+        try library.setProfileStatus(.invalid, invalidatingOutputs: true)
+        for (lineID, path) in [(queuedID, queuedPath), (generatingID, generatingPath)] {
+            let line = try XCTUnwrap(library.lines.first(where: { $0.id == lineID }))
+            XCTAssertEqual(line.status, .stale)
+            XCTAssertEqual(line.outputRelativePath, path)
+            XCTAssertTrue(library.referencedManagedPaths.contains(path))
+        }
     }
 
     func testStoreRejectsSymlinkRootAndSymlinkDestination() throws {
@@ -131,23 +248,70 @@ final class DialogueVoiceTests: XCTestCase {
     }
 
     func testAddEditFailureAndRetryTransitions() throws {
-        var library = try libraryWithQueuedLine()
+        var library = try libraryWithQueuedLine(state: .running)
         XCTAssertEqual(library.lines[0].status, .queued)
         XCTAssertEqual(library.lines[0].textLanguage, "yue")
+        XCTAssertEqual(library.lines[0].state, .running)
 
         let ticket = try library.beginGeneration(for: lineID)
         try library.failGeneration(ticket: ticket, failureCode: "SERVICE_UNAVAILABLE")
         XCTAssertEqual(library.lines[0].status, .failed)
         XCTAssertEqual(library.lines[0].failureCode, "SERVICE_UNAVAILABLE")
+        XCTAssertEqual(library.lines[0].state, .running)
 
         try library.retryLine(id: lineID)
         XCTAssertEqual(library.lines[0].status, .queued)
         XCTAssertNil(library.lines[0].failureCode)
+        XCTAssertEqual(library.lines[0].state, .running)
 
         let edited = try library.editLine(id: lineID, text: "新的台詞", language: "zh")
         XCTAssertEqual(edited.revision, 2)
         XCTAssertEqual(edited.status, .queued)
         XCTAssertEqual(edited.textLanguage, "zh")
+        XCTAssertEqual(edited.state, .running)
+
+        let reassigned = try library.editLine(
+            id: lineID,
+            text: edited.text,
+            language: edited.textLanguage,
+            state: .review
+        )
+        XCTAssertEqual(reassigned.state, .review)
+
+        let completionTicket = try library.beginGeneration(for: lineID)
+        let completed = try library.completeGeneration(
+            ticket: completionTicket,
+            outputPath: "voice/generated/review.wav"
+        )
+        XCTAssertEqual(completed.state, .review)
+
+        try library.replaceActiveProfile(profile(revision: 2))
+        XCTAssertEqual(library.lines[0].state, .review)
+        try library.retryLine(id: lineID)
+        _ = try library.beginGeneration(for: lineID)
+        XCTAssertEqual(try library.recoverInterruptedGenerations(), 1)
+        XCTAssertEqual(library.lines[0].state, .review)
+    }
+
+    func testPreferredLineSelectsReadyFirstWithinRequestedState() throws {
+        let idleDraftID = UUID(uuidString: "10000000-0000-0000-0000-000000000001")!
+        let idleReadyID = UUID(uuidString: "10000000-0000-0000-0000-000000000002")!
+        let runningID = UUID(uuidString: "10000000-0000-0000-0000-000000000003")!
+        var library = try DialogueVoiceLibrary(profile: profile())
+        _ = try library.addLine(text: "Idle draft", state: .idle, id: idleDraftID)
+        _ = try library.addLine(text: "Idle ready", state: .idle, id: idleReadyID)
+        _ = try library.addLine(text: "Running", state: .running, id: runningID)
+
+        let readyTicket = try library.beginGeneration(for: idleReadyID)
+        _ = try library.completeGeneration(
+            ticket: readyTicket,
+            outputPath: "voice/generated/idle-ready.wav"
+        )
+
+        XCTAssertEqual(library.preferredLine(for: .idle)?.id, idleReadyID)
+        XCTAssertEqual(library.preferredLine(for: .running)?.id, runningID)
+        XCTAssertNil(library.preferredLine(for: .waiting))
+        XCTAssertEqual(library.lines.first(where: { $0.id == idleDraftID })?.status, .queued)
     }
 
     func testProfileValidationStatusControlsQueueingAndPersists() throws {
@@ -327,7 +491,7 @@ final class DialogueVoiceTests: XCTestCase {
     func testProfileReplacementInvalidatesReadyAudioAndOldTicket() throws {
         var library = try libraryWithQueuedLine()
         let ticket = try library.beginGeneration(for: lineID)
-        try library.completeGeneration(ticket: ticket, outputPath: "audio/original.wav")
+        try library.completeGeneration(ticket: ticket, outputPath: "voice/generated/original.wav")
 
         try library.replaceActiveProfile(profile(revision: 2))
         XCTAssertEqual(library.lines[0].status, .stale)
@@ -337,6 +501,8 @@ final class DialogueVoiceTests: XCTestCase {
         }
 
         try library.retryLine(id: lineID)
+        XCTAssertNil(library.lines[0].outputRelativePath)
+        XCTAssertNoThrow(try library.enqueueCleanup(paths: ["voice/generated/original.wav"]))
         let replacementTicket = try library.beginGeneration(for: lineID)
         XCTAssertThrowsError(try library.completeGeneration(ticket: ticket, outputPath: "audio/late.wav")) {
             XCTAssertEqual($0 as? DialogueVoiceError, .generationResultRejected)

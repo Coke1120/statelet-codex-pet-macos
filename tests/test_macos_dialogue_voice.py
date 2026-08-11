@@ -66,6 +66,7 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
             "Import reference audio",
             "Dialogue lines",
             "Dialogue text",
+            "Owning lifecycle state",
             "Add dialogue line",
             "Preview selected dialogue line",
         }
@@ -75,6 +76,7 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         self.assertIn("field.setAccessibilityLabel(label)", self.voice_view)
         self.assertIn('linesTable.setAccessibilityLabel("Dialogue lines")', self.voice_view)
         self.assertIn('dialogueTextView.setAccessibilityLabel("Dialogue text")', self.voice_view)
+        self.assertIn('dialogueStatePopup.setAccessibilityLabel("Owning lifecycle state")', self.voice_view)
         self.assertIn("setAccessibilityHelp", self.voice_view)
 
     def test_gpt_sovits_and_reference_audio_are_separate_typed_imports(self) -> None:
@@ -143,11 +145,31 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
                 "promptLanguage": "prompt_lang",
                 "mediaType": "media_type",
                 "streamingMode": "streaming_mode",
+                "textSplitMethod": "text_split_method",
+                "batchSize": "batch_size",
+                "splitBucket": "split_bucket",
+                "fragmentInterval": "fragment_interval",
+                "parallelInfer": "parallel_infer",
+                "repetitionPenalty": "repetition_penalty",
+                "topK": "top_k",
+                "topP": "top_p",
             },
         )
         self.assertRegex(body, r"\bcase\s+text\b")
         self.assertIn('request.httpMethod = "POST"', self.runtime)
         self.assertIn('request.setValue("application/json", forHTTPHeaderField: "Content-Type")', self.runtime)
+        for declaration in (
+            'let textSplitMethod = "cut0"',
+            "let batchSize = 1",
+            "let parallelInfer = false",
+            "let splitBucket = false",
+            "let fragmentInterval = 0.0",
+            "let topK = 5",
+            "let topP = 0.8",
+            "let temperature = 0.6",
+            "let repetitionPenalty = 1.35",
+        ):
+            self.assertIn(declaration, self.runtime)
 
     def test_add_and_edit_persist_before_asynchronous_pre_generation(self) -> None:
         for method_name, mutation in (
@@ -218,11 +240,13 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         self.assertIn("let preserveProfileEdits = profileEditorIsDirty", update)
         self.assertIn("let preserveDialogueEdits = dialogueEditorIsDirty", update)
         self.assertIn("let preserveNewDialogueText = newDialogueTextIsDirty", update)
+        self.assertIn("let preserveNewDialogueState = newDialogueStateIsDirty", update)
         self.assertIn("let preserveNewDialogueLanguage = newDialogueLanguageIsDirty", update)
         self.assertIn("if !preserveProfileEdits", update)
         self.assertIn("if !preserveDialogueEdits || editorContentChanged", update)
-        self.assertIn("!preserveNewDialogueText && !preserveNewDialogueLanguage", update)
-        self.assertIn("else if !preserveNewDialogueLanguage", update)
+        self.assertIn("!preserveNewDialogueText && !preserveNewDialogueState && !preserveNewDialogueLanguage", update)
+        self.assertIn("if !preserveNewDialogueState", update)
+        self.assertIn("if !preserveNewDialogueLanguage", update)
         self.assertIn("lastAppliedProfileDraft", self.voice_view)
         self.assertIn("lastAppliedEditorLine", self.voice_view)
 
@@ -235,12 +259,19 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
             r"private var newDialogueLanguageIsDirty: Bool \{(?P<body>[\s\S]*?)\n    \}",
             self.voice_view,
         )
+        state_dirty = re.search(
+            r"private var newDialogueStateIsDirty: Bool \{(?P<body>[\s\S]*?)\n    \}",
+            self.voice_view,
+        )
         self.assertIsNotNone(text_dirty, "New-dialogue text dirty-state check was not found")
         self.assertIsNotNone(language_dirty, "New-dialogue language dirty-state check was not found")
+        self.assertIsNotNone(state_dirty, "New-dialogue state dirty-state check was not found")
         self.assertIn("selectedLineID == nil", text_dirty.group("body"))
         self.assertIn("!dialogueTextView.string.isEmpty", text_dirty.group("body"))
         self.assertIn("selectedLineID == nil", language_dirty.group("body"))
         self.assertIn("lastAppliedNewDialogueLanguage", language_dirty.group("body"))
+        self.assertIn("selectedLineID == nil", state_dirty.group("body"))
+        self.assertIn("lastAppliedNewDialogueState", state_dirty.group("body"))
 
         update = method_body(self.voice_view, "    func update")
         no_selection = re.search(
@@ -249,15 +280,18 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         )
         self.assertIsNotNone(no_selection, "No-selection refresh branch was not found")
         self.assertIn(
-            "!preserveNewDialogueText && !preserveNewDialogueLanguage",
+            "!preserveNewDialogueText && !preserveNewDialogueState && !preserveNewDialogueLanguage",
             no_selection.group("body"),
         )
         self.assertIn("clearEditorFields()", no_selection.group("body"))
-        self.assertIn("else if !preserveNewDialogueLanguage", no_selection.group("body"))
+        self.assertIn("if !preserveNewDialogueState", no_selection.group("body"))
+        self.assertIn("if !preserveNewDialogueLanguage", no_selection.group("body"))
+        self.assertIn("applyDefaultDialogueState()", no_selection.group("body"))
         self.assertIn("applyDefaultDialogueLanguage()", no_selection.group("body"))
 
         clear_fields = method_body(self.voice_view, "    private func clearEditorFields")
         self.assertIn("applyDefaultDialogueLanguage()", clear_fields)
+        self.assertIn("applyDefaultDialogueState()", clear_fields)
         apply_default = method_body(self.voice_view, "    private func applyDefaultDialogueLanguage")
         self.assertIn("lastAppliedNewDialogueLanguage = dialogueLanguageField.stringValue", apply_default)
 
@@ -270,6 +304,7 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         enablement = method_body(self.voice_view, "    private func refreshButtonEnablement")
         self.assertIn("clearEditorButton.isEnabled = newDialogueTextIsDirty", enablement)
         self.assertIn("|| newDialogueLanguageIsDirty", enablement)
+        self.assertIn("|| newDialogueStateIsDirty", enablement)
 
         clear_editor = method_body(self.voice_view, "    @objc private func clearEditor()")
         self.assertIn("pendingNewDialogueSubmission = nil", clear_editor)
@@ -306,6 +341,60 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
             self.assertIn(f"{page}.isHidden", self.voice_view)
         self.assertNotIn("removeArrangedSubview(dialoguePage)", self.voice_view)
         self.assertNotIn("removeArrangedSubview(voiceSetupPage)", self.voice_view)
+
+    def test_dialogue_messages_and_voice_are_owned_by_lifecycle_state(self) -> None:
+        self.assertIn('sectionTitle("STATE-OWNED MESSAGES & VOICE")', self.voice_view)
+        self.assertIn('fieldLabel("Owning state")', self.voice_view)
+        self.assertIn('addColumn(Column.state, title: "State"', self.voice_view)
+        self.assertIn("cell.textField?.stringValue = line.state.displayName", self.voice_view)
+        self.assertIn("dialogueStatePopup.addItems(withTitles: PetState.allCases.map(\\.displayName))", self.voice_view)
+        self.assertIn("var onAddLine: ((String, String, PetState) -> Void)?", self.voice_view)
+        self.assertIn("var onUpdateLine: ((DialogueLine, String, String, PetState) -> Void)?", self.voice_view)
+        self.assertIn("var onAddDialogueLine: ((String, String, PetState) -> Void)?", self.settings)
+        self.assertIn("var onUpdateDialogueLine: ((DialogueLine, String, String, PetState) -> Void)?", self.settings)
+        add_line = method_body(self.voice_view, "    @objc private func addLine()")
+        update_line = method_body(self.voice_view, "    @objc private func updateLine()")
+        self.assertIn("selectedDialogueState", add_line)
+        self.assertIn("selectedDialogueState", update_line)
+
+        presentation = method_body(
+            self.app_delegate,
+            "    private func presentStateOwnedDialogueIfNeeded",
+        )
+        self.assertIn("stateDialoguePresentation?.state == state", presentation)
+        self.assertIn("lineID: line?.id", presentation)
+        self.assertIn("retryStateOwnedDialogueAudioIfReady()", presentation)
+        lifecycle_start = method_body(
+            self.app_delegate,
+            "    private func startLifecyclePresentation",
+        )
+        self.assertIn("stateDialoguePresentation?.state != state", lifecycle_start)
+        self.assertLess(
+            lifecycle_start.index("cancelPendingAutomaticPlayback()"),
+            lifecycle_start.index("let started = DispatchTime.now()"),
+        )
+        refresh = method_body(
+            self.app_delegate,
+            "    private func refreshStateOwnedDialogue",
+        )
+        self.assertIn("presentation.lineID", refresh)
+        self.assertIn("line.state == presentation.state", refresh)
+        self.assertNotIn("preferredLine(for:", refresh)
+        self.assertIn("presentation.audioDisposition = .pending", refresh)
+        retry = method_body(
+            self.app_delegate,
+            "    private func retryStateOwnedDialogueAudioIfReady",
+        )
+        self.assertIn("line.state == presentation.state", retry)
+        automatic = method_body(
+            self.coordinator,
+            "    func playReadyLineAutomatically",
+        )
+        self.assertIn("cancelPendingAutomaticPlayback()", automatic)
+        self.assertIn("while let self, !Task.isCancelled", automatic)
+        self.assertIn("!self.audioPlayer.isPlaying", automatic)
+        self.assertIn("return .deferred", automatic)
+        self.assertIn("onAutomaticPlaybackStarted?(requestID, id)", automatic)
 
     def test_voice_page_default_and_user_selection_are_preserved(self) -> None:
         update = method_body(self.voice_view, "    func update")
@@ -362,6 +451,13 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         self.assertIn("public var referencedManagedPaths", self.core)
         self.assertIn("Set(validatedCleanupPaths).isDisjoint", self.core)
         self.assertIn("Set(validated).isDisjoint(with: referencedManagedPaths)", self.core)
+        self.assertIn("public enum DialogueSynthesisPolicy", self.core)
+        self.assertIn('case generatedSynthesisPolicyVersion = "generated_synthesis_policy_version"', self.core)
+        self.assertIn("migrateOutdatedSynthesisOutputs()", self.coordinator)
+        self.assertIn("pendingLineRetainingOutput", self.core)
+        generation_finish = method_body(self.coordinator, "    private func finishGeneration")
+        self.assertIn("replacedOutput", generation_finish)
+        self.assertIn("enqueueCleanup(paths: [replacedOutput])", generation_finish)
 
         retry_cleanup = method_body(
             self.coordinator,

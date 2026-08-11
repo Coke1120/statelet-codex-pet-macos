@@ -140,7 +140,8 @@ The character selector at the top of **Settings → Animations** chooses which
 character owns the four state libraries shown below it. **New Character…**
 starts with an empty map that copies the current map's window/default-format
 settings; the actions menu can rename, duplicate, export, or delete the active
-character.
+character. A directly visible **Delete Profile…** button uses the same confirmed
+deletion flow.
 Duplicate copies the character's map, while Delete removes only its catalog
 entry and keeps its map and media files. The last character cannot be deleted.
 
@@ -190,8 +191,12 @@ appearance, resize, FPS, prompts, deletion, and recovery behavior.
 ## Dialogue and local GPT-SoVITS voice
 
 The **Voice** Settings pane has separate **Dialogue** and **Voice Setup** pages.
-Dialogue provides the text editor, generated-line library, preview, retry, and
-regeneration controls. Voice Setup manages one local character voice profile
+Dialogue assigns every message and generated voice to Idle, Running, Waiting,
+or Review, and provides preview, retry, and regeneration controls. When a new
+lifecycle state is presented, Statelet shows its selected message on the pet
+and plays ready audio without interrupting speech already in progress; the
+latest state-entry voice waits until the active clip finishes. Voice
+Setup manages one local character voice profile
 and accepts separate user-selected GPT `.ckpt` and SoVITS `.pth` weights plus
 reference audio, reference text, and the language identifiers required by
 GPT-SoVITS API v2. Imported assets are copied into private Application Support
@@ -206,6 +211,10 @@ Statelet connects only to an explicit loopback HTTP endpoint such as
 queues background synthesis. Successful WAV output is validated and published
 atomically before it becomes available to **Preview**. Playback never starts
 synchronous inference, and failed or stale lines remain editable and retryable.
+Requests use conservative single-batch, non-parallel GPT-SoVITS settings so a
+short state message is not split into silent or widely separated fragments.
+After an inference-recipe upgrade, legacy generated clips are refreshed in the
+background and their old WAV files are retained until replacement succeeds.
 
 Statelet does not install or train GPT-SoVITS. Start its API v2 locally before
 generating speech, import only model files you trust, and use voices and

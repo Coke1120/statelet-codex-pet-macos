@@ -58,6 +58,31 @@ enum PlaybackPresentationStatus: Equatable {
     }
 }
 
+/// Retains a resume request while `AVPlayerLooper` is still populating its
+/// queue. A later suspension cancels the deferred request; clearing that
+/// suspension produces a fresh directive from `PlaybackSuspensionPolicy`.
+struct DeferredPlaybackResume: Equatable {
+    private(set) var rate: Double?
+
+    mutating func prepare(rate: Double, currentItemAvailable: Bool) -> Double? {
+        guard !currentItemAvailable else {
+            self.rate = nil
+            return rate
+        }
+        self.rate = rate
+        return nil
+    }
+
+    mutating func consumeWhenCurrentItemBecomesAvailable() -> Double? {
+        defer { rate = nil }
+        return rate
+    }
+
+    mutating func cancel() {
+        rate = nil
+    }
+}
+
 final class PetPlayerView: NSView {
     private struct ResizeEdges: OptionSet {
         let rawValue: UInt8
@@ -90,6 +115,8 @@ final class PetPlayerView: NSView {
     private let placeholderLabel = NSTextField(wrappingLabelWithString: "")
     private let stateBadge = PetStateBadgeView()
     private let fpsBadge = NSTextField(labelWithString: "")
+    private let dialogueBubble = NSView()
+    private let dialogueLabel = NSTextField(wrappingLabelWithString: "")
     private let nextClipButton = NSButton()
     private let temporaryStateButton = NSButton()
     private let quickControls = NSStackView()
@@ -144,6 +171,7 @@ final class PetPlayerView: NSView {
         addSubview(stateBadge)
         configureFPSBadge()
         configureQuickControls()
+        configureDialogueBubble()
         applyAppearance(appearanceConfiguration)
         updateStateBadge(state: .idle, publisherStatus: .checking)
         updateQuickControls(
@@ -180,6 +208,7 @@ final class PetPlayerView: NSView {
         layoutFPSBadge()
         layoutStateBadge()
         layoutQuickControls()
+        layoutDialogueBubble()
     }
 
     override func resetCursorRects() {
@@ -335,6 +364,26 @@ final class PetPlayerView: NSView {
         addSubview(quickControls)
     }
 
+    private func configureDialogueBubble() {
+        dialogueBubble.wantsLayer = true
+        dialogueBubble.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.88).cgColor
+        dialogueBubble.layer?.cornerCurve = .continuous
+        dialogueBubble.layer?.cornerRadius = 10
+        dialogueBubble.isHidden = true
+        dialogueBubble.setAccessibilityElement(true)
+        dialogueBubble.setAccessibilityRole(.staticText)
+        dialogueBubble.setAccessibilityLabel("Statelet message")
+
+        dialogueLabel.alignment = .center
+        dialogueLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        dialogueLabel.textColor = .labelColor
+        dialogueLabel.maximumNumberOfLines = 4
+        dialogueLabel.lineBreakMode = .byWordWrapping
+        dialogueLabel.translatesAutoresizingMaskIntoConstraints = true
+        dialogueBubble.addSubview(dialogueLabel)
+        addSubview(dialogueBubble)
+    }
+
     private func configureQuickControlButton(
         _ button: NSButton,
         symbolName: String,
@@ -371,6 +420,51 @@ final class PetPlayerView: NSView {
             }
         }
         quickControls.frame = NSRect(origin: origin, size: size)
+    }
+
+    private func layoutDialogueBubble() {
+        guard !dialogueBubble.isHidden else { return }
+        let margin: CGFloat = 12
+        let horizontalPadding: CGFloat = 12
+        let verticalPadding: CGFloat = 8
+        let overlayGap: CGFloat = 8
+        let availableMaxX = quickControls.isHidden
+            ? bounds.maxX - margin
+            : quickControls.frame.minX - overlayGap
+        let availableWidth = max(0, availableMaxX - margin)
+        let bubbleWidth = min(320, availableWidth)
+        guard bubbleWidth > horizontalPadding * 2 else {
+            dialogueBubble.frame = .zero
+            return
+        }
+
+        dialogueLabel.preferredMaxLayoutWidth = bubbleWidth - horizontalPadding * 2
+        let fittingSize = dialogueLabel.fittingSize
+        let bubbleHeight = min(
+            bounds.height - margin * 2,
+            ceil(fittingSize.height + verticalPadding * 2)
+        )
+        let x = margin + max(0, (availableWidth - bubbleWidth) / 2)
+        let occupiedFrames = [stateBadge, fpsBadge, quickControls]
+            .filter { !$0.isHidden && !$0.frame.isEmpty }
+            .map(\.frame)
+        let candidateYPositions = ([margin] + occupiedFrames.map { $0.maxY + overlayGap })
+            .sorted()
+        let resolvedFrame = candidateYPositions.lazy
+            .map { y in
+                NSRect(x: x, y: y, width: bubbleWidth, height: max(0, bubbleHeight))
+            }
+            .first { candidate in
+                candidate.maxY <= bounds.maxY - margin
+                    && occupiedFrames.allSatisfy { occupied in
+                        !candidate.intersects(occupied.insetBy(dx: -overlayGap, dy: -overlayGap))
+                    }
+            }
+        dialogueBubble.frame = resolvedFrame ?? .zero
+        dialogueLabel.frame = dialogueBubble.bounds.insetBy(
+            dx: horizontalPadding,
+            dy: verticalPadding
+        )
     }
 
     func applyAppearance(_ configuration: PetAppearanceConfiguration) {
@@ -484,6 +578,16 @@ final class PetPlayerView: NSView {
     func showPlaceholder(_ message: String?) {
         placeholderLabel.stringValue = message ?? ""
         placeholderLabel.isHidden = message == nil
+    }
+
+    /// Shows the current lifecycle-state message without coupling the view to
+    /// dialogue storage or voice playback. Nil and whitespace-only text hide it.
+    func showDialogueMessage(_ message: String?) {
+        let normalized = message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        dialogueLabel.stringValue = normalized
+        dialogueBubble.isHidden = normalized.isEmpty
+        dialogueBubble.setAccessibilityValue(normalized.isEmpty ? nil : normalized)
+        needsLayout = true
     }
 
     func showPoster(_ image: NSImage?) {
@@ -785,6 +889,7 @@ final class PetPlayerController {
     private(set) var presentationStatus: PlaybackPresentationStatus = .awaiting
     private var reduceMotion = false
     private var suspensionPolicy = PlaybackSuspensionPolicy()
+    private var deferredPlaybackResume = DeferredPlaybackResume()
 
     var onPresentationEvent: ((UInt64, PetState, PlaybackPresentationEvent) -> Void)?
     var onOneShotEnded: ((UInt64) -> Void)?
@@ -1043,6 +1148,9 @@ final class PetPlayerController {
         }
         observedCurrentItemIdentifier = identifier
         activeItemIdentifiers.insert(identifier)
+        if let rate = deferredPlaybackResume.consumeWhenCurrentItemBecomesAvailable() {
+            queuePlayer.playImmediately(atRate: Float(rate))
+        }
         readyItemIdentifier = nil
         itemStatusObservation = nil
         itemStatusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
@@ -1175,6 +1283,7 @@ final class PetPlayerController {
         view.playerLayer.player = nil
         queuePlayer.pause()
         suspensionPolicy.clearPlayback()
+        deferredPlaybackResume.cancel()
         looper = nil
         queuePlayer.removeAllItems()
         view.playerLayer.player = queuePlayer
@@ -1185,10 +1294,15 @@ final class PetPlayerController {
         case .none:
             break
         case .pause:
+            deferredPlaybackResume.cancel()
             queuePlayer.pause()
         case let .resume(rate):
-            guard queuePlayer.currentItem != nil else { return }
-            queuePlayer.playImmediately(atRate: Float(rate))
+            if let applicableRate = deferredPlaybackResume.prepare(
+                rate: rate,
+                currentItemAvailable: queuePlayer.currentItem != nil
+            ) {
+                queuePlayer.playImmediately(atRate: Float(applicableRate))
+            }
         }
     }
 

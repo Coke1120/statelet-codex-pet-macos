@@ -5,6 +5,13 @@ versioning for the public source release.
 
 ## Unreleased
 
+### Added
+
+- Dialogue messages and generated voice can be owned by Idle, Running, Waiting,
+  or Review and are presented automatically when that lifecycle state appears.
+- The active-character row exposes a directly visible **Delete Profile…**
+  control while retaining confirmed, non-destructive deletion semantics.
+
 ### Changed
 
 - Voice settings now separate dialogue text and generated-line controls from
@@ -18,6 +25,11 @@ versioning for the public source release.
 
 ### Fixed
 
+- Looping animations no longer remain on their first frame when
+  `AVPlayerLooper` populates its first queue item asynchronously.
+- GPT-SoVITS requests use contiguous, non-parallel inference settings for short
+  state messages; old-recipe clips are regenerated without deleting their WAV
+  fallback before replacement succeeds.
 - Odd requested HEVC-alpha dimensions are aligned before matting so Apple
   `avconvert` cannot silently crop a row or column after reference generation.
 - The Animations pane keeps its per-state clip list visible at minimum window

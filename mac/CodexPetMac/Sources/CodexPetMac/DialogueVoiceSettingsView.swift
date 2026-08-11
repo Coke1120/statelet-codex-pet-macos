@@ -19,8 +19,8 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     var onImportReferenceAudio: ((DialogueVoiceProfileDraft) -> Void)?
     var onSaveProfile: ((DialogueVoiceProfileDraft) -> Void)?
     var onRemoveProfile: ((GPTSoVITSVoiceProfile) -> Void)?
-    var onAddLine: ((String, String) -> Void)?
-    var onUpdateLine: ((DialogueLine, String, String) -> Void)?
+    var onAddLine: ((String, String, PetState) -> Void)?
+    var onUpdateLine: ((DialogueLine, String, String, PetState) -> Void)?
     var onClearEditor: (() -> Void)?
     var onDeleteLine: ((DialogueLine) -> Void)?
     var onPreviewLine: ((DialogueLine) -> Void)?
@@ -29,6 +29,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
 
     private enum Column {
         static let dialogue = NSUserInterfaceItemIdentifier("dialogue-voice.dialogue")
+        static let state = NSUserInterfaceItemIdentifier("dialogue-voice.state")
         static let language = NSUserInterfaceItemIdentifier("dialogue-voice.language")
         static let status = NSUserInterfaceItemIdentifier("dialogue-voice.status")
     }
@@ -40,8 +41,10 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
 
     private struct PendingNewDialogueSubmission {
         let editorText: String
+        let editorState: PetState
         let editorLanguage: String
         let submittedText: String
+        let submittedState: PetState
         let submittedLanguage: String
         let existingLineIDs: Set<UUID>
     }
@@ -72,6 +75,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     private let removeProfileButton = NSButton(title: "Remove Profile…", target: nil, action: nil)
 
     private let dialogueTextView = NSTextView()
+    private let dialogueStatePopup = NSPopUpButton()
     private let dialogueLanguageField = NSTextField()
     private let addLineButton = NSButton(title: "Add", target: nil, action: nil)
     private let updateLineButton = NSButton(title: "Update", target: nil, action: nil)
@@ -94,6 +98,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     private var selectedLineID: UUID?
     private var lastAppliedProfileDraft: DialogueVoiceProfileDraft?
     private var lastAppliedEditorLine: DialogueLine?
+    private var lastAppliedNewDialogueState: PetState = .idle
     private var lastAppliedNewDialogueLanguage = ""
     private var pendingNewDialogueSubmission: PendingNewDialogueSubmission?
     private var isRefreshing = false
@@ -124,6 +129,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             && snapshot.draft == lastAppliedProfileDraft
         let preserveDialogueEdits = dialogueEditorIsDirty
         let preserveNewDialogueText = newDialogueTextIsDirty
+        let preserveNewDialogueState = newDialogueStateIsDirty
         let preserveNewDialogueLanguage = newDialogueLanguageIsDirty
         isRefreshing = true
         defer {
@@ -136,11 +142,13 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             library.lines.contains {
                 !submission.existingLineIDs.contains($0.id)
                     && $0.text == submission.submittedText
+                    && $0.state == submission.submittedState
                     && $0.textLanguage == submission.submittedLanguage
             }
         } ?? false
         let shouldClearSubmittedNewDialogue = submittedNewDialogueWasSaved
             && dialogueTextView.string == pendingNewDialogueSubmission?.editorText
+            && selectedDialogueState == pendingNewDialogueSubmission?.editorState
             && dialogueLanguageField.stringValue == pendingNewDialogueSubmission?.editorLanguage
         if submittedNewDialogueWasSaved {
             pendingNewDialogueSubmission = nil
@@ -184,10 +192,11 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             selectedLineID = nil
             lastAppliedEditorLine = nil
             linesTable.deselectAll(nil)
-            if shouldClearSubmittedNewDialogue || (!preserveNewDialogueText && !preserveNewDialogueLanguage) {
+            if shouldClearSubmittedNewDialogue || (!preserveNewDialogueText && !preserveNewDialogueState && !preserveNewDialogueLanguage) {
                 clearEditorFields()
-            } else if !preserveNewDialogueLanguage {
-                applyDefaultDialogueLanguage()
+            } else {
+                if !preserveNewDialogueState { applyDefaultDialogueState() }
+                if !preserveNewDialogueLanguage { applyDefaultDialogueLanguage() }
             }
         }
         linesTable.setAccessibilityHelp(
@@ -221,6 +230,9 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             cell.textField?.stringValue = line.text
             cell.textField?.lineBreakMode = .byTruncatingTail
             cell.setAccessibilityLabel(line.text)
+        case Column.state:
+            cell.textField?.stringValue = line.state.displayName
+            cell.setAccessibilityLabel("State \(line.state.displayName)")
         case Column.language:
             cell.textField?.stringValue = line.textLanguage
             cell.setAccessibilityLabel("Language \(line.textLanguage)")
@@ -293,12 +305,15 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         let profileGridRow = centeredRow(profileGrid)
         let profileActions = buttonRow([saveProfileButton, removeProfileButton])
 
-        let dialogueTitle = sectionTitle("DIALOGUE LINES")
-        let dialogueHelp = helpLabel("Adding or updating a line requests background pre-generation. Playback and persistence are handled outside this view.")
+        let dialogueTitle = sectionTitle("STATE-OWNED MESSAGES & VOICE")
+        let dialogueHelp = helpLabel("Each message and its generated voice belongs to one Statelet lifecycle state. Adding or updating a message requests background pre-generation.")
         let textLabel = fieldLabel("Dialogue text")
         textLabel.alignment = .left
         textLabel.setAccessibilityLabel("Dialogue text label")
-        let languageRow = NSStackView(views: [fieldLabel("Text language"), dialogueLanguageField])
+        let languageRow = NSStackView(views: [
+            fieldLabel("Owning state"), dialogueStatePopup,
+            fieldLabel("Text language"), dialogueLanguageField,
+        ])
         languageRow.orientation = .horizontal
         languageRow.alignment = .centerY
         languageRow.spacing = 10
@@ -363,6 +378,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             voiceSetupPage.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             linesScrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 190),
             dialogueLanguageField.widthAnchor.constraint(greaterThanOrEqualToConstant: 150),
+            dialogueStatePopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 110),
         ])
         selectVoiceSection(.voiceSetup, userInitiated: false)
     }
@@ -409,6 +425,12 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         defaultTextLanguageField.placeholderString = "e.g. zh, yue, en, ja"
         referenceTextField.placeholderString = "Transcript of the reference audio"
         dialogueLanguageField.placeholderString = "Text language"
+        dialogueStatePopup.addItems(withTitles: PetState.allCases.map(\.displayName))
+        dialogueStatePopup.selectItem(at: PetState.allCases.firstIndex(of: .idle) ?? 0)
+        dialogueStatePopup.target = self
+        dialogueStatePopup.action = #selector(dialogueStateChanged)
+        dialogueStatePopup.setAccessibilityLabel("Owning lifecycle state")
+        dialogueStatePopup.setAccessibilityHelp("Choose which Statelet lifecycle state owns this message and generated voice.")
         for (field, label, help) in [
             (nameField, "Voice profile display name", "A local label for this voice profile."),
             (apiBaseURLField, "GPT-SoVITS API base URL", "Use a loopback URL such as http://127.0.0.1:9880."),
@@ -464,6 +486,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         linesTable.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
         linesTable.setAccessibilityLabel("Dialogue lines")
         addColumn(Column.dialogue, title: "Dialogue", width: 390, minimumWidth: 220)
+        addColumn(Column.state, title: "State", width: 90, minimumWidth: 75)
         addColumn(Column.language, title: "Language", width: 90, minimumWidth: 75)
         addColumn(Column.status, title: "Status", width: 170, minimumWidth: 120)
         linesScrollView.translatesAutoresizingMaskIntoConstraints = false
@@ -584,13 +607,30 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
 
     private func populateEditor(with line: DialogueLine) {
         dialogueTextView.string = line.text
+        selectDialogueState(line.state)
         dialogueLanguageField.stringValue = line.textLanguage
         lastAppliedEditorLine = line
     }
 
     private func clearEditorFields() {
         dialogueTextView.string = ""
+        applyDefaultDialogueState()
         applyDefaultDialogueLanguage()
+    }
+
+    private var selectedDialogueState: PetState {
+        let index = dialogueStatePopup.indexOfSelectedItem
+        guard PetState.allCases.indices.contains(index) else { return .idle }
+        return PetState.allCases[index]
+    }
+
+    private func selectDialogueState(_ state: PetState) {
+        dialogueStatePopup.selectItem(at: PetState.allCases.firstIndex(of: state) ?? 0)
+    }
+
+    private func applyDefaultDialogueState() {
+        selectDialogueState(.idle)
+        lastAppliedNewDialogueState = selectedDialogueState
     }
 
     private func applyDefaultDialogueLanguage() {
@@ -606,6 +646,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     private var dialogueEditorIsDirty: Bool {
         guard let line = lastAppliedEditorLine, selectedLineID == line.id else { return false }
         return dialogueTextView.string != line.text
+            || selectedDialogueState != line.state
             || dialogueLanguageField.stringValue != line.textLanguage
     }
 
@@ -617,6 +658,11 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     private var newDialogueLanguageIsDirty: Bool {
         guard selectedLineID == nil else { return false }
         return dialogueLanguageField.stringValue != lastAppliedNewDialogueLanguage
+    }
+
+    private var newDialogueStateIsDirty: Bool {
+        guard selectedLineID == nil else { return false }
+        return selectedDialogueState != lastAppliedNewDialogueState
     }
 
     private func applyProfileDraft(_ draft: DialogueVoiceProfileDraft) {
@@ -633,6 +679,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         return line.id != lastAppliedEditorLine.id
             || line.revision != lastAppliedEditorLine.revision
             || line.text != lastAppliedEditorLine.text
+            || line.state != lastAppliedEditorLine.state
             || line.textLanguage != lastAppliedEditorLine.textLanguage
     }
 
@@ -655,6 +702,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         addLineButton.isEnabled = hasLineText && hasLineLanguage && selectedLine() == nil
         updateLineButton.isEnabled = hasLineText && hasLineLanguage && selectedLine() != nil
         clearEditorButton.isEnabled = newDialogueTextIsDirty
+            || newDialogueStateIsDirty
             || newDialogueLanguageIsDirty
             || selectedLine() != nil
 
@@ -700,14 +748,17 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         let submittedLanguage = dialogueLanguageField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         pendingNewDialogueSubmission = PendingNewDialogueSubmission(
             editorText: dialogueTextView.string,
+            editorState: selectedDialogueState,
             editorLanguage: dialogueLanguageField.stringValue,
             submittedText: submittedText,
+            submittedState: selectedDialogueState,
             submittedLanguage: submittedLanguage,
             existingLineIDs: Set(lines.map(\.id))
         )
         onAddLine?(
             submittedText,
-            submittedLanguage
+            submittedLanguage,
+            selectedDialogueState
         )
     }
     @objc private func updateLine() {
@@ -715,7 +766,8 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         onUpdateLine?(
             line,
             dialogueTextView.string.trimmingCharacters(in: .whitespacesAndNewlines),
-            dialogueLanguageField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            dialogueLanguageField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
+            selectedDialogueState
         )
     }
     @objc private func clearEditor() {
@@ -749,5 +801,9 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     }
     @objc private func openVoiceSetup() {
         selectVoiceSection(.voiceSetup, userInitiated: true)
+    }
+    @objc private func dialogueStateChanged() {
+        guard !isRefreshing else { return }
+        refreshButtonEnablement()
     }
 }
