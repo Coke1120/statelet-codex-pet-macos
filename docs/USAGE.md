@@ -335,20 +335,27 @@ them.
 
 ## Dialogue and local voice
 
-Open **Settings → Voice** to configure one local GPT-SoVITS voice profile and
-its dialogue library.
+Open **Settings → Voice**. Use **Voice Setup** to configure one local GPT-SoVITS
+voice profile, then use **Dialogue** to enter text and manage generated lines.
+If no profile has been saved yet, Voice opens on Voice Setup; otherwise it opens
+on Dialogue and remembers subsequent page changes while Settings remains open.
 
 1. Start GPT-SoVITS API v2 on this Mac. The default endpoint is
    `http://127.0.0.1:9880`.
-2. Enter a profile name, prompt language, default dialogue language, and the
-   exact transcript of the reference recording.
-3. Import the trained GPT `.ckpt` weight, SoVITS `.pth` weight, and reference
-   audio separately. Import only files you trust and recordings you are
-   authorized to use.
+2. In **Voice Setup**, enter a profile name, prompt language, default dialogue
+   language, and the exact transcript of the reference recording.
+3. Still in Voice Setup, import the trained GPT `.ckpt` weight, SoVITS `.pth`
+   weight, and reference audio separately. Import only files you trust and
+   recordings you are authorized to use.
 4. Save the profile. Statelet rejects non-loopback endpoints, missing managed
    assets, unsafe paths, symbolic links, and unsupported import extensions.
-5. Enter a dialogue line and its GPT-SoVITS language identifier, then choose
-   **Add**. The line is saved before background generation begins.
+5. Switch to **Dialogue**, enter a line and its GPT-SoVITS language identifier,
+   then choose **Add**. The line is saved before background generation begins.
+
+Dialogue text can be saved as a draft before Voice Setup is ready. The page
+shows that generation will begin only after a valid profile and local service
+are available; switching between the two pages does not discard unsaved form
+or dialogue edits.
 
 The profile reports `Not configured`, `Validating`, `Ready`, `Invalid`, or
 `Local service unavailable`; Statelet fingerprints the model bytes, reference

@@ -217,10 +217,135 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         update = method_body(self.voice_view, "    func update")
         self.assertIn("let preserveProfileEdits = profileEditorIsDirty", update)
         self.assertIn("let preserveDialogueEdits = dialogueEditorIsDirty", update)
+        self.assertIn("let preserveNewDialogueText = newDialogueTextIsDirty", update)
+        self.assertIn("let preserveNewDialogueLanguage = newDialogueLanguageIsDirty", update)
         self.assertIn("if !preserveProfileEdits", update)
         self.assertIn("if !preserveDialogueEdits || editorContentChanged", update)
+        self.assertIn("!preserveNewDialogueText && !preserveNewDialogueLanguage", update)
+        self.assertIn("else if !preserveNewDialogueLanguage", update)
         self.assertIn("lastAppliedProfileDraft", self.voice_view)
         self.assertIn("lastAppliedEditorLine", self.voice_view)
+
+    def test_background_refresh_preserves_an_unselected_new_dialogue_draft(self) -> None:
+        text_dirty = re.search(
+            r"private var newDialogueTextIsDirty: Bool \{(?P<body>[\s\S]*?)\n    \}",
+            self.voice_view,
+        )
+        language_dirty = re.search(
+            r"private var newDialogueLanguageIsDirty: Bool \{(?P<body>[\s\S]*?)\n    \}",
+            self.voice_view,
+        )
+        self.assertIsNotNone(text_dirty, "New-dialogue text dirty-state check was not found")
+        self.assertIsNotNone(language_dirty, "New-dialogue language dirty-state check was not found")
+        self.assertIn("selectedLineID == nil", text_dirty.group("body"))
+        self.assertIn("!dialogueTextView.string.isEmpty", text_dirty.group("body"))
+        self.assertIn("selectedLineID == nil", language_dirty.group("body"))
+        self.assertIn("lastAppliedNewDialogueLanguage", language_dirty.group("body"))
+
+        update = method_body(self.voice_view, "    func update")
+        no_selection = re.search(
+            r"else \{\s*selectedLineID = nil[\s\S]*?linesTable\.deselectAll\(nil\)(?P<body>[\s\S]*?)\n        \}",
+            update,
+        )
+        self.assertIsNotNone(no_selection, "No-selection refresh branch was not found")
+        self.assertIn(
+            "!preserveNewDialogueText && !preserveNewDialogueLanguage",
+            no_selection.group("body"),
+        )
+        self.assertIn("clearEditorFields()", no_selection.group("body"))
+        self.assertIn("else if !preserveNewDialogueLanguage", no_selection.group("body"))
+        self.assertIn("applyDefaultDialogueLanguage()", no_selection.group("body"))
+
+        clear_fields = method_body(self.voice_view, "    private func clearEditorFields")
+        self.assertIn("applyDefaultDialogueLanguage()", clear_fields)
+        apply_default = method_body(self.voice_view, "    private func applyDefaultDialogueLanguage")
+        self.assertIn("lastAppliedNewDialogueLanguage = dialogueLanguageField.stringValue", apply_default)
+
+        add_line = method_body(self.voice_view, "    @objc private func addLine()")
+        self.assertIn("pendingNewDialogueSubmission = PendingNewDialogueSubmission", add_line)
+        self.assertIn("existingLineIDs: Set(lines.map(\\.id))", add_line)
+        self.assertIn("shouldClearSubmittedNewDialogue", update)
+
+    def test_language_only_new_draft_can_be_cleared_and_pending_state_is_cancelled(self) -> None:
+        enablement = method_body(self.voice_view, "    private func refreshButtonEnablement")
+        self.assertIn("clearEditorButton.isEnabled = newDialogueTextIsDirty", enablement)
+        self.assertIn("|| newDialogueLanguageIsDirty", enablement)
+
+        clear_editor = method_body(self.voice_view, "    @objc private func clearEditor()")
+        self.assertIn("pendingNewDialogueSubmission = nil", clear_editor)
+        selection = method_body(self.voice_view, "    func tableViewSelectionDidChange")
+        self.assertIn("if let line = selectedLine()", selection)
+        self.assertIn("pendingNewDialogueSubmission = nil", selection)
+
+    def test_voice_view_has_two_persistent_internal_pages(self) -> None:
+        self.assertIn("private final class TopAlignedVoiceDocumentView", self.voice_view)
+        self.assertIn("override var isFlipped: Bool { true }", self.voice_view)
+        self.assertIn("private let documentView = TopAlignedVoiceDocumentView()", self.voice_view)
+        section_control = re.search(
+            r'NSSegmentedControl\(\s*labels:\s*\[(?P<labels>[^]]+)\]',
+            self.voice_view,
+        )
+        self.assertIsNotNone(section_control, "Voice section control was not found")
+        labels = re.findall(r'"([^"]+)"', section_control.group("labels"))
+        self.assertEqual(labels, ["Dialogue", "Voice Setup"])
+        self.assertIn('voiceSectionControl.setAccessibilityLabel("Voice section")', self.voice_view)
+        self.assertIn("let voiceSectionPickerRow = centeredRow(voiceSectionControl)", self.voice_view)
+        self.assertIn("let profileGridRow = centeredRow(profileGrid)", self.voice_view)
+        self.assertIn("views: [profileTitle, profileHelp, profileGridRow, profileActions]", self.voice_view)
+        self.assertIn(
+            "voiceSectionPickerRow.widthAnchor.constraint(equalTo: contentStack.widthAnchor)",
+            self.voice_view,
+        )
+        self.assertIn("dialoguePage.widthAnchor.constraint(equalTo: contentStack.widthAnchor)", self.voice_view)
+        self.assertIn("voiceSetupPage.widthAnchor.constraint(equalTo: contentStack.widthAnchor)", self.voice_view)
+        self.assertIn("view.widthAnchor.constraint(equalTo: page.widthAnchor).isActive = true", self.voice_view)
+        self.assertIn("textLabel.alignment = .left", self.voice_view)
+
+        for page in ("dialoguePage", "voiceSetupPage"):
+            self.assertIn(f"private let {page} = NSStackView()", self.voice_view)
+            self.assertIn(f"{page}.isHidden", self.voice_view)
+        self.assertNotIn("removeArrangedSubview(dialoguePage)", self.voice_view)
+        self.assertNotIn("removeArrangedSubview(voiceSetupPage)", self.voice_view)
+
+    def test_voice_page_default_and_user_selection_are_preserved(self) -> None:
+        update = method_body(self.voice_view, "    func update")
+        self.assertIn("if !hasSelectedVoiceSection", update)
+        self.assertIn("profile == nil ? .voiceSetup : .dialogue", update)
+        selection = method_body(self.voice_view, "    private func selectVoiceSection")
+        self.assertIn("hasSelectedVoiceSection = true", selection)
+        self.assertIn("dialoguePage.isHidden = section != .dialogue", selection)
+        self.assertIn("voiceSetupPage.isHidden = section != .voiceSetup", selection)
+
+    def test_dialogue_page_offers_voice_setup_without_losing_drafts(self) -> None:
+        self.assertIn("Choose Add to save this text as a draft.", self.voice_view)
+        self.assertIn("Voice Setup and the local service must be ready to generate audio.", self.voice_view)
+        self.assertIn('NSButton(title: "Open Voice Setup"', self.voice_view)
+        self.assertIn("#selector(openVoiceSetup)", self.voice_view)
+        update = method_body(self.voice_view, "    func update")
+        self.assertIn("dialogueSetupHint.isHidden = library.profileStatus == .ready", update)
+        self.assertIn('accessibilityLabel: "Dialogue page"', self.voice_view)
+        self.assertIn('accessibilityLabel: "Voice Setup page"', self.voice_view)
+        self.assertIn("page.setAccessibilityRole(.group)", self.voice_view)
+        self.assertIn("page.setAccessibilityLabel(accessibilityLabel)", self.voice_view)
+
+    def test_internal_pages_preserve_existing_voice_callbacks(self) -> None:
+        callback_actions = {
+            "onImportGPTWeight": "importGPTWeight",
+            "onImportSoVITSWeight": "importSoVITSWeight",
+            "onImportReferenceAudio": "importReferenceAudio",
+            "onSaveProfile": "saveProfile",
+            "onRemoveProfile": "removeProfile",
+            "onAddLine": "addLine",
+            "onUpdateLine": "updateLine",
+            "onClearEditor": "clearEditor",
+            "onDeleteLine": "deleteLine",
+            "onPreviewLine": "previewLine",
+            "onRetryLine": "retryLine",
+            "onRegenerateLine": "regenerateLine",
+        }
+        for callback, action in callback_actions.items():
+            self.assertIn(callback, self.voice_view)
+            self.assertIn(f"#selector({action})", self.voice_view)
 
     def test_profile_state_fingerprint_and_secure_cleanup_are_persisted(self) -> None:
         for status in ("notConfigured", "validating", "ready", "invalid", "unavailable"):

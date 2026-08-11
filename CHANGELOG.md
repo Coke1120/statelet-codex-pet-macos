@@ -7,6 +7,8 @@ versioning for the public source release.
 
 ### Changed
 
+- Voice settings now separate dialogue text and generated-line controls from
+  local GPT-SoVITS model, reference-audio, and profile setup.
 - MP4 authoring now uses a stable even 320×480 pixel canvas independent of the
   resizable AppKit window.
 - Conversion reports and import results identify stripped audio, non-identical

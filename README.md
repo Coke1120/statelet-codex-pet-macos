@@ -189,15 +189,17 @@ appearance, resize, FPS, prompts, deletion, and recovery behavior.
 
 ## Dialogue and local GPT-SoVITS voice
 
-The **Voice** Settings pane manages one local character voice profile and a
-library of dialogue lines. Statelet accepts separate user-selected GPT `.ckpt`
-and SoVITS `.pth` weights plus reference audio, reference text, and the language
-identifiers required by GPT-SoVITS API v2. Imported assets are copied into
-private Application Support storage; they are never added to the repository or
-release bundle. A persisted content fingerprint covers the model bytes,
-reference inputs, endpoint, and language settings and is revalidated at launch.
-Reference audio must decode locally, and a profile becomes ready only after its
-user-managed API accepts both weight files.
+The **Voice** Settings pane has separate **Dialogue** and **Voice Setup** pages.
+Dialogue provides the text editor, generated-line library, preview, retry, and
+regeneration controls. Voice Setup manages one local character voice profile
+and accepts separate user-selected GPT `.ckpt` and SoVITS `.pth` weights plus
+reference audio, reference text, and the language identifiers required by
+GPT-SoVITS API v2. Imported assets are copied into private Application Support
+storage; they are never added to the repository or release bundle. A persisted
+content fingerprint covers the model bytes, reference inputs, endpoint, and
+language settings and is revalidated at launch. Reference audio must decode
+locally, and a profile becomes ready only after its user-managed API accepts
+both weight files.
 
 Statelet connects only to an explicit loopback HTTP endpoint such as
 `http://127.0.0.1:9880`. Adding or editing a line persists it immediately and
