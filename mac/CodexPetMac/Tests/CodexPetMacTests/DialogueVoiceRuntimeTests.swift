@@ -281,6 +281,162 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
     }
 
     @MainActor
+    func testCoordinatorPersistsImportedAssetCleanupAndRemovesItOnShutdownBeforeSave() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dialogue-import-shutdown-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("source.ckpt")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("first model".utf8).write(to: source)
+
+        let coordinator = DialogueVoiceCoordinator(applicationSupportRoot: root)
+        coordinator.start()
+        let imported = expectation(description: "asset is imported")
+        coordinator.onChange = { snapshot in
+            if snapshot.importedAssets.gptWeightRelativePath != nil {
+                imported.fulfill()
+            }
+        }
+        coordinator.importAsset(
+            sourceURL: source,
+            kind: .gptWeight,
+            preserving: coordinator.draft
+        )
+        await fulfillment(of: [imported], timeout: 5)
+
+        let relativePath = try XCTUnwrap(coordinator.importedAssets.gptWeightRelativePath)
+        let store = DialogueVoiceStore(rootURL: root.appendingPathComponent("voice", isDirectory: true))
+        XCTAssertEqual(try store.load().pendingCleanupPaths, [relativePath])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(relativePath).path))
+
+        coordinator.shutdown()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent(relativePath).path))
+        XCTAssertTrue(try store.load().pendingCleanupPaths.isEmpty)
+    }
+
+    @MainActor
+    func testCoordinatorCleansReplacedImportButPreservesCurrentImportUntilShutdown() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dialogue-import-replacement-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let firstSource = root.appendingPathComponent("first.ckpt")
+        let secondSource = root.appendingPathComponent("second.ckpt")
+        try Data("first model".utf8).write(to: firstSource)
+        try Data("second model".utf8).write(to: secondSource)
+
+        let coordinator = DialogueVoiceCoordinator(applicationSupportRoot: root)
+        coordinator.start()
+        let firstImported = expectation(description: "first asset is imported")
+        coordinator.onChange = { snapshot in
+            if snapshot.importedAssets.gptWeightRelativePath != nil {
+                firstImported.fulfill()
+            }
+        }
+        coordinator.importAsset(
+            sourceURL: firstSource,
+            kind: .gptWeight,
+            preserving: coordinator.draft
+        )
+        await fulfillment(of: [firstImported], timeout: 5)
+        let firstPath = try XCTUnwrap(coordinator.importedAssets.gptWeightRelativePath)
+
+        let secondImported = expectation(description: "replacement asset is imported")
+        coordinator.onChange = { snapshot in
+            if let path = snapshot.importedAssets.gptWeightRelativePath, path != firstPath {
+                secondImported.fulfill()
+            }
+        }
+        coordinator.importAsset(
+            sourceURL: secondSource,
+            kind: .gptWeight,
+            preserving: coordinator.draft
+        )
+        await fulfillment(of: [secondImported], timeout: 5)
+        let secondPath = try XCTUnwrap(coordinator.importedAssets.gptWeightRelativePath)
+        let store = DialogueVoiceStore(rootURL: root.appendingPathComponent("voice", isDirectory: true))
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent(firstPath).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(secondPath).path))
+        XCTAssertEqual(try store.load().pendingCleanupPaths, [secondPath])
+
+        coordinator.shutdown()
+    }
+
+    @MainActor
+    func testDialogueCleanupOperationPreservesCurrentStagedImport() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dialogue-import-preservation-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let source = root.appendingPathComponent("source.ckpt")
+        try Data("staged model".utf8).write(to: source)
+
+        let coordinator = DialogueVoiceCoordinator(applicationSupportRoot: root)
+        coordinator.start()
+        try coordinator.addLine(text: "Before", language: "en")
+        let lineID = try XCTUnwrap(coordinator.library.lines.first?.id)
+        let imported = expectation(description: "asset is imported")
+        coordinator.onChange = { snapshot in
+            if snapshot.importedAssets.gptWeightRelativePath != nil {
+                imported.fulfill()
+            }
+        }
+        coordinator.importAsset(
+            sourceURL: source,
+            kind: .gptWeight,
+            preserving: coordinator.draft
+        )
+        await fulfillment(of: [imported], timeout: 5)
+        let relativePath = try XCTUnwrap(coordinator.importedAssets.gptWeightRelativePath)
+
+        try coordinator.updateLine(id: lineID, text: "After", language: "en")
+
+        let store = DialogueVoiceStore(rootURL: root.appendingPathComponent("voice", isDirectory: true))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(relativePath).path))
+        XCTAssertEqual(try store.load().pendingCleanupPaths, [relativePath])
+        coordinator.shutdown()
+    }
+
+    @MainActor
+    func testCoordinatorStartupCleansPersistedStagedImportFromPriorRun() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dialogue-import-restart-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let source = root.appendingPathComponent("source.ckpt")
+        try Data("orphaned staged model".utf8).write(to: source)
+
+        let firstCoordinator = DialogueVoiceCoordinator(applicationSupportRoot: root)
+        firstCoordinator.start()
+        let imported = expectation(description: "asset is imported before simulated crash")
+        firstCoordinator.onChange = { snapshot in
+            if snapshot.importedAssets.gptWeightRelativePath != nil {
+                imported.fulfill()
+            }
+        }
+        firstCoordinator.importAsset(
+            sourceURL: source,
+            kind: .gptWeight,
+            preserving: firstCoordinator.draft
+        )
+        await fulfillment(of: [imported], timeout: 5)
+        let relativePath = try XCTUnwrap(firstCoordinator.importedAssets.gptWeightRelativePath)
+        let store = DialogueVoiceStore(rootURL: root.appendingPathComponent("voice", isDirectory: true))
+        XCTAssertEqual(try store.load().pendingCleanupPaths, [relativePath])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(relativePath).path))
+
+        let restartedCoordinator = DialogueVoiceCoordinator(applicationSupportRoot: root)
+        restartedCoordinator.start()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent(relativePath).path))
+        XCTAssertTrue(try store.load().pendingCleanupPaths.isEmpty)
+        restartedCoordinator.shutdown()
+        firstCoordinator.shutdown()
+    }
+
+    @MainActor
     func testCoordinatorRestoresQueuedLineGeneratesPublishesAndPlaysReadyAudio() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("dialogue-coordinator-tests-\(UUID().uuidString)", isDirectory: true)

@@ -223,6 +223,9 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         activeGenerationTask = nil
         activeTicket = nil
         audioPlayer.stop()
+        if !persistenceBlocked {
+            _ = retryPendingCleanup(preserving: [])
+        }
     }
 
     func importAsset(sourceURL: URL, kind: DialogueVoiceAssetKind, preserving draft: DialogueVoiceProfileDraft) {
@@ -263,14 +266,19 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                 self.activeImportTask = nil
                 switch result {
                 case let .success(asset):
-                    self.replaceImportedAsset(kind: kind, asset: asset)
-                    self.activityMessage = self.persistenceBlocked
-                        ? "The asset was imported, but cleanup state could not be saved. Restart Statelet before editing voice data."
-                        : self.cleanupAwareMessage(
-                            "\(self.assetDisplayName(kind)) imported. Save the profile to use it.",
-                            outcome: .retryPending(self.library.pendingCleanupPaths.count)
+                    let cleanup = self.acceptImportedAsset(kind: kind, asset: asset)
+                    if self.persistenceBlocked {
+                        self.activityMessage = self.cleanupAwareMessage(
+                            "The imported asset was discarded because its cleanup state could not be saved. Restart Statelet before editing voice data.",
+                            outcome: cleanup
                         )
-                    self.logger.info("event=asset_imported kind=\(kind.rawValue, privacy: .public)")
+                    } else {
+                        self.activityMessage = self.cleanupAwareMessage(
+                            "\(self.assetDisplayName(kind)) imported. Save the profile to use it.",
+                            outcome: cleanup
+                        )
+                        self.logger.info("event=asset_imported kind=\(kind.rawValue, privacy: .public)")
+                    }
                 case let .failure(error):
                     self.activityMessage = error.localizedDescription
                     self.logger.error("event=asset_import_failed kind=\(kind.rawValue, privacy: .public) code=\(error.safeCode, privacy: .public)")
@@ -340,6 +348,10 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             activeProfile: profile
         )
         var updated = library
+        let activeAssetPaths = Set([gptPath, sovitsPath, referencePath])
+        try updated.replacePendingCleanupPaths(
+            updated.pendingCleanupPaths.filter { !activeAssetPaths.contains($0) }
+        )
         try updated.replaceActiveProfile(profile)
         for line in updated.lines where line.status == .stale {
             _ = try updated.retryLine(id: line.id)
@@ -403,7 +415,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         try updated.enqueueCleanup(paths: generatedPaths + managedAssetPaths.sorted())
         try store.save(updated)
         library = updated
-        let cleanup = retryPendingCleanup()
+        let cleanup = retryPendingCleanup(preserving: [])
         importedAssets = DialogueVoiceImportedAssets()
         draft = DialogueVoiceProfileDraft(
             name: "",
@@ -832,29 +844,65 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         return line
     }
 
-    private func replaceImportedAsset(kind: DialogueVoiceAssetKind, asset: DialogueVoiceInstalledAsset) {
-        let previous: String?
-        switch kind {
-        case .gptWeight:
-            previous = importedAssets.gptWeightRelativePath
-            importedAssets.gptWeightRelativePath = asset.relativePath
-            importedAssets.gptWeightDigest = asset.contentDigest
-        case .sovitsWeight:
-            previous = importedAssets.sovitsWeightRelativePath
-            importedAssets.sovitsWeightRelativePath = asset.relativePath
-            importedAssets.sovitsWeightDigest = asset.contentDigest
-        case .referenceAudio:
-            previous = importedAssets.referenceAudioRelativePath
-            importedAssets.referenceAudioRelativePath = asset.relativePath
-            importedAssets.referenceAudioDigest = asset.contentDigest
-        }
+    private func acceptImportedAsset(
+        kind: DialogueVoiceAssetKind,
+        asset: DialogueVoiceInstalledAsset
+    ) -> CleanupOutcome {
         let activePaths = Set([
             library.profile?.gptWeightRelativePath,
             library.profile?.sovitsWeightRelativePath,
             library.profile?.referenceAudioRelativePath,
         ].compactMap { $0 })
-        if let previous, previous != asset.relativePath, !activePaths.contains(previous) {
-            deferCleanup(paths: [previous])
+        if !activePaths.contains(asset.relativePath) {
+            var updated = library
+            do {
+                try updated.enqueueCleanup(paths: [asset.relativePath])
+                try store.save(updated)
+                library = updated
+            } catch {
+                persistenceBlocked = true
+                let cleanup = discardUnpersistedAsset(asset.relativePath)
+                logger.error("event=import_cleanup_schedule_failed code=STORE_FAILURE")
+                return cleanup
+            }
+        }
+
+        switch kind {
+        case .gptWeight:
+            importedAssets.gptWeightRelativePath = asset.relativePath
+            importedAssets.gptWeightDigest = asset.contentDigest
+        case .sovitsWeight:
+            importedAssets.sovitsWeightRelativePath = asset.relativePath
+            importedAssets.sovitsWeightDigest = asset.contentDigest
+        case .referenceAudio:
+            importedAssets.referenceAudioRelativePath = asset.relativePath
+            importedAssets.referenceAudioDigest = asset.contentDigest
+        }
+        return retryPendingCleanup(preserving: stagedImportedPaths)
+    }
+
+    private var stagedImportedPaths: Set<String> {
+        let activePaths = library.referencedManagedPaths
+        return Set([
+            importedAssets.gptWeightRelativePath,
+            importedAssets.sovitsWeightRelativePath,
+            importedAssets.referenceAudioRelativePath,
+        ].compactMap { $0 }).subtracting(activePaths)
+    }
+
+    private func discardUnpersistedAsset(_ path: String) -> CleanupOutcome {
+        guard !library.referencedManagedPaths.contains(path) else {
+            return CleanupOutcome(remainingCount: 1, issue: .activeReferenceConflict)
+        }
+        do {
+            _ = try DialogueVoiceAssetInstaller.removeManagedFile(
+                relativePath: path,
+                root: applicationSupportRoot,
+                maximumBytes: DialogueVoiceAssetKind.gptWeight.maximumBytes
+            )
+            return CleanupOutcome(remainingCount: 0, issue: .metadataPersistenceFailed)
+        } catch {
+            return CleanupOutcome(remainingCount: 1, issue: .metadataPersistenceFailed)
         }
     }
 
@@ -949,9 +997,10 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     }
 
     @discardableResult
-    private func retryPendingCleanup() -> CleanupOutcome {
+    private func retryPendingCleanup(preserving preservedPaths: Set<String>? = nil) -> CleanupOutcome {
         let candidates = library.pendingCleanupPaths
         guard !candidates.isEmpty else { return .complete }
+        let preservedPaths = preservedPaths ?? stagedImportedPaths
         let referencedPaths = library.referencedManagedPaths
         guard Set(candidates).isDisjoint(with: referencedPaths) else {
             persistenceBlocked = true
@@ -962,7 +1011,12 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             )
         }
         var remaining: [String] = []
+        var retryFailureCount = 0
         for path in candidates {
+            if preservedPaths.contains(path) {
+                remaining.append(path)
+                continue
+            }
             guard !library.referencedManagedPaths.contains(path) else {
                 persistenceBlocked = true
                 logger.error("event=cleanup_reference_conflict code=INVALID_CLEANUP_STATE")
@@ -979,6 +1033,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                 )
             } catch {
                 remaining.append(path)
+                retryFailureCount += 1
             }
         }
         if remaining != candidates {
@@ -996,10 +1051,10 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                 )
             }
         }
-        if !remaining.isEmpty {
-            logger.error("event=cleanup_deferred count=\(remaining.count, privacy: .public) code=CLEANUP_RETRY_PENDING")
+        if retryFailureCount > 0 {
+            logger.error("event=cleanup_deferred count=\(retryFailureCount, privacy: .public) code=CLEANUP_RETRY_PENDING")
         }
-        return .retryPending(remaining.count)
+        return .retryPending(retryFailureCount)
     }
 
     private func cleanupAwareMessage(_ message: String, outcome: CleanupOutcome) -> String {

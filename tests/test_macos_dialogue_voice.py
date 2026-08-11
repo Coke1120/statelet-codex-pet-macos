@@ -225,6 +225,36 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         late_import = method_body(self.coordinator, "    func importAsset")
         self.assertIn("if cleanup.requiresNotice", late_import)
         self.assertIn("self.notify()", late_import)
+        self.assertIn("acceptImportedAsset(kind: kind, asset: asset)", late_import)
+
+        accept_import = method_body(
+            self.coordinator,
+            "    private func acceptImportedAsset",
+        )
+        self.assertIn("updated.enqueueCleanup(paths: [asset.relativePath])", accept_import)
+        self.assertLess(
+            accept_import.index("store.save(updated)"),
+            accept_import.index("importedAssets.gptWeightRelativePath = asset.relativePath"),
+        )
+        self.assertIn("retryPendingCleanup(preserving: stagedImportedPaths)", accept_import)
+
+        shutdown = method_body(self.coordinator, "    func shutdown")
+        self.assertIn("retryPendingCleanup(preserving: [])", shutdown)
+
+        remove_profile = method_body(self.coordinator, "    func removeProfile")
+        self.assertIn("retryPendingCleanup(preserving: [])", remove_profile)
+
+        retry_cleanup = method_body(
+            self.coordinator,
+            "    private func retryPendingCleanup",
+        )
+        self.assertIn("preservedPaths ?? stagedImportedPaths", retry_cleanup)
+
+        save_profile = method_body(self.coordinator, "    func saveProfile")
+        self.assertLess(
+            save_profile.index("replacePendingCleanupPaths"),
+            save_profile.index("replaceActiveProfile(profile)"),
+        )
         self.assertIn("Replace the active voice profile?", self.app_delegate)
         self.assertIn(
             "Saving this profile invalidates all generated dialogue audio.",
@@ -241,6 +271,10 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         )
         self.assertIn(
             "testCoordinatorRestoresQueuedLineGeneratesPublishesAndPlaysReadyAudio",
+            coordinator_tests,
+        )
+        self.assertIn(
+            "testCoordinatorStartupCleansPersistedStagedImportFromPriorRun",
             coordinator_tests,
         )
 
