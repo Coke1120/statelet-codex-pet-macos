@@ -191,6 +191,7 @@ private enum StatusMenuTag: Int {
     case temporaryState = 6
     case followCodex = 7
     case alwaysOnTop = 8
+    case character = 9
 }
 
 final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @unchecked Sendable {
@@ -204,10 +205,22 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var options: LaunchOptions!
     private var mediaMap = try! MediaMap()
     private var mediaMapURL: URL!
+    private var configuredMediaMapURL: URL!
+    private var mediaMapEncodedData: Data?
+    private var characterLibrary = CharacterLibrary.legacy
+    private var characterLibraryEncodedData: Data?
+    private var characterLibraryStorage: CharacterLibraryStorage!
+    private var characterClipCounts: [String: Int] = [:]
+    private let characterMetadataQueue = DispatchQueue(
+        label: "com.coke1120.CodexPetMac.character-metadata",
+        qos: .utility
+    )
+    private var characterCountRefreshGeneration: UInt64 = 0
     private var panel: PetPanel!
     private var player: PetPlayerController!
     private var stateWatcher: StateDirectoryWatcher!
     private var mapWatcher: StateDirectoryWatcher!
+    private var characterLibraryWatcher: StateDirectoryWatcher!
     private var healthCheckTimer: DispatchSourceTimer?
     private var positionSaveWorkItem: DispatchWorkItem?
     private var positionSaveGeneration: UInt64 = 0
@@ -244,10 +257,14 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var pendingRecoveryNotice: (PetState, String)?
     private var mp4BatchCancellationRequested = false
     private var mediaMapReloadDeferred = false
+    private var characterLibraryReloadDeferred = false
+    private var pendingCharacterBundleOpenURL: URL?
     private var mediaMutationInProgress = false {
         didSet {
             if oldValue, !mediaMutationInProgress {
                 applyDeferredMediaMapReloadIfNeeded()
+                applyDeferredCharacterLibraryReloadIfNeeded()
+                processPendingCharacterBundleOpenIfPossible()
             }
         }
     }
@@ -255,13 +272,15 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     func applicationDidFinishLaunching(_ notification: Notification) {
         conversionProfile = AlphaConversionProfile.restored()
         options = LaunchOptions.parse(arguments: CommandLine.arguments)
-        mediaMapURL = options.mediaMapURL
+        configuredMediaMapURL = options.mediaMapURL
+        configureCharacterLibrary()
         loadMediaMap()
         dialogueVoiceCoordinator = DialogueVoiceCoordinator()
         dialogueVoiceCoordinator.onChange = { [weak self] snapshot in
             self?.settingsController?.update(dialogueVoice: snapshot)
         }
         dialogueVoiceCoordinator.start()
+        refreshCharacterClipCounts()
 
         let configuredWindow = mediaMap.window
         let size = NSSize(width: configuredWindow.width, height: configuredWindow.height)
@@ -282,7 +301,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         panel.delegate = self
         panel.contentView = PetPlayerView(frame: panel.contentRect(forFrameRect: panel.frame))
         player = PetPlayerController(view: panel.contentView as! PetPlayerView)
-        player.view.applyAppearance(configuredWindow.appearance)
+        player.applyAppearance(configuredWindow.appearance)
         player.onPresentationEvent = { [weak self] transitionID, state, event in
             self?.handlePresentationEvent(transitionID: transitionID, state: state, event: event)
         }
@@ -313,6 +332,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         } else {
             panel.orderFront(nil)
         }
+        updateWindowOcclusionSuspension()
 
         installStatusItem()
         NotificationCenter.default.addObserver(
@@ -327,6 +347,18 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
             object: nil
         )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(screensDidSleep),
+            name: NSWorkspace.screensDidSleepNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(screensDidWake),
+            name: NSWorkspace.screensDidWakeNotification,
+            object: nil
+        )
         if let forcedState = options.forcedState {
             setPublisherHealth(.manual)
             apply(state: forcedState)
@@ -334,6 +366,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             installWatchers()
             // Close the startup race between the pre-window load and each
             // watcher's initial identity snapshot.
+            handleCharacterLibraryReloadRequest()
             if loadMediaMap().didChange {
                 applyConfiguredWindowSize()
             }
@@ -344,11 +377,28 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             DispatchQueue.main.async { [weak self] in self?.showSettings() }
         }
         recoverInterruptedConversionIfPresent()
+        DispatchQueue.main.async { [weak self] in
+            self?.processPendingCharacterBundleOpenIfPossible()
+        }
+    }
+
+    func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        let bundles = filenames.map { URL(fileURLWithPath: $0).standardizedFileURL }.filter {
+            $0.pathExtension.caseInsensitiveCompare("statelet-character") == .orderedSame
+        }
+        guard bundles.count == 1, pendingCharacterBundleOpenURL == nil else {
+            sender.reply(toOpenOrPrint: .failure)
+            return
+        }
+        pendingCharacterBundleOpenURL = bundles[0]
+        sender.reply(toOpenOrPrint: .success)
+        processPendingCharacterBundleOpenIfPossible()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         stateWatcher?.stop()
         mapWatcher?.stop()
+        characterLibraryWatcher?.stop()
         healthCheckTimer?.cancel()
         healthCheckTimer = nil
         positionSaveGeneration &+= 1
@@ -363,6 +413,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
 
     func windowDidMove(_ notification: Notification) { schedulePositionSave() }
     func windowDidResize(_ notification: Notification) { schedulePositionSave() }
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        updateWindowOcclusionSuspension()
+    }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         showSettings()
@@ -383,14 +436,50 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             player?.setReduceMotion(reduceMotion)
             apply(state: currentState, forceRefresh: true)
         }
-        player?.view.applyAppearance(mediaMap.window.appearance)
+        player?.applyAppearance(mediaMap.window.appearance)
         refreshSettings()
+    }
+
+    @objc private func screensDidSleep() {
+        player?.setSuspended(true, for: .screenAsleep)
+    }
+
+    @objc private func screensDidWake() {
+        for step in DisplayWakeRecoveryPolicy.steps {
+            switch step {
+            case .clearWindowOcclusion:
+                player?.setSuspended(false, for: .windowOccluded)
+            case .clearScreenSleep:
+                player?.setSuspended(false, for: .screenAsleep)
+            case .recheckWindowOcclusion:
+                DispatchQueue.main.async { [weak self] in
+                    self?.updateWindowOcclusionSuspension()
+                }
+            }
+        }
+    }
+
+    private func updateWindowOcclusionSuspension() {
+        guard let panel else { return }
+        player?.setSuspended(
+            !panel.occlusionState.contains(.visible),
+            for: .windowOccluded
+        )
     }
 
     private func installWatchers() {
         guard options.forcedState == nil else { return }
         stateWatcher = StateDirectoryWatcher(fileURL: options.stateURL)
         stateWatcher.start(emitInitial: false) { [weak self] url in self?.readState(from: url) }
+        installMapWatcher()
+        characterLibraryWatcher = StateDirectoryWatcher(fileURL: characterLibraryStorage.catalogURL)
+        characterLibraryWatcher.start(emitInitial: false) { [weak self] _ in
+            self?.handleCharacterLibraryReloadRequest()
+        }
+    }
+
+    private func installMapWatcher() {
+        mapWatcher?.stop()
         mapWatcher = StateDirectoryWatcher(fileURL: mediaMapURL)
         mapWatcher.start(emitInitial: false) { [weak self] _ in
             self?.handleMediaMapReloadRequest()
@@ -410,6 +499,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             // The same low-frequency timer covers in-place map edits that may
             // not produce a containing-directory event.
             self.handleMediaMapReloadRequest()
+            self.handleCharacterLibraryReloadRequest()
             self.readState(from: self.options.stateURL)
         }
         healthCheckTimer = timer
@@ -428,6 +518,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
         if result == .playbackChanged {
             apply(state: currentState, forceRefresh: true)
+        } else if result == .windowChanged {
+            updateStatusMenu()
+            refreshSettings()
         }
     }
 
@@ -437,15 +530,71 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         handleMediaMapReloadRequest()
     }
 
+    private func configureCharacterLibrary() {
+        characterLibraryStorage = CharacterLibraryStorage(mediaMapURL: configuredMediaMapURL)
+        do {
+            let snapshot = try characterLibraryStorage.loadCatalog()
+            characterLibrary = snapshot.library
+            characterLibraryEncodedData = snapshot.encodedData
+        } catch {
+            characterLibrary = (try? CharacterLibrary.legacy(
+                mapPath: configuredMediaMapURL.lastPathComponent
+            )) ?? .legacy
+            characterLibraryEncodedData = nil
+            logger.error("event=character_library_load_failed action=use_legacy_profile")
+        }
+        mediaMapURL = characterLibrary.activeCharacter.resolvedMapURL(
+            relativeTo: configuredMediaMapURL
+        )
+    }
+
+    private func handleCharacterLibraryReloadRequest() {
+        guard !mediaMutationInProgress else {
+            characterLibraryReloadDeferred = true
+            return
+        }
+        do {
+            let snapshot = try characterLibraryStorage.loadCatalog()
+            guard snapshot.encodedData != characterLibraryEncodedData else { return }
+            let activeMapChanged = snapshot.library.activeCharacterID != characterLibrary.activeCharacterID
+                || snapshot.library.activeCharacter.mapPath != characterLibrary.activeCharacter.mapPath
+            if activeMapChanged {
+                let entry = snapshot.library.activeCharacter
+                let loaded = try characterLibraryStorage.loadMediaMap(for: entry)
+                characterLibrary = snapshot.library
+                characterLibraryEncodedData = snapshot.encodedData
+                activateCharacter(entry: entry, map: loaded.map, encodedData: loaded.encodedData)
+                refreshCharacterClipCounts()
+            } else {
+                characterLibrary = snapshot.library
+                characterLibraryEncodedData = snapshot.encodedData
+                refreshCharacterClipCounts()
+                updateStatusMenu()
+                refreshSettings()
+            }
+        } catch {
+            logger.error("event=character_library_reload_failed action=retain_current")
+        }
+    }
+
+    private func applyDeferredCharacterLibraryReloadIfNeeded() {
+        guard characterLibraryReloadDeferred else { return }
+        characterLibraryReloadDeferred = false
+        handleCharacterLibraryReloadRequest()
+    }
+
     @discardableResult
     private func loadMediaMap() -> MediaMapLoadResult {
         do {
-            let data = try Data(contentsOf: mediaMapURL)
-            let decoded = try JSONDecoder.codexPet.decode(MediaMap.self, from: data)
+            let loaded = try characterLibraryStorage.loadMediaMap(
+                for: characterLibrary.activeCharacter
+            )
+            let decoded = loaded.map
             let impact = MediaMapChangeImpact.decide(previous: mediaMap, incoming: decoded)
             mediaMap = decoded
+            mediaMapEncodedData = loaded.encodedData
+            characterClipCounts[characterLibrary.activeCharacterID] = totalClipCount(in: decoded)
             mapReadFailureReported = false
-            refreshSettings()
             switch impact {
             case .unchanged: return .unchanged
             case .windowOnly: return .windowChanged
@@ -460,16 +609,80 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
     }
 
+    private func activateCharacter(
+        entry: CharacterLibraryEntry,
+        map: MediaMap,
+        encodedData: Data
+    ) {
+        cancelActiveOneShotWithoutRestore(reason: "character_changed")
+        _ = temporaryStatePreviewPolicy.cancel()
+        player?.clearTransientPresentation()
+        mediaSelectionCursor = MediaSelectionCursor()
+        manualPreviewSelectionCursor = MediaSelectionCursor()
+        lastLifecycleStateForSelection = nil
+        lastPresentedState = nil
+        pendingPresentationState = nil
+        mediaMapURL = entry.resolvedMapURL(relativeTo: configuredMediaMapURL)
+        mediaMap = map
+        mediaMapEncodedData = encodedData
+        characterClipCounts[entry.id] = totalClipCount(in: map)
+        if options.forcedState == nil {
+            installMapWatcher()
+            // Close the same load-to-watch race as startup: if another writer
+            // replaced the selected map between validation and registration,
+            // prefer the newly stable bytes before presenting the character.
+            _ = loadMediaMap()
+        }
+        applyConfiguredWindowSize()
+        apply(state: currentState, forceRefresh: true)
+        updateStatusMenu()
+        refreshSettings()
+    }
+
+    private func refreshCharacterClipCounts() {
+        characterCountRefreshGeneration &+= 1
+        let generation = characterCountRefreshGeneration
+        let librarySnapshot = characterLibrary
+        let rootMapURL = configuredMediaMapURL!
+        characterClipCounts = characterClipCounts.filter { id, _ in
+            librarySnapshot.character(id: id) != nil
+        }
+        characterClipCounts[librarySnapshot.activeCharacterID] = totalClipCount(in: mediaMap)
+        characterMetadataQueue.async { [weak self] in
+            let storage = CharacterLibraryStorage(mediaMapURL: rootMapURL)
+            var counts: [String: Int] = [:]
+            for entry in librarySnapshot.characters where entry.id != librarySnapshot.activeCharacterID {
+                counts[entry.id] = autoreleasepool {
+                    guard let loaded = try? storage.loadMediaMap(for: entry) else { return 0 }
+                    return loaded.map.states.values.reduce(0) { $0 + $1.entries.count }
+                }
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      generation == self.characterCountRefreshGeneration,
+                      librarySnapshot == self.characterLibrary else { return }
+                for (id, count) in counts { self.characterClipCounts[id] = count }
+                self.refreshSettings()
+            }
+        }
+    }
+
+    private func totalClipCount(in map: MediaMap) -> Int {
+        map.states.values.reduce(0) { $0 + $1.entries.count }
+    }
+
     private func applyConfiguredWindowSize() {
         guard let panel else { return }
         let size = NSSize(width: mediaMap.window.width, height: mediaMap.window.height)
         let resized = WindowFramePolicy.applyingConfiguredSize(size, to: panel.frame)
         panel.setFrame(positionStore.clampedFrame(resized), display: true)
+        clickThrough = options.clickThroughOverride ?? mediaMap.window.clickThrough
+        panel.ignoresMouseEvents = clickThrough
         panel.apply(
             alwaysOnTop: options.alwaysOnTopOverride ?? mediaMap.window.alwaysOnTop,
             fullScreenAuxiliary: mediaMap.window.fullScreenAuxiliary
         )
-        player?.view.applyAppearance(mediaMap.window.appearance)
+        player?.applyAppearance(mediaMap.window.appearance)
     }
 
     private func readState(from url: URL) {
@@ -521,6 +734,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func apply(state: PetState, forceRefresh: Bool = false) {
+        let previousProducerState = currentState
         let shouldAdvanceSelection = MediaSelectionAdvancePolicy.shouldAdvance(
             previousLifecycleState: lastLifecycleStateForSelection,
             incomingState: state,
@@ -554,9 +768,18 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             forceRefresh: forceRefresh
         )
         currentState = state
-        updateStatusMenu()
-        refreshSettings()
-        guard decision.shouldRefresh else { return }
+        let shouldRefreshUI = LifecycleUIRefreshPolicy.shouldRefresh(
+            previousProducerState: previousProducerState,
+            incomingProducerState: state,
+            presentationWillRefresh: decision.shouldRefresh
+        )
+        guard decision.shouldRefresh else {
+            if shouldRefreshUI {
+                updateStatusMenu()
+                refreshSettings()
+            }
+            return
+        }
 
         startLifecyclePresentation(
             state: presentationState,
@@ -851,6 +1074,14 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         healthItem.tag = StatusMenuTag.publisherHealth.rawValue
         healthItem.isEnabled = false
         menu.addItem(healthItem)
+        let characterItem = NSMenuItem(
+            title: "Character: \(characterLibrary.activeCharacter.name)",
+            action: nil,
+            keyEquivalent: ""
+        )
+        characterItem.tag = StatusMenuTag.character.rawValue
+        characterItem.submenu = makeCharacterMenu()
+        menu.addItem(characterItem)
         let stopPreviewItem = NSMenuItem(
             title: "Stop Play Once",
             action: #selector(stopOneShotPreviewFromMenu),
@@ -922,6 +1153,31 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         return menu
     }
 
+    private func makeCharacterMenu() -> NSMenu {
+        let menu = NSMenu(title: "Character")
+        for character in characterLibrary.characters {
+            let item = NSMenuItem(
+                title: character.name,
+                action: #selector(selectCharacterFromMenu(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = character.id
+            item.state = character.id == characterLibrary.activeCharacterID ? .on : .off
+            item.isEnabled = !mediaMutationInProgress
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        let manage = NSMenuItem(
+            title: "Manage Characters…",
+            action: #selector(showSettings),
+            keyEquivalent: ""
+        )
+        manage.target = self
+        menu.addItem(manage)
+        return menu
+    }
+
     private func updateStatusMenu() {
         let stateTitle = statusMenuStateTitle
         let targetState = effectivePresentationState
@@ -935,6 +1191,10 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
         if let healthItem = menu?.item(withTag: StatusMenuTag.publisherHealth.rawValue) {
             healthItem.title = healthTitle
+        }
+        if let characterItem = menu?.item(withTag: StatusMenuTag.character.rawValue) {
+            characterItem.title = "Character: \(characterLibrary.activeCharacter.name)"
+            characterItem.submenu = makeCharacterMenu()
         }
         if let clickItem = menu?.item(withTag: StatusMenuTag.clickThrough.rawValue) {
             clickItem.state = clickThrough ? .on : .off
@@ -969,7 +1229,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 followItem.isEnabled = manualPreview != nil
             }
         }
-        let tooltip = "Statelet — \(stateTitle) — \(healthTitle)"
+        let tooltip = "Statelet — \(characterLibrary.activeCharacter.name) — \(stateTitle) — \(healthTitle)"
         statusItem.button?.toolTip = tooltip
         player?.view.toolTip = tooltip
         player?.updatePublisherHealth(
@@ -1010,6 +1270,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
 
     @objc private func advanceCurrentClipFromMenu() {
         advanceCurrentClip(reason: "menu")
+    }
+
+    @objc private func selectCharacterFromMenu(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        selectCharacter(id: id)
     }
 
     @objc private func selectTemporaryStateFromMenu(_ sender: NSMenuItem) {
@@ -1118,6 +1383,17 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         controller.onPreviewDialogueLine = { [weak self] line in self?.previewDialogueLine(line) }
         controller.onRetryDialogueLine = { [weak self] line in self?.retryDialogueLine(line) }
         controller.onRegenerateDialogueLine = { [weak self] line in self?.regenerateDialogueLine(line) }
+        controller.onCharacterSelection = { [weak self] id in self?.selectCharacter(id: id) }
+        controller.onCreateCharacter = { [weak self] name in self?.createCharacter(name: name) }
+        controller.onRenameCharacter = { [weak self] id, name in
+            self?.renameCharacter(id: id, name: name)
+        }
+        controller.onDuplicateCharacter = { [weak self] id, name in
+            self?.duplicateCharacter(id: id, name: name)
+        }
+        controller.onDeleteCharacter = { [weak self] id in self?.deleteCharacter(id: id) }
+        controller.onImportCharacterBundle = { [weak self] in self?.chooseCharacterBundle() }
+        controller.onExportCharacterBundle = { [weak self] id in self?.exportCharacterBundle(id: id) }
         controller.update(toolchainState: toolchainState)
         controller.update(conversionProfile: conversionProfile)
         controller.update(dialogueVoice: dialogueVoiceCoordinator.snapshot)
@@ -1152,11 +1428,340 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 diagnosticsReport: cachedDiagnosticsReport,
                 launchAtLoginEnabled: cachedLaunchAtLoginStatus?.isEnabled ?? false,
                 launchAtLoginSummary: cachedLaunchAtLoginStatus?.summary ?? "Choose Refresh to inspect startup.",
-                repairAvailable: cachedLaunchAtLoginStatus?.canRepair ?? false
+                repairAvailable: cachedLaunchAtLoginStatus?.canRepair ?? false,
+                characterProfiles: characterLibrary.characters.map {
+                    CharacterProfileSummary(
+                        id: $0.id,
+                        name: $0.name,
+                        clipCount: characterClipCounts[$0.id, default: 0]
+                    )
+                },
+                activeCharacterID: characterLibrary.activeCharacterID
             )
         )
         settingsController.update(toolchainState: toolchainState)
         settingsController.update(dialogueVoice: dialogueVoiceCoordinator.snapshot)
+    }
+
+    private func persistCharacterLibrary(_ updated: CharacterLibrary) throws {
+        let data = try characterLibraryStorage.saveCatalog(
+            updated,
+            expectedData: characterLibraryEncodedData
+        )
+        characterLibrary = updated
+        characterLibraryEncodedData = data
+    }
+
+    private func selectCharacter(id: String) {
+        guard !mediaMutationInProgress, id != characterLibrary.activeCharacterID,
+              let entry = characterLibrary.character(id: id) else { return }
+        do {
+            let loaded = try characterLibraryStorage.loadMediaMap(for: entry)
+            let updated = try characterLibrary.selectingCharacter(id: id)
+            try persistCharacterLibrary(updated)
+            activateCharacter(entry: entry, map: loaded.map, encodedData: loaded.encodedData)
+            settingsController?.update(
+                activity: .characterSucceeded("\(entry.name) is now the active character")
+            )
+            logger.info("event=character_selected")
+        } catch {
+            settingsController?.update(
+                activity: .failed(nil, "Character could not be selected. The previous character remains active.")
+            )
+            logger.error("event=character_select_failed action=retain_current")
+            handleCharacterLibraryReloadRequest()
+        }
+    }
+
+    private func createCharacter(name: String) {
+        guard !mediaMutationInProgress else { return }
+        let id = UUID().uuidString.lowercased()
+        var createdEntry: CharacterLibraryEntry?
+        do {
+            let added = try characterLibrary.addingCharacter(id: id, name: name)
+            guard let entry = added.character(id: id) else {
+                throw PetContractError.invalidValue("new character was not created")
+            }
+            createdEntry = entry
+            let emptyMap = try MediaMap(
+                defaultFormat: mediaMap.defaultFormat,
+                window: mediaMap.window,
+                states: [PetState: StateMediaPlaylist]()
+            )
+            let encodedMap = try characterLibraryStorage.saveMediaMap(
+                emptyMap,
+                for: entry,
+                expectedData: nil
+            )
+            do {
+                let selected = try added.selectingCharacter(id: id)
+                try persistCharacterLibrary(selected)
+                activateCharacter(entry: entry, map: emptyMap, encodedData: encodedMap)
+            } catch {
+                try? FileManager.default.removeItem(
+                    at: entry.resolvedMapURL(relativeTo: configuredMediaMapURL)
+                )
+                throw error
+            }
+            settingsController?.update(activity: .characterSucceeded("Created \(entry.name)"))
+            logger.info("event=character_created")
+        } catch {
+            if let createdEntry,
+               characterLibrary.character(id: createdEntry.id) == nil {
+                try? FileManager.default.removeItem(
+                    at: createdEntry.resolvedMapURL(relativeTo: configuredMediaMapURL)
+                )
+            }
+            settingsController?.update(activity: .failed(nil, "Character could not be created. Check that its name is unique."))
+            logger.error("event=character_create_failed")
+        }
+    }
+
+    private func renameCharacter(id: String, name: String) {
+        guard !mediaMutationInProgress else { return }
+        do {
+            let updated = try characterLibrary.renamingCharacter(id: id, to: name)
+            try persistCharacterLibrary(updated)
+            updateStatusMenu()
+            refreshSettings()
+            settingsController?.update(activity: .characterSucceeded("Character renamed to \(name)"))
+            logger.info("event=character_renamed")
+        } catch {
+            settingsController?.update(activity: .failed(nil, "Character could not be renamed. Check that its name is unique."))
+            logger.error("event=character_rename_failed")
+        }
+    }
+
+    private func duplicateCharacter(id: String, name: String) {
+        guard !mediaMutationInProgress, let source = characterLibrary.character(id: id) else { return }
+        let newID = UUID().uuidString.lowercased()
+        var destination: CharacterLibraryEntry?
+        do {
+            let loaded = try characterLibraryStorage.loadMediaMap(for: source)
+            let added = try characterLibrary.duplicatingCharacter(
+                id: id,
+                as: newID,
+                name: name
+            )
+            guard let entry = added.character(id: newID) else {
+                throw PetContractError.invalidValue("duplicated character was not created")
+            }
+            destination = entry
+            let encoded = try characterLibraryStorage.saveMediaMap(
+                loaded.map,
+                for: entry,
+                expectedData: nil
+            )
+            do {
+                let selected = try added.selectingCharacter(id: newID)
+                try persistCharacterLibrary(selected)
+                activateCharacter(entry: entry, map: loaded.map, encodedData: encoded)
+            } catch {
+                try? FileManager.default.removeItem(
+                    at: entry.resolvedMapURL(relativeTo: configuredMediaMapURL)
+                )
+                throw error
+            }
+            settingsController?.update(activity: .characterSucceeded("Duplicated as \(entry.name)"))
+            logger.info("event=character_duplicated")
+        } catch {
+            if let destination,
+               characterLibrary.character(id: destination.id) == nil {
+                try? FileManager.default.removeItem(
+                    at: destination.resolvedMapURL(relativeTo: configuredMediaMapURL)
+                )
+            }
+            settingsController?.update(activity: .failed(nil, "Character could not be duplicated. Check that its name is unique."))
+            logger.error("event=character_duplicate_failed")
+        }
+    }
+
+    private func deleteCharacter(id: String) {
+        guard !mediaMutationInProgress else { return }
+        do {
+            let updated = try characterLibrary.removingCharacter(id: id)
+            let activeChanged = updated.activeCharacterID != characterLibrary.activeCharacterID
+            let replacement: (entry: CharacterLibraryEntry, map: MediaMap, encodedData: Data)?
+            if activeChanged {
+                let entry = updated.activeCharacter
+                let loaded = try characterLibraryStorage.loadMediaMap(for: entry)
+                replacement = (entry, loaded.map, loaded.encodedData)
+            } else {
+                replacement = nil
+            }
+            try persistCharacterLibrary(updated)
+            characterClipCounts[id] = nil
+            if let replacement {
+                activateCharacter(
+                    entry: replacement.entry,
+                    map: replacement.map,
+                    encodedData: replacement.encodedData
+                )
+            } else {
+                updateStatusMenu()
+                refreshSettings()
+            }
+            settingsController?.update(activity: .characterSucceeded("Character deleted; its media files were kept"))
+            logger.info("event=character_deleted files=kept")
+        } catch {
+            settingsController?.update(activity: .failed(nil, "Character could not be deleted."))
+            logger.error("event=character_delete_failed action=retain_current")
+        }
+    }
+
+    private static var characterBundleType: UTType {
+        UTType(
+            exportedAs: "com.coke1120.statelet.character-bundle",
+            conformingTo: .package
+        )
+    }
+
+    private func chooseCharacterBundle() {
+        guard !mediaMutationInProgress, let window = settingsController?.window else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Import Statelet Character"
+        panel.prompt = "Import Character"
+        panel.allowedContentTypes = [Self.characterBundleType]
+        panel.allowsMultipleSelection = false
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            self?.confirmCharacterBundleImport(url)
+        }
+    }
+
+    private func confirmCharacterBundleImport(_ url: URL) {
+        guard let window = settingsController?.window else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Import Character Bundle?"
+        alert.informativeText = "Statelet will verify the bundle manifest, every file hash, reports when present, and AVFoundation playback. Legacy reportless clips receive playback checks only and require this explicit trust."
+        alert.addButton(withTitle: "Import Character")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.importCharacterBundle(url, allowLegacyTrust: true)
+        }
+    }
+
+    private func processPendingCharacterBundleOpenIfPossible() {
+        guard characterLibraryStorage != nil,
+              panel != nil,
+              !mediaMutationInProgress,
+              let url = pendingCharacterBundleOpenURL else { return }
+        pendingCharacterBundleOpenURL = nil
+        showSettings()
+        DispatchQueue.main.async { [weak self] in
+            self?.confirmCharacterBundleImport(url)
+        }
+    }
+
+    private func importCharacterBundle(_ url: URL, allowLegacyTrust: Bool) {
+        guard !mediaMutationInProgress else { return }
+        mediaMutationInProgress = true
+        settingsController?.update(activity: .characterWorking("Checking character bundle and media…"))
+        let storage = characterLibraryStorage!
+        let baselineLibrary = characterLibrary
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let result = await Task.detached(priority: .userInitiated) {
+                Result {
+                    try storage.stageImport(
+                        from: url,
+                        against: baselineLibrary,
+                        allowLegacyTrust: allowLegacyTrust
+                    )
+                }
+            }.value
+            switch result {
+            case let .failure(error):
+                mediaMutationInProgress = false
+                let detail = (error as? CharacterLibraryStorageError)?.localizedDescription
+                    ?? "The bundle did not satisfy Statelet's character safety contract."
+                settingsController?.update(
+                    activity: .failed(nil, "Character bundle was not imported · \(detail)")
+                )
+                logger.error("event=character_bundle_import_failed")
+            case let .success(staged):
+                do {
+                    let entry = try staged.commit()
+                    do {
+                        let loaded = try characterLibraryStorage.loadMediaMap(for: entry)
+                        let added = try characterLibrary.addingCharacter(
+                            id: entry.id,
+                            name: entry.name
+                        )
+                        let selected = try added.selectingCharacter(id: entry.id)
+                        try persistCharacterLibrary(selected)
+                        activateCharacter(
+                            entry: entry,
+                            map: loaded.map,
+                            encodedData: loaded.encodedData
+                        )
+                        staged.finalize()
+                        mediaMutationInProgress = false
+                        settingsController?.update(
+                            activity: .characterSucceeded("Imported and activated \(entry.name)")
+                        )
+                        logger.info("event=character_bundle_imported")
+                    } catch {
+                        staged.rollback()
+                        throw error
+                    }
+                } catch {
+                    staged.discard()
+                    mediaMutationInProgress = false
+                    settingsController?.update(
+                        activity: .failed(nil, "Character bundle could not be installed. The library was not changed.")
+                    )
+                    logger.error("event=character_bundle_install_failed action=rollback")
+                }
+            }
+        }
+    }
+
+    private func exportCharacterBundle(id: String) {
+        guard !mediaMutationInProgress,
+              let entry = characterLibrary.character(id: id),
+              let window = settingsController?.window else { return }
+        let panel = NSSavePanel()
+        panel.title = "Export Statelet Character"
+        panel.prompt = "Export Character"
+        panel.allowedContentTypes = [Self.characterBundleType]
+        panel.canCreateDirectories = true
+        let safeName = entry.name
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+        panel.nameFieldStringValue = "\(safeName).statelet-character"
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let destination = panel.url, let self else { return }
+            self.mediaMutationInProgress = true
+            self.settingsController?.update(
+                activity: .characterWorking("Exporting \(entry.name)…")
+            )
+            let storage = self.characterLibraryStorage!
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let result = await Task.detached(priority: .userInitiated) {
+                    Result { try storage.exportCharacter(entry, to: destination) }
+                }.value
+                self.mediaMutationInProgress = false
+                switch result {
+                case .success:
+                    self.settingsController?.update(
+                        activity: .characterSucceeded("Exported \(entry.name)")
+                    )
+                    NSWorkspace.shared.activateFileViewerSelecting([destination])
+                    self.logger.info("event=character_bundle_exported")
+                case .failure:
+                    self.settingsController?.update(
+                        activity: .failed(nil, "Character bundle could not be exported. No partial bundle was kept.")
+                    )
+                    self.logger.error("event=character_bundle_export_failed")
+                }
+            }
+        }
     }
 
     private var publisherSettingsSummary: String {
@@ -1925,11 +2530,59 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
 
     private func isMediaPathReferenced(_ url: URL) -> Bool {
         let target = url.standardizedFileURL.path
-        return mediaMap.states.values.contains { playlist in
-            playlist.entries.contains { entry in
-                mediaMap.resolvedURL(for: entry, relativeTo: mediaMapURL)
-                    .standardizedFileURL.path == target
+        do {
+            return try allCharacterMediaMaps().contains { _, map, mapURL in
+                map.states.values.contains { playlist in
+                    playlist.entries.contains { entry in
+                        let movie = map.resolvedURL(for: entry, relativeTo: mapURL)
+                            .standardizedFileURL
+                        return movie.path == target
+                            || movie.deletingPathExtension()
+                                .appendingPathExtension("report.json")
+                                .standardizedFileURL.path == target
+                            || map.resolvedPosterURL(for: entry, relativeTo: mapURL)?
+                                .standardizedFileURL.path == target
+                    }
+                }
             }
+        } catch {
+            // Missing or corrupt inactive profiles must never make managed
+            // artifacts look safe to quarantine or delete.
+            return true
+        }
+    }
+
+    private func isMediaPathReferencedByInactiveCharacter(_ url: URL) -> Bool {
+        let target = url.standardizedFileURL.path
+        do {
+            return try allCharacterMediaMaps().contains { character, map, mapURL in
+                guard character.id != characterLibrary.activeCharacterID else { return false }
+                return map.states.values.contains { playlist in
+                    playlist.entries.contains { entry in
+                        let movie = map.resolvedURL(for: entry, relativeTo: mapURL)
+                            .standardizedFileURL
+                        return movie.path == target
+                            || movie.deletingPathExtension()
+                                .appendingPathExtension("report.json")
+                                .standardizedFileURL.path == target
+                            || map.resolvedPosterURL(for: entry, relativeTo: mapURL)?
+                                .standardizedFileURL.path == target
+                    }
+                }
+            }
+        } catch {
+            return true
+        }
+    }
+
+    private func allCharacterMediaMaps() throws -> [(CharacterLibraryEntry, MediaMap, URL)] {
+        try characterLibrary.characters.map { entry in
+            let mapURL = entry.resolvedMapURL(relativeTo: configuredMediaMapURL)
+            if entry.id == characterLibrary.activeCharacterID {
+                return (entry, mediaMap, mapURL)
+            }
+            let loaded = try characterLibraryStorage.loadMediaMap(for: entry)
+            return (entry, loaded.map, mapURL)
         }
     }
 
@@ -2621,6 +3274,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                     path: path,
                     canonicalRoot: canonicalManagedMediaRoot
                 )
+                guard !plan.trashURLs.contains(where: isMediaPathReferencedByInactiveCharacter) else {
+                    throw PetContractError.invalidValue(
+                        "This media is shared by another character. Remove only the library entry to keep that character working."
+                    )
+                }
                 trashSnapshot = try ManagedMediaTrashRevalidator.capture(
                     targetURLs: plan.trashURLs,
                     plannedMediaMap: mediaMap,
@@ -2783,34 +3441,23 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func publishMediaMap(_ updated: MediaMap) throws {
-        let directory = mediaMapURL.deletingLastPathComponent()
-        try FileManager.default.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
+        mediaMapEncodedData = try characterLibraryStorage.saveMediaMap(
+            updated,
+            for: characterLibrary.activeCharacter,
+            expectedData: mediaMapEncodedData
         )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        let data = try encoder.encode(updated)
-        _ = try JSONDecoder.codexPet.decode(MediaMap.self, from: data)
-        let temporary = directory.appendingPathComponent(".media-map.\(UUID().uuidString).tmp")
-        defer { try? FileManager.default.removeItem(at: temporary) }
-        try data.write(to: temporary, options: .withoutOverwriting)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
-        guard Darwin.rename(temporary.path, mediaMapURL.path) == 0 else {
-            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
-        }
     }
 
     private func applyPublishedMediaMap(_ updated: MediaMap, refreshPlayback: Bool = true) {
         mediaMap = updated
+        characterClipCounts[characterLibrary.activeCharacterID] = totalClipCount(in: updated)
         applyConfiguredWindowSize()
         if refreshPlayback {
             apply(state: currentState, forceRefresh: true)
         } else {
             updateStatusMenu()
+            refreshSettings()
         }
-        refreshSettings()
     }
 
     private func applyWindowSettings(_ update: WindowSettingsUpdate) {
@@ -2830,7 +3477,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             clickThrough = update.clickThrough
             panel.ignoresMouseEvents = clickThrough
             applyPublishedMediaMap(updated, refreshPlayback: false)
-            updateStatusMenu()
         } catch {
             presentSettingsError("The window setting could not be saved.")
             refreshSettings()
@@ -3085,7 +3731,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private func unusedMediaCandidates() throws -> [URL] {
         let canonicalRoot = canonicalManagedMediaRoot
         let canonicalMap = canonicalRoot.appendingPathComponent("media-map.json").standardizedFileURL
-        let configuredMap = mediaMapURL.standardizedFileURL
+        let configuredMap = configuredMediaMapURL.standardizedFileURL
         let rootValues = try canonicalRoot.resourceValues(forKeys: [.isSymbolicLinkKey])
         guard configuredMap.path == canonicalMap.path,
               configuredMap.resolvingSymlinksInPath().path == canonicalMap.path,
@@ -3097,23 +3743,29 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
         let root = canonicalRoot
         var referenced = Set<String>()
-        referenced.insert(mediaMapURL.resolvingSymlinksInPath().standardizedFileURL.path)
-        for playlist in mediaMap.states.values {
-            for entry in playlist.entries {
-                let movie = mediaMap.resolvedURL(for: entry, relativeTo: mediaMapURL)
+        referenced.insert(characterLibraryStorage.catalogURL.standardizedFileURL.path)
+        for (character, map, mapURL) in try allCharacterMediaMaps() {
+            referenced.insert(
+                character.resolvedMapURL(relativeTo: configuredMediaMapURL)
+                    .resolvingSymlinksInPath().standardizedFileURL.path
+            )
+            for playlist in map.states.values {
+                for entry in playlist.entries {
+                    let movie = map.resolvedURL(for: entry, relativeTo: mapURL)
                     .resolvingSymlinksInPath().standardizedFileURL
-                if isInsideManagedMedia(movie, root: root) {
-                    referenced.insert(movie.path)
-                    referenced.insert(
-                        movie.deletingPathExtension()
-                            .appendingPathExtension("report.json")
-                            .standardizedFileURL.path
-                    )
-                }
-                if let poster = mediaMap.resolvedPosterURL(for: entry, relativeTo: mediaMapURL)?
-                    .resolvingSymlinksInPath().standardizedFileURL,
-                   isInsideManagedMedia(poster, root: root) {
-                    referenced.insert(poster.path)
+                    if isInsideManagedMedia(movie, root: root) {
+                        referenced.insert(movie.path)
+                        referenced.insert(
+                            movie.deletingPathExtension()
+                                .appendingPathExtension("report.json")
+                                .standardizedFileURL.path
+                        )
+                    }
+                    if let poster = map.resolvedPosterURL(for: entry, relativeTo: mapURL)?
+                        .resolvingSymlinksInPath().standardizedFileURL,
+                       isInsideManagedMedia(poster, root: root) {
+                        referenced.insert(poster.path)
+                    }
                 }
             }
         }

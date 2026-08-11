@@ -55,7 +55,7 @@ class MacAnimationLibraryUISourceTests(unittest.TestCase):
             self.source,
         )
         self.assertIn(
-            'clipsCountLabel.setAccessibilityLabel("\\(clipRows.count) \\(clipNoun) for \\(selectedState.displayName)")',
+            'clipsCountLabel.setAccessibilityLabel("\\(clipRows.count) \\(clipNoun) for \\(characterName), \\(selectedState.displayName)")',
             self.source,
         )
 
@@ -292,7 +292,7 @@ class MacAnimationLibraryUILayoutTests(unittest.TestCase):
                         "clip count did not refresh after state switch"
                     )
                     try require(
-                        tableView.accessibilityLabel() == "Running animation clips",
+                        tableView.accessibilityLabel() == "Default, Running animation clips",
                         "clip list accessibility label did not refresh after state switch"
                     )
                     print("layout-ok")

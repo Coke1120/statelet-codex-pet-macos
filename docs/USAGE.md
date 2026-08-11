@@ -43,9 +43,14 @@ At equal priority, the newest session event wins. A Stop event changes only its
 own session to Idle; another active session may still keep Statelet in Waiting,
 Review, or Running.
 
-Session records remain eligible for 900 seconds. The aggregator checks them
-every 250 ms and republishes unchanged state once per minute. A heartbeat
-refreshes publisher health but does not restart a movie or advance a playlist.
+Session records remain eligible for 900 seconds. On macOS, `kqueue` directory
+events normally wake the aggregator immediately; explicit TTL, temporary-force,
+and once-per-minute heartbeat deadlines handle changes that do not produce a
+file event. If event watching is unsupported or fails, bounded 250 ms polling
+preserves correctness. The aggregator log reports a path-free
+`mode=event_driven` or `mode=poll_fallback` diagnostic with a sanitized reason
+category. A heartbeat refreshes publisher health but does not restart a movie
+or advance a playlist.
 
 The badge reports:
 
@@ -111,6 +116,60 @@ or **Stop Play Once** returns to the current lifecycle animation. A real state
 change or a new Temporary State preempts it immediately.
 
 Play Once is unavailable while Reduce Motion is enabled.
+
+## Manage characters
+
+The character selector at the top of **Settings → Animations** controls the
+complete animation map currently being viewed and played. Its menu shows each
+character's name and clip count, followed by:
+
+- **New Character…**, which creates and activates an empty four-state map while
+  copying the current map's window and default-format settings; and
+- **Import Bundle…**, which verifies and installs one `.statelet-character`
+  directory package, then activates the imported character.
+
+Use the adjacent actions button for **Rename…**, **Duplicate…**, **Export…**,
+and **Delete…**. Names must be unique. Duplicate copies the selected character's
+entire map and activates the copy; media paths may remain shared. Delete removes
+the character from the selector but deliberately keeps its map, movies, posters,
+reports, and imported asset directory. This avoids irreversible data loss. The
+last character cannot be deleted.
+
+The original installation is always bootstrapped as `Default` and continues to
+use the configured root map basename—normally `media-map.json`. Statelet does
+not embed the character catalog into that map. Instead, it stores an
+authoritative `character-library.json` sidecar beside the root map and gives
+new characters separate same-directory hidden maps named
+`.character-<id>.media-map.json`. Therefore:
+
+- each character still has one ordinary, backward-compatible `MediaMap`;
+- relative movie and poster paths resolve from the same directory as before;
+- an older Statelet build can keep reading and writing the root default map;
+  and
+- switching characters loads that character's map directly rather than
+  mirroring it into `media-map.json`.
+
+### Import and export character packages
+
+A `.statelet-character` item is a directory package. Export writes
+`manifest.json` plus declared movies, posters, and any matching reports under
+the package. The manifest carries one ordinary Statelet media map with paths
+rewritten only to its bundle-relative assets.
+
+Import is local and fail-closed. Statelet bounds the manifest, asset count,
+individual role sizes, and aggregate size; rejects absolute, traversing,
+backslash, non-normalized, duplicate, and case/NFC-colliding paths; opens package
+content without following symbolic links; verifies every declared byte size and
+lowercase SHA-256; and requires movie, poster, and report references to match
+their declared roles. Movies must also pass AVFoundation playback checks.
+
+When a report is present, Statelet validates the report against the copied
+movie and does not convert a portable claim into local attestation. A package
+may omit reports for legacy portability, but importing those reportless movies
+requires the explicit trust confirmation shown before import. Explicit trust
+does not create a report or claim full alpha/composite provenance; the movies
+still have to pass playback checks. Cancel the confirmation if the package or
+its media source is not trusted.
 
 ## Manage animation libraries
 
@@ -240,17 +299,19 @@ HEVC video track, find zero delivery audio tracks, match the reported
 geometry/FPS/duration, and decode its first frame. A source-audio-stripped
 notice describes authoring input; it never permits audio in the delivered movie.
 
-An arbitrary MOV, opaque H.264 MP4, renamed file, missing report, mismatched
-report is rejected. A portable unattested report never passes silently: either
-the user explicitly accepts it or imports the authorized source MP4 so this
-Statelet installation can convert and attest it locally. This runtime playback
-smoke check complements rather than replaces the converter's all-frame Apple
-round-trip and alpha/composite gates.
+For the direct **Verified MOVs…** workflow, an arbitrary MOV, opaque H.264 MP4,
+renamed file, missing report, or mismatched report is rejected. A portable
+unattested report never passes silently: either the user explicitly accepts it
+or imports the authorized source MP4 so this Statelet installation can convert
+and attest it locally. The separate character-package workflow permits
+reportless legacy clips only with the explicit package-level trust described
+above. Its runtime playback smoke check complements rather than replaces the
+converter's all-frame Apple round-trip and alpha/composite gates.
 
 ## Remove clips and clean media
 
-**Remove from State** changes only `media-map.json`; it keeps the movie, report,
-and poster files.
+**Remove from State** changes only the active character's map; it keeps the
+movie, report, and poster files.
 
 **Remove & Move Files to Trash** appears only when the movie is an unshared
 regular file inside the canonical managed media folder and the active media map
@@ -263,9 +324,14 @@ remaining library. Removing the last entry removes that state mapping and uses
 the normal no-media fallback.
 
 Use **Settings → Diagnostics → Clean Unused Media…** to find recognized files
-inside the managed media directory that no playlist references. Statelet lists
-names and approximate size, asks for confirmation, rescans, and moves only files
-that remain eligible to Trash.
+inside the managed media directory that no character playlist references.
+Statelet loads every profile map before considering a file unused; a missing or
+invalid inactive map makes cleanup fail closed instead of risking shared media.
+The catalog and all profile map files are always retained. Statelet lists names
+and approximate size, asks for confirmation, rescans, and moves only recognized
+movie, poster, or report files that remain eligible to Trash. Files retained by
+Delete become cleanup candidates only when no remaining profile references
+them.
 
 ## Dialogue and local voice
 

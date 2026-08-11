@@ -1277,6 +1277,266 @@ final class CodexPetCoreTests: XCTestCase {
         XCTAssertTrue(displays.contains { visibleArea(of: oversizedRepaired, in: $0) })
     }
 
+    func testPlaybackSuspensionComposesReasonsAndPreservesResumeRate() {
+        var policy = PlaybackSuspensionPolicy()
+        XCTAssertEqual(policy.replacePlayback(rate: 0.75), .resume(rate: 0.75))
+        XCTAssertEqual(policy.setSuspended(true, for: .windowOccluded), .pause)
+        XCTAssertEqual(policy.setSuspended(true, for: .screenAsleep), .pause)
+        XCTAssertEqual(policy.setSuspended(false, for: .windowOccluded), .none)
+        XCTAssertFalse(policy.canStartReadinessDeadline)
+        XCTAssertEqual(policy.setSuspended(false, for: .screenAsleep), .resume(rate: 0.75))
+        XCTAssertTrue(policy.canStartReadinessDeadline)
+
+        XCTAssertEqual(policy.setSuspended(true, for: .screenAsleep), .pause)
+        XCTAssertEqual(policy.replacePlayback(rate: 1.25), .pause)
+        XCTAssertEqual(policy.setSuspended(false, for: .screenAsleep), .resume(rate: 1.25))
+        policy.clearPlayback()
+        XCTAssertEqual(policy.setSuspended(true, for: .windowOccluded), .pause)
+        XCTAssertEqual(policy.setSuspended(false, for: .windowOccluded), .none)
+    }
+
+    func testDisplayWakeRecoveryClearsStaleOcclusionBeforeRechecking() {
+        XCTAssertEqual(
+            DisplayWakeRecoveryPolicy.steps,
+            [.clearWindowOcclusion, .clearScreenSleep, .recheckWindowOcclusion]
+        )
+    }
+
+    func testBoundedLRUCacheEvictsLeastRecentlyUsedAndFileRevisionInvalidates() throws {
+        var cache = BoundedLRUCache<Int, String>(capacity: 2)
+        cache.insert("one", for: 1)
+        cache.insert("two", for: 2)
+        XCTAssertEqual(cache.value(for: 1), "one")
+        cache.insert("three", for: 3)
+        XCTAssertNil(cache.value(for: 2))
+        XCTAssertEqual(cache.count, 2)
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("statelet-runtime-policy-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let file = directory.appendingPathComponent("clip.mov")
+        XCTAssertNil(LocalFileRevision(url: file))
+        try Data("first".utf8).write(to: file)
+        let first = try XCTUnwrap(LocalFileRevision(url: file))
+        try FileManager.default.removeItem(at: file)
+        try Data("replacement-longer".utf8).write(to: file)
+        let replacement = try XCTUnwrap(LocalFileRevision(url: file))
+        XCTAssertNotEqual(first, replacement)
+        XCTAssertTrue(LibraryRowRefreshPolicy.shouldRefresh(previous: [first], incoming: [replacement]))
+    }
+
+    func testLifecycleUIRefreshSkipsHeartbeatButTracksProducerBehindPreview() {
+        XCTAssertFalse(LifecycleUIRefreshPolicy.shouldRefresh(
+            previousProducerState: .running,
+            incomingProducerState: .running,
+            presentationWillRefresh: false
+        ))
+        XCTAssertTrue(LifecycleUIRefreshPolicy.shouldRefresh(
+            previousProducerState: .running,
+            incomingProducerState: .waiting,
+            presentationWillRefresh: false
+        ))
+        XCTAssertTrue(LifecycleUIRefreshPolicy.shouldRefresh(
+            previousProducerState: .running,
+            incomingProducerState: .running,
+            presentationWillRefresh: true
+        ))
+    }
+
+    func testCharacterLibraryLegacyFallbackAndRoundTripKeepMediaMapUnchanged() throws {
+        let library = CharacterLibrary.legacy
+        XCTAssertEqual(library.activeCharacterID, "default")
+        XCTAssertEqual(library.activeCharacter.name, "Default")
+        XCTAssertEqual(library.activeCharacter.mapPath, "media-map.json")
+
+        let encoded = try JSONEncoder().encode(library)
+        XCTAssertEqual(try JSONDecoder().decode(CharacterLibrary.self, from: encoded), library)
+
+        let legacyMap = try MediaMap(states: [.idle: MediaEntry(path: "idle.mov")])
+        let mapObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(legacyMap)) as? [String: Any]
+        )
+        XCTAssertNil(mapObject["characters"])
+        XCTAssertNil(mapObject["active_character_id"])
+        XCTAssertNotNil(mapObject["states"])
+    }
+
+    func testCharacterLibraryBootstrapsCustomRootMapBasename() throws {
+        let library = try CharacterLibrary.legacy(mapPath: "custom.json")
+        XCTAssertEqual(library.activeCharacter.mapPath, "custom.json")
+        XCTAssertEqual(
+            library.activeCharacter.resolvedMapURL(relativeTo: URL(fileURLWithPath: "/tmp/maps/custom.json")).path,
+            "/tmp/maps/custom.json"
+        )
+        XCTAssertThrowsError(try CharacterLibrary.legacy(mapPath: "nested/custom.json"))
+        XCTAssertThrowsError(try CharacterLibrary.legacy(mapPath: ".."))
+        XCTAssertThrowsError(try CharacterLibrary.legacy(mapPath: "custom\\map.json"))
+    }
+
+    func testCharacterLibraryImmutableProfileIsolationSwitchAndDeleteGuard() throws {
+        let original = CharacterLibrary.legacy
+        let added = try original.addingCharacter(id: "chloe", name: "Chloe")
+        XCTAssertEqual(original.characters.count, 1)
+        XCTAssertEqual(added.character(id: "default")?.mapPath, "media-map.json")
+        XCTAssertEqual(added.character(id: "chloe")?.mapPath, ".character-chloe.media-map.json")
+
+        let renamed = try added.renamingCharacter(id: "chloe", to: "Chloe Prime")
+        XCTAssertEqual(added.character(id: "chloe")?.name, "Chloe")
+        XCTAssertEqual(renamed.character(id: "chloe")?.name, "Chloe Prime")
+        let duplicated = try renamed.duplicatingCharacter(id: "chloe", as: "chloe-copy", name: "Chloe Copy")
+        XCTAssertEqual(duplicated.character(id: "chloe-copy")?.mapPath, ".character-chloe-copy.media-map.json")
+
+        let selected = try duplicated.selectingCharacter(id: "chloe")
+        XCTAssertEqual(selected.activeCharacterID, "chloe")
+        XCTAssertEqual(selected.activeCharacter.mapPath, ".character-chloe.media-map.json")
+        let removedActive = try selected.removingCharacter(id: "chloe")
+        XCTAssertEqual(removedActive.activeCharacterID, "default")
+        XCTAssertNotNil(removedActive.character(id: "chloe-copy"))
+        XCTAssertThrowsError(try CharacterLibrary.legacy.removingCharacter(id: "default"))
+        XCTAssertThrowsError(try added.addingCharacter(id: "other", name: "CHLOE"))
+        XCTAssertThrowsError(try added.addingCharacter(id: "../escape", name: "Escape"))
+    }
+
+    func testCharacterBundleRoundTripAndImportPathRewritePreserveGlobalMapSettings() throws {
+        let window = try WindowConfiguration(width: 444, height: 555, clickThrough: true)
+        let entry = try MediaEntry(
+            path: "movies/idle.mov",
+            posterPath: "posters/idle.png",
+            playbackRate: 1.25
+        )
+        let map = try MediaMap(defaultFormat: "mov", window: window, states: [.idle: entry])
+        let hash = String(repeating: "a", count: 64)
+        let manifest = try CharacterBundleManifest(
+            characterID: "chloe",
+            characterName: "Chloe",
+            mediaMap: map,
+            assets: [
+                CharacterBundleAsset(role: .movie, path: "movies/idle.mov", size: 1024, sha256: hash),
+                CharacterBundleAsset(role: .poster, path: "posters/idle.png", size: 256, sha256: hash),
+                CharacterBundleAsset(
+                    role: .report,
+                    path: "reports/idle.json",
+                    size: 128,
+                    sha256: hash,
+                    moviePath: "movies/idle.mov"
+                ),
+            ]
+        )
+        let decoded = try CharacterBundleManifest.decode(JSONEncoder().encode(manifest))
+        XCTAssertEqual(decoded, manifest)
+
+        let imported = try decoded.mediaMap { "installed/\($0)" }
+        XCTAssertEqual(imported.entry(for: .idle)?.path, "installed/movies/idle.mov")
+        XCTAssertEqual(imported.entry(for: .idle)?.posterPath, "installed/posters/idle.png")
+        XCTAssertEqual(imported.window, window)
+        XCTAssertEqual(imported.defaultFormat, map.defaultFormat)
+    }
+
+    func testCharacterBundleRejectsTraversalCaseCollisionAndOversizedManifest() throws {
+        let hash = String(repeating: "a", count: 64)
+        let traversalMap = try MediaMap(states: [.idle: MediaEntry(path: "../idle.mov")])
+        XCTAssertThrowsError(try CharacterBundleManifest(
+            characterID: "chloe",
+            characterName: "Chloe",
+            mediaMap: traversalMap,
+            assets: [CharacterBundleAsset(role: .movie, path: "../idle.mov", size: 1, sha256: hash)]
+        ))
+
+        let map = try MediaMap(states: [.idle: MediaEntry(path: "movies/idle.mov")])
+        XCTAssertThrowsError(try CharacterBundleManifest(
+            characterID: "chloe",
+            characterName: "Chloe",
+            mediaMap: map,
+            assets: [
+                CharacterBundleAsset(role: .movie, path: "movies/idle.mov", size: 1, sha256: hash),
+                CharacterBundleAsset(role: .movie, path: "movies/IDLE.mov", size: 1, sha256: hash),
+            ]
+        ))
+        XCTAssertThrowsError(try CharacterBundleManifest.decode(
+            Data(repeating: 0x20, count: Int(CharacterBundleManifest.maximumManifestSize) + 1)
+        ))
+        XCTAssertThrowsError(try CharacterLibrary.legacy(mapPath: "bad\nmap.json"))
+        XCTAssertThrowsError(try CharacterLibrary.legacy(
+            mapPath: String(repeating: "a", count: CharacterBundlePath.maximumComponentBytes + 1)
+        ))
+    }
+
+    func testCharacterBundleRejectsAbsentAndWrongRoleReferences() throws {
+        let hash = String(repeating: "a", count: 64)
+        let map = try MediaMap(states: [
+            .idle: MediaEntry(path: "movies/idle.mov", posterPath: "posters/idle.png"),
+        ])
+        XCTAssertThrowsError(try CharacterBundleManifest(
+            characterID: "chloe",
+            characterName: "Chloe",
+            mediaMap: map,
+            assets: [
+                CharacterBundleAsset(role: .poster, path: "movies/idle.mov", size: 1, sha256: hash),
+                CharacterBundleAsset(role: .poster, path: "posters/idle.png", size: 1, sha256: hash),
+            ]
+        ))
+        XCTAssertThrowsError(try CharacterBundleManifest(
+            characterID: "chloe",
+            characterName: "Chloe",
+            mediaMap: map,
+            assets: [
+                CharacterBundleAsset(role: .movie, path: "movies/idle.mov", size: 1, sha256: hash),
+                CharacterBundleAsset(role: .poster, path: "posters/idle.png", size: 1, sha256: hash),
+                CharacterBundleAsset(role: .report, path: "reports/idle.json", size: 1, sha256: hash),
+            ]
+        ))
+        XCTAssertThrowsError(try CharacterBundleManifest(
+            characterID: "chloe",
+            characterName: "Chloe",
+            mediaMap: map,
+            assets: [
+                CharacterBundleAsset(role: .movie, path: "movies/idle.mov", size: 1, sha256: hash),
+                CharacterBundleAsset(role: .poster, path: "posters/idle.png", size: 1, sha256: hash),
+                CharacterBundleAsset(
+                    role: .report,
+                    path: "reports/idle.json",
+                    size: 1,
+                    sha256: hash,
+                    moviePath: "movies/missing.mov"
+                ),
+            ]
+        ))
+        XCTAssertThrowsError(try CharacterBundleManifest(
+            characterID: "chloe",
+            characterName: "Chloe",
+            mediaMap: map,
+            assets: [
+                CharacterBundleAsset(role: .movie, path: "movies/idle.mov", size: 1, sha256: hash),
+                CharacterBundleAsset(role: .movie, path: "movies/unused.mov", size: 1, sha256: hash),
+                CharacterBundleAsset(role: .poster, path: "posters/idle.png", size: 1, sha256: hash),
+            ]
+        ))
+        XCTAssertThrowsError(try CharacterBundleManifest(
+            characterID: "chloe",
+            characterName: "Chloe",
+            mediaMap: map,
+            assets: [
+                CharacterBundleAsset(role: .movie, path: "movies/idle.mov", size: 1, sha256: hash),
+                CharacterBundleAsset(role: .poster, path: "posters/idle.png", size: 1, sha256: hash),
+                CharacterBundleAsset(
+                    role: .report,
+                    path: "reports/first.json",
+                    size: 1,
+                    sha256: hash,
+                    moviePath: "movies/idle.mov"
+                ),
+                CharacterBundleAsset(
+                    role: .report,
+                    path: "reports/second.json",
+                    size: 1,
+                    sha256: hash,
+                    moviePath: "movies/idle.mov"
+                ),
+            ]
+        ))
+    }
+
     private func visibleArea(of frame: CGRect, in display: CGRect) -> Bool {
         let intersection = frame.intersection(display)
         return intersection.width >= 48 && intersection.height >= 48

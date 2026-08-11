@@ -725,6 +725,157 @@ private func runSelfTest() throws {
     try require(defaultAppearance.fpsColor == "#00FF00", "legacy media map did not use the default FPS color")
     try require(defaultAppearance.fpsLabelSize == .small, "legacy media map did not use the default FPS size")
 
+    let legacyLibrary = CharacterLibrary.legacy
+    try require(legacyLibrary.activeCharacterID == "default", "legacy character id changed")
+    try require(legacyLibrary.activeCharacter.name == "Default", "legacy character name changed")
+    try require(legacyLibrary.activeCharacter.mapPath == "media-map.json", "legacy map path changed")
+    let customRootLibrary = try CharacterLibrary.legacy(mapPath: "custom.json")
+    try require(customRootLibrary.activeCharacter.mapPath == "custom.json", "custom root map did not bootstrap")
+    try requiresError("nested custom root map was accepted") {
+        _ = try CharacterLibrary.legacy(mapPath: "nested/custom.json")
+    }
+    let libraryRoundTrip = try JSONDecoder().decode(
+        CharacterLibrary.self,
+        from: JSONEncoder().encode(legacyLibrary)
+    )
+    try require(libraryRoundTrip == legacyLibrary, "character library did not round-trip")
+    let addedLibrary = try legacyLibrary.addingCharacter(id: "chloe", name: "Chloe")
+    try require(
+        addedLibrary.character(id: "default")?.mapPath == "media-map.json",
+        "adding a character changed the default profile map"
+    )
+    try require(
+        addedLibrary.character(id: "chloe")?.mapPath == ".character-chloe.media-map.json",
+        "new character did not receive an isolated profile map"
+    )
+    let renamedLibrary = try addedLibrary.renamingCharacter(id: "chloe", to: "Chloe Prime")
+    try require(addedLibrary.character(id: "chloe")?.name == "Chloe", "rename mutated original library")
+    let duplicatedLibrary = try renamedLibrary.duplicatingCharacter(
+        id: "chloe",
+        as: "chloe-copy",
+        name: "Chloe Copy"
+    )
+    let selectedLibrary = try duplicatedLibrary.selectingCharacter(id: "chloe")
+    try require(selectedLibrary.activeCharacterID == "chloe", "character selection failed")
+    let removedActiveLibrary = try selectedLibrary.removingCharacter(id: "chloe")
+    try require(removedActiveLibrary.activeCharacterID == "default", "active removal did not fall back to default")
+    try requiresError("last character removal was accepted") {
+        _ = try legacyLibrary.removingCharacter(id: "default")
+    }
+
+    let bundleHash = String(repeating: "d", count: 64)
+    let bundleMap = try MediaMap(states: [
+        .idle: MediaEntry(path: "movies/idle.mov", posterPath: "posters/idle.png"),
+    ])
+    let bundle = try CharacterBundleManifest(
+        characterID: "chloe",
+        characterName: "Chloe",
+        mediaMap: bundleMap,
+        assets: [
+            CharacterBundleAsset(role: .movie, path: "movies/idle.mov", size: 100, sha256: bundleHash),
+            CharacterBundleAsset(role: .poster, path: "posters/idle.png", size: 50, sha256: bundleHash),
+            CharacterBundleAsset(
+                role: .report,
+                path: "reports/idle.json",
+                size: 25,
+                sha256: bundleHash,
+                moviePath: "movies/idle.mov"
+            ),
+        ]
+    )
+    let bundleRoundTrip = try CharacterBundleManifest.decode(JSONEncoder().encode(bundle))
+    try require(bundleRoundTrip == bundle, "character bundle did not round-trip")
+    let rewrittenBundleMap = try bundle.mediaMap { "imports/\($0)" }
+    try require(
+        rewrittenBundleMap.entry(for: .idle)?.path == "imports/movies/idle.mov",
+        "bundle movie path was not rewritten"
+    )
+    try require(
+        rewrittenBundleMap.entry(for: .idle)?.posterPath == "imports/posters/idle.png",
+        "bundle poster path was not rewritten"
+    )
+    try requiresError("bundle traversal path was accepted") {
+        _ = try CharacterBundleManifest(
+            characterID: "chloe",
+            characterName: "Chloe",
+            mediaMap: MediaMap(states: [.idle: MediaEntry(path: "../idle.mov")]),
+            assets: [
+                CharacterBundleAsset(role: .movie, path: "../idle.mov", size: 1, sha256: bundleHash),
+            ]
+        )
+    }
+    try requiresError("bundle control-character path was accepted") {
+        _ = try CharacterLibrary.legacy(mapPath: "bad\nmap.json")
+    }
+    try requiresError("bundle case-colliding paths were accepted") {
+        _ = try CharacterBundleManifest(
+            characterID: "chloe",
+            characterName: "Chloe",
+            mediaMap: MediaMap(states: [.idle: MediaEntry(path: "movies/idle.mov")]),
+            assets: [
+                CharacterBundleAsset(role: .movie, path: "movies/idle.mov", size: 1, sha256: bundleHash),
+                CharacterBundleAsset(role: .movie, path: "movies/IDLE.mov", size: 1, sha256: bundleHash),
+            ]
+        )
+    }
+    try requiresError("bundle wrong-role reference was accepted") {
+        _ = try CharacterBundleManifest(
+            characterID: "chloe",
+            characterName: "Chloe",
+            mediaMap: MediaMap(states: [.idle: MediaEntry(path: "movies/idle.mov")]),
+            assets: [
+                CharacterBundleAsset(role: .poster, path: "movies/idle.mov", size: 1, sha256: bundleHash),
+            ]
+        )
+    }
+    try requiresError("bundle report without movie_path was accepted") {
+        _ = try CharacterBundleManifest(
+            characterID: "chloe",
+            characterName: "Chloe",
+            mediaMap: MediaMap(states: [:] as [PetState: StateMediaPlaylist]),
+            assets: [
+                CharacterBundleAsset(role: .report, path: "reports/idle.json", size: 1, sha256: bundleHash),
+            ]
+        )
+    }
+    try requiresError("bundle unreferenced movie was accepted") {
+        _ = try CharacterBundleManifest(
+            characterID: "chloe",
+            characterName: "Chloe",
+            mediaMap: bundleMap,
+            assets: [
+                CharacterBundleAsset(role: .movie, path: "movies/idle.mov", size: 1, sha256: bundleHash),
+                CharacterBundleAsset(role: .movie, path: "movies/unused.mov", size: 1, sha256: bundleHash),
+                CharacterBundleAsset(role: .poster, path: "posters/idle.png", size: 1, sha256: bundleHash),
+            ]
+        )
+    }
+    try requiresError("bundle duplicate reports were accepted") {
+        _ = try CharacterBundleManifest(
+            characterID: "chloe",
+            characterName: "Chloe",
+            mediaMap: bundleMap,
+            assets: [
+                CharacterBundleAsset(role: .movie, path: "movies/idle.mov", size: 1, sha256: bundleHash),
+                CharacterBundleAsset(role: .poster, path: "posters/idle.png", size: 1, sha256: bundleHash),
+                CharacterBundleAsset(
+                    role: .report,
+                    path: "reports/first.json",
+                    size: 1,
+                    sha256: bundleHash,
+                    moviePath: "movies/idle.mov"
+                ),
+                CharacterBundleAsset(
+                    role: .report,
+                    path: "reports/second.json",
+                    size: 1,
+                    sha256: bundleHash,
+                    moviePath: "movies/idle.mov"
+                ),
+            ]
+        )
+    }
+
     let appearanceJSON = Data(##"{"background_color":"#a1b2c3","border_color":"#dEf012","border_enabled":false,"border_width":4.5,"corner_radius":31,"show_state_label":false,"state_label_position":"bottom_right","state_label_size":"large","state_label_color":"#1a2B3c","show_fps":false,"fps_color":"#00eE77","fps_label_size":"regular"}"##.utf8)
     let appearance = try JSONDecoder.codexPet.decode(PetAppearanceConfiguration.self, from: appearanceJSON)
     try require(appearance.backgroundColor == "#A1B2C3", "background color was not normalized")
@@ -964,6 +1115,59 @@ private func runSelfTest() throws {
     _ = preview.begin(previewState: .waiting, baselineRealState: .idle)
     try require(preview.begin(previewState: .review, baselineRealState: .running) == .review, "repeated begin did not replace manual preview")
     try require(preview.receiveLifecycleState(.running) == .presentingPreview(.review), "repeated begin did not replace the baseline")
+
+    var suspension = PlaybackSuspensionPolicy()
+    try require(suspension.replacePlayback(rate: 0.75) == .resume(rate: 0.75), "initial playback did not resume")
+    try require(suspension.setSuspended(true, for: .windowOccluded) == .pause, "occlusion did not pause")
+    try require(suspension.setSuspended(true, for: .screenAsleep) == .pause, "screen sleep did not remain paused")
+    try require(suspension.setSuspended(false, for: .windowOccluded) == .none, "clearing one reason resumed another")
+    try require(suspension.setSuspended(false, for: .screenAsleep) == .resume(rate: 0.75), "final reason did not restore rate")
+    try require(
+        DisplayWakeRecoveryPolicy.steps == [.clearWindowOcclusion, .clearScreenSleep, .recheckWindowOcclusion],
+        "wake recovery can retain stale occlusion"
+    )
+    var lru = BoundedLRUCache<Int, String>(capacity: 2)
+    lru.insert("one", for: 1)
+    lru.insert("two", for: 2)
+    _ = lru.value(for: 1)
+    lru.insert("three", for: 3)
+    try require(lru.value(for: 2) == nil && lru.count == 2, "FPS cache did not evict least-recently-used entry")
+    try require(
+        !LifecycleUIRefreshPolicy.shouldRefresh(
+            previousProducerState: .running,
+            incomingProducerState: .running,
+            presentationWillRefresh: false
+        ),
+        "unchanged heartbeat refreshed UI"
+    )
+    try require(
+        LifecycleUIRefreshPolicy.shouldRefresh(
+            previousProducerState: .running,
+            incomingProducerState: .waiting,
+            presentationWillRefresh: false
+        ),
+        "producer change behind stable preview did not refresh UI"
+    )
+
+    let runtimeRevisionRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("statelet-runtime-revision-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: runtimeRevisionRoot) }
+    try FileManager.default.createDirectory(at: runtimeRevisionRoot, withIntermediateDirectories: true)
+    let runtimeRevisionFile = runtimeRevisionRoot.appendingPathComponent("clip.mov")
+    try require(LocalFileRevision(url: runtimeRevisionFile) == nil, "missing file had a revision")
+    try Data("first".utf8).write(to: runtimeRevisionFile)
+    let firstRevision = LocalFileRevision(url: runtimeRevisionFile)
+    try FileManager.default.removeItem(at: runtimeRevisionFile)
+    try Data("replacement-longer".utf8).write(to: runtimeRevisionFile)
+    let replacementRevision = LocalFileRevision(url: runtimeRevisionFile)
+    try require(
+        firstRevision != nil && replacementRevision != nil && firstRevision != replacementRevision,
+        "file replacement did not invalidate revision identity"
+    )
+    try require(
+        LibraryRowRefreshPolicy.shouldRefresh(previous: firstRevision, incoming: replacementRevision),
+        "library row policy retained stale file metadata"
+    )
 
     let displays = [
         CGRect(x: -1920, y: -1080, width: 1920, height: 1080),
