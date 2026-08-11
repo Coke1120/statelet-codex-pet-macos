@@ -252,9 +252,9 @@ public enum DialogueSynthesisPolicy {
     /// GPT-SoVITS request recipe.
     public static let legacyVersion = 1
 
-    /// `cut0`, serial inference, no split buckets or fragment padding, and the
-    /// pinned sampling controls used by the current runtime.
-    public static let currentVersion = 2
+    /// `cut0`, serial inference, no split buckets or fragment padding, pinned
+    /// sampling controls, and a deterministic GPT-SoVITS seed.
+    public static let currentVersion = 3
 }
 
 public enum DialogueVoiceProfileStatus: String, Codable, CaseIterable, Sendable {

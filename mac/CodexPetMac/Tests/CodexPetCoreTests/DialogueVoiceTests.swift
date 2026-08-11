@@ -126,6 +126,31 @@ final class DialogueVoiceTests: XCTestCase {
         XCTAssertEqual(migrated.lines[0].outputRelativePath, "voice/generated/current.wav")
     }
 
+    func testPreviousDeterministicPolicyOutputBecomesStaleAfterSeedPin() throws {
+        XCTAssertEqual(DialogueSynthesisPolicy.currentVersion, 3)
+
+        var library = try libraryWithQueuedLine()
+        let currentTicket = try library.beginGeneration(for: lineID)
+        let previousPolicyTicket = try DialogueGenerationTicket(
+            lineID: currentTicket.lineID,
+            lineRevision: currentTicket.lineRevision,
+            profileID: currentTicket.profileID,
+            profileRevision: currentTicket.profileRevision,
+            synthesisPolicyVersion: 2
+        )
+        _ = try library.completeGeneration(
+            ticket: previousPolicyTicket,
+            outputPath: "voice/generated/pre-seed.wav"
+        )
+
+        XCTAssertEqual(library.lines[0].status, .ready)
+        XCTAssertEqual(library.lines[0].generatedSynthesisPolicyVersion, 2)
+        XCTAssertEqual(try library.migrateOutdatedSynthesisOutputs(), 1)
+        XCTAssertEqual(library.lines[0].status, .stale)
+        XCTAssertEqual(library.lines[0].outputRelativePath, "voice/generated/pre-seed.wav")
+        XCTAssertTrue(library.referencedManagedPaths.contains("voice/generated/pre-seed.wav"))
+    }
+
     func testInvalidationKeepsQueuedAndGeneratingMigrationOutputsReferenced() throws {
         let queuedID = UUID(uuidString: "10000000-0000-0000-0000-000000000010")!
         let generatingID = UUID(uuidString: "10000000-0000-0000-0000-000000000011")!

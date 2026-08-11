@@ -40,3 +40,34 @@ artifacts by SHA-256. Require every decoded frame to pass the Apple round-trip,
 outer-border alpha, alpha-loss, direct edge, and white/black/checkerboard
 composite gates. Inspect the complete loop visually in Statelet as a separate
 final check; report that check as not run when it was not observed.
+
+## Runtime playback acceptance
+
+Separate asset evidence from player evidence:
+
+1. Use FFprobe to confirm duration, frame rate, frame count, codec, and loop
+   length. Decode frames at separated timestamps and prove their hashes differ.
+2. Verify the active character map resolves to the expected installed movie and
+   that the current lifecycle state selects that entry. For random or sequential
+   playlists, preview or temporarily select the candidate directly. Treat Reduce
+   Motion separately from screen-sleep or window-occlusion suspension.
+3. Observe the installed Statelet across at least two complete loops. Compare
+   screenshots or frames from separated timestamps and inspect player time/rate;
+   a single screenshot cannot prove animation.
+4. When the first decoded frame appears but time stays at zero, treat
+   asynchronous `AVPlayerLooper.currentItem` population as a player race rather
+   than regenerating a known-moving asset. Defer the intended resume rate until
+   the current item exists, while allowing pause/stop to cancel that intent.
+5. Keep a full-Xcode regression that exercises a real `AVPlayerLooper` with a
+   runtime-generated multi-frame MOV. Require current-item population, nonzero
+   playback rate, and advancing current time.
+6. After release installation, confirm the installed executable hash equals the
+   packaged `mac/CodexPetMac/dist/Statelet.app` executable before recording the
+   live result. Also confirm the player LaunchAgent targets the installed app and
+   the live PID began after installation.
+
+When runtime telemetry is unavailable, record that limitation. Separated screen
+captures plus differing pixels prove visible motion; they do not identify player
+rate, current time, `currentItem`, or suspension state. Use the real full-Xcode
+player integration test for that internal evidence rather than inferring it from
+an asset-only check.

@@ -156,6 +156,7 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
             },
         )
         self.assertRegex(body, r"\bcase\s+text\b")
+        self.assertRegex(body, r"\bcase\s+seed\b")
         self.assertIn('request.httpMethod = "POST"', self.runtime)
         self.assertIn('request.setValue("application/json", forHTTPHeaderField: "Content-Type")', self.runtime)
         for declaration in (
@@ -168,6 +169,7 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
             "let topP = 0.8",
             "let temperature = 0.6",
             "let repetitionPenalty = 1.35",
+            "seed: Int = 24_681",
         ):
             self.assertIn(declaration, self.runtime)
 
@@ -452,6 +454,7 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         self.assertIn("Set(validatedCleanupPaths).isDisjoint", self.core)
         self.assertIn("Set(validated).isDisjoint(with: referencedManagedPaths)", self.core)
         self.assertIn("public enum DialogueSynthesisPolicy", self.core)
+        self.assertIn("public static let currentVersion = 3", self.core)
         self.assertIn('case generatedSynthesisPolicyVersion = "generated_synthesis_policy_version"', self.core)
         self.assertIn("migrateOutdatedSynthesisOutputs()", self.coordinator)
         self.assertIn("pendingLineRetainingOutput", self.core)
