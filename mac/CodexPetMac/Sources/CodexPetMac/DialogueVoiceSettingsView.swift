@@ -9,6 +9,10 @@ struct DialogueVoiceProfileDraft: Equatable {
     var referenceText: String
 }
 
+private final class TopAlignedVoiceDocumentView: NSView {
+    override var isFlipped: Bool { true }
+}
+
 final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate, NSTextViewDelegate {
     var onImportGPTWeight: ((DialogueVoiceProfileDraft) -> Void)?
     var onImportSoVITSWeight: ((DialogueVoiceProfileDraft) -> Void)?
@@ -29,8 +33,29 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         static let status = NSUserInterfaceItemIdentifier("dialogue-voice.status")
     }
 
+    private enum VoiceSection: Int {
+        case dialogue
+        case voiceSetup
+    }
+
+    private struct PendingNewDialogueSubmission {
+        let editorText: String
+        let editorLanguage: String
+        let submittedText: String
+        let submittedLanguage: String
+        let existingLineIDs: Set<UUID>
+    }
+
     private let outerScrollView = NSScrollView()
-    private let documentView = NSView()
+    private let documentView = TopAlignedVoiceDocumentView()
+    private let voiceSectionControl = NSSegmentedControl(
+        labels: ["Dialogue", "Voice Setup"],
+        trackingMode: .selectOne,
+        target: nil,
+        action: nil
+    )
+    private let dialoguePage = NSStackView()
+    private let voiceSetupPage = NSStackView()
     private let nameField = NSTextField()
     private let apiBaseURLField = NSTextField()
     private let promptLanguageField = NSTextField()
@@ -57,6 +82,8 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     private let previewButton = NSButton(title: "Preview", target: nil, action: nil)
     private let retryButton = NSButton(title: "Retry", target: nil, action: nil)
     private let regenerateButton = NSButton(title: "Regenerate", target: nil, action: nil)
+    private let dialogueSetupHint = NSStackView()
+    private let openVoiceSetupButton = NSButton(title: "Open Voice Setup", target: nil, action: nil)
     private let activityLabel = NSTextField(wrappingLabelWithString: "")
 
     private var profile: GPTSoVITSVoiceProfile?
@@ -67,7 +94,10 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     private var selectedLineID: UUID?
     private var lastAppliedProfileDraft: DialogueVoiceProfileDraft?
     private var lastAppliedEditorLine: DialogueLine?
+    private var lastAppliedNewDialogueLanguage = ""
+    private var pendingNewDialogueSubmission: PendingNewDialogueSubmission?
     private var isRefreshing = false
+    private var hasSelectedVoiceSection = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -93,6 +123,8 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         let preserveProfileEdits = profileEditorIsDirty
             && snapshot.draft == lastAppliedProfileDraft
         let preserveDialogueEdits = dialogueEditorIsDirty
+        let preserveNewDialogueText = newDialogueTextIsDirty
+        let preserveNewDialogueLanguage = newDialogueLanguageIsDirty
         isRefreshing = true
         defer {
             isRefreshing = false
@@ -100,11 +132,28 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         }
 
         let library = snapshot.library
+        let submittedNewDialogueWasSaved = pendingNewDialogueSubmission.map { submission in
+            library.lines.contains {
+                !submission.existingLineIDs.contains($0.id)
+                    && $0.text == submission.submittedText
+                    && $0.textLanguage == submission.submittedLanguage
+            }
+        } ?? false
+        let shouldClearSubmittedNewDialogue = submittedNewDialogueWasSaved
+            && dialogueTextView.string == pendingNewDialogueSubmission?.editorText
+            && dialogueLanguageField.stringValue == pendingNewDialogueSubmission?.editorLanguage
+        if submittedNewDialogueWasSaved {
+            pendingNewDialogueSubmission = nil
+        }
         profile = library.profile
         profileStatus = library.profileStatus
         lines = library.lines
         importedAssets = snapshot.importedAssets
         draftDefaultTextLanguage = snapshot.draft.defaultTextLanguage
+        if !hasSelectedVoiceSection {
+            selectVoiceSection(profile == nil ? .voiceSetup : .dialogue, userInitiated: false)
+        }
+        dialogueSetupHint.isHidden = library.profileStatus == .ready
         if !preserveProfileEdits {
             applyProfileDraft(snapshot.draft)
         }
@@ -135,7 +184,11 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             selectedLineID = nil
             lastAppliedEditorLine = nil
             linesTable.deselectAll(nil)
-            clearEditorFields()
+            if shouldClearSubmittedNewDialogue || (!preserveNewDialogueText && !preserveNewDialogueLanguage) {
+                clearEditorFields()
+            } else if !preserveNewDialogueLanguage {
+                applyDefaultDialogueLanguage()
+            }
         }
         linesTable.setAccessibilityHelp(
             lines.isEmpty
@@ -149,6 +202,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     func tableViewSelectionDidChange(_ notification: Notification) {
         guard !isRefreshing else { return }
         if let line = selectedLine() {
+            pendingNewDialogueSubmission = nil
             selectedLineID = line.id
             populateEditor(with: line)
         } else {
@@ -216,6 +270,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         configureFields()
         configureButtons()
         configureTable()
+        configureVoiceSections()
 
         let profileTitle = sectionTitle("VOICE PROFILE")
         let profileHelp = helpLabel("Connect to a GPT-SoVITS API running only on this Mac. Statelet stores managed copies of the selected model files and reference audio.")
@@ -235,11 +290,13 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         profileGrid.columnSpacing = 10
         profileGrid.column(at: 0).xPlacement = .trailing
         profileGrid.column(at: 1).xPlacement = .fill
+        let profileGridRow = centeredRow(profileGrid)
         let profileActions = buttonRow([saveProfileButton, removeProfileButton])
 
         let dialogueTitle = sectionTitle("DIALOGUE LINES")
         let dialogueHelp = helpLabel("Adding or updating a line requests background pre-generation. Playback and persistence are handled outside this view.")
         let textLabel = fieldLabel("Dialogue text")
+        textLabel.alignment = .left
         textLabel.setAccessibilityLabel("Dialogue text label")
         let languageRow = NSStackView(views: [fieldLabel("Text language"), dialogueLanguageField])
         languageRow.orientation = .horizontal
@@ -248,43 +305,101 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         let editorActions = buttonRow([addLineButton, updateLineButton, clearEditorButton])
         let selectedActions = buttonRow([deleteButton, previewButton, retryButton, regenerateButton])
 
+        let dialogueSetupText = helpLabel("Choose Add to save this text as a draft. Voice Setup and the local service must be ready to generate audio.")
+        dialogueSetupHint.orientation = .horizontal
+        dialogueSetupHint.alignment = .centerY
+        dialogueSetupHint.spacing = 8
+        dialogueSetupHint.addArrangedSubview(dialogueSetupText)
+        dialogueSetupHint.addArrangedSubview(openVoiceSetupButton)
+        dialogueSetupText.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        configurePage(
+            voiceSetupPage,
+            views: [profileTitle, profileHelp, profileGridRow, profileActions],
+            accessibilityLabel: "Voice Setup page"
+        )
+        configurePage(
+            dialoguePage,
+            views: [
+                dialogueTitle,
+                dialogueHelp,
+                dialogueSetupHint,
+                textLabel,
+                dialogueTextScrollView(),
+                languageRow,
+                editorActions,
+                linesScrollView,
+                selectedActions,
+            ],
+            accessibilityLabel: "Dialogue page"
+        )
+        voiceSetupPage.setCustomSpacing(4, after: profileTitle)
+        dialoguePage.setCustomSpacing(4, after: dialogueTitle)
+
         activityLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         activityLabel.textColor = .secondaryLabelColor
         activityLabel.isHidden = true
         activityLabel.setAccessibilityLabel("Dialogue voice activity")
 
+        let voiceSectionPickerRow = centeredRow(voiceSectionControl)
         let contentStack = NSStackView(views: [
-            profileTitle,
-            profileHelp,
-            profileGrid,
-            profileActions,
-            separator(),
-            dialogueTitle,
-            dialogueHelp,
-            textLabel,
-            dialogueTextScrollView(),
-            languageRow,
-            editorActions,
-            linesScrollView,
-            selectedActions,
+            voiceSectionPickerRow,
+            dialoguePage,
+            voiceSetupPage,
             activityLabel,
         ])
         contentStack.translatesAutoresizingMaskIntoConstraints = false
         contentStack.orientation = .vertical
         contentStack.alignment = .width
         contentStack.spacing = 8
-        contentStack.setCustomSpacing(4, after: profileTitle)
-        contentStack.setCustomSpacing(14, after: profileActions)
-        contentStack.setCustomSpacing(14, after: separatorView(in: contentStack))
         documentView.addSubview(contentStack)
         NSLayoutConstraint.activate([
             contentStack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor, constant: 4),
             contentStack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor, constant: -8),
             contentStack.topAnchor.constraint(equalTo: documentView.topAnchor, constant: 2),
             contentStack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor, constant: -8),
+            voiceSectionPickerRow.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
+            dialoguePage.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
+            voiceSetupPage.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             linesScrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 190),
             dialogueLanguageField.widthAnchor.constraint(greaterThanOrEqualToConstant: 150),
         ])
+        selectVoiceSection(.voiceSetup, userInitiated: false)
+    }
+
+    private func configureVoiceSections() {
+        voiceSectionControl.target = self
+        voiceSectionControl.action = #selector(voiceSectionChanged)
+        voiceSectionControl.segmentStyle = .rounded
+        voiceSectionControl.setAccessibilityLabel("Voice section")
+        voiceSectionControl.setAccessibilityHelp("Choose between dialogue editing and local voice profile setup.")
+        openVoiceSetupButton.target = self
+        openVoiceSetupButton.action = #selector(openVoiceSetup)
+        openVoiceSetupButton.setAccessibilityLabel("Open Voice Setup")
+        openVoiceSetupButton.setAccessibilityHelp("Open the voice profile and model import page without discarding this dialogue draft.")
+    }
+
+    private func configurePage(_ page: NSStackView, views: [NSView], accessibilityLabel: String) {
+        page.translatesAutoresizingMaskIntoConstraints = false
+        page.orientation = .vertical
+        page.alignment = .width
+        page.spacing = 8
+        page.setAccessibilityElement(true)
+        page.setAccessibilityRole(.group)
+        page.setAccessibilityLabel(accessibilityLabel)
+        for view in views {
+            page.addArrangedSubview(view)
+            view.widthAnchor.constraint(equalTo: page.widthAnchor).isActive = true
+        }
+    }
+
+    private func selectVoiceSection(_ section: VoiceSection, userInitiated: Bool) {
+        voiceSectionControl.selectedSegment = section.rawValue
+        dialoguePage.isHidden = section != .dialogue
+        voiceSetupPage.isHidden = section != .voiceSetup
+        if userInitiated {
+            hasSelectedVoiceSection = true
+        }
     }
 
     private func configureFields() {
@@ -449,14 +564,16 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         return row
     }
 
-    private func separator() -> NSBox {
-        let box = NSBox()
-        box.boxType = .separator
-        return box
-    }
-
-    private func separatorView(in stack: NSStackView) -> NSView {
-        stack.arrangedSubviews.first { ($0 as? NSBox)?.boxType == .separator } ?? stack
+    private func centeredRow(_ view: NSView) -> NSStackView {
+        let leadingSpacer = NSView()
+        let trailingSpacer = NSView()
+        leadingSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        trailingSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let row = NSStackView(views: [leadingSpacer, view, trailingSpacer])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        leadingSpacer.widthAnchor.constraint(equalTo: trailingSpacer.widthAnchor).isActive = true
+        return row
     }
 
     private func selectedLine() -> DialogueLine? {
@@ -473,7 +590,12 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
 
     private func clearEditorFields() {
         dialogueTextView.string = ""
+        applyDefaultDialogueLanguage()
+    }
+
+    private func applyDefaultDialogueLanguage() {
         dialogueLanguageField.stringValue = profile?.defaultTextLanguage ?? draftDefaultTextLanguage
+        lastAppliedNewDialogueLanguage = dialogueLanguageField.stringValue
     }
 
     private var profileEditorIsDirty: Bool {
@@ -485,6 +607,16 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         guard let line = lastAppliedEditorLine, selectedLineID == line.id else { return false }
         return dialogueTextView.string != line.text
             || dialogueLanguageField.stringValue != line.textLanguage
+    }
+
+    private var newDialogueTextIsDirty: Bool {
+        guard selectedLineID == nil else { return false }
+        return !dialogueTextView.string.isEmpty
+    }
+
+    private var newDialogueLanguageIsDirty: Bool {
+        guard selectedLineID == nil else { return false }
+        return dialogueLanguageField.stringValue != lastAppliedNewDialogueLanguage
     }
 
     private func applyProfileDraft(_ draft: DialogueVoiceProfileDraft) {
@@ -522,7 +654,9 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         let hasLineLanguage = !dialogueLanguageField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         addLineButton.isEnabled = hasLineText && hasLineLanguage && selectedLine() == nil
         updateLineButton.isEnabled = hasLineText && hasLineLanguage && selectedLine() != nil
-        clearEditorButton.isEnabled = hasLineText || selectedLine() != nil
+        clearEditorButton.isEnabled = newDialogueTextIsDirty
+            || newDialogueLanguageIsDirty
+            || selectedLine() != nil
 
         let line = selectedLine()
         deleteButton.isEnabled = line != nil
@@ -562,9 +696,18 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         onRemoveProfile?(profile)
     }
     @objc private func addLine() {
+        let submittedText = dialogueTextView.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        let submittedLanguage = dialogueLanguageField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        pendingNewDialogueSubmission = PendingNewDialogueSubmission(
+            editorText: dialogueTextView.string,
+            editorLanguage: dialogueLanguageField.stringValue,
+            submittedText: submittedText,
+            submittedLanguage: submittedLanguage,
+            existingLineIDs: Set(lines.map(\.id))
+        )
         onAddLine?(
-            dialogueTextView.string.trimmingCharacters(in: .whitespacesAndNewlines),
-            dialogueLanguageField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            submittedText,
+            submittedLanguage
         )
     }
     @objc private func updateLine() {
@@ -576,6 +719,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         )
     }
     @objc private func clearEditor() {
+        pendingNewDialogueSubmission = nil
         selectedLineID = nil
         lastAppliedEditorLine = nil
         linesTable.deselectAll(nil)
@@ -598,5 +742,12 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     @objc private func regenerateLine() {
         guard let line = selectedLine(), line.status != .queued, line.status != .generating else { return }
         onRegenerateLine?(line)
+    }
+    @objc private func voiceSectionChanged() {
+        guard let section = VoiceSection(rawValue: voiceSectionControl.selectedSegment) else { return }
+        selectVoiceSection(section, userInitiated: true)
+    }
+    @objc private func openVoiceSetup() {
+        selectVoiceSection(.voiceSetup, userInitiated: true)
     }
 }
