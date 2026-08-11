@@ -75,6 +75,72 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         }
     }
 
+    private final class UnavailableThenSuccessfulGPTSoVITSURLProtocol: URLProtocol {
+        private static let stateLock = NSLock()
+        private static var failNextRequest = true
+
+        static func reset() {
+            stateLock.lock()
+            failNextRequest = true
+            stateLock.unlock()
+        }
+
+        override class func canInit(with request: URLRequest) -> Bool { true }
+        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+        override func startLoading() {
+            Self.stateLock.lock()
+            let shouldFail = Self.failNextRequest
+            Self.failNextRequest = false
+            Self.stateLock.unlock()
+
+            let isTTSRequest = request.url?.lastPathComponent == "tts"
+            let statusCode = shouldFail ? 503 : 200
+            let data = isTTSRequest ? Self.pcmWAV() : Data("{}".utf8)
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: statusCode,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": isTTSRequest ? "audio/wav" : "application/json"]
+            )!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        }
+
+        override func stopLoading() {}
+
+        private static func pcmWAV() -> Data {
+            let sampleBytes = 32_000
+            var data = Data("RIFF".utf8)
+            appendUInt32(UInt32(36 + sampleBytes), to: &data)
+            data.append(Data("WAVEfmt ".utf8))
+            appendUInt32(16, to: &data)
+            appendUInt16(1, to: &data)
+            appendUInt16(1, to: &data)
+            appendUInt32(16_000, to: &data)
+            appendUInt32(32_000, to: &data)
+            appendUInt16(2, to: &data)
+            appendUInt16(16, to: &data)
+            data.append(Data("data".utf8))
+            appendUInt32(UInt32(sampleBytes), to: &data)
+            data.append(Data(repeating: 0, count: sampleBytes))
+            return data
+        }
+
+        private static func appendUInt16(_ value: UInt16, to data: inout Data) {
+            data.append(UInt8(value & 0xff))
+            data.append(UInt8((value >> 8) & 0xff))
+        }
+
+        private static func appendUInt32(_ value: UInt32, to data: inout Data) {
+            data.append(UInt8(value & 0xff))
+            data.append(UInt8((value >> 8) & 0xff))
+            data.append(UInt8((value >> 16) & 0xff))
+            data.append(UInt8((value >> 24) & 0xff))
+        }
+    }
+
     private final class FakePlayer: DialogueAudioPlaying {
         var playedPaths: [String] = []
         var error: Error?
@@ -435,6 +501,134 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         XCTAssertTrue(try store.load().pendingCleanupPaths.isEmpty)
         restartedCoordinator.shutdown()
         firstCoordinator.shutdown()
+    }
+
+    @MainActor
+    func testRetryStaleLineWhenProfileIsUnavailableReactivatesAndProcessesIt() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dialogue-unavailable-retry-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = (
+            gpt: "voice/assets/gpt/test.ckpt",
+            sovits: "voice/assets/sovits/test.pth",
+            reference: "voice/assets/reference/test.wav",
+            firstOutput: "voice/generated/stale-first.wav",
+            secondOutput: "voice/generated/stale-second.wav"
+        )
+        let secondLineID = UUID(uuidString: "66666666-7777-8888-9999-AAAAAAAAAAAA")!
+        for relativeDirectory in [
+            "voice/assets/gpt",
+            "voice/assets/sovits",
+            "voice/assets/reference",
+            "voice/generated",
+        ] {
+            try FileManager.default.createDirectory(
+                at: root.appendingPathComponent(relativeDirectory, isDirectory: true),
+                withIntermediateDirectories: true
+            )
+        }
+        try Data("gpt".utf8).write(to: root.appendingPathComponent(paths.gpt))
+        try Data("sovits".utf8).write(to: root.appendingPathComponent(paths.sovits))
+        try pcmWAV().write(to: root.appendingPathComponent(paths.reference))
+        try pcmWAV().write(to: root.appendingPathComponent(paths.firstOutput))
+        try pcmWAV().write(to: root.appendingPathComponent(paths.secondOutput))
+
+        let endpoint = try XCTUnwrap(URL(string: "http://127.0.0.1:9880"))
+        let provisionalProfile = try GPTSoVITSVoiceProfile(
+            id: UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!,
+            name: "Retry voice",
+            apiBaseURL: endpoint,
+            gptWeightRelativePath: paths.gpt,
+            sovitsWeightRelativePath: paths.sovits,
+            referenceAudioRelativePath: paths.reference,
+            referenceText: "Reference",
+            promptLanguage: "en",
+            defaultTextLanguage: "en",
+            inputFingerprint: String(repeating: "0", count: 64)
+        )
+        let validated = try DialogueVoiceProfileFingerprint.validateAssets(
+            profile: provisionalProfile,
+            applicationSupportRoot: root
+        )
+        let profile = try GPTSoVITSVoiceProfile(
+            id: provisionalProfile.id,
+            name: provisionalProfile.name,
+            apiBaseURL: endpoint,
+            gptWeightRelativePath: paths.gpt,
+            sovitsWeightRelativePath: paths.sovits,
+            referenceAudioRelativePath: paths.reference,
+            referenceText: provisionalProfile.referenceText,
+            promptLanguage: provisionalProfile.promptLanguage,
+            defaultTextLanguage: provisionalProfile.defaultTextLanguage,
+            inputFingerprint: DialogueVoiceProfileFingerprint.compute(
+                apiBaseURL: endpoint,
+                referenceText: provisionalProfile.referenceText,
+                promptLanguage: provisionalProfile.promptLanguage,
+                defaultTextLanguage: provisionalProfile.defaultTextLanguage,
+                assetDigests: validated.digests
+            )
+        )
+        var library = try DialogueVoiceLibrary(profile: profile)
+        _ = try library.addLine(text: "Retry me", id: lineID)
+        let firstTicket = try library.beginGeneration(for: lineID)
+        _ = try library.completeGeneration(ticket: firstTicket, outputPath: paths.firstOutput)
+        _ = try library.addLine(text: "Reactivate me too", id: secondLineID)
+        let secondTicket = try library.beginGeneration(for: secondLineID)
+        _ = try library.completeGeneration(ticket: secondTicket, outputPath: paths.secondOutput)
+        try library.setProfileStatus(.unavailable, invalidatingOutputs: true)
+        let store = DialogueVoiceStore(
+            rootURL: root.appendingPathComponent("voice", isDirectory: true)
+        )
+        try store.save(library)
+
+        UnavailableThenSuccessfulGPTSoVITSURLProtocol.reset()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [UnavailableThenSuccessfulGPTSoVITSURLProtocol.self]
+        let coordinator = DialogueVoiceCoordinator(
+            applicationSupportRoot: root,
+            client: GPTSoVITSAPIClient(configuration: configuration)
+        )
+        defer { coordinator.shutdown() }
+        let unavailable = expectation(description: "saved profile becomes unavailable")
+        coordinator.onChange = { snapshot in
+            guard snapshot.library.profileStatus == .unavailable,
+                  snapshot.library.lines.count == 2,
+                  snapshot.library.lines.allSatisfy({ $0.status == .stale }) else {
+                return
+            }
+            unavailable.fulfill()
+        }
+        coordinator.start()
+        await fulfillment(of: [unavailable], timeout: 5)
+
+        let generated = expectation(description: "stale retry is processed")
+        coordinator.onChange = { snapshot in
+            guard snapshot.library.lines.count == 2,
+                  snapshot.library.lines.allSatisfy({ $0.status == .ready }) else {
+                return
+            }
+            generated.fulfill()
+        }
+        try coordinator.retryLine(id: lineID)
+        await fulfillment(of: [generated], timeout: 10)
+
+        let readyLine = try XCTUnwrap(
+            coordinator.library.lines.first(where: { $0.id == lineID })
+        )
+        XCTAssertEqual(readyLine.status, .ready)
+        let secondReadyLine = try XCTUnwrap(
+            coordinator.library.lines.first(where: { $0.id == secondLineID })
+        )
+        XCTAssertEqual(secondReadyLine.status, .ready)
+        XCTAssertNotEqual(readyLine.outputRelativePath, paths.firstOutput)
+        XCTAssertNotEqual(secondReadyLine.outputRelativePath, paths.secondOutput)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: root.appendingPathComponent(paths.firstOutput).path)
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: root.appendingPathComponent(paths.secondOutput).path)
+        )
+        XCTAssertTrue(try store.load().pendingCleanupPaths.isEmpty)
     }
 
     @MainActor

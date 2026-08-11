@@ -200,6 +200,19 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         self.assertIn("line.status == .failed || line.status == .stale", retry_action)
         self.assertIn("onRetryLine?(line)", retry_action)
 
+    def test_unavailable_stale_retry_uses_profile_activation_without_retrying_queued_state(self) -> None:
+        retry = method_body(self.coordinator, "    func retryLine")
+        self.assertIn("let selectedWasStale", retry)
+        self.assertIn("$0.activateValidatedProfile()", retry)
+        self.assertIn("if selectedWasStale", retry)
+        self.assertIn("activatedLine.status == .queued", retry)
+        self.assertIn("line = try $0.retryLine(id: id)", retry)
+        self.assertLess(
+            retry.index("$0.activateValidatedProfile()"),
+            retry.index("if selectedWasStale"),
+        )
+        self.assertIn("previousOutputPaths.subtracting(retainedOutputPaths).sorted()", retry)
+
     def test_background_refresh_preserves_dirty_settings_editors(self) -> None:
         update = method_body(self.voice_view, "    func update")
         self.assertIn("let preserveProfileEdits = profileEditorIsDirty", update)

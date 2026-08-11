@@ -467,13 +467,24 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     func retryLine(id: UUID) throws {
         assertMainThread()
         guard !persistenceBlocked else { throw DialogueVoiceError.storeFailure }
-        let oldOutput = library.lines.first(where: { $0.id == id })?.outputRelativePath
         _ = try commit {
+            let previousOutputPaths = Set($0.lines.compactMap(\.outputRelativePath))
+            let selectedWasStale = $0.lines.first(where: { $0.id == id })?.status == .stale
             if $0.profileStatus == .unavailable {
                 _ = try $0.activateValidatedProfile()
             }
-            let line = try $0.retryLine(id: id)
-            try $0.enqueueCleanup(paths: oldOutput.map { [$0] } ?? [])
+            let line: DialogueLine
+            if selectedWasStale,
+               let activatedLine = $0.lines.first(where: { $0.id == id }),
+               activatedLine.status == .queued {
+                line = activatedLine
+            } else {
+                line = try $0.retryLine(id: id)
+            }
+            let retainedOutputPaths = Set($0.lines.compactMap(\.outputRelativePath))
+            try $0.enqueueCleanup(
+                paths: previousOutputPaths.subtracting(retainedOutputPaths).sorted()
+            )
             return line
         }
         let cleanup = retryPendingCleanup()
