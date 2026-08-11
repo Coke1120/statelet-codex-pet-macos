@@ -389,6 +389,7 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             preserving: coordinator.draft
         )
         await fulfillment(of: [imported], timeout: 5)
+        coordinator.onChange = nil
         let relativePath = try XCTUnwrap(coordinator.importedAssets.gptWeightRelativePath)
 
         try coordinator.updateLine(id: lineID, text: "After", language: "en")
