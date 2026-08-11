@@ -439,6 +439,7 @@ private final class MP4DropZoneView: NSView {
 final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDelegate {
     private struct RowUpdateKey: Equatable {
         let selectedState: PetState
+        let characterName: String
         let playlist: StateMediaPlaylist?
         let mapURL: URL
         let selectedPreviewPath: String?
@@ -761,6 +762,7 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
 
         let rowUpdateKey = RowUpdateKey(
             selectedState: selectedState,
+            characterName: characterName,
             playlist: playlist,
             mapURL: mapURL.standardizedFileURL,
             selectedPreviewPath: preview?.state == selectedState ? preview?.path : nil,

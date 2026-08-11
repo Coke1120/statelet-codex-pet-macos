@@ -271,6 +271,28 @@ class CharacterProfileUIHarnessTests(unittest.TestCase):
                         table.accessibilityLabel() == "Chloe, Idle animation clips",
                         "animation table accessibility is not character-scoped"
                     )
+
+                    library.update(
+                        selectedState: .idle,
+                        currentState: .idle,
+                        playlist: playlist,
+                        counts: [.idle: 1],
+                        mapURL: mediaDirectory.appendingPathComponent("media-map.json"),
+                        mediaMap: mediaMap,
+                        preview: nil,
+                        reduceMotion: false,
+                        busy: false,
+                        importEnabled: true,
+                        characterName: "Nova"
+                    )
+                    try require(
+                        table.accessibilityLabel() == "Nova, Idle animation clips",
+                        "rename-only update left the animation table accessibility label stale"
+                    )
+                    try require(
+                        table.accessibilityHelp() == "1 clips for Nova, Idle. Use the arrow keys to select a clip, or double-click a row to preview it.",
+                        "rename-only update left the animation table accessibility help stale"
+                    )
                     print("character-profile-ui-ok")
                 }
             }
