@@ -177,6 +177,208 @@ final class ManagedMediaTrashRevalidationTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.movieURL.path))
     }
 
+    func testLibrarySnapshotRejectsInactiveMapChangedAfterActivePublish() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let inactiveURL = fixture.root.appendingPathComponent(".character-other.media-map.json")
+        let inactive = try MediaMap(states: [PetState: StateMediaPlaylist]())
+        try writeMap(inactive, to: inactiveURL)
+        let snapshot = try ManagedMediaTrashRevalidator.captureLibrary(
+            targetURLs: [fixture.movieURL],
+            maps: [
+                ManagedMediaTrashMap(url: fixture.mapURL, map: fixture.map),
+                ManagedMediaTrashMap(url: inactiveURL, map: inactive),
+            ],
+            catalogURL: nil,
+            canonicalRoot: fixture.root
+        )
+        let published = try MediaMap(states: [PetState: StateMediaPlaylist]())
+        try writeMap(published, to: fixture.mapURL)
+        try writeMap(
+            try MediaMap(states: [.review: try MediaEntry(path: fixture.relativeMoviePath)]),
+            to: inactiveURL
+        )
+
+        XCTAssertThrowsError(
+            try ManagedMediaTrashRevalidator.quarantineLibraryAfterPublish(
+                snapshot: snapshot,
+                publishedMap: ManagedMediaTrashMap(url: fixture.mapURL, map: published),
+                canonicalRoot: fixture.root
+            )
+        ) { error in
+            XCTAssertEqual(error as? ManagedMediaTrashRevalidationError, .mediaMapChangedBeforePublish)
+        }
+    }
+
+    func testLibrarySnapshotRejectsCatalogMutation() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let catalogURL = fixture.root.appendingPathComponent("character-library.json")
+        try Data("catalog-a".utf8).write(to: catalogURL)
+        let snapshot = try ManagedMediaTrashRevalidator.captureLibrary(
+            targetURLs: [fixture.movieURL],
+            maps: [ManagedMediaTrashMap(url: fixture.mapURL, map: fixture.map)],
+            catalogURL: catalogURL,
+            canonicalRoot: fixture.root
+        )
+        try Data("catalog-b".utf8).write(to: catalogURL, options: .atomic)
+
+        XCTAssertThrowsError(
+            try ManagedMediaTrashRevalidator.validateLibraryUnchanged(
+                snapshot: snapshot,
+                canonicalRoot: fixture.root
+            )
+        ) { error in
+            XCTAssertEqual(error as? ManagedMediaTrashRevalidationError, .mediaMapChangedBeforePublish)
+        }
+    }
+
+    func testLibrarySnapshotRejectsCatalogCreatedAfterAbsentCapture() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let catalogURL = fixture.root.appendingPathComponent("character-library.json")
+        let snapshot = try ManagedMediaTrashRevalidator.captureLibrary(
+            targetURLs: [fixture.movieURL],
+            maps: [ManagedMediaTrashMap(url: fixture.mapURL, map: fixture.map)],
+            catalogURL: catalogURL,
+            canonicalRoot: fixture.root
+        )
+        try Data("new catalog".utf8).write(to: catalogURL)
+
+        XCTAssertThrowsError(
+            try ManagedMediaTrashRevalidator.validateLibraryUnchanged(
+                snapshot: snapshot,
+                canonicalRoot: fixture.root
+            )
+        ) { error in
+            XCTAssertEqual(error as? ManagedMediaTrashRevalidationError, .mediaMapChangedBeforePublish)
+        }
+    }
+
+    func testLibrarySnapshotRejectsSymlinkedMap() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let realURL = fixture.root.appendingPathComponent("real-map.json")
+        let linkURL = fixture.root.appendingPathComponent("linked-map.json")
+        try writeMap(fixture.map, to: realURL)
+        try FileManager.default.createSymbolicLink(at: linkURL, withDestinationURL: realURL)
+
+        XCTAssertThrowsError(
+            try ManagedMediaTrashRevalidator.captureLibrary(
+                targetURLs: [fixture.movieURL],
+                maps: [ManagedMediaTrashMap(url: linkURL, map: fixture.map)],
+                catalogURL: nil,
+                canonicalRoot: fixture.root
+            )
+        ) { error in
+            XCTAssertEqual(error as? ManagedMediaTrashRevalidationError, .unsafeConfiguration)
+        }
+    }
+
+    func testQuarantineAtomicallyStagesVerifiedTargets() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let snapshot = try ManagedMediaTrashRevalidator.captureLibrary(
+            targetURLs: [fixture.movieURL, fixture.reportURL],
+            maps: [ManagedMediaTrashMap(url: fixture.mapURL, map: fixture.map)],
+            catalogURL: nil,
+            canonicalRoot: fixture.root
+        )
+        let published = try MediaMap(states: [PetState: StateMediaPlaylist]())
+        try writeMap(published, to: fixture.mapURL)
+
+        let quarantine = try ManagedMediaTrashRevalidator.quarantineLibraryAfterPublish(
+            snapshot: snapshot,
+            publishedMap: ManagedMediaTrashMap(url: fixture.mapURL, map: published),
+            canonicalRoot: fixture.root
+        )
+
+        XCTAssertEqual(quarantine.itemCount, 2)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.movieURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.reportURL.path))
+        let quarantined = try FileManager.default.contentsOfDirectory(
+            at: quarantine.directoryURL,
+            includingPropertiesForKeys: nil
+        )
+        XCTAssertEqual(quarantined.count, 2)
+    }
+
+    func testQuarantineRollsBackEarlierTargetsAndPreservesLaterReplacement() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let originalMovie = try Data(contentsOf: fixture.movieURL)
+        let snapshot = try ManagedMediaTrashRevalidator.captureLibrary(
+            targetURLs: [fixture.movieURL, fixture.reportURL],
+            maps: [ManagedMediaTrashMap(url: fixture.mapURL, map: fixture.map)],
+            catalogURL: nil,
+            canonicalRoot: fixture.root
+        )
+        let published = try MediaMap(states: [PetState: StateMediaPlaylist]())
+        try writeMap(published, to: fixture.mapURL)
+        let replacement = Data("replacement report".utf8)
+
+        XCTAssertThrowsError(
+            try ManagedMediaTrashRevalidator.quarantineLibraryAfterPublish(
+                snapshot: snapshot,
+                publishedMap: ManagedMediaTrashMap(url: fixture.mapURL, map: published),
+                canonicalRoot: fixture.root,
+                beforeStagingTarget: { index, _ in
+                    guard index == 1 else { return }
+                    try FileManager.default.removeItem(at: fixture.reportURL)
+                    try replacement.write(to: fixture.reportURL)
+                }
+            )
+        ) { error in
+            XCTAssertEqual(error as? ManagedMediaTrashRevalidationError, .targetChanged)
+        }
+
+        XCTAssertEqual(try Data(contentsOf: fixture.movieURL), originalMovie)
+        XCTAssertEqual(try Data(contentsOf: fixture.reportURL), replacement)
+        let quarantineNames = try FileManager.default.contentsOfDirectory(atPath: fixture.root.path)
+            .filter { $0.hasPrefix("Statelet Removed Media ") }
+        XCTAssertTrue(quarantineNames.isEmpty)
+    }
+
+    func testQuarantineRollbackPreservesReplacementCreatedAtAlreadyStagedPath() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let originalMovie = try Data(contentsOf: fixture.movieURL)
+        let snapshot = try ManagedMediaTrashRevalidator.captureLibrary(
+            targetURLs: [fixture.movieURL, fixture.reportURL],
+            maps: [ManagedMediaTrashMap(url: fixture.mapURL, map: fixture.map)],
+            catalogURL: nil,
+            canonicalRoot: fixture.root
+        )
+        let published = try MediaMap(states: [PetState: StateMediaPlaylist]())
+        try writeMap(published, to: fixture.mapURL)
+        let replacement = Data("concurrent replacement".utf8)
+
+        XCTAssertThrowsError(
+            try ManagedMediaTrashRevalidator.quarantineLibraryAfterPublish(
+                snapshot: snapshot,
+                publishedMap: ManagedMediaTrashMap(url: fixture.mapURL, map: published),
+                canonicalRoot: fixture.root,
+                beforeStagingTarget: { index, _ in
+                    guard index == 1 else { return }
+                    try replacement.write(to: fixture.movieURL)
+                    try FileManager.default.removeItem(at: fixture.reportURL)
+                    try Data("changed report".utf8).write(to: fixture.reportURL)
+                }
+            )
+        )
+        XCTAssertEqual(try Data(contentsOf: fixture.movieURL), originalMovie)
+        let siblingNames = try FileManager.default.contentsOfDirectory(
+            atPath: fixture.movieURL.deletingLastPathComponent().path
+        )
+        let preserved = try XCTUnwrap(
+            siblingNames.first { $0.hasPrefix("Statelet Preserved Replacement ") }
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: fixture.movieURL.deletingLastPathComponent().appendingPathComponent(preserved)),
+            replacement
+        )
+    }
+
     private func makeFixture() throws -> Fixture {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("codex-pet-trash-revalidation-\(UUID().uuidString)", isDirectory: true)

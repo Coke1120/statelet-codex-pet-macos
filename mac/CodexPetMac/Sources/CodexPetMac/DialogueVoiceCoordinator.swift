@@ -90,6 +90,13 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         case manual
     }
 
+    typealias QwenPackageInstall = @Sendable (
+        URL,
+        URL,
+        String,
+        URL
+    ) throws -> (Qwen3TTSImportedPackage, Qwen3TTSPythonRuntimeIdentity)
+
     private let logger = Logger(subsystem: StateletIdentity.bundleIdentifier, category: "dialogue-voice")
     private let applicationSupportRoot: URL
     private let store: DialogueVoiceStore
@@ -101,6 +108,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     private let playbackService: DialogueReadyPlaybackService
     private let randomIndex: @Sendable (Int) -> Int
     private let sleepForInterval: @Sendable (TimeInterval) async throws -> Void
+    private let qwenPackageInstall: QwenPackageInstall
 
     private(set) var library: DialogueVoiceLibrary
     private(set) var draft: DialogueVoiceProfileDraft
@@ -119,6 +127,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     private var lastNotifiedLibrary: DialogueVoiceLibrary?
     private var activeTicket: DialogueGenerationTicket?
     private var activeImportTask: Task<Void, Never>?
+    private var inFlightQwenPackagePaths: Set<String> = []
     private var profileValidationTask: Task<Void, Never>?
     private var validatedProviderIdentity: ValidatedProviderIdentity?
     private var profileValidationSequence: UInt64 = 0
@@ -142,6 +151,14 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         client: GPTSoVITSAPIClient = GPTSoVITSAPIClient(),
         qwenClient: Qwen3TTSClient = Qwen3TTSClient(),
         audioPlayer: DialogueAudioPlaying = DialogueAudioPlayer(),
+        qwenPackageInstall: @escaping QwenPackageInstall = { sourceURL, root, token, pythonURL in
+            let imported = try Qwen3TTSPackageInstaller(
+                applicationSupportRoot: root
+            ).install(sourceURL: sourceURL, destinationToken: token)
+            try Task.checkCancellation()
+            let runtime = try Qwen3TTSProfileValidator.validatePythonExecutable(at: pythonURL)
+            return (imported, runtime)
+        },
         randomIndex: @escaping @Sendable (Int) -> Int = { upperBound in
             Int.random(in: 0..<upperBound)
         },
@@ -158,6 +175,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         self.client = client
         self.qwenClient = qwenClient
         self.audioPlayer = audioPlayer
+        self.qwenPackageInstall = qwenPackageInstall
         self.randomIndex = randomIndex
         self.sleepForInterval = sleepForInterval
         playbackService = DialogueReadyPlaybackService(
@@ -281,7 +299,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         activeVoicePlayback = nil
         audioPlayer.stop()
         if !persistenceBlocked {
-            _ = retryPendingCleanup(preserving: [])
+            _ = retryPendingCleanup()
         }
     }
 
@@ -352,53 +370,68 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         importSequence &+= 1
         let sequence = importSequence
         activityMessage = "Importing and validating the private Qwen handover package…"
+        let token = UUID().uuidString.lowercased()
+        let managedPaths: (destination: String, staging: String)
+        do {
+            managedPaths = try Qwen3TTSPackageInstaller.managedRelativePaths(
+                destinationToken: token
+            )
+        } catch {
+            activityMessage = "The Qwen import could not reserve private storage."
+            logger.error("event=qwen_package_import_failed code=INVALID_MANAGED_PATH")
+            notify()
+            return
+        }
+        let reservedPaths = Set([managedPaths.destination, managedPaths.staging])
+        do {
+            var updated = library
+            try updated.enqueueCleanup(paths: reservedPaths.sorted())
+            try store.save(updated)
+            library = updated
+        } catch {
+            persistenceBlocked = true
+            activityMessage = "The Qwen import could not reserve durable cleanup ownership."
+            logger.error("event=qwen_package_import_failed code=STORE_FAILURE")
+            notify()
+            return
+        }
+        inFlightQwenPackagePaths.formUnion(reservedPaths)
         notify()
 
         let root = applicationSupportRoot
-        activeImportTask = Task.detached(priority: .userInitiated) { [self] in
-            var installedPackage: Qwen3TTSImportedPackage?
+        let qwenPackageInstall = qwenPackageInstall
+        activeImportTask = Task.detached(priority: .userInitiated) {
             let result: Result<
                 (Qwen3TTSImportedPackage, Qwen3TTSPythonRuntimeIdentity),
                 DialogueVoiceRuntimeError
             >
             do {
-                let imported = try Qwen3TTSPackageInstaller(
-                    applicationSupportRoot: root
-                ).install(sourceURL: sourceURL)
-                installedPackage = imported
-                try Task.checkCancellation()
-                let runtime = try Qwen3TTSProfileValidator.validatePythonExecutable(
-                    at: pythonExecutableURL
-                )
-                result = .success((imported, runtime))
+                result = .success(try qwenPackageInstall(
+                    sourceURL,
+                    root,
+                    token,
+                    pythonExecutableURL
+                ))
             } catch let error as DialogueVoiceRuntimeError {
-                if let installedPackage {
-                    try? Qwen3TTSPackageInstaller(
-                        applicationSupportRoot: root
-                    ).removeManagedPackage(relativePath: installedPackage.packageRootRelativePath)
-                }
                 result = .failure(error)
             } catch is CancellationError {
-                if let installedPackage {
-                    try? Qwen3TTSPackageInstaller(
-                        applicationSupportRoot: root
-                    ).removeManagedPackage(relativePath: installedPackage.packageRootRelativePath)
-                }
                 result = .failure(.cancelled)
             } catch {
-                if let installedPackage {
-                    try? Qwen3TTSPackageInstaller(
-                        applicationSupportRoot: root
-                    ).removeManagedPackage(relativePath: installedPackage.packageRootRelativePath)
-                }
                 result = .failure(.profileRejected)
             }
             await MainActor.run {
+                self.inFlightQwenPackagePaths.subtract(reservedPaths)
                 guard sequence == self.importSequence else {
-                    if case let .success((imported, _)) = result {
-                        try? Qwen3TTSPackageInstaller(
-                            applicationSupportRoot: root
-                        ).removeManagedPackage(relativePath: imported.packageRootRelativePath)
+                    // This detached importer has now stopped using its reserved
+                    // paths. Its durable journal can be retried without risking
+                    // a concurrent copy from this attempt.
+                    let cleanup = self.retryPendingCleanup()
+                    if cleanup.requiresNotice {
+                        self.activityMessage = self.cleanupAwareMessage(
+                            "An outdated Qwen package import was discarded.",
+                            outcome: cleanup
+                        )
+                        self.notify()
                     }
                     return
                 }
@@ -406,7 +439,11 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                 switch result {
                 case let .success((imported, runtime)):
                     do {
-                        try self.activateImportedQwenProfile(imported, runtime: runtime)
+                        try self.activateImportedQwenProfile(
+                            imported,
+                            stagingRelativePath: managedPaths.staging,
+                            runtime: runtime
+                        )
                     } catch {
                         let persistedLibrary: DialogueVoiceLibrary?
                         let storeWasReadable: Bool
@@ -423,10 +460,11 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                             self.library = persistedLibrary
                             self.activityMessage = "The Qwen profile was saved, but storage durability could not be confirmed. Restart Statelet before editing voice settings again."
                         } else if storeWasReadable {
-                            try? Qwen3TTSPackageInstaller(
-                                applicationSupportRoot: root
-                            ).removeManagedPackage(relativePath: imported.packageRootRelativePath)
-                            self.activityMessage = "The Qwen package was validated but its profile could not be saved. The imported copy was removed."
+                            let cleanup = self.retryPendingCleanup()
+                            self.activityMessage = self.cleanupAwareMessage(
+                                "The Qwen package was validated but its profile could not be saved.",
+                                outcome: cleanup
+                            )
                         } else {
                             self.activityMessage = "Qwen profile storage is unreadable, so the imported package was preserved to avoid data loss. Restore the voice library before editing settings again."
                         }
@@ -435,7 +473,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                         self.notify()
                     }
                 case let .failure(error):
-                    self.activityMessage = error.localizedDescription
+                    let cleanup = self.retryPendingCleanup()
+                    self.activityMessage = self.cleanupAwareMessage(error.localizedDescription, outcome: cleanup)
                     self.logger.error("event=qwen_package_import_failed code=\(error.safeCode, privacy: .public)")
                     self.notify()
                 }
@@ -536,6 +575,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
 
     private func activateImportedQwenProfile(
         _ imported: Qwen3TTSImportedPackage,
+        stagingRelativePath: String,
         runtime: Qwen3TTSPythonRuntimeIdentity
     ) throws {
         let previous = library.qwenProfile
@@ -575,19 +615,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             )
         )
 
-        profileValidationTask?.cancel()
-        profileValidationSequence &+= 1
-        profileValidationTask = nil
-        validatedProviderIdentity = nil
-        activeGenerationTask?.cancel()
-        activeGenerationTask = nil
-        activeTicket = nil
-        cancelAutomaticPlayback()
-        voicePlaybackSequence &+= 1
-        activeVoicePlayback = nil
-        audioPlayer.stop()
-
-        let priorOutputs = library.lines.compactMap(\.outputRelativePath)
+        let activatesQwen = library.activeProviderKind != .gptSovits
+        let priorOutputs = activatesQwen ? library.lines.compactMap(\.outputRelativePath) : []
         let replacedPackage: [String]
         if let previousPath = previous?.packageRootRelativePath,
            previousPath != profile.packageRootRelativePath {
@@ -597,24 +626,43 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         }
         var updated = library
         try updated.replacePendingCleanupPaths(
-            updated.pendingCleanupPaths.filter { $0 != profile.packageRootRelativePath }
+            updated.pendingCleanupPaths.filter {
+                $0 != profile.packageRootRelativePath && $0 != stagingRelativePath
+            }
         )
-        try updated.replaceActiveProfile(profile)
-        for line in updated.lines where line.status == .stale {
-            _ = try updated.retryLine(id: line.id)
+        if activatesQwen {
+            profileValidationTask?.cancel()
+            profileValidationSequence &+= 1
+            profileValidationTask = nil
+            validatedProviderIdentity = nil
+            activeGenerationTask?.cancel()
+            activeGenerationTask = nil
+            activeTicket = nil
+            cancelAutomaticPlayback()
+            voicePlaybackSequence &+= 1
+            activeVoicePlayback = nil
+            audioPlayer.stop()
+            try updated.replaceActiveProfile(profile)
+            for line in updated.lines where line.status == .stale {
+                _ = try updated.retryLine(id: line.id)
+            }
+            try updated.setProfileStatus(.validating)
+        } else {
+            try updated.replaceConfiguredProfile(profile)
         }
-        try updated.setProfileStatus(.validating)
         try updated.enqueueCleanup(paths: priorOutputs + replacedPackage)
         try store.save(updated)
         library = updated
         let cleanup = retryPendingCleanup()
         activityMessage = cleanupAwareMessage(
-            "Qwen3-TTS profile saved. Validating the private package and local Python runtime…",
+            activatesQwen
+                ? "Qwen3-TTS profile saved. Validating the private package and local Python runtime…"
+                : "Qwen3-TTS profile saved. Use Qwen3-TTS when you want to switch providers.",
             outcome: cleanup
         )
         logger.info("event=profile_saved provider=qwen3_tts revision=\(profile.revision, privacy: .public)")
         notify()
-        validatePersistedProfile(profile)
+        if activatesQwen { validatePersistedProfile(profile) }
     }
 
     func removeProfile() throws {
@@ -697,7 +745,11 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         try updated.enqueueCleanup(paths: generatedPaths + managedAssetPaths.sorted())
         try store.save(updated)
         library = updated
-        let cleanup = retryPendingCleanup(preserving: [])
+        let cleanup = retryPendingCleanup(
+            preserving: removedProvider == .gptSovits
+                ? inFlightQwenPackagePaths
+                : cleanupPreservationPaths
+        )
         if removedProvider == .gptSovits {
             importedAssets = DialogueVoiceImportedAssets()
             draft = DialogueVoiceProfileDraft(
@@ -1606,7 +1658,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             importedAssets.referenceAudioRelativePath = asset.relativePath
             importedAssets.referenceAudioDigest = asset.contentDigest
         }
-        return retryPendingCleanup(preserving: stagedImportedPaths)
+        return retryPendingCleanup(preserving: cleanupPreservationPaths)
     }
 
     private var stagedImportedPaths: Set<String> {
@@ -1616,6 +1668,10 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             importedAssets.sovitsWeightRelativePath,
             importedAssets.referenceAudioRelativePath,
         ].compactMap { $0 }).subtracting(activePaths)
+    }
+
+    private var cleanupPreservationPaths: Set<String> {
+        stagedImportedPaths.union(inFlightQwenPackagePaths)
     }
 
     private func discardUnpersistedAsset(_ path: String) -> CleanupOutcome {
@@ -1728,7 +1784,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     private func retryPendingCleanup(preserving preservedPaths: Set<String>? = nil) -> CleanupOutcome {
         let candidates = library.pendingCleanupPaths
         guard !candidates.isEmpty else { return .complete }
-        let preservedPaths = preservedPaths ?? stagedImportedPaths
+        let preservedPaths = preservedPaths ?? cleanupPreservationPaths
         let referencedPaths = library.referencedManagedPaths
         guard Set(candidates).isDisjoint(with: referencedPaths) else {
             persistenceBlocked = true

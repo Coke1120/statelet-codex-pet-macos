@@ -355,7 +355,7 @@ final class PetPlayerView: NSView {
         )
         quickControls.orientation = .vertical
         quickControls.alignment = .centerX
-        quickControls.spacing = 3
+        quickControls.spacing = 6
         quickControls.translatesAutoresizingMaskIntoConstraints = true
         quickControls.setViews([nextClipButton, temporaryStateButton], in: .leading)
         quickControls.setAccessibilityElement(true)
@@ -392,15 +392,15 @@ final class PetPlayerView: NSView {
     ) {
         button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)
         button.imagePosition = .imageOnly
-        button.bezelStyle = .inline
-        button.controlSize = .small
-        button.showsBorderOnlyWhileMouseInside = true
-        button.contentTintColor = .secondaryLabelColor
+        button.bezelStyle = .texturedRounded
+        button.controlSize = .regular
+        button.showsBorderOnlyWhileMouseInside = false
+        button.contentTintColor = .labelColor
         button.target = self
         button.action = action
         button.translatesAutoresizingMaskIntoConstraints = false
-        button.widthAnchor.constraint(equalToConstant: 28).isActive = true
-        button.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        button.widthAnchor.constraint(equalToConstant: 40).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 40).isActive = true
         button.setAccessibilityLabel(accessibilityLabel)
     }
 
@@ -661,6 +661,15 @@ final class PetPlayerView: NSView {
     }
 
     @objc private func showTemporaryStateMenu() {
+        let menu = makeTemporaryStateMenu()
+        menu.popUp(
+            positioning: menu.items.first(where: { $0.state == .on }),
+            at: NSPoint(x: temporaryStateButton.bounds.minX, y: temporaryStateButton.bounds.maxY + 2),
+            in: temporaryStateButton
+        )
+    }
+
+    func makeTemporaryStateMenu() -> NSMenu {
         let menu = NSMenu(title: "Temporary State")
         for (index, state) in PetState.allCases.enumerated() {
             let item = NSMenuItem(
@@ -687,14 +696,10 @@ final class PetPlayerView: NSView {
         returnItem.isEnabled = manualPreviewState != nil
         returnItem.setAccessibilityLabel("Return to live \(liveState.rawValue) state")
         menu.addItem(returnItem)
-        menu.popUp(
-            positioning: menu.items.first(where: { $0.state == .on }),
-            at: NSPoint(x: temporaryStateButton.bounds.minX, y: temporaryStateButton.bounds.maxY + 2),
-            in: temporaryStateButton
-        )
+        return menu
     }
 
-    @objc private func selectTemporaryState(_ sender: NSMenuItem) {
+    @objc func selectTemporaryState(_ sender: NSMenuItem) {
         guard let rawValue = sender.representedObject as? String,
               let state = PetState(rawValue: rawValue) else { return }
         onTemporaryStateSelection?(state)

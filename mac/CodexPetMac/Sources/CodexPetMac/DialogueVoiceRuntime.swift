@@ -145,7 +145,6 @@ enum Qwen3TTSLanguage {
 struct Qwen3TTSPackageInstaller: Sendable {
     private struct SourceFile {
         let relativePath: String
-        let url: URL
         let identity: DialogueVoiceFileIdentity
         let size: UInt64
     }
@@ -182,25 +181,59 @@ struct Qwen3TTSPackageInstaller: Sendable {
     static let maximumPackageBytes: UInt64 = 4_294_967_296
     let applicationSupportRoot: URL
 
-    func install(sourceURL: URL) throws -> Qwen3TTSImportedPackage {
+    static func managedRelativePaths(destinationToken token: String) throws -> (
+        destination: String,
+        staging: String
+    ) {
+        guard UUID(uuidString: token) != nil, token == token.lowercased() else {
+            throw DialogueVoiceRuntimeError.invalidManagedPath
+        }
+        return (
+            destination: "voice/packages/qwen/\(token)",
+            staging: "voice/packages/qwen/.\(token).partial"
+        )
+    }
+
+    static func checkedAggregateSize(
+        _ sizes: some Sequence<UInt64>,
+        maximum: UInt64 = maximumPackageBytes
+    ) throws -> UInt64 {
+        var total: UInt64 = 0
+        for size in sizes {
+            let (next, overflow) = total.addingReportingOverflow(size)
+            guard !overflow, next <= maximum else {
+                throw DialogueVoiceRuntimeError.sourceTooLarge
+            }
+            total = next
+        }
+        guard total > 0 else { throw DialogueVoiceRuntimeError.sourceTooLarge }
+        return total
+    }
+
+    func install(sourceURL: URL, destinationToken: String? = nil) throws -> Qwen3TTSImportedPackage {
         try Task.checkCancellation()
         guard sourceURL.isFileURL else { throw DialogueVoiceRuntimeError.invalidSource }
+        let rootDescriptor = Darwin.open(
+            sourceURL.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard rootDescriptor >= 0 else { throw DialogueVoiceRuntimeError.invalidSource }
+        defer { Darwin.close(rootDescriptor) }
         var rootStatus = stat()
-        guard Darwin.lstat(sourceURL.path, &rootStatus) == 0,
+        guard Darwin.fstat(rootDescriptor, &rootStatus) == 0,
               rootStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
             throw DialogueVoiceRuntimeError.invalidSource
         }
         let rootIdentity = DialogueVoiceFileIdentity(rootStatus)
-        let files = try enumerate(sourceURL)
-        let total = files.reduce(UInt64(0)) { $0 + $1.size }
-        guard total > 0, total <= Self.maximumPackageBytes else {
-            throw DialogueVoiceRuntimeError.sourceTooLarge
-        }
+        let files = try enumerate(rootDescriptor)
+        let total = try Self.checkedAggregateSize(files.lazy.map(\.size))
         let required = ["model/model.safetensors", "config.json", "generate.py"]
         guard required.allSatisfy({ name in files.contains(where: { $0.relativePath == name }) }) else {
             throw DialogueVoiceRuntimeError.invalidSource
         }
-        let configData = try boundedRead(sourceURL.appendingPathComponent("config.json"), maximum: 1_048_576)
+        let configData = try boundedRead(
+            relativePath: "config.json", rootDescriptor: rootDescriptor, maximum: 1_048_576
+        )
         let config = try JSONDecoder().decode(HandoverConfig.self, from: configData)
         guard config.modelPath == "model",
               config.referenceAudio.hasPrefix("reference/"),
@@ -224,50 +257,141 @@ struct Qwen3TTSPackageInstaller: Sendable {
 
         let packagesRoot = applicationSupportRoot.appendingPathComponent("voice/packages/qwen", isDirectory: true)
         try DialogueVoiceAssetInstaller.ensurePrivateDirectory(packagesRoot)
-        let token = UUID().uuidString.lowercased()
-        let stage = packagesRoot.appendingPathComponent(".\(token).partial", isDirectory: true)
-        let destination = packagesRoot.appendingPathComponent(token, isDirectory: true)
-        try DialogueVoiceAssetInstaller.ensurePrivateDirectory(stage)
+        let packagesDescriptor = Darwin.open(
+            packagesRoot.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard packagesDescriptor >= 0 else { throw DialogueVoiceRuntimeError.copyFailed }
+        defer { Darwin.close(packagesDescriptor) }
+        var packagesStatus = stat()
+        guard Darwin.fstat(packagesDescriptor, &packagesStatus) == 0,
+              packagesStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
+            throw DialogueVoiceRuntimeError.copyFailed
+        }
+        let token = destinationToken ?? UUID().uuidString.lowercased()
+        let managedPaths = try Self.managedRelativePaths(destinationToken: token)
+        let stageName = ".\(token).partial"
+        let destinationName = token
+        guard stageName.withCString({ Darwin.mkdirat(packagesDescriptor, $0, 0o700) }) == 0 else {
+            throw DialogueVoiceRuntimeError.copyFailed
+        }
+        let stageDescriptor = stageName.withCString {
+            Darwin.openat(
+                packagesDescriptor,
+                $0,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+            )
+        }
+        guard stageDescriptor >= 0 else {
+            stageName.withCString { _ = Darwin.unlinkat(packagesDescriptor, $0, AT_REMOVEDIR) }
+            throw DialogueVoiceRuntimeError.copyFailed
+        }
+        defer { Darwin.close(stageDescriptor) }
+        var stageStatus = stat()
+        guard Darwin.fstat(stageDescriptor, &stageStatus) == 0,
+              stageStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
+            throw DialogueVoiceRuntimeError.copyFailed
+        }
+        let stageIdentity = DialogueVoiceFileIdentity(stageStatus)
         var published = false
-        defer { if !published { try? FileManager.default.removeItem(at: stage) } }
+        defer {
+            if !published {
+                try? Qwen3TTSPackageInstaller(
+                    applicationSupportRoot: applicationSupportRoot
+                ).removeManagedPackage(relativePath: managedPaths.staging)
+            }
+        }
 
+        var stagedDigests: [String: String] = [:]
         for file in files {
             try Task.checkCancellation()
-            let target = stage.appendingPathComponent(file.relativePath)
-            try DialogueVoiceAssetInstaller.ensurePrivateDirectory(target.deletingLastPathComponent())
-            try copyRegularFile(file, to: target)
+            stagedDigests[file.relativePath] = try copyRegularFile(
+                file,
+                rootDescriptor: rootDescriptor,
+                stagingDescriptor: stageDescriptor
+            )
         }
         var finalRootStatus = stat()
-        guard Darwin.lstat(sourceURL.path, &finalRootStatus) == 0,
+        guard Darwin.fstat(rootDescriptor, &finalRootStatus) == 0,
               DialogueVoiceFileIdentity(finalRootStatus) == rootIdentity else {
             throw DialogueVoiceRuntimeError.sourceChanged
         }
-        let model = stage.appendingPathComponent("model/model.safetensors")
-        let generator = stage.appendingPathComponent("generate.py")
-        let reference = stage.appendingPathComponent(config.referenceAudio)
         let manifest = try Qwen3TTSPackageManifest(
             modelRelativePath: "model/model.safetensors",
             configRelativePath: "config.json",
             handoverGeneratorRelativePath: "generate.py",
             referenceAudioRelativePath: config.referenceAudio,
-            modelSHA256: digest(model),
-            configSHA256: digest(stage.appendingPathComponent("config.json")),
-            handoverGeneratorSHA256: digest(generator),
-            referenceAudioSHA256: digest(reference)
+            modelSHA256: try requiredDigest(
+                "model/model.safetensors", in: stagedDigests
+            ),
+            configSHA256: try requiredDigest("config.json", in: stagedDigests),
+            handoverGeneratorSHA256: try requiredDigest(
+                "generate.py", in: stagedDigests
+            ),
+            referenceAudioSHA256: try requiredDigest(
+                config.referenceAudio, in: stagedDigests
+            )
         )
-        let treeDigest = try Qwen3TTSProfileValidator.computePackageTreeSHA256(packageRoot: stage)
-        try FileManager.default.moveItem(at: stage, to: destination)
+        let treeDigest = Self.treeDigest(stagedDigests)
+        var finalPackagesStatus = stat()
+        var finalStageStatus = stat()
+        var namedStageStatus = stat()
+        guard Darwin.fstat(packagesDescriptor, &finalPackagesStatus) == 0,
+              DialogueVoiceFileIdentity(finalPackagesStatus)
+                == DialogueVoiceFileIdentity(packagesStatus),
+              Darwin.fstat(stageDescriptor, &finalStageStatus) == 0,
+              DialogueVoiceFileIdentity(finalStageStatus) == stageIdentity,
+              stageName.withCString({
+                  Darwin.fstatat(packagesDescriptor, $0, &namedStageStatus, AT_SYMLINK_NOFOLLOW)
+              }) == 0,
+              DialogueVoiceFileIdentity(namedStageStatus) == stageIdentity else {
+            throw DialogueVoiceRuntimeError.copyFailed
+        }
+        guard stageName.withCString({ stagePointer in
+            destinationName.withCString { destinationPointer in
+                Darwin.renameatx_np(
+                    packagesDescriptor,
+                    stagePointer,
+                    packagesDescriptor,
+                    destinationPointer,
+                    UInt32(RENAME_EXCL)
+                )
+            }
+        }) == 0,
+              Darwin.fsync(packagesDescriptor) == 0 else {
+            throw DialogueVoiceRuntimeError.copyFailed
+        }
+        var publishedStatus = stat()
+        guard destinationName.withCString({
+            Darwin.fstatat(packagesDescriptor, $0, &publishedStatus, AT_SYMLINK_NOFOLLOW)
+        }) == 0,
+              DialogueVoiceFileIdentity(publishedStatus) == stageIdentity else {
+            throw DialogueVoiceRuntimeError.copyFailed
+        }
         published = true
         return Qwen3TTSImportedPackage(
-            packageRootRelativePath: "voice/packages/qwen/\(token)", manifest: manifest,
+            packageRootRelativePath: managedPaths.destination, manifest: manifest,
             treeSHA256: treeDigest, referenceText: config.referenceText,
             referenceLanguage: Qwen3TTSLanguage.japanese, parameters: parameters
         )
     }
 
     func removeManagedPackage(relativePath: String) throws {
-        guard relativePath.hasPrefix("voice/packages/qwen/"),
-              relativePath.split(separator: "/").count == 4 else {
+        let components = relativePath.split(separator: "/", omittingEmptySubsequences: false)
+        guard components.count == 4,
+              components[0] == "voice",
+              components[1] == "packages",
+              components[2] == "qwen" else {
+            throw DialogueVoiceRuntimeError.invalidManagedPath
+        }
+        let leaf = String(components[3])
+        let token: String
+        if leaf.hasPrefix("."), leaf.hasSuffix(".partial") {
+            token = String(leaf.dropFirst().dropLast(".partial".count))
+        } else {
+            token = leaf
+        }
+        guard UUID(uuidString: token) != nil, token == token.lowercased() else {
             throw DialogueVoiceRuntimeError.invalidManagedPath
         }
         _ = try DialogueVoiceAssetInstaller.removeManagedDirectory(
@@ -277,47 +401,257 @@ struct Qwen3TTSPackageInstaller: Sendable {
         )
     }
 
-    private func enumerate(_ root: URL) throws -> [SourceFile] {
-        guard let enumerator = FileManager.default.enumerator(atPath: root.path) else {
-            throw DialogueVoiceRuntimeError.invalidSource
-        }
+    private func enumerate(_ rootDescriptor: Int32) throws -> [SourceFile] {
         var result: [SourceFile] = []
-        while let relative = enumerator.nextObject() as? String {
-            let url = try qwenPackageURL(relativePath: relative, root: root)
-            var status = stat()
-            guard Darwin.lstat(url.path, &status) == 0 else { throw DialogueVoiceRuntimeError.invalidSource }
-            let kind = status.st_mode & mode_t(S_IFMT)
-            if kind == mode_t(S_IFDIR) { continue }
-            guard kind == mode_t(S_IFREG), status.st_size > 0 else {
-                throw DialogueVoiceRuntimeError.invalidSource
-            }
-            result.append(SourceFile(relativePath: relative, url: url,
-                                     identity: DialogueVoiceFileIdentity(status), size: UInt64(status.st_size)))
-        }
+        var entryCount = 0
+        try enumerateDirectory(
+            descriptor: rootDescriptor, prefix: "", depth: 0,
+            entryCount: &entryCount, result: &result
+        )
         return result.sorted { $0.relativePath < $1.relativePath }
     }
 
-    private func copyRegularFile(_ source: SourceFile, to target: URL) throws {
-        try FileManager.default.copyItem(at: source.url, to: target)
-        guard chmod(target.path, 0o600) == 0 else { throw DialogueVoiceRuntimeError.copyFailed }
-        var sourceStatus = stat(), targetStatus = stat()
-        guard Darwin.lstat(source.url.path, &sourceStatus) == 0,
-              DialogueVoiceFileIdentity(sourceStatus) == source.identity,
-              Darwin.lstat(target.path, &targetStatus) == 0,
-              targetStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
-              UInt64(targetStatus.st_size) == source.size,
-              digest(source.url) == digest(target) else { throw DialogueVoiceRuntimeError.sourceChanged }
+    private func enumerateDirectory(
+        descriptor: Int32,
+        prefix: String,
+        depth: Int,
+        entryCount: inout Int,
+        result: inout [SourceFile]
+    ) throws {
+        guard depth <= 32 else { throw DialogueVoiceRuntimeError.invalidSource }
+        let duplicate = Darwin.dup(descriptor)
+        guard duplicate >= 0, let stream = Darwin.fdopendir(duplicate) else {
+            if duplicate >= 0 { Darwin.close(duplicate) }
+            throw DialogueVoiceRuntimeError.invalidSource
+        }
+        defer { Darwin.closedir(stream) }
+        while let entry = Darwin.readdir(stream) {
+            let name = withUnsafePointer(to: &entry.pointee.d_name) { pointer in
+                pointer.withMemoryRebound(to: CChar.self, capacity: Int(MAXNAMLEN) + 1) {
+                    String(cString: $0)
+                }
+            }
+            guard name != ".", name != ".." else { continue }
+            guard !name.isEmpty, !name.contains("/"), !name.contains("\\"), !name.contains(":") else {
+                throw DialogueVoiceRuntimeError.invalidSource
+            }
+            entryCount += 1
+            guard entryCount <= 100_000 else { throw DialogueVoiceRuntimeError.sourceTooLarge }
+            let relative = prefix.isEmpty ? name : "\(prefix)/\(name)"
+            var status = stat()
+            guard name.withCString({ Darwin.fstatat(descriptor, $0, &status, AT_SYMLINK_NOFOLLOW) }) == 0 else {
+                throw DialogueVoiceRuntimeError.invalidSource
+            }
+            let kind = status.st_mode & mode_t(S_IFMT)
+            if kind == mode_t(S_IFDIR) {
+                let child = name.withCString {
+                    Darwin.openat(descriptor, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                }
+                guard child >= 0 else { throw DialogueVoiceRuntimeError.invalidSource }
+                defer { Darwin.close(child) }
+                var opened = stat()
+                guard Darwin.fstat(child, &opened) == 0,
+                      DialogueVoiceFileIdentity(opened) == DialogueVoiceFileIdentity(status) else {
+                    throw DialogueVoiceRuntimeError.sourceChanged
+                }
+                try enumerateDirectory(
+                    descriptor: child, prefix: relative, depth: depth + 1,
+                    entryCount: &entryCount, result: &result
+                )
+                continue
+            }
+            guard kind == mode_t(S_IFREG), status.st_size > 0 else {
+                throw DialogueVoiceRuntimeError.invalidSource
+            }
+            result.append(SourceFile(
+                relativePath: relative,
+                identity: DialogueVoiceFileIdentity(status),
+                size: UInt64(status.st_size)
+            ))
+        }
     }
 
-    private func boundedRead(_ url: URL, maximum: Int) throws -> Data {
-        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+    private func copyRegularFile(
+        _ source: SourceFile,
+        rootDescriptor: Int32,
+        stagingDescriptor: Int32
+    ) throws -> String {
+        let sourceDescriptor = try openSourceFile(
+            relativePath: source.relativePath, rootDescriptor: rootDescriptor
+        )
+        defer { Darwin.close(sourceDescriptor) }
+        var sourceStatus = stat()
+        guard Darwin.fstat(sourceDescriptor, &sourceStatus) == 0,
+              DialogueVoiceFileIdentity(sourceStatus) == source.identity else {
+            throw DialogueVoiceRuntimeError.sourceChanged
+        }
+        let destinationParent = try openOrCreateDestinationParent(
+            relativePath: source.relativePath,
+            stagingDescriptor: stagingDescriptor
+        )
+        defer { Darwin.close(destinationParent.descriptor) }
+        let destinationDescriptor = destinationParent.name.withCString {
+            Darwin.openat(
+                destinationParent.descriptor,
+                $0,
+                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                mode_t(S_IRUSR | S_IWUSR)
+            )
+        }
+        guard destinationDescriptor >= 0 else { throw DialogueVoiceRuntimeError.copyFailed }
+        defer { Darwin.close(destinationDescriptor) }
+        var copied: UInt64 = 0
+        var hasher = SHA256()
+        var buffer = [UInt8](repeating: 0, count: 1_048_576)
+        while true {
+            try Task.checkCancellation()
+            let count = buffer.withUnsafeMutableBytes {
+                Darwin.read(sourceDescriptor, $0.baseAddress, $0.count)
+            }
+            if count == 0 { break }
+            guard count > 0 else {
+                if errno == EINTR { continue }
+                throw DialogueVoiceRuntimeError.copyFailed
+            }
+            var offset = 0
+            while offset < count {
+                let written = buffer.withUnsafeBytes {
+                    Darwin.write(destinationDescriptor, $0.baseAddress?.advanced(by: offset), count - offset)
+                }
+                guard written > 0 else {
+                    if written < 0, errno == EINTR { continue }
+                    throw DialogueVoiceRuntimeError.copyFailed
+                }
+                offset += written
+            }
+            copied += UInt64(count)
+            guard copied <= source.size else { throw DialogueVoiceRuntimeError.sourceChanged }
+            hasher.update(data: Data(buffer.prefix(count)))
+        }
+        var finalSource = stat()
+        guard copied == source.size,
+              Darwin.fstat(sourceDescriptor, &finalSource) == 0,
+              DialogueVoiceFileIdentity(finalSource) == source.identity,
+              Darwin.fchmod(destinationDescriptor, mode_t(S_IRUSR | S_IWUSR)) == 0,
+              Darwin.fsync(destinationDescriptor) == 0,
+              Darwin.fsync(destinationParent.descriptor) == 0 else {
+            throw DialogueVoiceRuntimeError.sourceChanged
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func requiredDigest(
+        _ relativePath: String,
+        in digests: [String: String]
+    ) throws -> String {
+        guard let digest = digests[relativePath] else {
+            throw DialogueVoiceRuntimeError.copyFailed
+        }
+        return digest
+    }
+
+    private static func treeDigest(_ digests: [String: String]) -> String {
+        var hasher = SHA256()
+        for (relativePath, digest) in digests.sorted(by: { $0.key < $1.key }) {
+            for field in [relativePath, digest] {
+                var length = UInt64(field.utf8.count).bigEndian
+                withUnsafeBytes(of: &length) { hasher.update(data: Data($0)) }
+                hasher.update(data: Data(field.utf8))
+            }
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func openOrCreateDestinationParent(
+        relativePath: String,
+        stagingDescriptor: Int32
+    ) throws -> (descriptor: Int32, name: String) {
+        let components = relativePath.split(separator: "/", omittingEmptySubsequences: false)
+        guard !components.isEmpty,
+              components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+            throw DialogueVoiceRuntimeError.invalidSource
+        }
+        var current = Darwin.dup(stagingDescriptor)
+        guard current >= 0 else { throw DialogueVoiceRuntimeError.copyFailed }
+        for component in components.dropLast() {
+            let opened = component.withCString {
+                Darwin.openat(current, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            }
+            if opened >= 0 {
+                Darwin.close(current)
+                current = opened
+                continue
+            }
+            guard errno == ENOENT else {
+                Darwin.close(current)
+                throw DialogueVoiceRuntimeError.copyFailed
+            }
+            let mkdirResult = component.withCString { Darwin.mkdirat(current, $0, 0o700) }
+            guard mkdirResult == 0 || errno == EEXIST else {
+                Darwin.close(current)
+                throw DialogueVoiceRuntimeError.copyFailed
+            }
+            let created = component.withCString {
+                Darwin.openat(current, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            }
+            Darwin.close(current)
+            guard created >= 0 else { throw DialogueVoiceRuntimeError.copyFailed }
+            current = created
+        }
+        return (current, String(components.last!))
+    }
+
+    private func boundedRead(
+        relativePath: String,
+        rootDescriptor: Int32,
+        maximum: Int
+    ) throws -> Data {
+        let descriptor = try openSourceFile(relativePath: relativePath, rootDescriptor: rootDescriptor)
+        defer { Darwin.close(descriptor) }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: min(maximum + 1, 65_536))
+        while data.count <= maximum {
+            let count = buffer.withUnsafeMutableBytes { Darwin.read(descriptor, $0.baseAddress, $0.count) }
+            if count == 0 { break }
+            guard count > 0 else {
+                if errno == EINTR { continue }
+                throw DialogueVoiceRuntimeError.invalidSource
+            }
+            data.append(contentsOf: buffer.prefix(count))
+        }
         guard !data.isEmpty, data.count <= maximum else { throw DialogueVoiceRuntimeError.invalidSource }
         return data
     }
 
-    private func digest(_ url: URL) -> String {
-        guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]) else { return "" }
-        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    private func openSourceFile(relativePath: String, rootDescriptor: Int32) throws -> Int32 {
+        let components = relativePath.split(separator: "/", omittingEmptySubsequences: false)
+        guard !components.isEmpty,
+              components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+            throw DialogueVoiceRuntimeError.invalidSource
+        }
+        var current = Darwin.dup(rootDescriptor)
+        guard current >= 0 else { throw DialogueVoiceRuntimeError.invalidSource }
+        for component in components.dropLast() {
+            let next = component.withCString {
+                Darwin.openat(current, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            }
+            Darwin.close(current)
+            guard next >= 0 else { throw DialogueVoiceRuntimeError.sourceChanged }
+            current = next
+        }
+        let file = components.last!.withCString {
+            Darwin.openat(current, $0, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+        }
+        Darwin.close(current)
+        guard file >= 0 else { throw DialogueVoiceRuntimeError.sourceChanged }
+        var status = stat()
+        guard Darwin.fstat(file, &status) == 0,
+              status.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              status.st_size > 0 else {
+            Darwin.close(file)
+            throw DialogueVoiceRuntimeError.invalidSource
+        }
+        return file
     }
 
 }
@@ -1186,7 +1520,7 @@ struct DialogueVoiceAssetInstaller: Sendable {
             guard statusResult == 0 else { throw DialogueVoiceRuntimeError.invalidManagedPath }
             let kind = status.st_mode & mode_t(S_IFMT)
             if kind == mode_t(S_IFREG) {
-                guard status.st_size > 0 else { throw DialogueVoiceRuntimeError.invalidManagedPath }
+                guard status.st_size >= 0 else { throw DialogueVoiceRuntimeError.invalidManagedPath }
                 let size = UInt64(status.st_size)
                 let (updatedBytes, overflow) = budget.bytes.addingReportingOverflow(size)
                 guard !overflow, updatedBytes <= maximumBytes else {
@@ -1868,15 +2202,103 @@ private final class QwenProcessCancellation: @unchecked Sendable {
     }
 }
 
+private final class QwenProcessFinalizer {
+    private let process: Process
+    private let stdinPipe: Pipe
+    private let stdoutPipe: Pipe
+    private let stderrPipe: Pipe
+    private let reads: DispatchGroup
+    private var processGroupEstablished = false
+    private var finalized = false
+    private var forcedCleanup = false
+
+    init(
+        process: Process,
+        stdinPipe: Pipe,
+        stdoutPipe: Pipe,
+        stderrPipe: Pipe,
+        reads: DispatchGroup
+    ) {
+        self.process = process
+        self.stdinPipe = stdinPipe
+        self.stdoutPipe = stdoutPipe
+        self.stderrPipe = stderrPipe
+        self.reads = reads
+    }
+
+    func markProcessGroupEstablished() {
+        processGroupEstablished = true
+    }
+
+    @discardableResult
+    func finalize() -> Bool {
+        guard !finalized else { return forcedCleanup }
+        finalized = true
+
+        try? stdinPipe.fileHandleForWriting.close()
+        let groupIsAlive = processGroupEstablished && processGroupExists()
+        forcedCleanup = process.isRunning || groupIsAlive
+        if process.isRunning || groupIsAlive {
+            terminate(signal: SIGTERM)
+            let termDeadline = Date().addingTimeInterval(0.5)
+            while (process.isRunning || processGroupExists()), Date() < termDeadline {
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+        }
+        if process.isRunning || (processGroupEstablished && processGroupExists()) {
+            terminate(signal: SIGKILL)
+        }
+
+        // Process owns the waitpid lifecycle. Once SIGKILL has been sent there is
+        // no safe error path that may bypass this reap without leaking a zombie.
+        process.waitUntilExit()
+
+        if reads.wait(timeout: .now() + 1) == .timedOut {
+            try? stdoutPipe.fileHandleForReading.close()
+            try? stderrPipe.fileHandleForReading.close()
+            _ = reads.wait(timeout: .now() + 1)
+        } else {
+            try? stdoutPipe.fileHandleForReading.close()
+            try? stderrPipe.fileHandleForReading.close()
+        }
+        return forcedCleanup
+    }
+
+    private func terminate(signal: Int32) {
+        let pid = process.processIdentifier
+        if processGroupEstablished || Darwin.getpgid(pid) == pid {
+            _ = Darwin.kill(-pid, signal)
+        } else {
+            _ = Darwin.kill(pid, signal)
+        }
+    }
+
+    private func processGroupExists() -> Bool {
+        guard processGroupEstablished else { return false }
+        errno = 0
+        return Darwin.kill(-process.processIdentifier, 0) == 0 || errno == EPERM
+    }
+}
+
 struct Qwen3TTSProcessRunner: Sendable {
+    typealias ProcessGroupValidator = @Sendable (Int32) -> Bool
     private static let maximumCapturedBytes = 65_536
+    private let processGroupValidator: ProcessGroupValidator
+
+    init(
+        processGroupValidator: @escaping ProcessGroupValidator = {
+            Darwin.getpgid($0) == $0
+        }
+    ) {
+        self.processGroupValidator = processGroupValidator
+    }
 
     func run(_ invocation: Qwen3TTSProcessInvocation) async throws {
         let cancellation = QwenProcessCancellation()
         do {
             try await withTaskCancellationHandler {
                 try await Task.detached(priority: .userInitiated) {
-                    try Self.runBlocking(invocation, cancellation: cancellation)
+                    try runBlocking(invocation, cancellation: cancellation)
                 }.value
             } onCancel: {
                 cancellation.cancel()
@@ -1886,7 +2308,7 @@ struct Qwen3TTSProcessRunner: Sendable {
         }
     }
 
-    private static func runBlocking(
+    private func runBlocking(
         _ invocation: Qwen3TTSProcessInvocation,
         cancellation: QwenProcessCancellation
     ) throws {
@@ -1894,8 +2316,8 @@ struct Qwen3TTSProcessRunner: Sendable {
         let stdinPipe = Pipe()
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
-        let stdout = QwenLockedDataBuffer(limit: maximumCapturedBytes)
-        let stderr = QwenLockedDataBuffer(limit: maximumCapturedBytes)
+        let stdout = QwenLockedDataBuffer(limit: Self.maximumCapturedBytes)
+        let stderr = QwenLockedDataBuffer(limit: Self.maximumCapturedBytes)
         let reads = DispatchGroup()
         process.executableURL = invocation.executableURL
         process.arguments = ["-B", invocation.helperURL.path]
@@ -1907,16 +2329,6 @@ struct Qwen3TTSProcessRunner: Sendable {
         do { try process.run() }
         catch { throw DialogueVoiceRuntimeError.inferenceUnavailable }
         cancellation.install(process)
-
-        let groupDeadline = Date().addingTimeInterval(2)
-        while process.isRunning, Date() < groupDeadline, Darwin.getpgid(process.processIdentifier) != process.processIdentifier {
-            Thread.sleep(forTimeInterval: 0.01)
-        }
-        guard process.isRunning,
-              Darwin.getpgid(process.processIdentifier) == process.processIdentifier else {
-            terminate(process, signal: SIGTERM)
-            throw DialogueVoiceRuntimeError.inferenceUnavailable
-        }
 
         for (pipe, buffer) in [(stdoutPipe, stdout), (stderrPipe, stderr)] {
             reads.enter()
@@ -1930,29 +2342,40 @@ struct Qwen3TTSProcessRunner: Sendable {
                 reads.leave()
             }
         }
+        let finalizer = QwenProcessFinalizer(
+            process: process,
+            stdinPipe: stdinPipe,
+            stdoutPipe: stdoutPipe,
+            stderrPipe: stderrPipe,
+            reads: reads
+        )
+        defer { finalizer.finalize() }
+
+        let groupDeadline = Date().addingTimeInterval(2)
+        while process.isRunning,
+              Date() < groupDeadline,
+              !processGroupValidator(process.processIdentifier) {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        guard process.isRunning,
+              processGroupValidator(process.processIdentifier) else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        finalizer.markProcessGroupEstablished()
         do {
             try stdinPipe.fileHandleForWriting.write(contentsOf: invocation.standardInput)
             try stdinPipe.fileHandleForWriting.close()
         } catch {
-            terminate(process, signal: SIGTERM)
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
         }
 
         let deadline = Date().addingTimeInterval(min(120, max(0.05, invocation.timeout)))
         while process.isRunning, Date() < deadline, !cancellation.isCancelled {
             Thread.sleep(forTimeInterval: 0.05)
         }
-        if process.isRunning {
-            terminate(process, signal: SIGTERM)
-            let grace = Date().addingTimeInterval(0.5)
-            while process.isRunning, Date() < grace { Thread.sleep(forTimeInterval: 0.02) }
-            if process.isRunning { terminate(process, signal: SIGKILL) }
-        }
-        if !process.isRunning { process.waitUntilExit() }
-        if reads.wait(timeout: .now() + 1) == .timedOut {
-            try? stdoutPipe.fileHandleForReading.close()
-            try? stderrPipe.fileHandleForReading.close()
-        }
         if cancellation.isCancelled { throw DialogueVoiceRuntimeError.cancelled }
+        guard !process.isRunning else { throw DialogueVoiceRuntimeError.inferenceUnavailable }
+        let forcedCleanup = finalizer.finalize()
         let standardOutput = stdout.snapshot
         let standardError = stderr.snapshot
         guard !standardOutput.overflowed, !standardError.overflowed,
@@ -1963,17 +2386,15 @@ struct Qwen3TTSProcessRunner: Sendable {
         guard process.terminationStatus == 0 else {
             throw DialogueVoiceRuntimeError.inferenceUnavailable
         }
+        guard !forcedCleanup else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
         guard !invocation.requiresOutputFile
                 || FileManager.default.fileExists(atPath: invocation.outputURL.path) else {
             throw DialogueVoiceRuntimeError.invalidAudio
         }
     }
 
-    private static func terminate(_ process: Process, signal: Int32) {
-        let pid = process.processIdentifier
-        if Darwin.getpgid(pid) == pid { _ = Darwin.kill(-pid, signal) }
-        else { _ = Darwin.kill(pid, signal) }
-    }
 }
 
 actor Qwen3TTSClient {

@@ -258,6 +258,21 @@ final class DialogueVoiceTests: XCTestCase {
         XCTAssertNotNil(library.qwenProfile)
     }
 
+    func testConfiguredQwenReplacementKeepsGPTActiveAndPreservesReadyOutput() throws {
+        var library = try DialogueVoiceLibrary(profile: profile())
+        _ = try library.addLine(text: "Hello", id: lineID)
+        let ticket = try library.beginGeneration(for: lineID)
+        try library.completeGeneration(ticket: ticket, outputPath: "voice/generated/gpt.wav")
+
+        try library.replaceConfiguredProfile(qwenProfile(revision: 2))
+
+        XCTAssertEqual(library.activeProviderKind, .gptSovits)
+        XCTAssertEqual(library.profileStatus, .ready)
+        XCTAssertEqual(library.lines[0].status, .ready)
+        XCTAssertEqual(library.lines[0].outputRelativePath, "voice/generated/gpt.wav")
+        XCTAssertEqual(library.qwenProfile?.revision, 2)
+    }
+
     func testProviderSwitchRejectsInFlightCompletionEvenWhenProfileRevisionsMatch() throws {
         var library = try DialogueVoiceLibrary(profile: profile(), qwenProfile: qwenProfile())
         _ = try library.addLine(text: "Hello", id: lineID)

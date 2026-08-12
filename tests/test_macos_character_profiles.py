@@ -95,19 +95,21 @@ class CharacterProfileAppSourceTests(unittest.TestCase):
             self.assertIn(contract, window_apply)
 
     def test_cleanup_fails_closed_for_inactive_profile_references(self) -> None:
-        inactive_reference = swift_function(
-            self.delegate,
-            "private func isMediaPathReferencedByInactiveCharacter(_ url: URL)",
-        )
-        self.assertIn("character.id != characterLibrary.activeCharacterID", inactive_reference)
-        self.assertIn("catch", inactive_reference)
-        self.assertIn("return true", inactive_reference)
-        self.assertIn(
-            "guard !plan.trashURLs.contains(where: isMediaPathReferencedByInactiveCharacter)",
-            self.delegate,
-        )
         all_maps = swift_function(self.delegate, "private func allCharacterMediaMaps()")
         self.assertIn("characterLibrary.characters.map", all_maps)
+        removal = swift_function(self.delegate, "private func removeMedia(")
+        self.assertIn("let libraryMaps = try allCharacterMediaMaps()", removal)
+        self.assertIn("character.id != characterLibrary.activeCharacterID", removal)
+        self.assertIn("ManagedMediaTrashRevalidator.captureLibrary(", removal)
+        self.assertIn("catalogURL: characterLibraryStorage.catalogURL", removal)
+        self.assertIn("ManagedMediaTrashRevalidator.validateLibraryUnchanged(", removal)
+        self.assertIn("ManagedMediaTrashRevalidator.quarantineLibraryAfterPublish(", removal)
+        self.assertIn("at: quarantine.directoryURL", removal)
+        self.assertNotIn("trashItem(at: target", removal)
+        self.assertLess(
+            removal.index("ManagedMediaTrashRevalidator.validateLibraryUnchanged("),
+            removal.index("try publishMediaMap(plan.updatedMap)"),
+        )
         self.assertIn("characterLibraryStorage.loadMediaMap(for: entry)", all_maps)
 
     def test_crud_rolls_back_new_map_when_catalog_save_fails(self) -> None:

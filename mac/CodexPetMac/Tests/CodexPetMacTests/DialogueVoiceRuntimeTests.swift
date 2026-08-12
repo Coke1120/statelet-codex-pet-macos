@@ -578,6 +578,46 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: managedRoot.path))
     }
 
+    func testQwenPackageSizeAccumulatorRejectsOverflowAndConfiguredLimit() throws {
+        XCTAssertThrowsError(
+            try Qwen3TTSPackageInstaller.checkedAggregateSize(
+                [UInt64.max, 1],
+                maximum: UInt64.max
+            )
+        ) { error in
+            XCTAssertEqual(error as? DialogueVoiceRuntimeError, .sourceTooLarge)
+        }
+        XCTAssertThrowsError(
+            try Qwen3TTSPackageInstaller.checkedAggregateSize([3, 3], maximum: 5)
+        ) { error in
+            XCTAssertEqual(error as? DialogueVoiceRuntimeError, .sourceTooLarge)
+        }
+        XCTAssertEqual(
+            try Qwen3TTSPackageInstaller.checkedAggregateSize([2, 3], maximum: 5),
+            5
+        )
+    }
+
+    func testQwenPackageInstallerRemovesJournaledPartialTree() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-partial-cleanup-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let support = root.appendingPathComponent("support", isDirectory: true)
+        let token = UUID().uuidString.lowercased()
+        let paths = try Qwen3TTSPackageInstaller.managedRelativePaths(destinationToken: token)
+        let partial = support.appendingPathComponent(paths.staging, isDirectory: true)
+        let nested = partial.appendingPathComponent("model/partial.bin")
+        try FileManager.default.createDirectory(
+            at: nested.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data().write(to: nested)
+
+        let installer = Qwen3TTSPackageInstaller(applicationSupportRoot: support)
+        XCTAssertNoThrow(try installer.removeManagedPackage(relativePath: paths.staging))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: partial.path))
+    }
+
     func testQwenPackageRemovalNeverFollowsSymbolicLinks() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("qwen-package-removal-\(UUID())", isDirectory: true)
@@ -646,6 +686,166 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             requiresOutputFile: false
         ))
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    func testQwenProcessRunnerKillsAndReapsTermResistantProcessGroup() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-resistant-probe-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let probe = root.appendingPathComponent("probe.py")
+        let parentPID = root.appendingPathComponent("parent.pid")
+        let childPID = root.appendingPathComponent("child.pid")
+        try Data(
+            "import os, signal, sys, time\n"
+                .appending("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n")
+                .appending("open('parent.pid','w').write(str(os.getpid()))\n")
+                .appending("pid = os.fork()\n")
+                .appending("if pid == 0:\n")
+                .appending(" signal.signal(signal.SIGTERM, signal.SIG_IGN)\n")
+                .appending(" open('child.pid','w').write(str(os.getpid()))\n")
+                .appending(" while True: time.sleep(1)\n")
+                .appending("sys.stdin.buffer.read()\n")
+                .appending("while True: time.sleep(1)\n")
+                .utf8
+        ).write(to: probe)
+
+        do {
+            try await Qwen3TTSProcessRunner().run(Qwen3TTSProcessInvocation(
+                executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+                helperURL: probe,
+                currentDirectoryURL: root,
+                environment: ["PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"],
+                standardInput: Data(), outputURL: root.appendingPathComponent("unused"),
+                timeout: 1, requiresOutputFile: false
+            ))
+            XCTFail("A TERM-resistant process completed successfully")
+        } catch let error as DialogueVoiceRuntimeError {
+            XCTAssertEqual(error, .inferenceUnavailable)
+        }
+
+        let publishedParent = try XCTUnwrap(readPublishedPID(parentPID))
+        let publishedChild = try XCTUnwrap(readPublishedPID(childPID))
+        XCTAssertTrue(waitForProcessExit(publishedParent), "parent remained alive or unreaped")
+        XCTAssertTrue(waitForProcessExit(publishedChild), "grandchild remained alive after group SIGKILL")
+    }
+
+    func testQwenProcessRunnerReapsChildWhenContainmentIsRejected() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-containment-rejection-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let probe = root.appendingPathComponent("probe.py")
+        let parentPID = root.appendingPathComponent("parent.pid")
+        let childPID = root.appendingPathComponent("child.pid")
+        try Data(
+            "import os, signal, time\n"
+                .appending("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n")
+                .appending("open('parent.pid','w').write(str(os.getpid()))\n")
+                .appending("pid = os.fork()\n")
+                .appending("if pid == 0:\n")
+                .appending(" signal.signal(signal.SIGTERM, signal.SIG_IGN)\n")
+                .appending(" open('child.pid','w').write(str(os.getpid()))\n")
+                .appending(" while True: time.sleep(1)\n")
+                .appending("while True: time.sleep(1)\n")
+                .utf8
+        ).write(to: probe)
+
+        do {
+            try await Qwen3TTSProcessRunner(processGroupValidator: { _ in false }).run(
+                Qwen3TTSProcessInvocation(
+                    executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+                    helperURL: probe,
+                    currentDirectoryURL: root,
+                    environment: ["PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"],
+                    standardInput: Data(), outputURL: root.appendingPathComponent("unused"),
+                    timeout: 5, requiresOutputFile: false
+                )
+            )
+            XCTFail("A process without accepted containment completed successfully")
+        } catch let error as DialogueVoiceRuntimeError {
+            XCTAssertEqual(error, .inferenceUnavailable)
+        }
+
+        let publishedParent = try XCTUnwrap(readPublishedPID(parentPID))
+        let publishedChild = try XCTUnwrap(readPublishedPID(childPID))
+        XCTAssertTrue(waitForProcessExit(publishedParent), "rejected child remained alive or unreaped")
+        XCTAssertTrue(waitForProcessExit(publishedChild), "rejected descendant escaped cleanup")
+    }
+
+    func testQwenProcessRunnerCancellationReapsContainedChild() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-cancelled-probe-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let probe = root.appendingPathComponent("probe.py")
+        let parentPID = root.appendingPathComponent("parent.pid")
+        try Data(
+            "import os, signal, time\n"
+                .appending("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n")
+                .appending("open('parent.pid','w').write(str(os.getpid()))\n")
+                .appending("while True: time.sleep(1)\n")
+                .utf8
+        ).write(to: probe)
+
+        let invocation = Qwen3TTSProcessInvocation(
+            executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+            helperURL: probe,
+            currentDirectoryURL: root,
+            environment: ["PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"],
+            standardInput: Data(), outputURL: root.appendingPathComponent("unused"),
+            timeout: 30, requiresOutputFile: false
+        )
+        let task = Task { try await Qwen3TTSProcessRunner().run(invocation) }
+        let publicationDeadline = Date().addingTimeInterval(2)
+        while readPublishedPID(parentPID) == nil, Date() < publicationDeadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let publishedParent = try XCTUnwrap(readPublishedPID(parentPID))
+        task.cancel()
+        do {
+            try await task.value
+            XCTFail("A cancelled Qwen process completed successfully")
+        } catch let error as DialogueVoiceRuntimeError {
+            XCTAssertEqual(error, .cancelled)
+        }
+        XCTAssertTrue(waitForProcessExit(publishedParent), "cancelled child remained alive or unreaped")
+    }
+
+    func testQwenProcessRunnerKillsDescendantAfterSuccessfulLeaderExit() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-orphan-probe-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let probe = root.appendingPathComponent("probe.py")
+        let childPID = root.appendingPathComponent("child.pid")
+        try Data(
+            "import os, signal, time\n"
+                .appending("child = os.fork()\n")
+                .appending("if child == 0:\n")
+                .appending(" signal.signal(signal.SIGTERM, signal.SIG_IGN)\n")
+                .appending(" open('child.pid','w').write(str(os.getpid()))\n")
+                .appending(" while True: time.sleep(1)\n")
+                .appending("deadline = time.time() + 2\n")
+                .appending("while not os.path.exists('child.pid') and time.time() < deadline: time.sleep(0.01)\n")
+                .utf8
+        ).write(to: probe)
+
+        do {
+            try await Qwen3TTSProcessRunner().run(Qwen3TTSProcessInvocation(
+                executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+                helperURL: probe,
+                currentDirectoryURL: root,
+                environment: ["PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"],
+                standardInput: Data(), outputURL: root.appendingPathComponent("unused"),
+                timeout: 5, requiresOutputFile: false
+            ))
+            XCTFail("A successful leader left a descendant but was accepted")
+        } catch let error as DialogueVoiceRuntimeError {
+            XCTAssertEqual(error, .inferenceUnavailable)
+        }
+        let publishedChild = try XCTUnwrap(readPublishedPID(childPID))
+        XCTAssertTrue(waitForProcessExit(publishedChild), "leader descendant escaped finalization")
     }
 
     func testQwenPythonRuntimeIdentityPreservesRegularAndAbsoluteSymlinkInvocation() throws {
@@ -1586,6 +1786,22 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             line: line
         )
         XCTAssertEqual(number.doubleValue, expected, accuracy: 0.000_001, file: file, line: line)
+    }
+
+    private func readPublishedPID(_ url: URL) -> Int32? {
+        guard let raw = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        return Int32(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    private func waitForProcessExit(_ pid: Int32, timeout: TimeInterval = 2) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        repeat {
+            errno = 0
+            if Darwin.kill(pid, 0) != 0, errno == ESRCH { return true }
+            Thread.sleep(forTimeInterval: 0.02)
+        } while Date() < deadline
+        errno = 0
+        return Darwin.kill(pid, 0) != 0 && errno == ESRCH
     }
 
     private func pcmWAV() -> Data {

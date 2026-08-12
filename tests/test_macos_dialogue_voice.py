@@ -374,7 +374,7 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
             "!preserveNewDialogueText && !preserveNewDialogueState && !preserveNewDialogueLanguage",
             no_selection.group("body"),
         )
-        self.assertIn("clearEditorFields()", no_selection.group("body"))
+        self.assertIn("clearSubmittedDialogueText()", no_selection.group("body"))
         self.assertIn("if !preserveNewDialogueState", no_selection.group("body"))
         self.assertIn("if !preserveNewDialogueLanguage", no_selection.group("body"))
         self.assertIn("applyDefaultDialogueState()", no_selection.group("body"))
@@ -383,6 +383,12 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         clear_fields = method_body(self.voice_view, "    private func clearEditorFields")
         self.assertIn("applyDefaultDialogueLanguage()", clear_fields)
         self.assertIn("applyDefaultDialogueState()", clear_fields)
+        clear_submitted = method_body(self.voice_view, "    private func clearSubmittedDialogueText")
+        self.assertIn('dialogueTextView.string = ""', clear_submitted)
+        self.assertNotIn("applyDefaultDialogueState()", clear_submitted)
+        self.assertNotIn("applyDefaultDialogueLanguage()", clear_submitted)
+        self.assertIn("lastAppliedNewDialogueState = selectedDialogueState", clear_submitted)
+        self.assertIn("lastAppliedNewDialogueLanguage = dialogueLanguageField.stringValue", clear_submitted)
         apply_default = method_body(self.voice_view, "    private func applyDefaultDialogueLanguage")
         self.assertIn("lastAppliedNewDialogueLanguage = dialogueLanguageField.stringValue", apply_default)
 
@@ -687,22 +693,24 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
             accept_import.index("store.save(updated)"),
             accept_import.index("importedAssets.gptWeightRelativePath = asset.relativePath"),
         )
-        self.assertIn("retryPendingCleanup(preserving: stagedImportedPaths)", accept_import)
+        self.assertIn("retryPendingCleanup(preserving: cleanupPreservationPaths)", accept_import)
+        self.assertIn("stagedImportedPaths.union(inFlightQwenPackagePaths)", accept_import)
 
         shutdown = method_body(self.coordinator, "    func shutdown")
-        self.assertIn("retryPendingCleanup(preserving: [])", shutdown)
+        self.assertIn("retryPendingCleanup()", shutdown)
+        self.assertIn("inFlightQwenPackagePaths", self.coordinator)
 
         remove_profile = method_body(
             self.coordinator,
             "    func removeProfile(provider removedProvider: DialogueVoiceProviderKind)",
         )
-        self.assertIn("retryPendingCleanup(preserving: [])", remove_profile)
+        self.assertIn("cleanupPreservationPaths", remove_profile)
 
         retry_cleanup = method_body(
             self.coordinator,
             "    private func retryPendingCleanup",
         )
-        self.assertIn("preservedPaths ?? stagedImportedPaths", retry_cleanup)
+        self.assertIn("preservedPaths ?? cleanupPreservationPaths", retry_cleanup)
 
         save_profile = method_body(self.coordinator, "    func saveProfile")
         self.assertLess(

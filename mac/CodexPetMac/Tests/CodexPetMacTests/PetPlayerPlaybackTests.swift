@@ -88,6 +88,69 @@ final class PetPlayerPlaybackTests: XCTestCase {
         XCTAssertNil(bubble.accessibilityValue())
     }
 
+    @MainActor
+    func testQuickControlsHaveLargeHitTargetsAndDispatchActionsInsidePetPanel() throws {
+        let panel = PetPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+            alwaysOnTop: false,
+            fullScreenAuxiliary: false
+        )
+        let view = PetPlayerView(frame: panel.contentView?.bounds ?? NSRect(x: 0, y: 0, width: 320, height: 240))
+        panel.contentView = view
+        view.updateQuickControls(
+            canAdvanceClip: true,
+            liveState: .idle,
+            displayedState: .idle,
+            manualPreview: nil
+        )
+        view.layoutSubtreeIfNeeded()
+
+        let controls = try XCTUnwrap(
+            view.subviews.compactMap { $0 as? NSStackView }
+                .first { $0.accessibilityLabel() == "Pet quick controls" }
+        )
+        let buttons = controls.arrangedSubviews.compactMap { $0 as? NSButton }
+        let nextButton = try XCTUnwrap(buttons.first { $0.accessibilityLabel() == "Next clip for idle" })
+        let stateButton = try XCTUnwrap(buttons.first { $0.accessibilityLabel()?.hasPrefix("Temporary State") == true })
+
+        for button in [nextButton, stateButton] {
+            XCTAssertGreaterThanOrEqual(button.frame.width, 40)
+            XCTAssertGreaterThanOrEqual(button.frame.height, 40)
+            XCTAssertFalse(button.showsBorderOnlyWhileMouseInside)
+
+            let center = controls.convert(NSPoint(x: button.frame.midX, y: button.frame.midY), to: view)
+            XCTAssertTrue(view.hitTest(center) === button)
+            let insideEdge = controls.convert(
+                NSPoint(x: button.frame.maxX - 0.5, y: button.frame.maxY - 0.5),
+                to: view
+            )
+            XCTAssertTrue(view.hitTest(insideEdge) === button)
+        }
+
+        let orderedButtons = [nextButton, stateButton].sorted { $0.frame.minY < $1.frame.minY }
+        let gapPoint = controls.convert(
+            NSPoint(
+                x: controls.bounds.midX,
+                y: (orderedButtons[0].frame.maxY + orderedButtons[1].frame.minY) / 2
+            ),
+            to: view
+        )
+        XCTAssertFalse(view.hitTest(gapPoint) is NSButton)
+
+        var advanceCount = 0
+        view.onAdvanceClip = { advanceCount += 1 }
+        nextButton.performClick(nil)
+        XCTAssertEqual(advanceCount, 1)
+
+        var selectedState: PetState?
+        view.onTemporaryStateSelection = { selectedState = $0 }
+        let menu = view.makeTemporaryStateMenu()
+        let runningItem = try XCTUnwrap(menu.items.first { $0.representedObject as? String == PetState.running.rawValue })
+        XCTAssertEqual(runningItem.action, #selector(PetPlayerView.selectTemporaryState(_:)))
+        XCTAssertTrue(NSApplication.shared.sendAction(runningItem.action!, to: runningItem.target, from: runningItem))
+        XCTAssertEqual(selectedState, .running)
+    }
+
     private static func writeTestMovie(to url: URL) async throws {
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         let width = 32

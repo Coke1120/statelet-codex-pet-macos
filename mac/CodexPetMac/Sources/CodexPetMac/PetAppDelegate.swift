@@ -262,6 +262,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         label: "com.coke1120.CodexPetMac.character-metadata",
         qos: .utility
     )
+    private let lifecycleStateReader = LifecycleStateFileReader()
     private var characterCountRefreshGeneration: UInt64 = 0
     private var panel: PetPanel!
     private var player: PetPlayerController!
@@ -742,19 +743,25 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func readState(from url: URL) {
-        guard FileManager.default.isReadableFile(atPath: url.path) else {
+        lifecycleStateReader.read(url) { [weak self] result in
+            self?.applyLifecycleStateReadResult(result)
+        }
+    }
+
+    private func applyLifecycleStateReadResult(_ result: LifecycleStateReadResult) {
+        switch result {
+        case .missing:
             lastPublishedSnapshot = nil
             rejectPublisher(.missing)
-            return
-        }
-        let state: CurrentState
-        do {
-            state = try JSONDecoder.codexPet.decode(CurrentState.self, from: Data(contentsOf: url))
-        } catch {
+        case .corrupt:
             lastPublishedSnapshot = nil
             rejectPublisher(.corrupt)
-            return
+        case let .state(state):
+            applyLifecycleState(state)
         }
+    }
+
+    private func applyLifecycleState(_ state: CurrentState) {
         lastPublishedSnapshot = state
         switch freshnessPolicy.freshness(of: state, now: Date().timeIntervalSince1970) {
         case .fresh:
@@ -1468,10 +1475,25 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     @objc private func toggleClickThrough() {
-        clickThrough.toggle()
-        panel.ignoresMouseEvents = clickThrough
-        updateStatusMenu()
-        persistRuntimeClickThrough()
+        let previous = clickThrough
+        do {
+            clickThrough = try ClickThroughPersistenceTransaction.apply(
+                current: previous,
+                updateRuntime: { [weak self] value in
+                    guard let self else { return }
+                    self.clickThrough = value
+                    self.panel.ignoresMouseEvents = value
+                    self.updateStatusMenu()
+                    self.refreshSettings()
+                },
+                persist: { [weak self] value in
+                    try self?.persistRuntimeClickThrough(value)
+                }
+            )
+        } catch {
+            logger.error("event=window_setting_save_failed setting=click_through")
+            presentSettingsError("Click-through could not be saved.")
+        }
         refreshSettings()
     }
 
@@ -2851,6 +2873,20 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
     }
 
+    private func mediaMap(_ map: MediaMap, at mapURL: URL, references url: URL) -> Bool {
+        let target = url.standardizedFileURL.path
+        return map.states.values.contains { playlist in
+            playlist.entries.contains { entry in
+                let movie = map.resolvedURL(for: entry, relativeTo: mapURL).standardizedFileURL
+                return movie.path == target
+                    || movie.deletingPathExtension().appendingPathExtension("report.json")
+                        .standardizedFileURL.path == target
+                    || map.resolvedPosterURL(for: entry, relativeTo: mapURL)?
+                        .standardizedFileURL.path == target
+            }
+        }
+    }
+
     private func allCharacterMediaMaps() throws -> [(CharacterLibraryEntry, MediaMap, URL)] {
         try characterLibrary.characters.map { entry in
             let mapURL = entry.resolvedMapURL(relativeTo: configuredMediaMapURL)
@@ -3423,7 +3459,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             self.mediaMutationInProgress = true
             self.settingsController?.update(activity: .working(state, "Copying Reduce Motion poster…"))
             DispatchQueue.global(qos: .userInitiated).async {
-                let copied = Result { try self.copyIntoMediaDirectory(sourceURL, subdirectory: "posters") }
+                let copied = Result { try self.copyPosterIntoMediaDirectory(sourceURL) }
                 DispatchQueue.main.async {
                     switch copied {
                     case let .success(installed):
@@ -3542,6 +3578,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         case .moveManagedFilesToTrash:
             let plan: ManagedMediaRemovalPlan
             let trashSnapshot: ManagedMediaTrashSnapshot
+            let originalMap = mediaMap
             do {
                 plan = try ManagedMediaRemovalPlanner.plan(
                     mediaMap: mediaMap,
@@ -3550,15 +3587,23 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                     path: path,
                     canonicalRoot: canonicalManagedMediaRoot
                 )
-                guard !plan.trashURLs.contains(where: isMediaPathReferencedByInactiveCharacter) else {
+                let libraryMaps = try allCharacterMediaMaps()
+                guard !plan.trashURLs.contains(where: { target in
+                    libraryMaps.contains { character, map, mapURL in
+                        guard character.id != characterLibrary.activeCharacterID else { return false }
+                        return mediaMap(map, at: mapURL, references: target)
+                    }
+                }) else {
                     throw PetContractError.invalidValue(
                         "This media is shared by another character. Remove only the library entry to keep that character working."
                     )
                 }
-                trashSnapshot = try ManagedMediaTrashRevalidator.capture(
+                trashSnapshot = try ManagedMediaTrashRevalidator.captureLibrary(
                     targetURLs: plan.trashURLs,
-                    plannedMediaMap: mediaMap,
-                    mapURL: mediaMapURL,
+                    maps: libraryMaps.map { character, map, mapURL in
+                        ManagedMediaTrashMap(url: mapURL, map: map)
+                    },
+                    catalogURL: characterLibraryStorage.catalogURL,
                     canonicalRoot: canonicalManagedMediaRoot
                 )
             } catch {
@@ -3573,9 +3618,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 )
             )
             do {
-                try ManagedMediaTrashRevalidator.validateMapUnchanged(
+                try ManagedMediaTrashRevalidator.validateLibraryUnchanged(
                     snapshot: trashSnapshot,
-                    mapURL: mediaMapURL,
                     canonicalRoot: canonicalManagedMediaRoot
                 )
                 try publishMediaMap(plan.updatedMap)
@@ -3594,17 +3638,25 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             }
             DispatchQueue.global(qos: .utility).async { [weak self] in
                 guard let self else { return }
-                let targets: [URL]
+                let quarantine: ManagedMediaTrashQuarantine
                 do {
-                    targets = try ManagedMediaTrashRevalidator.revalidate(
+                    quarantine = try ManagedMediaTrashRevalidator.quarantineLibraryAfterPublish(
                         snapshot: trashSnapshot,
-                        mapURL: self.mediaMapURL,
+                        publishedMap: ManagedMediaTrashMap(
+                            url: self.mediaMapURL,
+                            map: plan.updatedMap
+                        ),
                         canonicalRoot: self.canonicalManagedMediaRoot
                     )
                 } catch {
                     DispatchQueue.main.async {
                         self.mediaMutationInProgress = false
-                        self.handleMediaMapReloadRequest()
+                        do {
+                            try self.publishMediaMap(originalMap)
+                            self.applyPublishedMediaMap(originalMap)
+                        } catch {
+                            self.handleMediaMapReloadRequest()
+                        }
                         self.settingsController?.update(
                             activity: .failed(state, error.localizedDescription)
                         )
@@ -3613,15 +3665,18 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                     }
                     return
                 }
-                var moved = 0
-                var failed = 0
-                for target in targets {
-                    do {
-                        try FileManager.default.trashItem(at: target, resultingItemURL: nil)
-                        moved += 1
-                    } catch {
-                        failed += 1
-                    }
+                let moved: Int
+                let failed: Int
+                do {
+                    try FileManager.default.trashItem(
+                        at: quarantine.directoryURL,
+                        resultingItemURL: nil
+                    )
+                    moved = quarantine.itemCount
+                    failed = 0
+                } catch {
+                    moved = 0
+                    failed = quarantine.itemCount
                 }
                 DispatchQueue.main.async {
                     self.mediaMutationInProgress = false
@@ -3716,6 +3771,21 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         return (destination, relativePath)
     }
 
+    private func copyPosterIntoMediaDirectory(_ sourceURL: URL) throws -> (url: URL, relativePath: String) {
+        let root = mediaMapURL.deletingLastPathComponent()
+        let destinationDirectory = root.appendingPathComponent("posters", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: destinationDirectory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let sourceExtension = sourceURL.pathExtension.lowercased()
+        let filename = "\(sourceURL.deletingPathExtension().lastPathComponent.prefix(40))-\(versionToken()).\(sourceExtension)"
+        let destination = destinationDirectory.appendingPathComponent(filename)
+        try SecurePosterInstaller().install(source: sourceURL, destination: destination)
+        return (destination, "posters/\(filename)")
+    }
+
     private func publishMediaMap(_ updated: MediaMap) throws {
         mediaMapEncodedData = try characterLibraryStorage.saveMediaMap(
             updated,
@@ -3779,15 +3849,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
     }
 
-    private func persistRuntimeClickThrough() {
-        do {
-            let window = try mediaMap.window.replacing(clickThrough: clickThrough)
-            let updated = try mediaMap.replacingWindow(window)
-            try publishMediaMap(updated)
-            mediaMap = updated
-        } catch {
-            logger.error("event=window_setting_save_failed setting=click_through")
-        }
+    private func persistRuntimeClickThrough(_ value: Bool) throws {
+        let window = try mediaMap.window.replacing(clickThrough: value)
+        let updated = try mediaMap.replacingWindow(window)
+        try publishMediaMap(updated)
+        mediaMap = updated
     }
 
     private func resetPanelPosition() {
