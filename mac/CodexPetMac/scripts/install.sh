@@ -190,7 +190,7 @@ PY
 
 journal_command() {
   "$python_bin" - "$transaction_root" "$home_dir" "$@" <<'PY'
-import hashlib, json, os, shutil, stat, sys
+import hashlib, json, os, shutil, signal, stat, subprocess, sys, time
 from pathlib import Path
 
 root = Path(sys.argv[1])
@@ -267,6 +267,29 @@ elif command == "record":
         raise ValueError("invalid transaction operation")
     data["operations"].append({"kind": kind, "source": source, "target": target, "digest": expected})
     write(data)
+elif command == "launch-init":
+    data = load()
+    labels = args[:4]
+    plists = args[4:8]
+    loaded = [value == "1" for value in args[8:12]]
+    data["launch"] = {"labels": labels, "plists": plists, "loaded": loaded, "pending": [False] * 4, "changed": [False] * 4}
+    write(data)
+elif command == "launch-phase":
+    data = load()
+    if "launch" not in data:
+        raise ValueError("launch state was not initialized")
+    index = int(args[0])
+    phase = args[1]
+    if index not in range(4) or phase not in {"pending", "changed", "clear"}:
+        raise ValueError("invalid launch mutation phase")
+    if phase == "pending":
+        data["launch"]["pending"][index] = True
+    elif phase == "changed":
+        data["launch"]["changed"][index] = True
+        data["launch"]["pending"][index] = False
+    else:
+        data["launch"]["pending"][index] = False
+    write(data)
 elif command == "commit":
     data = load()
     data["state"] = "committed"
@@ -281,7 +304,8 @@ elif command == "recover":
         for relative in ("media", "voice", "characters", "sessions", "alpha-runtime", "runtime/current_state.json", "media/media-map.json", ".legacy-migration-v1.json")
     }
     allowed_exact.update(allowed_support)
-    if data["state"] == "active":
+    if data["state"] == "active" and not data.get("files_restored", False):
+        recovered_operations = 0
         for operation in reversed(data["operations"]):
             kind = operation.get("kind")
             source = Path(operation.get("source", ""))
@@ -308,8 +332,12 @@ elif command == "recover":
                 if target_exists:
                     if digest(target) != expected:
                         raise ValueError(f"installed target changed after interruption: {target}")
-                    shutil.rmtree(target) if target.is_dir() else target.unlink()
-                elif not source_exists:
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    os.rename(target, source)
+                elif source_exists:
+                    if digest(source) != expected:
+                        raise ValueError(f"restored staged target changed after interruption: {source}")
+                else:
                     raise ValueError(f"installed target and staged source are both missing: {target}")
             else:
                 if source_exists and target_exists:
@@ -321,6 +349,47 @@ elif command == "recover":
                     os.rename(source, target)
                 elif not target_exists or digest(target) != expected:
                     raise ValueError(f"original target changed after interruption: {target}")
+            recovered_operations += 1
+            if recovered_operations == 1 and os.environ.get("STATELET_INSTALL_CRASH_DURING_RECOVERY") == "1":
+                os.kill(os.getpid(), signal.SIGKILL)
+        data["files_restored"] = True
+        write(data)
+    launch_failed = False
+    launch = data.get("launch")
+    if data["state"] == "active" and isinstance(launch, dict):
+        domain = f"gui/{os.getuid()}"
+        for label, plist, should_load, pending, changed in zip(launch["labels"], launch["plists"], launch["loaded"], launch["pending"], launch["changed"]):
+            loaded = subprocess.run(["launchctl", "print", f"{domain}/{label}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+            if not changed and not pending:
+                continue
+            if loaded:
+                result = subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if result.returncode != 0:
+                    launch_failed = True
+                for _ in range(40):
+                    if subprocess.run(["launchctl", "print", f"{domain}/{label}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+                        break
+                    time.sleep(0.05)
+                else:
+                    launch_failed = True
+            if should_load:
+                if not Path(plist).is_file():
+                    launch_failed = True
+                    continue
+                result = subprocess.run(["launchctl", "bootstrap", domain, plist], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if result.returncode != 0:
+                    launch_failed = True
+                    continue
+                for _ in range(40):
+                    if subprocess.run(["launchctl", "print", f"{domain}/{label}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                        break
+                    time.sleep(0.05)
+                else:
+                    launch_failed = True
+            elif subprocess.run(["launchctl", "print", f"{domain}/{label}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                launch_failed = True
+    if launch_failed:
+        raise SystemExit(71)
     shutil.rmtree(root)
     sync_directory(root.parent)
 else:
@@ -329,14 +398,19 @@ PY
 }
 
 recover_transaction() {
-  [[ ! -e "$transaction_root" ]] || journal_command recover \
+  if [[ ! -e "$transaction_root" ]]; then return 0; fi
+  journal_command recover \
     "$app_dest" "$legacy_app" "$component_dir" "$legacy_component" \
     "$aggregator_plist" "$player_plist" "$legacy_aggregator_plist" "$legacy_player_plist" \
     "$hooks_file" "$applications_dir" "$home_dir/Library" "$home_dir/Library/Application Support" \
     "$support_dir" "$launch_agents_dir" "$home_dir/.codex" "$media_dir" "$runtime_dir" "$logs_dir" "$support_dir"
 }
 
-if ! recover_transaction; then
+if recover_transaction; then
+  :
+else
+  recovery_status=$?
+  if [[ "$recovery_status" -eq 71 ]]; then printf 'Interrupted installation files were recovered but launchd reconciliation was incomplete.\n' >&2; exit 71; fi
   printf 'Refusing to continue because the interrupted Statelet installation is ambiguous.\n' >&2
   exit 74
 fi
@@ -360,29 +434,6 @@ for plist in "$legacy_aggregator_plist" "$legacy_player_plist"; do
   [[ ! -e "$plist" ]] || is_legacy_plist "$plist" || { printf 'Refusing to migrate an unmanaged legacy LaunchAgent: %s\n' "$plist" >&2; exit 1; }
 done
 
-migration_relatives=()
-migration_digests=()
-# Before a completed migration is attested, canonical data wins only when it
-# matches the legacy source. Afterwards canonical is authoritative while the
-# attested, unchanged legacy source remains preserved for compatibility.
-for relative in media voice characters sessions alpha-runtime runtime/current_state.json; do
-  source="$legacy_support/$relative"
-  destination="$support_dir/$relative"
-  if [[ -e "$source" ]]; then
-    is_owned_legacy_data "$source" || { printf 'Refusing unowned legacy Statelet data: %s\n' "$source" >&2; exit 1; }
-    source_digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$source")" || { printf 'Refusing unsafe legacy Statelet data: %s\n' "$source" >&2; exit 1; }
-    migration_relatives+=("$relative")
-    migration_digests+=("$source_digest")
-    if [[ -e "$destination" ]]; then
-      destination_digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$destination")" || { printf 'Refusing unsafe Statelet destination data: %s\n' "$destination" >&2; exit 1; }
-      if [[ "$source_digest" != "$destination_digest" ]] && ! migration_attests "$relative" "$source_digest"; then
-        printf 'Refusing to overwrite conflicting Statelet data: %s\n' "$destination" >&2
-        exit 1
-      fi
-    fi
-  fi
-done
-
 for plist in "$player_plist" "$legacy_player_plist"; do
   if [[ -f "$plist" ]] && [[ "$(/usr/libexec/PlistBuddy -c 'Print :RunAtLoad' "$plist" 2>/dev/null || true)" == "false" ]]; then
     player_run_at_load=0
@@ -391,17 +442,10 @@ for plist in "$player_plist" "$legacy_player_plist"; do
 done
 
 journal_command init
-installed_targets=()
-backed_up_targets=()
-backed_up_paths=()
-created_dirs=()
 committed=0
-targets_mutated=0
-launch_state_mutated=0
 labels=("$aggregator_label" "$player_label" "$legacy_aggregator_label" "$legacy_player_label")
 plists=("$aggregator_plist" "$player_plist" "$legacy_aggregator_plist" "$legacy_player_plist")
 was_loaded=(0 0 0 0)
-transition_requested=(0 0 0 0)
 
 job_is_loaded() { launchctl print "gui/$(id -u)/$1" >/dev/null 2>&1; }
 wait_for_job_state() {
@@ -413,32 +457,24 @@ wait_for_job_state() {
   done
   return 1
 }
-restore_jobs() {
-  local index label plist
-  for ((index=0; index<4; index++)); do
-    label="${labels[$index]}"; plist="${plists[$index]}"
-    if job_is_loaded "$label"; then launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || return 1; wait_for_job_state "$label" 0 || return 1; fi
-    if [[ "${was_loaded[$index]}" -eq 1 ]]; then
-      [[ -f "$plist" ]] || return 1
-      launchctl bootstrap "gui/$(id -u)" "$plist" >/dev/null 2>&1 || return 1
-      wait_for_job_state "$label" 1 || return 1
-    fi
-  done
-}
 rollback() {
-  local original_status=$? index rollback_failed=0
+  local original_status=$?
   trap - EXIT
   if [[ "$committed" -eq 0 ]]; then
-    if ! recover_transaction; then
+    if recover_transaction; then
+      :
+    else
+      recovery_status=$?
+      if [[ "$recovery_status" -eq 71 ]]; then printf 'Installation failed and launchd rollback was incomplete.\n' >&2; exit 71; fi
       printf 'Installation failed and file rollback was ambiguous.\n' >&2
       exit 74
     fi
-    if [[ "$skip_launchctl" -eq 0 && "$launch_state_mutated" -eq 1 ]]; then restore_jobs || rollback_failed=1; fi
   fi
-  if [[ "$rollback_failed" -ne 0 ]]; then printf 'Installation failed and launchd rollback was incomplete.\n' >&2; exit 71; fi
   exit "$original_status"
 }
 trap rollback EXIT
+backup_target() { local target="$1" name="$2"; if [[ -e "$target" ]]; then local saved="$backup_root/$name" digest; mkdir -p "$(dirname "$saved")"; digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$target")"; journal_command record backup "$saved" "$target" "$digest"; mv "$target" "$saved"; fi; }
+install_target() { local staged="$1" target="$2" digest; mkdir -p "$(dirname "$target")"; digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$staged")"; journal_command record install "$staged" "$target" "$digest"; mv "$staged" "$target"; }
 
 stage_app="$stage_root/Statelet.app"
 stage_component="$stage_root/Statelet"
@@ -456,6 +492,72 @@ rm -rf "$stage_component/python/__pycache__"
 
 stage_hooks="$stage_root/hooks.json"
 "$python_bin" "$script_dir/merge_hooks.py" --destination "$hooks_file" --output "$stage_hooks" --python "$python_bin" --hook-script "$python_dir/statelet_hook.py"
+stage_quiesced_hooks="$stage_root/hooks-quiesced.json"
+if hook_drain_seconds="$("$python_bin" - "$hooks_file" "$stage_quiesced_hooks" <<'PY'
+import json, math, os, shlex, stat, sys
+from pathlib import Path
+
+source, output = map(Path, sys.argv[1:])
+data = json.loads(source.read_text(encoding="utf-8")) if source.exists() else {}
+mode = stat.S_IMODE(source.stat().st_mode) if source.exists() else 0o600
+hooks = data.get("hooks", {})
+if not isinstance(data, dict) or not isinstance(hooks, dict):
+    raise SystemExit(2)
+maximum_timeout = 0.0
+if isinstance(hooks, dict):
+    for event, groups in list(hooks.items()):
+        if not isinstance(groups, list):
+            continue
+        retained_groups = []
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                retained_groups.append(group)
+                continue
+            retained_items = []
+            for item in group["hooks"]:
+                command = item.get("command") if isinstance(item, dict) else None
+                try:
+                    parts = shlex.split(command) if isinstance(command, str) else []
+                except ValueError:
+                    parts = []
+                normalized = parts[1].replace("\\", "/") if len(parts) == 2 else ""
+                managed = (
+                    Path(normalized).name in {"statelet_hook.py", "codex_pet_hook.py"}
+                    and (
+                        any(prefix in normalized for prefix in ("/Library/Application Support/Statelet/", "/Library/Application Support/CodexPet/"))
+                        or normalized.endswith("/Documents/codex-pet-dev-board/mac/codex_pet_hook.py")
+                        or normalized.endswith("/Documents/codex-pet-dev-board/mac/statelet_hook.py")
+                        or normalized.endswith("/Documents/codex-pet-arduino/mac/codex_pet_hook.py")
+                        or normalized.endswith("/Documents/codex-pet-arduino/mac/statelet_hook.py")
+                    )
+                )
+                if not managed:
+                    retained_items.append(item)
+                else:
+                    try:
+                        timeout = float(item["timeout"])
+                        if not math.isfinite(timeout) or timeout < 0 or timeout > 60:
+                            raise ValueError
+                    except KeyError:
+                        timeout = 10.0
+                    except (TypeError, ValueError):
+                        raise SystemExit("Unsupported managed hook timeout.")
+                    maximum_timeout = max(maximum_timeout, timeout)
+            replacement = dict(group)
+            replacement["hooks"] = retained_items
+            if retained_items or set(replacement) - {"hooks", "matcher"}:
+                retained_groups.append(replacement)
+        hooks[event] = retained_groups
+output.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+os.chmod(output, mode)
+print(maximum_timeout + 0.1 if maximum_timeout else 0.0)
+PY
+)"; then
+  :
+else
+  printf 'Refusing unsupported Statelet hook configuration.\n' >&2
+  exit 1
+fi
 
 "$python_bin" - "$stage_aggregator_plist" "$stage_player_plist" "$python_bin" "$python_dir" "$support_dir" "$app_dest" "$aggregator_label" "$player_label" "$managed_marker" "$player_run_at_load" <<'PY'
 import plistlib, sys
@@ -476,11 +578,75 @@ for path, payload in ((aggregator_path, aggregator), (player_path, player)):
 PY
 plutil -lint "$stage_aggregator_plist" "$stage_player_plist" >/dev/null
 
+if [[ "$skip_launchctl" -eq 0 ]]; then
+  for ((index=0; index<4; index++)); do if job_is_loaded "${labels[$index]}"; then was_loaded[$index]=1; fi; done
+  journal_command launch-init "${labels[@]}" "${plists[@]}" "${was_loaded[@]}"
+  for ((index=0; index<4; index++)); do
+    label="${labels[$index]}"
+    if [[ "${was_loaded[$index]}" -eq 1 ]]; then
+      journal_command launch-phase "$index" pending
+      if ! launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1; then
+        if wait_for_job_state "$label" "${was_loaded[$index]}"; then
+          journal_command launch-phase "$index" clear
+          printf 'Could not stop managed LaunchAgent %s; installation was not applied.\n' "$label" >&2
+          exit 72
+        fi
+        printf 'Managed LaunchAgent %s entered an ambiguous state; installation was not applied.\n' "$label" >&2
+        exit 71
+      fi
+      if [[ "${STATELET_INSTALL_CRASH_AT:-}" == "after-first-bootout-submit" ]]; then kill -KILL $$; fi
+      wait_for_job_state "$label" 0 || { printf 'Managed LaunchAgent %s remained loaded; installation was not applied.\n' "$label" >&2; exit 72; }
+      journal_command launch-phase "$index" changed
+      if [[ "${STATELET_INSTALL_CRASH_AT:-}" == "after-first-bootout" ]]; then kill -KILL $$; fi
+    fi
+  done
+fi
+
+if [[ -e "$hooks_file" ]]; then
+  backup_target "$hooks_file" hooks-original.json
+  install_target "$stage_quiesced_hooks" "$hooks_file"
+fi
+backup_target "$component_dir" component
+[[ "$legacy_component_is_managed" -eq 0 ]] || backup_target "$legacy_component" legacy/component
+# Drain already-running managed hooks for the largest configured timeout,
+# bounded to 10 seconds. The final post-publication digest check remains
+# authoritative if a process outlives that contract.
+[[ "$hook_drain_seconds" == "0.0" ]] || /bin/sleep "$hook_drain_seconds"
+
+migration_relatives=()
+migration_digests=()
+migration_present_relatives=()
+# Snapshot legacy data only after all managed legacy/canonical writers are
+# quiesced. Completed provenance makes canonical authoritative only when the
+# retained legacy source still matches the attested digest.
+for relative in media voice characters sessions alpha-runtime runtime/current_state.json; do
+  source="$legacy_support/$relative"
+  destination="$support_dir/$relative"
+  migration_relatives+=("$relative")
+  if [[ -e "$source" ]]; then
+    is_owned_legacy_data "$source" || { printf 'Refusing unowned legacy Statelet data.\n' >&2; exit 1; }
+    source_digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$source")" || { printf 'Refusing unsafe legacy Statelet data.\n' >&2; exit 1; }
+    migration_digests+=("$source_digest")
+    migration_present_relatives+=("$relative")
+    if [[ -e "$destination" ]]; then
+      destination_digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$destination")" || { printf 'Refusing unsafe Statelet destination data.\n' >&2; exit 1; }
+      if [[ "$source_digest" != "$destination_digest" ]] && ! migration_attests "$relative" "$source_digest"; then
+        printf 'Refusing to overwrite conflicting Statelet data.\n' >&2
+        exit 1
+      fi
+    fi
+  else
+    migration_digests+=("__absent__")
+  fi
+done
+
 stage_migration_manifest="$stage_root/legacy-migration-v1.json"
 migration_manifest_args=("$stage_migration_manifest" "$legacy_marker" "$legacy_support")
-for ((index=0; index<${#migration_relatives[@]}; index++)); do migration_manifest_args+=("${migration_relatives[$index]}"); done
+for ((index=0; index<${#migration_present_relatives[@]}; index++)); do migration_manifest_args+=("${migration_present_relatives[$index]}"); done
 migration_manifest_args+=(--)
-for ((index=0; index<${#migration_digests[@]}; index++)); do migration_manifest_args+=("${migration_digests[$index]}"); done
+for ((index=0; index<${#migration_relatives[@]}; index++)); do
+  [[ "${migration_digests[$index]}" == "__absent__" ]] || migration_manifest_args+=("${migration_digests[$index]}")
+done
 "$python_bin" - "${migration_manifest_args[@]}" <<'PY'
 import json, os, sys
 from pathlib import Path
@@ -515,39 +681,48 @@ for relative in media voice characters sessions alpha-runtime runtime/current_st
   fi
 done
 
-if [[ "$skip_launchctl" -eq 0 ]]; then
-  for ((index=0; index<4; index++)); do
-    label="${labels[$index]}"
-    if job_is_loaded "$label"; then
-      was_loaded[$index]=1; transition_requested[$index]=1
-      launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || { printf 'Could not stop managed LaunchAgent %s; installation was not applied.\n' "$label" >&2; exit 72; }
-      wait_for_job_state "$label" 0 || { printf 'Managed LaunchAgent %s remained loaded; installation was not applied.\n' "$label" >&2; exit 72; }
-      launch_state_mutated=1
-    fi
-  done
+# Hooks can still write while launchd is quiesced. Revalidate every selected
+# source and staged copy immediately before the first destination mutation.
+if [[ -n "${STATELET_INSTALL_TEST_MIGRATION_GATE:-}" ]]; then
+  gate="${STATELET_INSTALL_TEST_MIGRATION_GATE}"
+  [[ "$gate" = "$home_dir"/* ]] || { printf 'Invalid migration test gate.\n' >&2; exit 2; }
+  : > "$gate.ready"
+  attempt=0
+  while [[ "$attempt" -lt 200 && ! -e "$gate.release" ]]; do /bin/sleep 0.01; attempt=$((attempt + 1)); done
+  [[ -e "$gate.release" ]] || { printf 'Migration test gate timed out.\n' >&2; exit 76; }
 fi
+for ((index=0; index<${#migration_relatives[@]}; index++)); do
+  relative="${migration_relatives[$index]}"
+  source="$legacy_support/$relative"
+  expected_digest="${migration_digests[$index]}"
+  if [[ "$expected_digest" == "__absent__" ]]; then
+    [[ ! -e "$source" ]] || { printf 'Legacy Statelet data changed during migration.\n' >&2; exit 75; }
+    continue
+  fi
+  current_digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$source")" || { printf 'Legacy Statelet data changed during migration.\n' >&2; exit 75; }
+  [[ "$current_digest" == "$expected_digest" ]] || { printf 'Legacy Statelet data changed during migration.\n' >&2; exit 75; }
+  if [[ -e "$stage_root/migration/$relative" ]]; then
+    staged_digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$stage_root/migration/$relative")"
+    [[ "$staged_digest" == "$expected_digest" ]] || { printf 'Staged Statelet data failed migration validation.\n' >&2; exit 75; }
+  fi
+done
 
-ensure_dir() { if [[ ! -d "$1" ]]; then journal_command record mkdir "" "$1" ""; mkdir "$1"; created_dirs+=("$1"); fi; }
-ensure_private_dir() { if [[ ! -d "$1" ]]; then journal_command record mkdir "" "$1" ""; mkdir -m 0700 "$1"; created_dirs+=("$1"); fi; }
+ensure_dir() { if [[ ! -d "$1" ]]; then journal_command record mkdir "" "$1" ""; mkdir "$1"; fi; }
+ensure_private_dir() { if [[ ! -d "$1" ]]; then journal_command record mkdir "" "$1" ""; mkdir -m 0700 "$1"; fi; }
 ensure_dir "$applications_dir"
 ensure_dir "$home_dir/Library"
 ensure_dir "$home_dir/Library/Application Support"
 ensure_private_dir "$support_dir"
 ensure_dir "$launch_agents_dir"
 ensure_dir "$home_dir/.codex"
-backup_target() { local target="$1" name="$2"; if [[ -e "$target" ]]; then local saved="$backup_root/$name" digest; mkdir -p "$(dirname "$saved")"; digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$target")"; journal_command record backup "$saved" "$target" "$digest"; mv "$target" "$saved"; backed_up_targets+=("$target"); backed_up_paths+=("$saved"); fi; }
-install_target() { local staged="$1" target="$2" digest; mkdir -p "$(dirname "$target")"; digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$staged")"; journal_command record install "$staged" "$target" "$digest"; mv "$staged" "$target"; installed_targets+=("$target"); }
 
-targets_mutated=1
 backup_target "$app_dest" app
 [[ "$legacy_app_is_managed" -eq 0 ]] || backup_target "$legacy_app" legacy/app
-backup_target "$component_dir" component
-[[ "$legacy_component_is_managed" -eq 0 ]] || backup_target "$legacy_component" legacy/component
 backup_target "$aggregator_plist" agents/aggregator
 backup_target "$player_plist" agents/player
 [[ ! -e "$legacy_aggregator_plist" ]] || backup_target "$legacy_aggregator_plist" agents/legacy-aggregator
 [[ ! -e "$legacy_player_plist" ]] || backup_target "$legacy_player_plist" agents/legacy-player
-backup_target "$hooks_file" hooks.json
+[[ ! -e "$hooks_file" ]] || backup_target "$hooks_file" hooks-quiesced.json
 install_target "$stage_app" "$app_dest"
 if [[ "${STATELET_INSTALL_CRASH_AT:-}" == "after-app" ]]; then kill -KILL $$; fi
 if [[ "${STATELET_INSTALL_FAIL_AT:-${CODEX_PET_INSTALL_FAIL_AT:-}}" == "after-app" ]]; then printf 'Injected installation failure after app replacement.\n' >&2; exit 70; fi
@@ -556,25 +731,54 @@ install_target "$stage_aggregator_plist" "$aggregator_plist"
 if [[ "$install_player" -eq 1 ]]; then install_target "$stage_player_plist" "$player_plist"; fi
 install_target "$stage_hooks" "$hooks_file"
 
-for relative in media voice characters sessions alpha-runtime runtime/current_state.json; do
-  source="$legacy_support/$relative"; destination="$support_dir/$relative"
-  if [[ -e "$source" ]]; then
-    if [[ -e "$stage_root/migration/$relative" ]]; then install_target "$stage_root/migration/$relative" "$destination"; fi
-  fi
+for ((index=0; index<${#migration_relatives[@]}; index++)); do
+  [[ "${migration_digests[$index]}" == "__absent__" ]] && continue
+  relative="${migration_relatives[$index]}"
+  destination="$support_dir/$relative"
+  if [[ -e "$stage_root/migration/$relative" ]]; then install_target "$stage_root/migration/$relative" "$destination"; fi
 done
 backup_target "$migration_manifest" migration-manifest
 install_target "$stage_migration_manifest" "$migration_manifest"
-for directory in "$media_dir" "$runtime_dir" "$logs_dir"; do if [[ ! -d "$directory" ]]; then journal_command record mkdir "" "$directory" ""; mkdir -m 0700 "$directory"; created_dirs+=("$directory"); fi; done
+for directory in "$media_dir" "$runtime_dir" "$logs_dir"; do if [[ ! -d "$directory" ]]; then journal_command record mkdir "" "$directory" ""; mkdir -m 0700 "$directory"; fi; done
 if [[ ! -e "$media_map" ]]; then cp "$package_dir/Examples/media-map.json" "$stage_root/media-map.json"; chmod 0600 "$stage_root/media-map.json"; install_target "$stage_root/media-map.json" "$media_map"; fi
+if [[ -n "${STATELET_INSTALL_TEST_POSTVALIDATION_GATE:-}" ]]; then
+  gate="${STATELET_INSTALL_TEST_POSTVALIDATION_GATE}"
+  [[ "$gate" = "$home_dir"/* ]] || { printf 'Invalid migration test gate.\n' >&2; exit 2; }
+  : > "$gate.ready"
+  attempt=0
+  while [[ "$attempt" -lt 200 && ! -e "$gate.release" ]]; do /bin/sleep 0.01; attempt=$((attempt + 1)); done
+  [[ -e "$gate.release" ]] || { printf 'Migration test gate timed out.\n' >&2; exit 76; }
+fi
+for ((index=0; index<${#migration_relatives[@]}; index++)); do
+  relative="${migration_relatives[$index]}"
+  source="$legacy_support/$relative"
+  expected_digest="${migration_digests[$index]}"
+  if [[ "$expected_digest" == "__absent__" ]]; then
+    [[ ! -e "$source" ]] || { printf 'Legacy Statelet data changed during publication.\n' >&2; exit 75; }
+    continue
+  fi
+  current_digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$source")" || { printf 'Legacy Statelet data changed during publication.\n' >&2; exit 75; }
+  [[ "$current_digest" == "$expected_digest" ]] || { printf 'Legacy Statelet data changed during publication.\n' >&2; exit 75; }
+  destination="$support_dir/$relative"
+  if [[ -e "$stage_root/migration/$relative" ]]; then
+    published_digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$destination")"
+    [[ "$published_digest" == "$expected_digest" ]] || { printf 'Published Statelet data failed migration validation.\n' >&2; exit 75; }
+  fi
+done
 if [[ "${STATELET_INSTALL_CRASH_AT:-}" == "after-support" ]]; then kill -KILL $$; fi
 if [[ "${STATELET_INSTALL_FAIL_AT:-${CODEX_PET_INSTALL_FAIL_AT:-}}" == "after-support" ]]; then printf 'Injected installation failure after support migration.\n' >&2; exit 70; fi
 
 if [[ "$skip_launchctl" -eq 0 ]]; then
+  journal_command launch-phase 0 pending
   launchctl bootstrap "gui/$(id -u)" "$aggregator_plist"
   wait_for_job_state "$aggregator_label" 1 || { printf 'The aggregator LaunchAgent did not load after bootstrap.\n' >&2; exit 73; }
+  if [[ "${STATELET_INSTALL_CRASH_AT:-}" == "after-aggregator-rebootstrap" ]]; then kill -KILL $$; fi
+  journal_command launch-phase 0 changed
   if [[ "$install_player" -eq 1 ]]; then
+    journal_command launch-phase 1 pending
     launchctl bootstrap "gui/$(id -u)" "$player_plist"
     wait_for_job_state "$player_label" 1 || { printf 'The player LaunchAgent did not register after bootstrap.\n' >&2; exit 73; }
+    journal_command launch-phase 1 changed
     [[ "$player_run_at_load" -eq 1 ]] || /usr/bin/open "$app_dest"
   fi
 fi

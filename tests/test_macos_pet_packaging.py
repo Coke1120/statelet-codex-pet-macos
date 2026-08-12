@@ -2130,6 +2130,436 @@ struct WatchdogHarness {
         self.assertEqual(failed.returncode, 71, failed.stderr)
         self.assertIn("launchd rollback was incomplete", failed.stderr)
 
+    def test_fresh_install_player_bootstrap_failure_removes_new_aggregator(self) -> None:
+        bundle = self.make_bundle("FreshPlayerBootstrapFailure")
+        aggregator = "com.coke1120.statelet.state-aggregator"
+        player = "com.coke1120.statelet.mac-player"
+        environment, log = self.fake_launchctl_environment(
+            fail_action="bootstrap",
+            fail_label=player,
+        )
+
+        failed = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(failed.returncode, 64, failed.stderr)
+        state = log.parent / "state"
+        self.assertFalse((state / aggregator).exists())
+        self.assertFalse((state / player).exists())
+        self.assertFalse((self.home / "Applications" / "Statelet.app").exists())
+        self.assertFalse((self.home / "Library" / "Application Support" / "Statelet").exists())
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+        commands = log.read_text(encoding="utf-8").splitlines()
+        self.assertTrue(any(command.startswith("bootstrap ") and "state-aggregator.plist" in command for command in commands))
+        self.assertTrue(any(command.startswith("bootout ") and aggregator in command for command in commands))
+
+    def test_sigkill_after_first_bootout_recovers_original_launch_jobs(self) -> None:
+        bundle = self.make_bundle("CrashAfterFirstBootout")
+        aggregator = "com.coke1120.statelet.state-aggregator"
+        player = "com.coke1120.statelet.mac-player"
+        environment, log = self.fake_launchctl_environment(aggregator, player)
+        launch_agents = self.home / "Library" / "LaunchAgents"
+        launch_agents.mkdir(parents=True)
+        for label in (aggregator, player):
+            (launch_agents / f"{label}.plist").write_bytes(
+                plistlib.dumps({"Label": label, "StateletManaged": MANAGED_MARKER})
+            )
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-first-bootout"
+
+        crashed = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(crashed.returncode, -9, crashed.stderr)
+        state = log.parent / "state"
+        self.assertFalse((state / aggregator).exists())
+        self.assertTrue((state / player).exists())
+        environment.pop("STATELET_INSTALL_CRASH_AT")
+        recovered = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertTrue((state / aggregator).exists())
+        self.assertTrue((state / player).exists())
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+        commands = log.read_text(encoding="utf-8").splitlines()
+        first_recovery_bootstrap = next(
+            index for index, command in enumerate(commands) if command.startswith("bootstrap ")
+        )
+        later_requiesce = next(
+            index for index, command in enumerate(commands[first_recovery_bootstrap + 1 :], first_recovery_bootstrap + 1)
+            if command.startswith("bootout ")
+        )
+        self.assertLess(first_recovery_bootstrap, later_requiesce)
+
+    def test_sigkill_after_delayed_bootout_submission_reconciles_pending_state(self) -> None:
+        bundle = self.make_bundle("CrashAfterDelayedBootoutSubmit")
+        aggregator = "com.coke1120.statelet.state-aggregator"
+        environment, _ = self.fake_launchctl_environment(aggregator, delay_label=aggregator)
+        launch_agents = self.home / "Library" / "LaunchAgents"
+        launch_agents.mkdir(parents=True)
+        (launch_agents / f"{aggregator}.plist").write_bytes(
+            plistlib.dumps({"Label": aggregator, "StateletManaged": MANAGED_MARKER})
+        )
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-first-bootout-submit"
+
+        crashed = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(crashed.returncode, -9, crashed.stderr)
+        environment.pop("STATELET_INSTALL_CRASH_AT")
+        recovered = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertTrue((Path(environment["CODEX_PET_FAKE_LAUNCH_STATE"]) / aggregator).exists())
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+
+    def test_launch_recovery_failure_retains_journal_for_retry(self) -> None:
+        bundle = self.make_bundle("LaunchRecoveryRetry")
+        aggregator = "com.coke1120.statelet.state-aggregator"
+        environment, _ = self.fake_launchctl_environment(aggregator)
+        launch_agents = self.home / "Library" / "LaunchAgents"
+        launch_agents.mkdir(parents=True)
+        plist = launch_agents / f"{aggregator}.plist"
+        plist.write_bytes(plistlib.dumps({"Label": aggregator, "StateletManaged": MANAGED_MARKER}))
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-first-bootout"
+        self.assertEqual(
+            subprocess.run(
+                ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+                cwd=ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            ).returncode,
+            -9,
+        )
+        environment.pop("STATELET_INSTALL_CRASH_AT")
+        environment["CODEX_PET_FAKE_FAIL_ACTION"] = "bootstrap"
+        environment["CODEX_PET_FAKE_FAIL_LABEL"] = aggregator
+
+        failed_recovery = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(failed_recovery.returncode, 71, failed_recovery.stderr)
+        transaction = self.home / ".statelet-install-transaction"
+        self.assertTrue((transaction / "journal.json").exists())
+        environment["CODEX_PET_FAKE_FAIL_ACTION"] = ""
+        environment["CODEX_PET_FAKE_FAIL_LABEL"] = ""
+        recovered = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertFalse(transaction.exists())
+
+    def test_crash_after_rebootstrap_reloads_restored_old_plist(self) -> None:
+        first = self.make_bundle("RebootstrapCrashFirst", "first")
+        self.assertEqual(self.install(first).returncode, 0)
+        aggregator = "com.coke1120.statelet.state-aggregator"
+        environment, log = self.fake_launchctl_environment(aggregator)
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-aggregator-rebootstrap"
+        crashed = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(self.make_bundle("RebootstrapCrashSecond", "second"))],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        self.assertEqual(crashed.returncode, -9, crashed.stderr)
+        environment.pop("STATELET_INSTALL_CRASH_AT")
+        before = len(log.read_text(encoding="utf-8").splitlines())
+        recovered = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(first)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        recovery_commands = log.read_text(encoding="utf-8").splitlines()[before:]
+        self.assertTrue(any(command.startswith("bootout ") and aggregator in command for command in recovery_commands))
+        self.assertTrue(any(command.startswith("bootstrap ") and "state-aggregator.plist" in command for command in recovery_commands))
+
+    def test_file_recovery_crash_is_idempotent_on_retry(self) -> None:
+        first = self.make_bundle("RecoveryCrashFirst", "first")
+        self.assertEqual(self.install(first).returncode, 0)
+        second = self.make_bundle("RecoveryCrashSecond", "second")
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-app"
+        self.assertEqual(self.install(second, env=environment).returncode, -9)
+        environment.pop("STATELET_INSTALL_CRASH_AT")
+        environment["STATELET_INSTALL_CRASH_DURING_RECOVERY"] = "1"
+        recovery_crash = self.install(second, env=environment)
+        self.assertEqual(recovery_crash.returncode, 74, recovery_crash.stderr)
+        self.assertIn("interrupted Statelet installation is ambiguous", recovery_crash.stderr)
+        transaction = self.home / ".statelet-install-transaction"
+        self.assertTrue((transaction / "journal.json").exists())
+        environment.pop("STATELET_INSTALL_CRASH_DURING_RECOVERY")
+        recovered = self.install(second, env=environment)
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertFalse(transaction.exists())
+
+    def test_legacy_source_mutation_after_copy_aborts_before_publication(self) -> None:
+        legacy = self.home / "Library" / "Application Support" / "CodexPet"
+        voice = legacy / "voice" / "profile.json"
+        voice.parent.mkdir(parents=True)
+        voice.write_bytes(b"snapshot-before-mutation")
+        cached_legacy_hook = legacy / "mac-widget" / "python" / "codex_pet_hook.py"
+        cached_legacy_hook.parent.mkdir(parents=True)
+        cached_legacy_hook.write_text("# cached legacy writer\n", encoding="utf-8")
+        (legacy / "mac-widget" / "MANAGED_BY_CODEX_PET").write_text(LEGACY_MARKER + "\n", encoding="utf-8")
+        hooks_file = self.home / ".codex" / "hooks.json"
+        hooks_file.parent.mkdir()
+        legacy_hook_command = shlex.join(
+            ["/usr/bin/python3", str(cached_legacy_hook)]
+        )
+        hooks_payload = {
+            "unrelated": {"keep": True},
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": legacy_hook_command, "timeout": 0.1}]}]},
+        }
+        hooks_file.write_text(json.dumps(hooks_payload), encoding="utf-8")
+        original_hooks = hooks_file.read_bytes()
+        legacy_plist = self.home / "Library" / "LaunchAgents" / "com.coke1120.codex-pet.state-aggregator.plist"
+        legacy_plist.parent.mkdir(parents=True)
+        legacy_plist.write_bytes(
+            plistlib.dumps(
+                {
+                    "Label": "com.coke1120.codex-pet.state-aggregator",
+                    "CodexPetMacManaged": LEGACY_MARKER,
+                }
+            )
+        )
+        legacy_label = "com.coke1120.codex-pet.state-aggregator"
+        environment, log = self.fake_launchctl_environment(legacy_label)
+        gate = self.home / "migration-gate"
+        environment["STATELET_INSTALL_TEST_POSTVALIDATION_GATE"] = str(gate)
+        process = subprocess.Popen(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(self.make_bundle("MutationGate"))],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        import time
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
+            time.sleep(0.01)
+        if not Path(f"{gate}.ready").exists():
+            process.terminate()
+            _, stderr = process.communicate(timeout=5)
+            self.fail(f"migration gate was not reached: {stderr}")
+        self.assertFalse((log.parent / "state" / legacy_label).exists())
+        self.assertFalse(cached_legacy_hook.exists())
+        quiesced_hooks = hooks_file.read_text(encoding="utf-8")
+        self.assertNotIn(legacy_hook_command, quiesced_hooks)
+        self.assertIn('"keep": true', quiesced_hooks)
+        voice.write_bytes(b"mutated-after-copy")
+        Path(f"{gate}.release").touch()
+
+        _, stderr = process.communicate(timeout=10)
+
+        self.assertEqual(process.returncode, 75, stderr)
+        self.assertEqual(voice.read_bytes(), b"mutated-after-copy")
+        self.assertFalse((self.home / "Applications" / "Statelet.app").exists())
+        self.assertFalse((self.home / "Library" / "Application Support" / "Statelet").exists())
+        self.assertTrue((log.parent / "state" / legacy_label).exists())
+        self.assertEqual(hooks_file.read_bytes(), original_hooks)
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+
+    def test_legacy_path_created_after_snapshot_aborts_and_rolls_back(self) -> None:
+        legacy = self.home / "Library" / "Application Support" / "CodexPet"
+        legacy.mkdir(parents=True)
+        hooks_file = self.home / ".codex" / "hooks.json"
+        hooks_file.parent.mkdir()
+        hooks_file.write_text(json.dumps({"hooks": {}}), encoding="utf-8")
+        original_hooks = hooks_file.read_bytes()
+        gate = self.home / "absent-migration-gate"
+        environment = os.environ.copy()
+        environment["HOME"] = str(self.home)
+        environment["STATELET_INSTALL_TEST_POSTVALIDATION_GATE"] = str(gate)
+        process = subprocess.Popen(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(self.make_bundle("AbsentMutationGate")), "--skip-launchctl"],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        import time
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
+            time.sleep(0.01)
+        if not Path(f"{gate}.ready").exists():
+            process.terminate()
+            _, stderr = process.communicate(timeout=5)
+            self.fail(f"migration gate was not reached: {stderr}")
+        created = legacy / "sessions" / "late" / "state.json"
+        created.parent.mkdir(parents=True)
+        created.write_bytes(b"late-hook-write")
+        Path(f"{gate}.release").touch()
+        _, stderr = process.communicate(timeout=10)
+
+        self.assertEqual(process.returncode, 75, stderr)
+        self.assertEqual(created.read_bytes(), b"late-hook-write")
+        self.assertEqual(hooks_file.read_bytes(), original_hooks)
+        self.assertFalse((self.home / "Applications" / "Statelet.app").exists())
+        self.assertFalse((self.home / "Library" / "Application Support" / "Statelet").exists())
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+
+    def test_managed_hook_without_timeout_uses_nonzero_conservative_drain(self) -> None:
+        source = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('except KeyError:\n                        timeout = 10.0', source)
+
+    def test_obsolete_documents_hook_is_disabled_before_snapshot(self) -> None:
+        legacy = self.home / "Library" / "Application Support" / "CodexPet"
+        voice = legacy / "voice" / "profile.json"
+        voice.parent.mkdir(parents=True)
+        voice.write_bytes(b"documents-hook-snapshot")
+        hooks_file = self.home / ".codex" / "hooks.json"
+        hooks_file.parent.mkdir()
+        obsolete = self.home / "Documents" / "codex-pet-dev-board" / "mac" / "codex_pet_hook.py"
+        obsolete.parent.mkdir(parents=True)
+        obsolete.write_text("# obsolete writer\n", encoding="utf-8")
+        command = shlex.join(["/usr/bin/python3", str(obsolete)])
+        hooks_file.write_text(
+            json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": command, "timeout": 0.1}]}]}}),
+            encoding="utf-8",
+        )
+        gate = self.home / "documents-hook-gate"
+        environment = os.environ.copy()
+        environment["HOME"] = str(self.home)
+        environment["STATELET_INSTALL_TEST_MIGRATION_GATE"] = str(gate)
+        process = subprocess.Popen(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(self.make_bundle("DocumentsHookGate")), "--skip-launchctl"],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        import time
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
+            time.sleep(0.01)
+        if not Path(f"{gate}.ready").exists():
+            process.terminate()
+            _, stderr = process.communicate(timeout=5)
+            self.fail(f"migration gate was not reached: {stderr}")
+        self.assertNotIn(command, hooks_file.read_text(encoding="utf-8"))
+        Path(f"{gate}.release").touch()
+        _, stderr = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 0, stderr)
+
+    def test_explicit_long_hook_timeout_is_fully_drained_before_snapshot(self) -> None:
+        legacy = self.home / "Library" / "Application Support" / "CodexPet"
+        voice = legacy / "voice" / "profile.json"
+        voice.parent.mkdir(parents=True)
+        voice.write_bytes(b"before-delayed-writer")
+        hooks_file = self.home / ".codex" / "hooks.json"
+        hooks_file.parent.mkdir()
+        hook_path = legacy / "runtime" / "codex_pet_hook.py"
+        hook_path.parent.mkdir(parents=True)
+        hook_path.write_text("# delayed writer\n", encoding="utf-8")
+        command = shlex.join(["/usr/bin/python3", str(hook_path)])
+        hooks_file.write_text(
+            json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": command, "timeout": 10.2}]}]}}),
+            encoding="utf-8",
+        )
+        writer = subprocess.Popen(["/bin/bash", "-c", f"sleep 10.05; printf after-delayed-writer > {shlex.quote(str(voice))}"])
+        try:
+            installed = self.install(self.make_bundle("LongHookDrain"))
+            writer.wait(timeout=5)
+        finally:
+            if writer.poll() is None:
+                writer.terminate()
+                writer.wait(timeout=5)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        canonical = self.home / "Library" / "Application Support" / "Statelet" / "voice" / "profile.json"
+        self.assertEqual(canonical.read_bytes(), b"after-delayed-writer")
+        self.assertEqual(voice.read_bytes(), b"after-delayed-writer")
+
+    def test_unsupported_managed_hook_timeout_fails_before_mutation_privately(self) -> None:
+        hooks_file = self.home / ".codex" / "hooks.json"
+        hooks_file.parent.mkdir()
+        private_hook = self.home / "Library" / "Application Support" / "CodexPet" / "runtime" / "codex_pet_hook.py"
+        private_hook.parent.mkdir(parents=True)
+        private_hook.write_text("# private hook\n", encoding="utf-8")
+        private_name = "private-profile-name"
+        hooks_file.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "Stop": [
+                            {
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": shlex.join(["/usr/bin/python3", str(private_hook)]),
+                                        "timeout": 60.1,
+                                        "private": private_name,
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        original = hooks_file.read_bytes()
+
+        failed = self.install(self.make_bundle("RejectUnsupportedHookTimeout"))
+
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("Refusing unsupported Statelet hook configuration", failed.stderr)
+        self.assertNotIn(str(private_hook), failed.stderr)
+        self.assertNotIn(private_name, failed.stderr)
+        self.assertEqual(hooks_file.read_bytes(), original)
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+        self.assertFalse((self.home / "Applications" / "Statelet.app").exists())
+
     def test_install_waits_for_delayed_launchd_transitions(self) -> None:
         first = self.make_bundle("DelayedLaunchFirst", "first")
         installed = self.install(first)
