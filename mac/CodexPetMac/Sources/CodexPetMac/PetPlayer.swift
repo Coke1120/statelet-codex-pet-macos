@@ -730,15 +730,14 @@ final class PetPlayerView: NSView {
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard !isHidden, bounds.contains(point) else { return nil }
+        // NSStackView's fitting frame can be narrower than an arranged
+        // button's visible 40-point bezel. Test the button bounds first so the
+        // entire physical target remains clickable at every edge.
+        for button in [nextClipButton, temporaryStateButton] where !button.isHidden {
+            let target = button.convert(button.bounds, to: self)
+            if target.contains(point) { return button }
+        }
         if quickControls.frame.contains(point) {
-            // NSStackView may return an internal view (or nil in a headless
-            // AppKit test host) for a button's visible bezel. Route the full
-            // 40-point target explicitly so physical clicks consistently
-            // reach the NSButton across panel and activation states.
-            for button in [nextClipButton, temporaryStateButton] where !button.isHidden {
-                let target = button.convert(button.bounds, to: self)
-                if target.contains(point) { return button }
-            }
             return self
         }
         return self

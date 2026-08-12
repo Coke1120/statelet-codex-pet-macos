@@ -183,6 +183,43 @@ public enum ManagedMediaTrashRevalidator {
         }
     }
 
+    /// Proves that a failed quarantine restored every captured target before
+    /// callers republish the map that references those targets. A rename-based
+    /// rollback changes ctime, so restoration is identity/content-bound rather
+    /// than requiring the pre-quarantine ctime to remain unchanged.
+    public static func validateLibraryReadyForMapRestore(
+        snapshot: ManagedMediaTrashSnapshot,
+        publishedMap: ManagedMediaTrashMap,
+        canonicalRoot: URL
+    ) throws {
+        let root = try validateRoot(canonicalRoot)
+        try validateCatalog(snapshot.catalog, root: root)
+        let publishedURL = try validateManagedFile(publishedMap.url, root: root)
+        for expected in snapshot.maps {
+            let current = try inspectMap(try validateManagedFile(expected.url, root: root))
+            if expected.url.standardizedFileURL == publishedURL {
+                guard current.map == publishedMap.map else {
+                    throw ManagedMediaTrashRevalidationError.mediaMapChangedBeforePublish
+                }
+            } else {
+                guard current == expected else {
+                    throw ManagedMediaTrashRevalidationError.mediaMapChangedBeforePublish
+                }
+            }
+        }
+        for expected in snapshot.targets {
+            let current: ManagedMediaTrashTarget
+            do {
+                current = try inspectTarget(expected.url, root: root)
+            } catch {
+                throw ManagedMediaTrashRevalidationError.targetChanged
+            }
+            guard target(current, matchesIdentityAndContentsOf: expected) else {
+                throw ManagedMediaTrashRevalidationError.targetChanged
+            }
+        }
+    }
+
     public static func revalidate(
         snapshot: ManagedMediaTrashSnapshot,
         mapURL: URL,
@@ -494,6 +531,17 @@ public enum ManagedMediaTrashRevalidator {
             && Int64(information.st_size) == expected.size
             && Int64(information.st_mtimespec.tv_sec) == expected.modifiedSeconds
             && Int64(information.st_mtimespec.tv_nsec) == expected.modifiedNanoseconds
+    }
+
+    private static func target(
+        _ current: ManagedMediaTrashTarget,
+        matchesIdentityAndContentsOf expected: ManagedMediaTrashTarget
+    ) -> Bool {
+        current.device == expected.device
+            && current.inode == expected.inode
+            && current.size == expected.size
+            && current.modifiedSeconds == expected.modifiedSeconds
+            && current.modifiedNanoseconds == expected.modifiedNanoseconds
     }
 
     private static func validateLayout(

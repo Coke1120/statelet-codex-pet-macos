@@ -24,6 +24,7 @@ struct SecurePosterInstaller {
         }
         return UInt64(capacity)
     }
+    var syncDirectory: (Int32) -> Int32 = { Darwin.fsync($0) }
 
     func install(source: URL, destination: URL) throws {
         let sourceDescriptor = Darwin.open(source.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
@@ -109,11 +110,52 @@ struct SecurePosterInstaller {
             parentDescriptor,
             destinationName,
             UInt32(RENAME_EXCL)
-        ) == 0,
-              Darwin.fsync(parentDescriptor) == 0 else {
+        ) == 0 else {
+            throw SecurePosterInstallerError.publicationFailed
+        }
+        guard syncDirectory(parentDescriptor) == 0 else {
+            rollbackPublishedDestination(
+                parentDescriptor: parentDescriptor,
+                destinationDescriptor: destinationDescriptor,
+                destinationName: destinationName
+            )
             throw SecurePosterInstallerError.publicationFailed
         }
         published = true
+    }
+
+    private func rollbackPublishedDestination(
+        parentDescriptor: Int32,
+        destinationDescriptor: Int32,
+        destinationName: String
+    ) {
+        let rollbackName = ".\(destinationName).\(UUID().uuidString).rollback"
+        guard Darwin.renameatx_np(
+            parentDescriptor,
+            destinationName,
+            parentDescriptor,
+            rollbackName,
+            UInt32(RENAME_EXCL)
+        ) == 0 else {
+            return
+        }
+        var opened = stat()
+        var staged = stat()
+        guard Darwin.fstat(destinationDescriptor, &opened) == 0,
+              Darwin.fstatat(parentDescriptor, rollbackName, &staged, AT_SYMLINK_NOFOLLOW) == 0,
+              opened.st_dev == staged.st_dev,
+              opened.st_ino == staged.st_ino else {
+            _ = Darwin.renameatx_np(
+                parentDescriptor,
+                rollbackName,
+                parentDescriptor,
+                destinationName,
+                UInt32(RENAME_EXCL)
+            )
+            return
+        }
+        guard Darwin.unlinkat(parentDescriptor, rollbackName, 0) == 0 else { return }
+        _ = syncDirectory(parentDescriptor)
     }
 
     private func validateImage(data: Data) throws {

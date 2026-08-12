@@ -104,11 +104,16 @@ class CharacterProfileAppSourceTests(unittest.TestCase):
         self.assertIn("catalogURL: characterLibraryStorage.catalogURL", removal)
         self.assertIn("ManagedMediaTrashRevalidator.validateLibraryUnchanged(", removal)
         self.assertIn("ManagedMediaTrashRevalidator.quarantineLibraryAfterPublish(", removal)
+        self.assertIn("ManagedMediaTrashRevalidator.validateLibraryReadyForMapRestore(", removal)
         self.assertIn("at: quarantine.directoryURL", removal)
         self.assertNotIn("trashItem(at: target", removal)
         self.assertLess(
             removal.index("ManagedMediaTrashRevalidator.validateLibraryUnchanged("),
             removal.index("try publishMediaMap(plan.updatedMap)"),
+        )
+        self.assertLess(
+            removal.index("ManagedMediaTrashRevalidator.validateLibraryReadyForMapRestore("),
+            removal.index("try self.publishMediaMap(originalMap)"),
         )
         self.assertIn("characterLibraryStorage.loadMediaMap(for: entry)", all_maps)
 

@@ -1,5 +1,6 @@
 import AppKit
 import CodexPetCore
+import Darwin
 import XCTest
 @testable import CodexPetMac
 
@@ -95,6 +96,37 @@ final class StorageLifecycleHardeningTests: XCTestCase {
             XCTAssertEqual($0 as? SecurePosterInstallerError, .publicationFailed)
         }
         XCTAssertEqual(try Data(contentsOf: destination), Data("keep".utf8))
+    }
+
+    func testPosterInstallerRollsBackDestinationWhenPostRenameSyncFails() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("source.png")
+        let destination = root.appendingPathComponent("installed.png")
+        let image = NSImage(size: NSSize(width: 1, height: 1))
+        image.lockFocus()
+        NSColor.systemPurple.setFill()
+        NSRect(x: 0, y: 0, width: 1, height: 1).fill()
+        image.unlockFocus()
+        guard let tiff = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff),
+              let png = bitmap.representation(using: .png, properties: [:]) else {
+            return XCTFail("fixture image encoding failed")
+        }
+        try png.write(to: source)
+
+        var syncCalls = 0
+        let installer = SecurePosterInstaller(syncDirectory: { descriptor in
+            syncCalls += 1
+            return syncCalls == 1 ? -1 : Darwin.fsync(descriptor)
+        })
+
+        XCTAssertThrowsError(try installer.install(source: source, destination: destination)) {
+            XCTAssertEqual($0 as? SecurePosterInstallerError, .publicationFailed)
+        }
+        XCTAssertEqual(syncCalls, 2)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), ["source.png"])
     }
 
     func testLifecycleReaderRejectsSymlinkAndOversizedFile() throws {

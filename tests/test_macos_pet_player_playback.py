@@ -45,6 +45,10 @@ class PetPlayerPlaybackSourceTests(unittest.TestCase):
         self.assertIn("button.heightAnchor.constraint(equalToConstant: 40)", text)
         self.assertIn("button.convert(button.bounds, to: self)", text)
         self.assertIn("if target.contains(point) { return button }", text)
+        self.assertLess(
+            text.index("for button in [nextClipButton, temporaryStateButton]"),
+            text.index("if quickControls.frame.contains(point)"),
+        )
 
 
 if __name__ == "__main__":

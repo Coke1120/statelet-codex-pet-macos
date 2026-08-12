@@ -118,10 +118,13 @@ final class PetPlayerPlaybackTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(button.frame.height, 40)
             XCTAssertFalse(button.showsBorderOnlyWhileMouseInside)
 
-            let center = controls.convert(NSPoint(x: button.frame.midX, y: button.frame.midY), to: view)
+            let center = button.convert(
+                NSPoint(x: button.bounds.midX, y: button.bounds.midY),
+                to: view
+            )
             XCTAssertTrue(view.hitTest(center) === button)
-            let insideEdge = controls.convert(
-                NSPoint(x: button.frame.maxX - 0.5, y: button.frame.maxY - 0.5),
+            let insideEdge = button.convert(
+                NSPoint(x: button.bounds.maxX - 0.5, y: button.bounds.maxY - 0.5),
                 to: view
             )
             XCTAssertTrue(view.hitTest(insideEdge) === button)

@@ -3652,6 +3652,14 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                     DispatchQueue.main.async {
                         self.mediaMutationInProgress = false
                         do {
+                            try ManagedMediaTrashRevalidator.validateLibraryReadyForMapRestore(
+                                snapshot: trashSnapshot,
+                                publishedMap: ManagedMediaTrashMap(
+                                    url: self.mediaMapURL,
+                                    map: plan.updatedMap
+                                ),
+                                canonicalRoot: self.canonicalManagedMediaRoot
+                            )
                             try self.publishMediaMap(originalMap)
                             self.applyPublishedMediaMap(originalMap)
                         } catch {
