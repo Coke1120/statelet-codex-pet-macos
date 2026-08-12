@@ -108,6 +108,44 @@ for index, raw_path in enumerate(sys.argv[1:]):
 PY
 }
 
+is_safe_destination_dir() {
+  "$python_bin" - "$1" <<'PY'
+import os, stat, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+try:
+    status = path.lstat()
+except OSError:
+    raise SystemExit(1)
+raise SystemExit(0 if stat.S_ISDIR(status.st_mode) and not stat.S_ISLNK(status.st_mode) and status.st_uid == os.getuid() else 1)
+PY
+}
+
+validate_support_parent_chain() {
+  "$python_bin" - "$support_dir" "$1" <<'PY'
+import os, stat, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+target = Path(sys.argv[2])
+try:
+    relative = target.relative_to(root)
+except ValueError:
+    raise SystemExit(1)
+candidates = [root]
+candidate = root
+for part in relative.parts:
+    candidate = candidate / part
+    candidates.append(candidate)
+for candidate in candidates:
+    try:
+        status = candidate.lstat()
+    except OSError:
+        raise SystemExit(1)
+    if not stat.S_ISDIR(status.st_mode) or stat.S_ISLNK(status.st_mode) or status.st_uid != os.getuid():
+        raise SystemExit(1)
+PY
+}
+
 if ! validate_support_roots; then
   printf 'Refusing unsafe Statelet support directory layout.\n' >&2
   exit 1
@@ -190,7 +228,7 @@ PY
 
 journal_command() {
   "$python_bin" - "$transaction_root" "$home_dir" "$@" <<'PY'
-import hashlib, json, os, shutil, signal, stat, subprocess, sys, time
+import ctypes, hashlib, json, os, shutil, signal, stat, subprocess, sys, time
 from pathlib import Path
 
 root = Path(sys.argv[1])
@@ -223,6 +261,90 @@ def digest(path):
             finally:
                 os.close(descriptor)
     return value.hexdigest()
+
+def open_directory_chain(base, relative_parts):
+    descriptor = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        status = os.fstat(descriptor)
+        if status.st_uid != os.getuid():
+            raise ValueError("unsafe directory owner")
+        for part in relative_parts:
+            next_descriptor = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+            status = os.fstat(descriptor)
+            if status.st_uid != os.getuid():
+                raise ValueError("unsafe directory owner")
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+def relative_to(path, base):
+    try:
+        return Path(path).relative_to(base)
+    except ValueError as error:
+        raise ValueError("path outside allowed root") from error
+
+def rename_exclusive(source_parent, source_name, target_parent, target_name):
+    libc = ctypes.CDLL(None, use_errno=True)
+    function = libc.renameatx_np
+    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    if function(source_parent, os.fsencode(source_name), target_parent, os.fsencode(target_name), 0x00000004) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, "exclusive rename failed")
+
+def entry_digest(parent_fd, name):
+    status = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if stat.S_ISLNK(status.st_mode):
+        raise ValueError("unsafe entry")
+    value = hashlib.sha256()
+    def visit(directory_fd, entry_name, relative):
+        current = os.stat(entry_name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISREG(current.st_mode):
+            value.update(b"F\0" + relative.encode() + b"\0")
+            descriptor = os.open(entry_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+            try:
+                while chunk := os.read(descriptor, 1024 * 1024): value.update(chunk)
+            finally: os.close(descriptor)
+        elif stat.S_ISDIR(current.st_mode):
+            value.update(b"D\0" + relative.encode() + b"\0")
+            child = os.open(entry_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
+            try:
+                for child_name in sorted(os.listdir(child)):
+                    child_relative = child_name if relative == "." else f"{relative}/{child_name}"
+                    visit(child, child_name, child_relative)
+            finally: os.close(child)
+        else:
+            raise ValueError("unsafe entry")
+    if stat.S_ISDIR(status.st_mode):
+        child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        try:
+            for child_name in sorted(os.listdir(child)):
+                visit(child, child_name, child_name)
+        finally:
+            os.close(child)
+    else:
+        visit(parent_fd, name, ".")
+    return value.hexdigest()
+
+def remove_entry(parent_fd, name):
+    status = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if stat.S_ISDIR(status.st_mode):
+        child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        try:
+            for child_name in os.listdir(child): remove_entry(child, child_name)
+        finally: os.close(child)
+        os.rmdir(name, dir_fd=parent_fd)
+    elif stat.S_ISREG(status.st_mode):
+        os.unlink(name, dir_fd=parent_fd)
+    else:
+        raise ValueError("unsafe entry")
+
+def open_parent(path, base):
+    relative = relative_to(path, base)
+    return open_directory_chain(base, relative.parts[:-1]), relative.name
 
 def sync_directory(path):
     descriptor = os.open(path, os.O_RDONLY)
@@ -267,6 +389,95 @@ elif command == "record":
         raise ValueError("invalid transaction operation")
     data["operations"].append({"kind": kind, "source": source, "target": target, "digest": expected})
     write(data)
+elif command == "install-move":
+    source, target, expected = map(str, args)
+    data = load()
+    if data["state"] != "active":
+        raise ValueError("inactive transaction")
+    source_path = Path(source)
+    target_path = Path(target)
+    source_relative = relative_to(source_path, root)
+    target_relative = relative_to(target_path, home)
+    source_parent = open_directory_chain(root, source_relative.parts[:-1])
+    target_parent = open_directory_chain(home, target_relative.parts[:-1])
+    try:
+        if entry_digest(source_parent, source_relative.name) != expected:
+            raise ValueError("staged digest changed")
+        source_identity = os.fstat(source_parent)
+        target_identity = os.fstat(target_parent)
+        data["operations"].append({"kind": "install", "source": source, "target": target, "digest": expected,
+                                   "source_parent": [source_identity.st_dev, source_identity.st_ino],
+                                   "target_parent": [target_identity.st_dev, target_identity.st_ino]})
+        write(data)
+        gate = os.environ.get("STATELET_INSTALL_TEST_PARENT_FD_GATE")
+        if gate:
+            gate_path = Path(gate)
+            relative_to(gate_path, home)
+            Path(str(gate_path) + ".ready").touch()
+            for _ in range(1500):
+                if Path(str(gate_path) + ".release").exists():
+                    break
+                time.sleep(0.01)
+            else:
+                raise ValueError("test gate timeout")
+        rename_exclusive(source_parent, source_relative.name, target_parent, target_relative.name)
+        os.fsync(target_parent)
+        os.fsync(source_parent)
+        try:
+            reopened = open_directory_chain(home, target_relative.parts[:-1])
+            try:
+                reopened_identity = os.fstat(reopened)
+                if [reopened_identity.st_dev, reopened_identity.st_ino] != data["operations"][-1]["target_parent"]:
+                    rename_exclusive(target_parent, target_relative.name, source_parent, source_relative.name)
+                    os.fsync(target_parent); os.fsync(source_parent)
+                    raise ValueError("destination parent changed")
+            finally:
+                os.close(reopened)
+        except Exception:
+            if os.path.exists(source_path):
+                raise
+            rename_exclusive(target_parent, target_relative.name, source_parent, source_relative.name)
+            os.fsync(target_parent); os.fsync(source_parent)
+            raise
+    finally:
+        os.close(source_parent)
+        os.close(target_parent)
+elif command == "backup-move":
+    target, source, expected = map(str, args)
+    data = load()
+    target_path, source_path = Path(target), Path(source)
+    target_parent, target_name = open_parent(target_path, home)
+    source_parent, source_name = open_parent(source_path, root)
+    try:
+        if entry_digest(target_parent, target_name) != expected:
+            raise ValueError("backup source changed")
+        source_identity, target_identity = os.fstat(source_parent), os.fstat(target_parent)
+        data["operations"].append({"kind": "backup", "source": source, "target": target, "digest": expected,
+                                   "source_parent": [source_identity.st_dev, source_identity.st_ino],
+                                   "target_parent": [target_identity.st_dev, target_identity.st_ino]})
+        write(data)
+        rename_exclusive(target_parent, target_name, source_parent, source_name)
+        os.fsync(target_parent); os.fsync(source_parent)
+    finally:
+        os.close(target_parent); os.close(source_parent)
+elif command == "mkdir-make":
+    target, mode = args
+    data = load()
+    parent, name = open_parent(Path(target), home)
+    try:
+        identity = os.fstat(parent)
+        data["operations"].append({"kind": "mkdir", "source": "", "target": target, "digest": "",
+                                   "target_parent": [identity.st_dev, identity.st_ino], "created": None})
+        write(data)
+        os.mkdir(name, int(mode, 8), dir_fd=parent)
+        os.fsync(parent)
+        created = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if not stat.S_ISDIR(created.st_mode):
+            raise ValueError("created entry is not directory")
+        data["operations"][-1]["created"] = [created.st_dev, created.st_ino]
+        write(data)
+    finally:
+        os.close(parent)
 elif command == "launch-init":
     data = load()
     labels = args[:4]
@@ -292,6 +503,39 @@ elif command == "launch-phase":
     write(data)
 elif command == "commit":
     data = load()
+    for operation in data.get("operations", []):
+        kind = operation.get("kind")
+        if kind in {"install", "backup"}:
+            source_parent, _ = open_parent(Path(operation["source"]), root)
+            target_parent, _ = open_parent(Path(operation["target"]), home)
+            try:
+                source_status, target_status = os.fstat(source_parent), os.fstat(target_parent)
+                if ([source_status.st_dev, source_status.st_ino] != operation.get("source_parent") or
+                    [target_status.st_dev, target_status.st_ino] != operation.get("target_parent")):
+                    raise ValueError("transaction parent changed")
+                try: os.stat(Path(operation["source"]).name, dir_fd=source_parent, follow_symlinks=False); source_exists = True
+                except FileNotFoundError: source_exists = False
+                try: os.stat(Path(operation["target"]).name, dir_fd=target_parent, follow_symlinks=False); target_exists = True
+                except FileNotFoundError: target_exists = False
+                if kind == "install":
+                    if source_exists or not target_exists or entry_digest(target_parent, Path(operation["target"]).name) != operation["digest"]:
+                        raise ValueError("installed entry changed")
+                else:
+                    if target_exists or not source_exists or entry_digest(source_parent, Path(operation["source"]).name) != operation["digest"]:
+                        raise ValueError("backup entry changed")
+            finally:
+                os.close(source_parent); os.close(target_parent)
+        elif kind == "mkdir":
+            parent, _ = open_parent(Path(operation["target"]), home)
+            try:
+                status = os.fstat(parent)
+                if [status.st_dev, status.st_ino] != operation.get("target_parent"):
+                    raise ValueError("transaction parent changed")
+                child = os.stat(Path(operation["target"]).name, dir_fd=parent, follow_symlinks=False)
+                if not stat.S_ISDIR(child.st_mode) or [child.st_dev, child.st_ino] != operation.get("created"):
+                    raise ValueError("transaction directory changed")
+            finally:
+                os.close(parent)
     data["state"] = "committed"
     write(data)
 elif command == "recover":
@@ -314,28 +558,48 @@ elif command == "recover":
             if not target.is_absolute() or str(target) not in allowed_exact:
                 raise ValueError(f"transaction target is outside the installer allowlist: {target}")
             if kind == "mkdir":
-                if target.is_dir():
+                target_parent, target_name = open_parent(target, home)
+                identity = os.fstat(target_parent)
+                if [identity.st_dev, identity.st_ino] != operation.get("target_parent"):
+                    raise ValueError("destination parent changed")
+                try:
+                    target_status = os.stat(target_name, dir_fd=target_parent, follow_symlinks=False)
+                except FileNotFoundError:
+                    target_status = None
+                if operation.get("created") is None:
+                    raise ValueError("directory creation was not completed")
+                if target_status is not None and stat.S_ISDIR(target_status.st_mode) and [target_status.st_dev, target_status.st_ino] == operation.get("created"):
                     try:
-                        target.rmdir()
+                        os.rmdir(target_name, dir_fd=target_parent)
                     except OSError as error:
                         raise ValueError(f"created directory is no longer empty: {target}") from error
-                elif target.exists() or target.is_symlink():
+                elif target_status is not None:
                     raise ValueError(f"created directory became ambiguous: {target}")
+                os.close(target_parent)
                 continue
             if kind not in {"backup", "install"} or not str(source).startswith(root_prefix):
                 raise ValueError("transaction operation is invalid")
-            source_exists = source.exists() or source.is_symlink()
-            target_exists = target.exists() or target.is_symlink()
+            source_parent, source_name = open_parent(source, root)
+            target_parent, target_name = open_parent(target, home)
+            source_identity, target_identity = os.fstat(source_parent), os.fstat(target_parent)
+            if ([source_identity.st_dev, source_identity.st_ino] != operation.get("source_parent") or
+                [target_identity.st_dev, target_identity.st_ino] != operation.get("target_parent")):
+                raise ValueError("transaction parent changed")
+            try: source_status = os.stat(source_name, dir_fd=source_parent, follow_symlinks=False)
+            except FileNotFoundError: source_status = None
+            try: target_status = os.stat(target_name, dir_fd=target_parent, follow_symlinks=False)
+            except FileNotFoundError: target_status = None
+            source_exists = source_status is not None
+            target_exists = target_status is not None
             if kind == "install":
                 if source_exists and target_exists:
                     raise ValueError(f"install state is ambiguous: {target}")
                 if target_exists:
-                    if digest(target) != expected:
+                    if entry_digest(target_parent, target_name) != expected:
                         raise ValueError(f"installed target changed after interruption: {target}")
-                    source.parent.mkdir(parents=True, exist_ok=True)
-                    os.rename(target, source)
+                    rename_exclusive(target_parent, target_name, source_parent, source_name)
                 elif source_exists:
-                    if digest(source) != expected:
+                    if entry_digest(source_parent, source_name) != expected:
                         raise ValueError(f"restored staged target changed after interruption: {source}")
                 else:
                     raise ValueError(f"installed target and staged source are both missing: {target}")
@@ -343,12 +607,13 @@ elif command == "recover":
                 if source_exists and target_exists:
                     raise ValueError(f"backup state is ambiguous: {target}")
                 if source_exists:
-                    if digest(source) != expected:
+                    if entry_digest(source_parent, source_name) != expected:
                         raise ValueError(f"backup changed after interruption: {source}")
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    os.rename(source, target)
-                elif not target_exists or digest(target) != expected:
+                    rename_exclusive(source_parent, source_name, target_parent, target_name)
+                elif not target_exists or entry_digest(target_parent, target_name) != expected:
                     raise ValueError(f"original target changed after interruption: {target}")
+            os.fsync(source_parent); os.fsync(target_parent)
+            os.close(source_parent); os.close(target_parent)
             recovered_operations += 1
             if recovered_operations == 1 and os.environ.get("STATELET_INSTALL_CRASH_DURING_RECOVERY") == "1":
                 os.kill(os.getpid(), signal.SIGKILL)
@@ -403,7 +668,7 @@ recover_transaction() {
     "$app_dest" "$legacy_app" "$component_dir" "$legacy_component" \
     "$aggregator_plist" "$player_plist" "$legacy_aggregator_plist" "$legacy_player_plist" \
     "$hooks_file" "$applications_dir" "$home_dir/Library" "$home_dir/Library/Application Support" \
-    "$support_dir" "$launch_agents_dir" "$home_dir/.codex" "$media_dir" "$runtime_dir" "$logs_dir" "$support_dir"
+    "$support_dir" "$launch_agents_dir" "$home_dir/.codex" "$media_dir" "$runtime_dir" "$logs_dir" "$support_dir" 2>/dev/null
 }
 
 if recover_transaction; then
@@ -473,8 +738,8 @@ rollback() {
   exit "$original_status"
 }
 trap rollback EXIT
-backup_target() { local target="$1" name="$2"; if [[ -e "$target" ]]; then local saved="$backup_root/$name" digest; mkdir -p "$(dirname "$saved")"; digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$target")"; journal_command record backup "$saved" "$target" "$digest"; mv "$target" "$saved"; fi; }
-install_target() { local staged="$1" target="$2" digest; mkdir -p "$(dirname "$target")"; digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$staged")"; journal_command record install "$staged" "$target" "$digest"; mv "$staged" "$target"; }
+backup_target() { local target="$1" name="$2"; if [[ -e "$target" ]]; then local saved="$backup_root/$name" digest; mkdir -p "$(dirname "$saved")"; digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$target")"; journal_command backup-move "$target" "$saved" "$digest" 2>/dev/null || { printf 'Statelet backup failed safely.\n' >&2; exit 74; }; fi; }
+install_target() { local staged="$1" target="$2" parent digest; parent="$(dirname "$target")"; is_safe_destination_dir "$parent" || { printf 'Installation target parent is unsafe.\n' >&2; exit 74; }; case "$parent" in "$support_dir"|"$support_dir"/*) validate_support_parent_chain "$parent" || { printf 'Installation target parent is unsafe.\n' >&2; exit 74; } ;; esac; digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$staged")"; journal_command install-move "$staged" "$target" "$digest" 2>/dev/null || { printf 'Statelet publication failed safely.\n' >&2; exit 74; }; }
 
 stage_app="$stage_root/Statelet.app"
 stage_component="$stage_root/Statelet"
@@ -711,8 +976,8 @@ for ((index=0; index<${#migration_relatives[@]}; index++)); do
   fi
 done
 
-ensure_dir() { if [[ ! -d "$1" ]]; then journal_command record mkdir "" "$1" ""; mkdir "$1"; fi; }
-ensure_private_dir() { if [[ ! -d "$1" ]]; then journal_command record mkdir "" "$1" ""; mkdir -m 0700 "$1"; fi; }
+ensure_dir() { if [[ -e "$1" || -L "$1" ]]; then is_safe_destination_dir "$1" || { printf 'Refusing unsafe Statelet destination directory.\n' >&2; exit 1; }; else journal_command mkdir-make "$1" 0755 2>/dev/null || { printf 'Statelet directory creation failed safely.\n' >&2; exit 74; }; is_safe_destination_dir "$1" || exit 1; fi; }
+ensure_private_dir() { if [[ -e "$1" || -L "$1" ]]; then is_safe_destination_dir "$1" || { printf 'Refusing unsafe Statelet destination directory.\n' >&2; exit 1; }; else journal_command mkdir-make "$1" 0700 2>/dev/null || { printf 'Statelet directory creation failed safely.\n' >&2; exit 74; }; is_safe_destination_dir "$1" || exit 1; fi; }
 ensure_dir "$applications_dir"
 ensure_dir "$home_dir/Library"
 ensure_dir "$home_dir/Library/Application Support"
@@ -739,11 +1004,15 @@ for ((index=0; index<${#migration_relatives[@]}; index++)); do
   [[ "${migration_digests[$index]}" == "__absent__" ]] && continue
   relative="${migration_relatives[$index]}"
   destination="$support_dir/$relative"
-  if [[ -e "$stage_root/migration/$relative" ]]; then install_target "$stage_root/migration/$relative" "$destination"; fi
+  if [[ -e "$stage_root/migration/$relative" ]]; then
+    destination_parent="$(dirname "$destination")"
+    ensure_private_dir "$destination_parent"
+    install_target "$stage_root/migration/$relative" "$destination"
+  fi
 done
 backup_target "$migration_manifest" migration-manifest
 install_target "$stage_migration_manifest" "$migration_manifest"
-for directory in "$media_dir" "$runtime_dir" "$logs_dir"; do if [[ ! -d "$directory" ]]; then journal_command record mkdir "" "$directory" ""; mkdir -m 0700 "$directory"; fi; done
+for directory in "$media_dir" "$runtime_dir" "$logs_dir"; do ensure_private_dir "$directory"; done
 if [[ ! -e "$media_map" ]]; then cp "$package_dir/Examples/media-map.json" "$stage_root/media-map.json"; chmod 0600 "$stage_root/media-map.json"; install_target "$stage_root/media-map.json" "$media_map"; fi
 if [[ -n "${STATELET_INSTALL_TEST_POSTVALIDATION_GATE:-}" ]]; then
   gate="${STATELET_INSTALL_TEST_POSTVALIDATION_GATE}"

@@ -2063,6 +2063,143 @@ struct WatchdogHarness {
         self.assertFalse((self.home / "Library" / "Application Support" / "Statelet" / "voice").exists())
         self.assertFalse((self.home / "Applications" / "Statelet.app").exists())
 
+    def test_runtime_file_only_migration_failure_removes_journaled_parent(self) -> None:
+        legacy = self.home / "Library" / "Application Support" / "CodexPet"
+        current_state = legacy / "runtime" / "current_state.json"
+        current_state.parent.mkdir(parents=True)
+        payload = b'{"state":"retained-runtime-only"}\n'
+        current_state.write_bytes(payload)
+        hooks_file = self.home / ".codex" / "hooks.json"
+        hooks_file.parent.mkdir()
+        hooks_file.write_text(json.dumps({"unrelated": {"keep": True}, "hooks": {}}), encoding="utf-8")
+        original_hooks = hooks_file.read_bytes()
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_FAIL_AT"] = "after-support"
+
+        failed = self.install(self.make_bundle("RuntimeOnlyRollback"), env=environment)
+
+        self.assertEqual(failed.returncode, 70, failed.stderr)
+        self.assertEqual(current_state.read_bytes(), payload)
+        self.assertFalse((self.home / "Library" / "Application Support" / "Statelet").exists())
+        self.assertFalse((self.home / "Applications" / "Statelet.app").exists())
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+        self.assertEqual(hooks_file.read_bytes(), original_hooks)
+
+    def test_runtime_symlink_destination_is_rejected_before_external_write(self) -> None:
+        legacy = self.home / "Library" / "Application Support" / "CodexPet"
+        current_state = legacy / "runtime" / "current_state.json"
+        current_state.parent.mkdir(parents=True)
+        current_state.write_bytes(b'{"state":"legacy"}\n')
+        support = self.home / "Library" / "Application Support" / "Statelet"
+        support.mkdir(parents=True)
+        external = self.base / "external-runtime"
+        external.mkdir()
+        sentinel = external / "sentinel.txt"
+        sentinel.write_bytes(b"external-unchanged")
+        (support / "runtime").symlink_to(external, target_is_directory=True)
+        hooks_file = self.home / ".codex" / "hooks.json"
+        hooks_file.parent.mkdir()
+        hooks_file.write_text(json.dumps({"hooks": {}, "unrelated": {"keep": True}}), encoding="utf-8")
+        original_hooks = hooks_file.read_bytes()
+
+        failed = self.install(self.make_bundle("RejectRuntimeSymlink"))
+
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual(sentinel.read_bytes(), b"external-unchanged")
+        self.assertFalse((external / "current_state.json").exists())
+        self.assertEqual(current_state.read_bytes(), b'{"state":"legacy"}\n')
+        self.assertFalse((self.home / "Applications" / "Statelet.app").exists())
+        self.assertEqual(hooks_file.read_bytes(), original_hooks)
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+
+    def test_codex_directory_symlink_is_rejected_before_hook_publication(self) -> None:
+        external = self.base / "external-codex"
+        external.mkdir()
+        sentinel = external / "sentinel.txt"
+        sentinel.write_bytes(b"external-codex-unchanged")
+        (self.home / ".codex").symlink_to(external, target_is_directory=True)
+
+        failed = self.install(self.make_bundle("RejectCodexSymlink"))
+
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual(sentinel.read_bytes(), b"external-codex-unchanged")
+        self.assertFalse((external / "hooks.json").exists())
+        self.assertFalse((self.home / "Applications" / "Statelet.app").exists())
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+
+    def test_parent_swap_after_descriptor_open_never_writes_external_directory(self) -> None:
+        applications = self.home / "Applications"
+        applications.mkdir()
+        held_directory = self.base / "held-applications"
+        external = self.base / "external-applications"
+        external.mkdir()
+        sentinel = external / "sentinel.txt"
+        sentinel.write_bytes(b"external-unchanged")
+        gate = self.home / "parent-fd-gate"
+        environment = os.environ.copy()
+        environment["HOME"] = str(self.home)
+        environment["STATELET_INSTALL_TEST_PARENT_FD_GATE"] = str(gate)
+        process = subprocess.Popen(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(self.make_bundle("ParentSwap")), "--skip-launchctl"],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        import time
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
+            time.sleep(0.01)
+        if not Path(f"{gate}.ready").exists():
+            process.terminate()
+            try:
+                _, stderr = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                _, stderr = process.communicate(timeout=5)
+            self.fail(f"parent descriptor gate was not reached: {stderr}")
+        applications.rename(held_directory)
+        applications.symlink_to(external, target_is_directory=True)
+        Path(f"{gate}.release").touch()
+        _, stderr = process.communicate(timeout=15)
+
+        self.assertEqual(sentinel.read_bytes(), b"external-unchanged")
+        self.assertFalse((external / "Statelet.app").exists())
+        self.assertNotEqual(process.returncode, 0, stderr)
+        self.assertTrue((self.home / ".statelet-install-transaction" / "journal.json").exists())
+        self.assertFalse((held_directory / "Statelet.app").exists())
+        applications.unlink()
+        held_directory.rename(applications)
+        environment.pop("STATELET_INSTALL_TEST_PARENT_FD_GATE")
+        recovered = self.install(self.make_bundle("ParentSwapRecovery"), env=environment)
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+
+    def test_recovery_parent_swap_fails_closed_without_external_write(self) -> None:
+        first = self.make_bundle("RecoveryParentFirst", "first")
+        self.assertEqual(self.install(first).returncode, 0)
+        second = self.make_bundle("RecoveryParentSecond", "second")
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-app"
+        self.assertEqual(self.install(second, env=environment).returncode, -9)
+        applications = self.home / "Applications"
+        detached = self.base / "detached-recovery-applications"
+        external = self.base / "external-recovery-applications"
+        external.mkdir()
+        sentinel = external / "sentinel.txt"
+        sentinel.write_bytes(b"external-recovery-unchanged")
+        applications.rename(detached)
+        applications.symlink_to(external, target_is_directory=True)
+        environment.pop("STATELET_INSTALL_CRASH_AT")
+
+        failed = self.install(second, env=environment)
+
+        self.assertEqual(failed.returncode, 74, failed.stderr)
+        self.assertEqual(sentinel.read_bytes(), b"external-recovery-unchanged")
+        self.assertFalse((external / "Statelet.app").exists())
+        self.assertTrue((self.home / ".statelet-install-transaction" / "journal.json").exists())
+
     def test_unmanaged_legacy_app_is_preserved_while_statelet_installs(self) -> None:
         legacy = self.home / "Applications" / "CodexPetMac.app"
         contents = legacy / "Contents"
