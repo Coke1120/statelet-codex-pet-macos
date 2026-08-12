@@ -872,6 +872,15 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
         self = candidate
     }
 
+    /// Stores a validated Qwen profile without changing the currently selected
+    /// provider or invalidating outputs owned by that provider.
+    public mutating func replaceConfiguredProfile(_ profile: Qwen3TTSVoiceProfile) throws {
+        var candidate = self
+        candidate.qwenProfile = profile
+        try candidate.validateProfileRelationships()
+        self = candidate
+    }
+
     public mutating func selectActiveProvider(_ provider: DialogueVoiceProviderKind) throws {
         guard (provider == .gptSovits && profile != nil)
                 || (provider == .qwen3TTS && qwenProfile != nil) else {

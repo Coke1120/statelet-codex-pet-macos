@@ -35,6 +35,21 @@ class PetPlayerPlaybackSourceTests(unittest.TestCase):
         self.assertIn("quickControls.frame.minX - overlayGap", text)
         self.assertIn("occupiedFrames = [stateBadge, fpsBadge, quickControls]", text)
 
+    def test_quick_controls_are_visible_regular_size_targets(self) -> None:
+        text = source()
+
+        self.assertIn("button.bezelStyle = .texturedRounded", text)
+        self.assertIn("button.controlSize = .regular", text)
+        self.assertIn("button.showsBorderOnlyWhileMouseInside = false", text)
+        self.assertIn("button.widthAnchor.constraint(equalToConstant: 40)", text)
+        self.assertIn("button.heightAnchor.constraint(equalToConstant: 40)", text)
+        self.assertIn("button.convert(button.bounds, to: self)", text)
+        self.assertIn("if target.contains(point) { return button }", text)
+        self.assertLess(
+            text.index("for button in [nextClipButton, temporaryStateButton]"),
+            text.index("if quickControls.frame.contains(point)"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

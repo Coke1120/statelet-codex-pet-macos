@@ -100,6 +100,37 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
         }
     }
 
+    private final class BlockingQwenInstallGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var starts = 0
+        private var continuations: [Int: DispatchSemaphore] = [:]
+        private var onStart: ((Int) -> Void)?
+
+        func reset(onStart: @escaping (Int) -> Void) {
+            lock.withLock {
+                starts = 0
+                continuations = [:]
+                self.onStart = onStart
+            }
+        }
+
+        func wait() -> Int {
+            let state = lock.withLock { () -> (Int, DispatchSemaphore, ((Int) -> Void)?) in
+                starts += 1
+                let gate = DispatchSemaphore(value: 0)
+                continuations[starts] = gate
+                return (starts, gate, onStart)
+            }
+            state.2?(state.0)
+            state.1.wait()
+            return state.0
+        }
+
+        func release(_ number: Int) {
+            lock.withLock { continuations.removeValue(forKey: number) }?.signal()
+        }
+    }
+
     override func setUp() {
         super.setUp()
         QwenUnexpectedGPTURLProtocol.counter.reset()
@@ -168,6 +199,195 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
         coordinator.start()
         await fulfillment(of: [failed], timeout: 5)
         XCTAssertEqual(qwenCalls.value, 0)
+    }
+
+    @MainActor
+    func testStartupRetriesBothJournaledQwenDestinationAndPartialCleanup() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let token = UUID().uuidString.lowercased()
+        let paths = try Qwen3TTSPackageInstaller.managedRelativePaths(destinationToken: token)
+        for path in [paths.destination, paths.staging] {
+            let file = root.appendingPathComponent(path, isDirectory: true)
+                .appendingPathComponent("nested/payload.bin")
+            try FileManager.default.createDirectory(
+                at: file.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try Data("private".utf8).write(to: file)
+        }
+        var library = try DialogueVoiceLibrary()
+        try library.enqueueCleanup(paths: [paths.destination, paths.staging])
+        try save(library, root: root)
+
+        let coordinator = DialogueVoiceCoordinator(applicationSupportRoot: root)
+        defer { coordinator.shutdown() }
+        coordinator.start()
+
+        XCTAssertTrue(coordinator.library.pendingCleanupPaths.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent(paths.destination).path
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent(paths.staging).path
+        ))
+    }
+
+    @MainActor
+    func testOverlappingQwenImportsPreserveLiveReservationUntilImporterFinishes() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gptProfile = try makeGPTProfile(root: root)
+        var library = try DialogueVoiceLibrary(profile: gptProfile)
+        let line = try library.addLine(text: "Existing GPT line", language: "en")
+        let ticket = try library.beginGeneration(for: line.id)
+        let outputPath = "voice/generated/existing-gpt.wav"
+        let outputURL = root.appendingPathComponent(outputPath)
+        try FileManager.default.createDirectory(
+            at: outputURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Self.pcmWAV(sampleRate: 16_000, frames: 1_600).write(to: outputURL)
+        _ = try library.completeGeneration(ticket: ticket, outputPath: outputPath)
+        try save(library, root: root)
+        let gate = BlockingQwenInstallGate()
+        let firstStarted = expectation(description: "first Qwen import starts")
+        let secondStarted = expectation(description: "second Qwen import starts")
+        gate.reset { attempt in
+            if attempt == 1 { firstStarted.fulfill() }
+            if attempt == 2 { secondStarted.fulfill() }
+        }
+        let coordinator = DialogueVoiceCoordinator(
+            applicationSupportRoot: root,
+            qwenPackageInstall: { _, supportRoot, token, pythonURL in
+                let paths = try Qwen3TTSPackageInstaller.managedRelativePaths(
+                    destinationToken: token
+                )
+                let destination = supportRoot.appendingPathComponent(paths.destination, isDirectory: true)
+                let marker = destination.appendingPathComponent("marker.bin")
+                try FileManager.default.createDirectory(
+                    at: destination,
+                    withIntermediateDirectories: true
+                )
+                try Data("reserved".utf8).write(to: marker)
+                let attempt = gate.wait()
+                if attempt == 2 { throw DialogueVoiceRuntimeError.copyFailed }
+                throw DialogueVoiceRuntimeError.cancelled
+            }
+        )
+        defer {
+            gate.release(1)
+            gate.release(2)
+            coordinator.shutdown()
+        }
+        coordinator.start()
+        coordinator.configureQwenProfile(
+            sourceURL: root.appendingPathComponent("first"),
+            pythonExecutableURL: URL(fileURLWithPath: "/bin/sh")
+        )
+        await fulfillment(of: [firstStarted], timeout: 5)
+        let firstPaths = try XCTUnwrap(
+            qwenReservationPairs(in: coordinator.library).first
+        )
+
+        coordinator.configureQwenProfile(
+            sourceURL: root.appendingPathComponent("second"),
+            pythonExecutableURL: URL(fileURLWithPath: "/bin/sh")
+        )
+        await fulfillment(of: [secondStarted], timeout: 5)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent(firstPaths.destination).path
+        ))
+
+        gate.release(2)
+        try await waitUntil(timeout: 5) {
+            qwenReservationPairs(in: coordinator.library).count == 1
+        }
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent(firstPaths.destination).path
+        ))
+
+        gate.release(1)
+        try await waitUntil(timeout: 5) {
+            coordinator.library.pendingCleanupPaths.isEmpty
+        }
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent(firstPaths.destination).path
+        ))
+        XCTAssertEqual(coordinator.library.activeProviderKind, .gptSovits)
+        XCTAssertNil(coordinator.library.qwenProfile)
+        XCTAssertEqual(coordinator.library.lines.first?.status, .ready)
+        XCTAssertEqual(coordinator.library.lines.first?.outputRelativePath, outputPath)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: outputURL.path))
+    }
+
+    @MainActor
+    func testSuccessfulQwenConfigureKeepsActiveGPTReadyOutput() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gptProfile = try makeGPTProfile(root: root)
+        let qwenFixture = try makeQwenProfile(root: root)
+        var library = try DialogueVoiceLibrary(profile: gptProfile)
+        let line = try library.addLine(text: "Existing GPT line", language: "en")
+        let ticket = try library.beginGeneration(for: line.id)
+        let outputPath = "voice/generated/existing-gpt.wav"
+        let outputURL = root.appendingPathComponent(outputPath)
+        try FileManager.default.createDirectory(
+            at: outputURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Self.pcmWAV(sampleRate: 16_000, frames: 1_600).write(to: outputURL)
+        _ = try library.completeGeneration(ticket: ticket, outputPath: outputPath)
+        try save(library, root: root)
+        let fixtureRoot = root.appendingPathComponent(
+            qwenFixture.packageRootRelativePath,
+            isDirectory: true
+        )
+        let runtime = try Qwen3TTSProfileValidator.validatePythonExecutable(
+            at: URL(fileURLWithPath: "/bin/sh")
+        )
+
+        let coordinator = DialogueVoiceCoordinator(
+            applicationSupportRoot: root,
+            qwenPackageInstall: { _, supportRoot, token, _ in
+                let paths = try Qwen3TTSPackageInstaller.managedRelativePaths(
+                    destinationToken: token
+                )
+                let destination = supportRoot.appendingPathComponent(
+                    paths.destination,
+                    isDirectory: true
+                )
+                try FileManager.default.copyItem(at: fixtureRoot, to: destination)
+                return (
+                    Qwen3TTSImportedPackage(
+                        packageRootRelativePath: paths.destination,
+                        manifest: qwenFixture.manifest,
+                        treeSHA256: qwenFixture.packageTreeSHA256,
+                        referenceText: qwenFixture.referenceText,
+                        referenceLanguage: qwenFixture.referenceLanguage,
+                        parameters: qwenFixture.parameters
+                    ),
+                    runtime
+                )
+            }
+        )
+        defer { coordinator.shutdown() }
+        coordinator.start()
+        coordinator.configureQwenProfile(
+            sourceURL: fixtureRoot,
+            pythonExecutableURL: URL(fileURLWithPath: "/bin/sh")
+        )
+        try await waitUntil(timeout: 5) { coordinator.library.qwenProfile != nil }
+
+        XCTAssertEqual(coordinator.library.activeProviderKind, .gptSovits)
+        XCTAssertEqual(coordinator.library.lines.first?.status, .ready)
+        XCTAssertEqual(coordinator.library.lines.first?.outputRelativePath, outputPath)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: outputURL.path))
+        XCTAssertTrue(coordinator.library.pendingCleanupPaths.isEmpty)
+        let configured = try XCTUnwrap(coordinator.library.qwenProfile)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent(configured.packageRootRelativePath).path
+        ))
     }
 
     @MainActor
@@ -344,6 +564,21 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(10))
         }
         XCTFail("Timed out waiting for the expected coordinator state")
+    }
+
+    private func qwenReservationPairs(
+        in library: DialogueVoiceLibrary
+    ) -> [(destination: String, staging: String)] {
+        let paths = Set(library.pendingCleanupPaths)
+        return paths.compactMap { path in
+            guard path.hasPrefix("voice/packages/qwen/"),
+                  !path.contains(".partial") else { return nil }
+            let token = String(path.split(separator: "/").last ?? "")
+            guard let pair = try? Qwen3TTSPackageInstaller.managedRelativePaths(
+                destinationToken: token
+            ), paths.contains(pair.staging) else { return nil }
+            return pair
+        }
     }
 
     private func helperURL(_ root: URL) -> URL { root.appendingPathComponent("helper.py") }

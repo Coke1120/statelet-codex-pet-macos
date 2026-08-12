@@ -241,7 +241,11 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             lastAppliedEditorLine = nil
             linesTable.deselectAll(nil)
             if shouldClearSubmittedNewDialogue || (!preserveNewDialogueText && !preserveNewDialogueState && !preserveNewDialogueLanguage) {
-                clearEditorFields()
+                if shouldClearSubmittedNewDialogue {
+                    clearSubmittedDialogueText()
+                } else {
+                    clearEditorFields()
+                }
             } else {
                 if !preserveNewDialogueState { applyDefaultDialogueState() }
                 if !preserveNewDialogueLanguage { applyDefaultDialogueLanguage() }
@@ -762,6 +766,12 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         dialogueTextView.string = ""
         applyDefaultDialogueState()
         applyDefaultDialogueLanguage()
+    }
+
+    private func clearSubmittedDialogueText() {
+        dialogueTextView.string = ""
+        lastAppliedNewDialogueState = selectedDialogueState
+        lastAppliedNewDialogueLanguage = dialogueLanguageField.stringValue
     }
 
     private var selectedDialogueState: PetState {
