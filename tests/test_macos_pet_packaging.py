@@ -535,20 +535,19 @@ struct WatchdogHarness {
         AlphaConversionProfile.fit.persist(to: defaults)
         guard defaults.string(forKey: AlphaConversionProfile.defaultsKey) == "fit" else { exit(13) }
         guard AlphaRecoveryArtifactPolicy.accepts(
-            stateRawValue: "idle",
+            artifactStem: "idle",
             outputBasename: "idle-1723456789-deadbeef.mov",
             reportBasename: "idle-1723456789-deadbeef.report.json"
         ) else { exit(14) }
-        guard AlphaRecoveryArtifactPolicy.shouldQuarantine(
-            outputReferenced: false,
-            reportReferenced: false
-        ), !AlphaRecoveryArtifactPolicy.shouldQuarantine(
-            outputReferenced: false,
-            reportReferenced: true
-        ), !AlphaRecoveryArtifactPolicy.shouldQuarantine(
-            outputReferenced: true,
-            reportReferenced: false
-        ) else { exit(40) }
+        guard AlphaRecoveryArtifactPolicy.accepts(
+            artifactStem: "transition-idle-to-running",
+            outputBasename: "transition-idle-to-running-1723456789-deadbeef.mov",
+            reportBasename: "transition-idle-to-running-1723456789-deadbeef.report.json"
+        ), !AlphaRecoveryArtifactPolicy.accepts(
+            artifactStem: "transition-idle-to-thinking",
+            outputBasename: "transition-idle-to-running-1723456789-deadbeef.mov",
+            reportBasename: "transition-idle-to-running-1723456789-deadbeef.report.json"
+        ) else { exit(41) }
         let hostilePairs = [
             ("media-map.json", "media-map.report.json"),
             ("running-1723456789-deadbeef.mov", "running-1723456789-deadbeef.report.json"),
@@ -558,7 +557,7 @@ struct WatchdogHarness {
         ]
         for pair in hostilePairs {
             guard !AlphaRecoveryArtifactPolicy.accepts(
-                stateRawValue: "idle",
+                artifactStem: "idle",
                 outputBasename: pair.0,
                 reportBasename: pair.1
             ) else { exit(15) }
@@ -1194,24 +1193,14 @@ struct WatchdogHarness {
         )[0]
         self.assertIn("mediaMutationInProgress = true", recovery)
         self.assertIn("self.mediaMutationInProgress = false", recovery)
-        failure_branch = recovery.split("case .failure:", 1)[1].split("case .success:", 1)[0]
+        self.assertNotIn("removeItem(at: journalURL)", recovery)
+        failure_branch = recovery.split("case .failure:", 1)[1].split("case let .success", 1)[0]
         self.assertNotIn("removeItem(at: outputURL)", failure_branch)
         self.assertNotIn("removeItem(at: reportURL)", failure_branch)
-        self.assertIn("animation_recovery_quarantined", failure_branch)
-        self.assertIn("outputReferenced = self.isMediaPathReferenced(outputURL)", failure_branch)
-        self.assertIn("reportReferenced = self.isMediaPathReferenced(reportURL)", failure_branch)
-        self.assertIn("AlphaRecoveryArtifactPolicy.shouldQuarantine", failure_branch)
-        self.assertIn("quarantineFailedRecoveryArtifacts", failure_branch)
+        self.assertNotIn("clearConversionJournal", failure_branch)
+        self.assertNotIn("renameat", failure_branch)
+        self.assertIn("action=retain_journal_and_artifacts", failure_branch)
         self.assertIn("pendingRecoveryNotice", failure_branch)
-        quarantine = source.split("private func quarantineFailedRecoveryArtifacts", 1)[1].split(
-            "private func chooseTransparentMovie", 1
-        )[0]
-        self.assertIn("for sourceURL in [outputURL, reportURL]", quarantine)
-        self.assertIn("O_NOFOLLOW", quarantine)
-        self.assertIn("Darwin.renameat", quarantine)
-        self.assertIn("Darwin.fsync", quarantine)
-        self.assertNotIn("removeItem(at: outputURL)", quarantine)
-        self.assertNotIn("removeItem(at: reportURL)", quarantine)
 
     def test_portable_movs_require_explicit_user_trust_and_playback_acceptance(self) -> None:
         source = PET_APP_DELEGATE.read_text(encoding="utf-8")

@@ -185,6 +185,16 @@ The Animations pane also provides:
 - clip reordering, relinking, fixed selection, and Reduce Motion posters; and
 - state-only removal or eligible managed-file moves to macOS Trash.
 
+The **Transitions** mode in the same pane can assign an optional directional
+clip to every distinct source → destination lifecycle pair for the active
+character. Import an MP4 for conversion or a verified transparent MOV, then
+preview, replace, or remove it. A configured clip plays once before Statelet
+commits the destination animation; clips are limited to 4 seconds. Playback
+still uses the existing single AVFoundation decoder, with a hard cut and no
+cross-fade or warmed second decoder. Reduce Motion skips transition video and
+presents the destination fallback immediately. Existing maps without a
+`transitions` object retain their current direct-to-destination behavior.
+
 Read [Using Statelet](docs/USAGE.md) for the full interaction, animation,
 appearance, resize, FPS, prompts, deletion, and recovery behavior.
 

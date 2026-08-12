@@ -128,14 +128,6 @@ public enum ManagedMediaTrashRevalidator {
         }
         let root = try validateRoot(canonicalRoot)
         let targets = try targetURLs.map { try inspectTarget($0, root: root) }
-        let capturedMaps = try maps.map { planned -> ManagedMediaMapSnapshot in
-            let url = try validateManagedFile(planned.url, root: root)
-            let snapshot = try inspectMap(url)
-            guard snapshot.map == planned.map else {
-                throw ManagedMediaTrashRevalidationError.mediaMapChangedBeforePublish
-            }
-            return snapshot
-        }
         let catalog = try catalogURL.map { rawURL in
             let url = try validateManagedFile(rawURL, root: root)
             var info = stat()
@@ -145,8 +137,23 @@ public enum ManagedMediaTrashRevalidator {
                 }
                 return ManagedMediaCatalogSnapshot(url: url, file: nil)
             }
-            return ManagedMediaCatalogSnapshot(url: url, file: try inspectFile(url, maximumBytes: 1_048_576))
+            return ManagedMediaCatalogSnapshot(
+                url: url,
+                file: try inspectFile(url, maximumBytes: 1_048_576)
+            )
         }
+        if let catalog {
+            try validateCatalogMapSet(catalog, maps: maps, root: root)
+        }
+        let capturedMaps = try maps.map { planned -> ManagedMediaMapSnapshot in
+            let url = try validateManagedFile(planned.url, root: root)
+            let snapshot = try inspectMap(url)
+            guard snapshot.map == planned.map else {
+                throw ManagedMediaTrashRevalidationError.mediaMapChangedBeforePublish
+            }
+            return snapshot
+        }
+        try validateCatalog(catalog, root: root)
         return ManagedMediaTrashSnapshot(targets: targets, maps: capturedMaps, catalog: catalog)
     }
 
@@ -197,6 +204,7 @@ public enum ManagedMediaTrashRevalidator {
         let publishedURL = try validateManagedFile(publishedMap.url, root: root)
         for expected in snapshot.maps {
             let current = try inspectMap(try validateManagedFile(expected.url, root: root))
+            try rejectReferences(in: current.map, mapURL: current.url, targets: snapshot.targets)
             if expected.url.standardizedFileURL == publishedURL {
                 guard current.map == publishedMap.map else {
                     throw ManagedMediaTrashRevalidationError.mediaMapChangedBeforePublish
@@ -242,6 +250,18 @@ public enum ManagedMediaTrashRevalidator {
                 if targetPaths.contains(referenced.path) {
                     throw ManagedMediaTrashRevalidationError.stillReferenced
                 }
+            }
+        }
+        for entry in map.transitions.values {
+            let movie = map.resolvedURL(for: entry, relativeTo: mapURL)
+                .resolvingSymlinksInPath().standardizedFileURL
+            let report = movie.deletingPathExtension().appendingPathExtension("report.json")
+            let poster = map.resolvedPosterURL(for: entry, relativeTo: mapURL)?
+                .resolvingSymlinksInPath().standardizedFileURL
+            if targetPaths.contains(movie.path)
+                || targetPaths.contains(report.path)
+                || poster.map({ targetPaths.contains($0.path) }) == true {
+                throw ManagedMediaTrashRevalidationError.stillReferenced
             }
         }
 
@@ -466,6 +486,7 @@ public enum ManagedMediaTrashRevalidator {
         let publishedURL = try validateManagedFile(publishedMap.url, root: root)
         for expected in snapshot.maps {
             let current = try inspectMap(try validateManagedFile(expected.url, root: root))
+            try rejectReferences(in: current.map, mapURL: current.url, targets: snapshot.targets)
             if expected.url.standardizedFileURL == publishedURL {
                 guard current.map == publishedMap.map else {
                     throw ManagedMediaTrashRevalidationError.mediaMapChangedBeforePublish
@@ -475,7 +496,6 @@ public enum ManagedMediaTrashRevalidator {
                     throw ManagedMediaTrashRevalidationError.mediaMapChangedBeforePublish
                 }
             }
-            try rejectReferences(in: current.map, mapURL: current.url, targets: snapshot.targets)
         }
         try validateTargets(snapshot.targets, root: root)
         return root
@@ -690,6 +710,39 @@ public enum ManagedMediaTrashRevalidator {
         }
     }
 
+    private static func validateCatalogMapSet(
+        _ catalog: ManagedMediaCatalogSnapshot,
+        maps: [ManagedMediaTrashMap],
+        root: URL
+    ) throws {
+        let suppliedPaths = Set(try maps.map {
+            try validateManagedFile($0.url, root: root).path
+        })
+        guard suppliedPaths.count == maps.count else {
+            throw ManagedMediaTrashRevalidationError.unsafeConfiguration
+        }
+        let expectedPaths: Set<String>
+        if let file = catalog.file {
+            let library: CharacterLibrary
+            do {
+                library = try JSONDecoder.codexPet.decode(CharacterLibrary.self, from: file.data)
+            } catch {
+                throw ManagedMediaTrashRevalidationError.mediaMapUnreadable
+            }
+            expectedPaths = Set(try library.characters.map { character in
+                try validateManagedFile(
+                    root.appendingPathComponent(character.mapPath),
+                    root: root
+                ).path
+            })
+        } else {
+            expectedPaths = [root.appendingPathComponent(CharacterLibrary.defaultMapPath).path]
+        }
+        guard suppliedPaths == expectedPaths else {
+            throw ManagedMediaTrashRevalidationError.mediaMapChangedBeforePublish
+        }
+    }
+
     private static func rejectReferences(
         in map: MediaMap,
         mapURL: URL,
@@ -708,6 +761,18 @@ public enum ManagedMediaTrashRevalidator {
                     || poster.map({ targetPaths.contains($0.path) }) == true {
                     throw ManagedMediaTrashRevalidationError.stillReferenced
                 }
+            }
+        }
+        for entry in map.transitions.values {
+            let movie = map.resolvedURL(for: entry, relativeTo: mapURL)
+                .resolvingSymlinksInPath().standardizedFileURL
+            let report = movie.deletingPathExtension().appendingPathExtension("report.json")
+            let poster = map.resolvedPosterURL(for: entry, relativeTo: mapURL)?
+                .resolvingSymlinksInPath().standardizedFileURL
+            if targetPaths.contains(movie.path)
+                || targetPaths.contains(report.path)
+                || poster.map({ targetPaths.contains($0.path) }) == true {
+                throw ManagedMediaTrashRevalidationError.stillReferenced
             }
         }
     }

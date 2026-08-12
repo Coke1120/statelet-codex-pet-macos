@@ -29,6 +29,260 @@ final class PetPlayerPlaybackTests: XCTestCase {
         XCTAssertNil(deferred.consumeWhenCurrentItemBecomesAvailable())
     }
 
+    func testLifecycleTransitionPolicyOnlyUsesCommittedStateForAuthoritativeChange() {
+        XCTAssertEqual(
+            LifecycleTransitionPolicy.trigger(
+                previousLifecycleState: nil,
+                incomingState: .running,
+                forceRefresh: false
+            ),
+            .initialPresentation
+        )
+        XCTAssertEqual(
+            LifecycleTransitionPolicy.trigger(
+                previousLifecycleState: .running,
+                incomingState: .running,
+                forceRefresh: false
+            ),
+            .sameStateHeartbeat
+        )
+        XCTAssertEqual(
+            LifecycleTransitionPolicy.trigger(
+                previousLifecycleState: .idle,
+                incomingState: .running,
+                forceRefresh: false
+            ),
+            .authoritativeChange
+        )
+        XCTAssertEqual(
+            LifecycleTransitionPolicy.trigger(
+                previousLifecycleState: .idle,
+                incomingState: .running,
+                forceRefresh: true
+            ),
+            .forcedRefresh
+        )
+        XCTAssertEqual(
+            LifecycleTransitionPolicy.source(
+                lastCommittedState: .idle,
+                incomingState: .running,
+                trigger: .authoritativeChange,
+                reduceMotion: false,
+                hasConfiguredMedia: true
+            ),
+            .idle
+        )
+
+        for trigger in [
+            LifecyclePresentationTrigger.initialPresentation,
+            .sameStateHeartbeat,
+            .forcedRefresh,
+            .playlistRotation,
+            .nextClip,
+            .playOnce,
+            .temporaryState,
+        ] {
+            XCTAssertNil(
+                LifecycleTransitionPolicy.source(
+                    lastCommittedState: .idle,
+                    incomingState: .running,
+                    trigger: trigger,
+                    reduceMotion: false,
+                    hasConfiguredMedia: true
+                )
+            )
+        }
+    }
+
+    func testLifecycleTransitionPolicySkipsInitialSameStateMissingAndReduceMotion() {
+        XCTAssertNil(LifecycleTransitionPolicy.source(
+            lastCommittedState: nil,
+            incomingState: .running,
+            trigger: .authoritativeChange,
+            reduceMotion: false,
+            hasConfiguredMedia: true
+        ))
+        XCTAssertNil(LifecycleTransitionPolicy.source(
+            lastCommittedState: .running,
+            incomingState: .running,
+            trigger: .authoritativeChange,
+            reduceMotion: false,
+            hasConfiguredMedia: true
+        ))
+        XCTAssertNil(LifecycleTransitionPolicy.source(
+            lastCommittedState: .idle,
+            incomingState: .running,
+            trigger: .authoritativeChange,
+            reduceMotion: false,
+            hasConfiguredMedia: false
+        ))
+        XCTAssertNil(LifecycleTransitionPolicy.source(
+            lastCommittedState: .idle,
+            incomingState: .running,
+            trigger: .authoritativeChange,
+            reduceMotion: true,
+            hasConfiguredMedia: true
+        ))
+    }
+
+    func testLifecycleTransitionDeadlineIncludesReadinessInFourSecondBudget() {
+        let second: UInt64 = 1_000_000_000
+        XCTAssertEqual(
+            LifecycleTransitionDeadline.uptimeNanoseconds(startedAt: 10 * second),
+            14 * second
+        )
+        XCTAssertEqual(
+            LifecycleTransitionDeadline.uptimeNanoseconds(
+                startedAt: 10 * second,
+                maximumDuration: 0.25
+            ),
+            10 * second + 250_000_000
+        )
+    }
+
+    func testRapidLifecycleTransitionOnlyCommitsNewestAuthoritativeDestination() {
+        XCTAssertEqual(
+            LifecycleTransitionCompletionDecision.decide(
+                callbackID: 10,
+                currentSequence: 11,
+                activeID: 11,
+                activeDestination: .review,
+                authoritativeState: .review,
+                temporaryPreviewActive: false
+            ),
+            .ignore
+        )
+        XCTAssertEqual(
+            LifecycleTransitionCompletionDecision.decide(
+                callbackID: 11,
+                currentSequence: 11,
+                activeID: 11,
+                activeDestination: .review,
+                authoritativeState: .review,
+                temporaryPreviewActive: false
+            ),
+            .commit(.review)
+        )
+        XCTAssertEqual(
+            LifecycleTransitionCompletionDecision.decide(
+                callbackID: 11,
+                currentSequence: 11,
+                activeID: 11,
+                activeDestination: .review,
+                authoritativeState: .running,
+                temporaryPreviewActive: false
+            ),
+            .ignore
+        )
+        XCTAssertEqual(
+            LifecycleTransitionCompletionDecision.decide(
+                callbackID: 11,
+                currentSequence: 11,
+                activeID: 11,
+                activeDestination: .review,
+                authoritativeState: .review,
+                temporaryPreviewActive: true
+            ),
+            .ignore
+        )
+    }
+
+    func testRapidThreeStateTransitionIgnoresBothSupersededCallbacks() {
+        for staleID in [UInt64(1), UInt64(2)] {
+            XCTAssertEqual(
+                LifecycleTransitionCompletionDecision.decide(
+                    callbackID: staleID,
+                    currentSequence: 3,
+                    activeID: 3,
+                    activeDestination: .review,
+                    authoritativeState: .review,
+                    temporaryPreviewActive: false
+                ),
+                .ignore
+            )
+        }
+
+        XCTAssertEqual(
+            LifecycleTransitionCompletionDecision.decide(
+                callbackID: 3,
+                currentSequence: 3,
+                activeID: 3,
+                activeDestination: .review,
+                authoritativeState: .review,
+                temporaryPreviewActive: false
+            ),
+            .commit(.review)
+        )
+    }
+
+    @MainActor
+    func testLifecycleTransitionUsesSingleQueueAndEndsExactlyOnce() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("statelet-transition-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let movieURL = directory.appendingPathComponent("transition.mov")
+        try await Self.writeTestMovie(to: movieURL)
+
+        let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
+        let controller = PetPlayerController(view: view)
+        let entry = try MediaEntry(path: movieURL.lastPathComponent) // loop defaults true
+        var endedIDs: [UInt64] = []
+        controller.onLifecycleTransitionEnded = { endedIDs.append($0) }
+
+        XCTAssertEqual(
+            controller.showLifecycleTransition(
+                destinationState: .running,
+                entry: entry,
+                url: movieURL,
+                transitionID: 44,
+                startedAt: DispatchTime.now().uptimeNanoseconds
+            ),
+            .preparing
+        )
+        XCTAssertTrue(view.playerLayer.player is AVQueuePlayer)
+        try await Self.waitUntil("transition did not end exactly once") {
+            endedIDs == [44]
+        }
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(endedIDs, [44])
+        controller.clearTransientPresentation()
+    }
+
+    @MainActor
+    func testNewPresentationSuppressesStaleTransitionCompletion() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("statelet-transition-cancel-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let movieURL = directory.appendingPathComponent("transition.mov")
+        try await Self.writeTestMovie(to: movieURL)
+
+        let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
+        let controller = PetPlayerController(view: view)
+        let entry = try MediaEntry(path: movieURL.lastPathComponent)
+        var endedIDs: [UInt64] = []
+        controller.onLifecycleTransitionEnded = { endedIDs.append($0) }
+        _ = controller.showLifecycleTransition(
+            destinationState: .running,
+            entry: entry,
+            url: movieURL,
+            transitionID: 51,
+            startedAt: DispatchTime.now().uptimeNanoseconds
+        )
+        _ = controller.show(
+            state: .review,
+            entry: entry,
+            url: movieURL,
+            posterURL: nil,
+            transitionID: 52,
+            startedAt: DispatchTime.now().uptimeNanoseconds
+        )
+        try await Task.sleep(nanoseconds: 1_300_000_000)
+        XCTAssertTrue(endedIDs.isEmpty)
+        controller.clearTransientPresentation()
+    }
+
     @MainActor
     func testLoopingMovieStartsAfterAVPlayerLooperPopulatesQueue() async throws {
         let directory = FileManager.default.temporaryDirectory

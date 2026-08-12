@@ -89,6 +89,34 @@ final class ManagedMediaTrashRevalidationTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.reportURL.path))
     }
 
+    func testRejectsTransitionReferenceAddedBetweenMapPublishAndTrash() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let snapshot = try ManagedMediaTrashRevalidator.capture(
+            targetURLs: [fixture.movieURL, fixture.reportURL],
+            plannedMediaMap: fixture.map,
+            mapURL: fixture.mapURL,
+            canonicalRoot: fixture.root
+        )
+        try writeMap(try MediaMap(), to: fixture.mapURL)
+        let transitionMap = try MediaMap().settingTransition(
+            from: .idle,
+            to: .running,
+            entry: try MediaEntry(path: fixture.relativeMoviePath, loop: false)
+        )
+        try writeMap(transitionMap, to: fixture.mapURL)
+
+        XCTAssertThrowsError(
+            try ManagedMediaTrashRevalidator.revalidate(
+                snapshot: snapshot,
+                mapURL: fixture.mapURL,
+                canonicalRoot: fixture.root
+            )
+        ) { error in
+            XCTAssertEqual(error as? ManagedMediaTrashRevalidationError, .stillReferenced)
+        }
+    }
+
     func testRejectsExternalMapEditBeforePublish() throws {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -195,7 +223,7 @@ final class ManagedMediaTrashRevalidationTests: XCTestCase {
         let published = try MediaMap(states: [PetState: StateMediaPlaylist]())
         try writeMap(published, to: fixture.mapURL)
         try writeMap(
-            try MediaMap(states: [.review: try MediaEntry(path: fixture.relativeMoviePath)]),
+            try MediaMap(states: [.review: try MediaEntry(path: "unrelated.mov")]),
             to: inactiveURL
         )
 
@@ -210,18 +238,61 @@ final class ManagedMediaTrashRevalidationTests: XCTestCase {
         }
     }
 
+    func testLibraryQuarantineRejectsTransitionReferenceAddedToInactiveMap() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let inactiveURL = fixture.root.appendingPathComponent(".character-other.media-map.json")
+        let inactive = try MediaMap()
+        try writeMap(inactive, to: inactiveURL)
+        let originalMovie = try Data(contentsOf: fixture.movieURL)
+        let originalReport = try Data(contentsOf: fixture.reportURL)
+        let snapshot = try ManagedMediaTrashRevalidator.captureLibrary(
+            targetURLs: [fixture.movieURL, fixture.reportURL],
+            maps: [
+                ManagedMediaTrashMap(url: fixture.mapURL, map: fixture.map),
+                ManagedMediaTrashMap(url: inactiveURL, map: inactive),
+            ],
+            catalogURL: nil,
+            canonicalRoot: fixture.root
+        )
+        let published = try MediaMap()
+        try writeMap(published, to: fixture.mapURL)
+        let transitionMap = try inactive.settingTransition(
+            from: .idle,
+            to: .review,
+            entry: try MediaEntry(path: fixture.relativeMoviePath, loop: false)
+        )
+        try writeMap(transitionMap, to: inactiveURL)
+
+        XCTAssertThrowsError(
+            try ManagedMediaTrashRevalidator.quarantineLibraryAfterPublish(
+                snapshot: snapshot,
+                publishedMap: ManagedMediaTrashMap(url: fixture.mapURL, map: published),
+                canonicalRoot: fixture.root
+            )
+        ) { error in
+            XCTAssertEqual(error as? ManagedMediaTrashRevalidationError, .stillReferenced)
+        }
+        XCTAssertEqual(try Data(contentsOf: fixture.movieURL), originalMovie)
+        XCTAssertEqual(try Data(contentsOf: fixture.reportURL), originalReport)
+        XCTAssertEqual(try JSONDecoder.codexPet.decode(MediaMap.self, from: Data(contentsOf: fixture.mapURL)), published)
+        XCTAssertEqual(try JSONDecoder.codexPet.decode(MediaMap.self, from: Data(contentsOf: inactiveURL)), transitionMap)
+    }
+
     func testLibrarySnapshotRejectsCatalogMutation() throws {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let catalogURL = fixture.root.appendingPathComponent("character-library.json")
-        try Data("catalog-a".utf8).write(to: catalogURL)
+        let firstCatalog = try CharacterLibrary.legacy
+        try writeCatalog(firstCatalog, to: catalogURL)
         let snapshot = try ManagedMediaTrashRevalidator.captureLibrary(
             targetURLs: [fixture.movieURL],
             maps: [ManagedMediaTrashMap(url: fixture.mapURL, map: fixture.map)],
             catalogURL: catalogURL,
             canonicalRoot: fixture.root
         )
-        try Data("catalog-b".utf8).write(to: catalogURL, options: .atomic)
+        let changedCatalog = try firstCatalog.addingCharacter(id: "other", name: "Other")
+        try writeCatalog(changedCatalog, to: catalogURL)
 
         XCTAssertThrowsError(
             try ManagedMediaTrashRevalidator.validateLibraryUnchanged(
@@ -230,6 +301,30 @@ final class ManagedMediaTrashRevalidationTests: XCTestCase {
             )
         ) { error in
             XCTAssertEqual(error as? ManagedMediaTrashRevalidationError, .mediaMapChangedBeforePublish)
+        }
+    }
+
+    func testLibrarySnapshotRejectsCharacterMapOmittedFromCatalogSet() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let catalogURL = fixture.root.appendingPathComponent("character-library.json")
+        let catalog = try CharacterLibrary.legacy.addingCharacter(id: "other", name: "Other")
+        try writeCatalog(catalog, to: catalogURL)
+        let otherURL = fixture.root.appendingPathComponent(".character-other.media-map.json")
+        try writeMap(try MediaMap(), to: otherURL)
+
+        XCTAssertThrowsError(
+            try ManagedMediaTrashRevalidator.captureLibrary(
+                targetURLs: [fixture.movieURL],
+                maps: [ManagedMediaTrashMap(url: fixture.mapURL, map: fixture.map)],
+                catalogURL: catalogURL,
+                canonicalRoot: fixture.root
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? ManagedMediaTrashRevalidationError,
+                .mediaMapChangedBeforePublish
+            )
         }
     }
 
@@ -515,6 +610,10 @@ final class ManagedMediaTrashRevalidationTests: XCTestCase {
 
     private func writeMap(_ map: MediaMap, to url: URL) throws {
         try JSONEncoder().encode(map).write(to: url, options: .atomic)
+    }
+
+    private func writeCatalog(_ catalog: CharacterLibrary, to url: URL) throws {
+        try JSONEncoder().encode(catalog).write(to: url, options: .atomic)
     }
 
     private struct Fixture {

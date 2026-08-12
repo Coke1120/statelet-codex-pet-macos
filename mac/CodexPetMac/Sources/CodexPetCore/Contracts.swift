@@ -274,6 +274,7 @@ public enum StatePresentationDecision: String, Equatable, Sendable {
         if forceRefresh { return .forcedRefresh }
         if pendingState == incomingState { return .unchanged }
         guard let lastPresentedState else { return .initial }
+        if pendingState != nil { return .stateChanged }
         return lastPresentedState == incomingState ? .unchanged : .stateChanged
     }
 }
@@ -372,6 +373,48 @@ public struct MediaEntry: Codable, Equatable, Sendable {
     }
 }
 
+/// A directional lifecycle transition. Equal source and destination states are
+/// invalid because same-state publications never trigger transition media.
+public struct StateTransitionKey: Hashable, Codable, Sendable {
+    public let from: PetState
+    public let to: PetState
+
+    public init(from: PetState, to: PetState) throws {
+        guard from != to else {
+            throw PetContractError.invalidValue("transition states must be distinct")
+        }
+        self.from = from
+        self.to = to
+    }
+
+    public var storageKey: String { "\(from.rawValue)_to_\(to.rawValue)" }
+
+    public init(storageKey: String) throws {
+        guard let separator = storageKey.range(of: "_to_"),
+              storageKey[separator.upperBound...].range(of: "_to_") == nil,
+              let from = PetState(rawValue: String(storageKey[..<separator.lowerBound])),
+              let to = PetState(rawValue: String(storageKey[separator.upperBound...])) else {
+            throw PetContractError.invalidValue("invalid transition key")
+        }
+        try self.init(from: from, to: to)
+    }
+
+    public init(from decoder: Decoder) throws {
+        try self.init(storageKey: decoder.singleValueContainer().decode(String.self))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(storageKey)
+    }
+}
+
+public enum LifecycleTransitionMediaPolicy {
+    /// Transition clips are decorative and must not conceal an authoritative
+    /// lifecycle destination for more than four seconds.
+    public static let maximumDuration: TimeInterval = 4.0
+}
+
 public struct WindowConfiguration: Codable, Equatable, Sendable {
     public let width: Double
     public let height: Double
@@ -427,12 +470,14 @@ public struct MediaMap: Codable, Equatable, Sendable {
     public let defaultFormat: String
     public let window: WindowConfiguration
     public let states: [PetState: StateMediaPlaylist]
+    public let transitions: [StateTransitionKey: MediaEntry]
 
     public init(
         version: Int = StateContract.version,
         defaultFormat: String = "mov",
         window: WindowConfiguration = try! WindowConfiguration(),
-        states: [PetState: StateMediaPlaylist] = [:]
+        states: [PetState: StateMediaPlaylist] = [:],
+        transitions: [StateTransitionKey: MediaEntry] = [:]
     ) throws {
         guard version == StateContract.version else {
             throw PetContractError.unsupportedVersion(version)
@@ -445,10 +490,24 @@ public struct MediaMap: Codable, Equatable, Sendable {
                 _ = try PlaybackRate(entry.playbackRate.value)
             }
         }
+        var normalizedTransitions: [StateTransitionKey: MediaEntry] = [:]
+        for (key, entry) in transitions {
+            guard key.from != key.to else {
+                throw PetContractError.invalidValue("transition states must be distinct")
+            }
+            _ = try PlaybackRate(entry.playbackRate.value)
+            normalizedTransitions[key] = try MediaEntry(
+                path: entry.path,
+                posterPath: entry.posterPath,
+                loop: false,
+                playbackRate: entry.playbackRate.value
+            )
+        }
         self.version = version
         self.defaultFormat = defaultFormat
         self.window = window
         self.states = states
+        self.transitions = normalizedTransitions
     }
 
     /// Source-compatible initializer for callers that still supply one entry
@@ -457,7 +516,8 @@ public struct MediaMap: Codable, Equatable, Sendable {
         version: Int = StateContract.version,
         defaultFormat: String = "mov",
         window: WindowConfiguration = try! WindowConfiguration(),
-        states: [PetState: MediaEntry]
+        states: [PetState: MediaEntry],
+        transitions: [StateTransitionKey: MediaEntry] = [:]
     ) throws {
         let playlists = try Dictionary(uniqueKeysWithValues: states.map { state, entry in
             (state, try StateMediaPlaylist(entries: [entry]))
@@ -466,7 +526,8 @@ public struct MediaMap: Codable, Equatable, Sendable {
             version: version,
             defaultFormat: defaultFormat,
             window: window,
-            states: playlists
+            states: playlists,
+            transitions: transitions
         )
     }
 
@@ -475,6 +536,7 @@ public struct MediaMap: Codable, Equatable, Sendable {
         case defaultFormat = "default_format"
         case window
         case states
+        case transitions
     }
 
     public init(from decoder: Decoder) throws {
@@ -487,11 +549,20 @@ public struct MediaMap: Codable, Equatable, Sendable {
             }
             decodedStates[state] = playlist
         }
+        let rawTransitions = try container.decodeIfPresent([String: MediaEntry].self, forKey: .transitions) ?? [:]
+        var decodedTransitions: [StateTransitionKey: MediaEntry] = [:]
+        for (rawKey, entry) in rawTransitions {
+            let key = try StateTransitionKey(storageKey: rawKey)
+            guard decodedTransitions.updateValue(entry, forKey: key) == nil else {
+                throw PetContractError.invalidValue("duplicate transition key")
+            }
+        }
         try self.init(
             version: container.decode(Int.self, forKey: .version),
             defaultFormat: container.decodeIfPresent(String.self, forKey: .defaultFormat) ?? "mov",
             window: container.decodeIfPresent(WindowConfiguration.self, forKey: .window) ?? (try WindowConfiguration()),
-            states: decodedStates
+            states: decodedStates,
+            transitions: decodedTransitions
         )
     }
 
@@ -501,6 +572,12 @@ public struct MediaMap: Codable, Equatable, Sendable {
         try container.encode(defaultFormat, forKey: .defaultFormat)
         try container.encode(window, forKey: .window)
         try container.encode(Dictionary(uniqueKeysWithValues: states.map { ($0.key.rawValue, $0.value) }), forKey: .states)
+        if !transitions.isEmpty {
+            try container.encode(
+                Dictionary(uniqueKeysWithValues: transitions.map { ($0.key.storageKey, $0.value) }),
+                forKey: .transitions
+            )
+        }
     }
 
     public func entry(for state: PetState) -> MediaEntry? {
@@ -513,6 +590,11 @@ public struct MediaMap: Codable, Equatable, Sendable {
 
     public func entries(for state: PetState) -> [MediaEntry] {
         playlist(for: state)?.entries ?? []
+    }
+
+    public func transition(from: PetState, to: PetState) -> MediaEntry? {
+        guard from != to, let key = try? StateTransitionKey(from: from, to: to) else { return nil }
+        return transitions[key]
     }
 
     public func resolvedURL(for state: PetState, relativeTo mapURL: URL) -> URL? {
@@ -555,7 +637,8 @@ public enum MediaMapChangeImpact: String, Equatable, Sendable {
         guard previous != incoming else { return .unchanged }
         if previous.version != incoming.version
             || previous.defaultFormat != incoming.defaultFormat
-            || previous.states != incoming.states {
+            || previous.states != incoming.states
+            || previous.transitions != incoming.transitions {
             return .playback
         }
         return .windowOnly

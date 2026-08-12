@@ -436,6 +436,14 @@ private func runSelfTest() throws {
     )
     try require(
         StatePresentationDecision.decide(
+            lastPresentedState: .idle,
+            pendingState: .running,
+            incomingState: .idle
+        ) == .stateChanged,
+        "authoritative rollback did not cancel pending playback"
+    )
+    try require(
+        StatePresentationDecision.decide(
             lastPresentedState: .running,
             incomingState: .running,
             forceRefresh: true
