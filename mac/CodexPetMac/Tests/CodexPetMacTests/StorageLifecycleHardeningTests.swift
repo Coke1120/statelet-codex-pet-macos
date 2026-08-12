@@ -4,6 +4,27 @@ import XCTest
 @testable import CodexPetMac
 
 final class StorageLifecycleHardeningTests: XCTestCase {
+    private final class LockedState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var calls = 0
+        private var results: [LifecycleStateReadResult] = []
+
+        func nextCall() -> Int {
+            lock.withLock {
+                calls += 1
+                return calls
+            }
+        }
+
+        func append(_ result: LifecycleStateReadResult) {
+            lock.withLock { results.append(result) }
+        }
+
+        var snapshot: [LifecycleStateReadResult] {
+            lock.withLock { results }
+        }
+    }
+
     func testPosterInstallerRejectsSymlinkOversizeMalformedAndLowDisk() throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -97,26 +118,24 @@ final class StorageLifecycleHardeningTests: XCTestCase {
         let firstStarted = expectation(description: "first started")
         let releaseFirst = DispatchSemaphore(value: 0)
         let newestDelivered = expectation(description: "newest delivered")
-        var calls = 0
+        let state = LockedState()
         let reader = LifecycleStateFileReader { _ in
-            calls += 1
-            if calls == 1 {
+            if state.nextCall() == 1 {
                 firstStarted.fulfill()
                 releaseFirst.wait()
                 return .missing
             }
             return .corrupt
         }
-        var results: [LifecycleStateReadResult] = []
-        reader.read(URL(fileURLWithPath: "/tmp/one")) { results.append($0) }
+        reader.read(URL(fileURLWithPath: "/tmp/one")) { state.append($0) }
         wait(for: [firstStarted], timeout: 1)
         reader.read(URL(fileURLWithPath: "/tmp/two")) {
-            results.append($0)
+            state.append($0)
             newestDelivered.fulfill()
         }
         releaseFirst.signal()
         wait(for: [newestDelivered], timeout: 1)
-        XCTAssertEqual(results, [.corrupt])
+        XCTAssertEqual(state.snapshot, [.corrupt])
     }
 
     func testClickThroughRollsRuntimeBackWhenSaveFails() {
