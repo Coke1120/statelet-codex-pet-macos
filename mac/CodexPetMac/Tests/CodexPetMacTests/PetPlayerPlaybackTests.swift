@@ -3,7 +3,7 @@ import AppKit
 import CodexPetCore
 import CoreVideo
 import XCTest
-@testable import CodexPetMac
+@testable import Statelet
 
 final class PetPlayerPlaybackTests: XCTestCase {
     private enum TestFailure: Error {

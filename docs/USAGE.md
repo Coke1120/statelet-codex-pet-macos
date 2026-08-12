@@ -395,7 +395,7 @@ files remain protected until their replacements generate successfully.
 Managed voice data lives below:
 
 ```text
-~/Library/Application Support/CodexPet/voice/
+~/Library/Application Support/Statelet/voice/
 ```
 
 Directories and files are owner-only. Metadata and generated WAV files use
@@ -510,7 +510,7 @@ screen, use **Settings → General → Reset Position**.
 command -v ffmpeg
 command -v ffprobe
 test -x /usr/bin/avconvert
-"$HOME/Library/Application Support/CodexPet/alpha-runtime/bin/python3" \
+"$HOME/Library/Application Support/Statelet/alpha-runtime/bin/python3" \
   -c 'import numpy, PIL'
 ```
 
@@ -531,10 +531,10 @@ Restart Codex if hooks were installed while it was open. Then inspect managed
 jobs and logs:
 
 ```bash
-launchctl print gui/$(id -u)/com.coke1120.codex-pet.state-aggregator
-launchctl print gui/$(id -u)/com.coke1120.codex-pet.mac-player
-tail -n 100 "$HOME/Library/Application Support/CodexPet/logs/state-aggregator.err.log"
-tail -n 100 "$HOME/Library/Application Support/CodexPet/logs/mac-player.err.log"
+launchctl print gui/$(id -u)/com.coke1120.statelet.state-aggregator
+launchctl print gui/$(id -u)/com.coke1120.statelet.mac-player
+tail -n 100 "$HOME/Library/Application Support/Statelet/logs/state-aggregator.err.log"
+tail -n 100 "$HOME/Library/Application Support/Statelet/logs/mac-player.err.log"
 ```
 
 Missing, invalid, future-dated, or stale publisher data falls back safely to

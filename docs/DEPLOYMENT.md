@@ -1,7 +1,7 @@
 # Deploy Statelet on macOS
 
 This guide covers building, installing, upgrading, starting automatically, and
-uninstalling Statelet 1.6.0 (build 11) on macOS 13 or newer.
+uninstalling Statelet 1.7.0 (build 12) on macOS 13 or newer.
 
 The first public release is source-only. The maintained build script produces
 an ad-hoc-signed `.app` for personal local use. It does not produce a DMG,
@@ -83,7 +83,7 @@ open mac/CodexPetMac/dist/Statelet.app --args --settings
 ```
 
 This starts the app from the checkout and opens Settings. It reads the normal
-Statelet files under `~/Library/Application Support/CodexPet/`, but it does not
+Statelet files under `~/Library/Application Support/Statelet/`, but it does not
 install the lifecycle publisher, merge hooks, or add a login item.
 
 ## Install for the current account
@@ -109,9 +109,9 @@ The installer:
 - preserves an existing `media-map.json`, `character-library.json`, hidden
   per-character maps/assets, and user media during upgrades.
 
-A managed legacy `~/Applications/CodexPetMac.app` is migrated to
-`~/Applications/Statelet.app`. An unmanaged app or LaunchAgent at a managed
-destination causes installation to fail before replacement.
+An unmanaged app or LaunchAgent at a managed destination causes installation to
+fail before replacement. See [Legacy identity migration](#legacy-identity-migration)
+for the ownership checks applied to older installations.
 
 Restart Codex after the first installation so it loads the new hook
 configuration. Launch Statelet with:
@@ -138,7 +138,7 @@ process. Managed upgrades preserve that preference.
 
 Use **Repair Startup…** only when Diagnostics reports a missing or stale managed
 player startup item. Repair validates the installed app and changes only the
-`mac-widget-v1`-marked player LaunchAgent. It does not edit Codex hooks or the
+`statelet-v2`-marked player LaunchAgent. It does not edit Codex hooks or the
 state aggregator.
 
 ## Prepare MP4 conversion tools
@@ -169,15 +169,15 @@ brew install ffmpeg
 Create the reproducible Python 3.9 conversion environment:
 
 ```bash
-CODEX_PET_ALPHA_RUNTIME="$HOME/Library/Application Support/CodexPet/alpha-runtime"
-python3.9 -m venv "$CODEX_PET_ALPHA_RUNTIME"
-"$CODEX_PET_ALPHA_RUNTIME/bin/python3" -m pip install --require-hashes \
+STATELET_ALPHA_RUNTIME="$HOME/Library/Application Support/Statelet/alpha-runtime"
+python3.9 -m venv "$STATELET_ALPHA_RUNTIME"
+"$STATELET_ALPHA_RUNTIME/bin/python3" -m pip install --require-hashes \
   -r mac/requirements-alpha.txt
 
 command -v ffmpeg
 command -v ffprobe
 test -x /usr/bin/avconvert
-"$CODEX_PET_ALPHA_RUNTIME/bin/python3" \
+"$STATELET_ALPHA_RUNTIME/bin/python3" \
   -c 'import numpy, PIL; print(numpy.__version__, PIL.__version__)'
 ```
 
@@ -187,10 +187,10 @@ Python executable that can import NumPy and Pillow.
 
 Developers may configure these environment variables before launching the app:
 
-- `CODEX_PET_ALPHA_PYTHON`
-- `CODEX_PET_FFMPEG`
-- `CODEX_PET_FFPROBE`
-- `CODEX_PET_AVCONVERT`
+- `STATELET_ALPHA_PYTHON`
+- `STATELET_FFMPEG`
+- `STATELET_FFPROBE`
+- `STATELET_AVCONVERT`
 
 Return to **Animations** and choose **Check Again** after changing tools.
 
@@ -223,29 +223,42 @@ the current start-at-login choice. Multi-character installations also preserve
 the authoritative catalog sidecar and every profile map; the installer does not
 merge profile data into the legacy root map.
 
-The public name is Statelet, while compatibility identifiers remain unchanged:
+New builds and installations use the canonical Statelet identity:
 
 | Field | Value |
 | --- | --- |
 | Installed app | `~/Applications/Statelet.app` |
-| Bundle identifier | `com.coke1120.CodexPetMac` |
-| Executable and `CFBundleName` | `CodexPetMac` |
-| Managed marker | `mac-widget-v1` |
+| Bundle identifier | `com.coke1120.Statelet` |
+| Executable and `CFBundleName` | `Statelet` |
+| Application Support | `~/Library/Application Support/Statelet` |
+| LaunchAgents | `com.coke1120.statelet.state-aggregator`, `com.coke1120.statelet.mac-player` |
+| Managed marker | `statelet-v2` |
+
+### Legacy identity migration
+
+The installer recognizes a legacy `~/Applications/CodexPetMac.app`, bundle ID
+`com.coke1120.CodexPetMac`, `CodexPetManaged`/`CodexPetMacManaged` keys,
+`~/Library/Application Support/CodexPet`, `com.coke1120.codex-pet.*`
+LaunchAgents, and marker `mac-widget-v1` only when their ownership markers are
+valid. It migrates owned user data and startup files transactionally to the
+canonical Statelet locations, refuses conflicting canonical data, and preserves
+unmanaged legacy artifacts. Rollback restores both identity sets if installation
+does not commit.
 
 ## Installed files
 
 ```text
 ~/Applications/Statelet.app
-~/Library/Application Support/CodexPet/media/media-map.json
-~/Library/Application Support/CodexPet/media/character-library.json
-~/Library/Application Support/CodexPet/media/.character-<id>.media-map.json
-~/Library/Application Support/CodexPet/media/.character-<id>.assets/
-~/Library/Application Support/CodexPet/runtime/current_state.json
-~/Library/Application Support/CodexPet/sessions/
-~/Library/Application Support/CodexPet/logs/
-~/Library/Application Support/CodexPet/mac-widget/
-~/Library/LaunchAgents/com.coke1120.codex-pet.state-aggregator.plist
-~/Library/LaunchAgents/com.coke1120.codex-pet.mac-player.plist
+~/Library/Application Support/Statelet/media/media-map.json
+~/Library/Application Support/Statelet/media/character-library.json
+~/Library/Application Support/Statelet/media/.character-<id>.media-map.json
+~/Library/Application Support/Statelet/media/.character-<id>.assets/
+~/Library/Application Support/Statelet/runtime/current_state.json
+~/Library/Application Support/Statelet/sessions/
+~/Library/Application Support/Statelet/logs/
+~/Library/Application Support/Statelet/Statelet/
+~/Library/LaunchAgents/com.coke1120.statelet.state-aggregator.plist
+~/Library/LaunchAgents/com.coke1120.statelet.mac-player.plist
 ~/.codex/hooks.json
 ```
 
@@ -289,7 +302,7 @@ It intentionally preserves:
 
 This preservation makes reinstall and recovery possible. If you want to remove
 the retained data, open Finder, choose **Go → Go to Folder…**, enter
-`~/Library/Application Support/CodexPet`, inspect its contents, and move the
+`~/Library/Application Support/Statelet`, inspect its contents, and move the
 chosen data to Trash.
 
 ## Public binary distribution

@@ -2,7 +2,7 @@ import CodexPetCore
 import CryptoKit
 import Foundation
 import XCTest
-@testable import CodexPetMac
+@testable import Statelet
 
 final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
     private final class RequestCounter: @unchecked Sendable {

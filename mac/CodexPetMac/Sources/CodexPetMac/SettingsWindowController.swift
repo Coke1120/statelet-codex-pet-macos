@@ -1513,7 +1513,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     @objc private func showSetupGuide() {
         let alert = NSAlert()
         alert.messageText = "Prepare Local Conversion Tools"
-        alert.informativeText = "Install ffmpeg with Homebrew, then choose a Python 3 executable containing NumPy and Pillow. Developers can also set CODEX_PET_ALPHA_PYTHON before launch. Conversion and verification stay entirely on this Mac."
+        alert.informativeText = "Install ffmpeg with Homebrew, then choose a Python 3 executable containing NumPy and Pillow. Developers can also set STATELET_ALPHA_PYTHON before launch. Conversion and verification stay entirely on this Mac."
         alert.addButton(withTitle: "Choose Python…")
         alert.addButton(withTitle: "Close")
         if let window {

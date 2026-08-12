@@ -77,7 +77,7 @@ struct AlphaConversionResult {
 }
 
 enum AlphaConversionProfile: String, CaseIterable {
-    static let defaultsKey = "CodexPetAlphaConversionProfile"
+    static let defaultsKey = "StateletAlphaConversionProfile"
 
     case fill
     case fit
@@ -554,7 +554,7 @@ struct PortableMediaSecureCopier {
 }
 
 final class AlphaToolchainDiscovery {
-    static let configuredPythonDefaultsKey = "CodexPetAlphaPythonPath"
+    static let configuredPythonDefaultsKey = "StateletAlphaPythonPath"
 
     private let fileManager: FileManager
     private let environment: [String: String]
@@ -584,8 +584,8 @@ final class AlphaToolchainDiscovery {
         guard let converter = firstReadableFile(converterCandidates()) else {
             return .unavailable("Converter resources are missing. Rebuild or reinstall Statelet.")
         }
-        guard let ffmpeg = firstExecutable(toolCandidates(environmentKey: "CODEX_PET_FFMPEG", name: "ffmpeg")),
-              let ffprobe = firstExecutable(toolCandidates(environmentKey: "CODEX_PET_FFPROBE", name: "ffprobe")) else {
+        guard let ffmpeg = firstExecutable(toolCandidates(environmentKey: "STATELET_FFMPEG", legacyEnvironmentKey: "CODEX_PET_FFMPEG", name: "ffmpeg")),
+              let ffprobe = firstExecutable(toolCandidates(environmentKey: "STATELET_FFPROBE", legacyEnvironmentKey: "CODEX_PET_FFPROBE", name: "ffprobe")) else {
             return .unavailable("ffmpeg and ffprobe are required. Install them with Homebrew, then check again.")
         }
         guard let avconvert = firstExecutable(avconvertCandidates()) else {
@@ -610,7 +610,10 @@ final class AlphaToolchainDiscovery {
 
     private func converterCandidates() -> [URL] {
         var candidates: [URL] = []
-        if let configured = environment["CODEX_PET_ALPHA_CONVERTER"] {
+        if let configured = environmentValue(
+            canonical: "STATELET_ALPHA_CONVERTER",
+            legacy: "CODEX_PET_ALPHA_CONVERTER"
+        ) {
             candidates.append(URL(fileURLWithPath: configured))
         }
         if let resources = bundle.resourceURL {
@@ -634,7 +637,10 @@ final class AlphaToolchainDiscovery {
 
     private func pythonCandidates() -> [URL] {
         var candidates: [URL] = []
-        if let configured = environment["CODEX_PET_ALPHA_PYTHON"] {
+        if let configured = environmentValue(
+            canonical: "STATELET_ALPHA_PYTHON",
+            legacy: "CODEX_PET_ALPHA_PYTHON"
+        ) {
             candidates.append(URL(fileURLWithPath: configured))
         }
         if let configured = userDefaults.string(forKey: Self.configuredPythonDefaultsKey) {
@@ -659,9 +665,16 @@ final class AlphaToolchainDiscovery {
         return unique(candidates).filter(isExecutable)
     }
 
-    private func toolCandidates(environmentKey: String, name: String) -> [URL] {
+    private func toolCandidates(
+        environmentKey: String,
+        legacyEnvironmentKey: String,
+        name: String
+    ) -> [URL] {
         var candidates: [URL] = []
-        if let configured = environment[environmentKey] {
+        if let configured = environmentValue(
+            canonical: environmentKey,
+            legacy: legacyEnvironmentKey
+        ) {
             candidates.append(URL(fileURLWithPath: configured))
         }
         candidates.append(contentsOf: [
@@ -674,11 +687,18 @@ final class AlphaToolchainDiscovery {
 
     private func avconvertCandidates() -> [URL] {
         var candidates: [URL] = []
-        if let configured = environment["CODEX_PET_AVCONVERT"] {
+        if let configured = environmentValue(
+            canonical: "STATELET_AVCONVERT",
+            legacy: "CODEX_PET_AVCONVERT"
+        ) {
             candidates.append(URL(fileURLWithPath: configured))
         }
         candidates.append(URL(fileURLWithPath: "/usr/bin/avconvert"))
         return unique(candidates)
+    }
+
+    private func environmentValue(canonical: String, legacy: String) -> String? {
+        environment[canonical] ?? environment[legacy]
     }
 
     private func pythonSupportsImageDependencies(_ python: URL) -> Bool {

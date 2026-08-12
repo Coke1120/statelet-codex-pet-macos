@@ -11,7 +11,7 @@ transparent desktop presence. It runs without a development board, keeps its
 runtime data on the Mac, and uses AppKit and AVFoundation rather than a browser
 runtime.
 
-Statelet 1.6.0 (build 11) requires macOS 13 or newer. The first public release
+Statelet 1.7.0 (build 12) requires macOS 13 or newer. The first public release
 is source-only: the build script creates an ad-hoc-signed app for personal local
 use, not a Developer ID-signed or notarized public binary.
 
@@ -235,7 +235,7 @@ Statelet is designed for local operation:
   directories, account information, and credentials.
 - The installer restricts managed support directories to the current account;
   imported media and state files receive restrictive local permissions.
-- Logs remain under `~/Library/Application Support/CodexPet/logs/`.
+- Logs remain under `~/Library/Application Support/Statelet/logs/`.
 - **Copy Diagnostics** emits sanitized categories and counts rather than raw
   paths, clip names, session identifiers, logs, or tool output. Review copied
   diagnostics before sharing them.
@@ -274,16 +274,19 @@ a public report.
 - Full Swift XCTest execution requires full Xcode. Command Line Tools can build
   the app and run the dependency-free core self-test but may not include XCTest.
 
-The visible bundle is `Statelet.app`. Upgrade compatibility intentionally keeps
-these internal identifiers:
+Statelet uses one canonical identity for new builds and installations:
 
 | Field | Value |
 | --- | --- |
-| Bundle identifier | `com.coke1120.CodexPetMac` |
-| `CFBundleName` | `CodexPetMac` |
-| Executable | `CodexPetMac` |
-| App version | `1.6.0` |
-| Build number | `11` |
+| App bundle | `Statelet.app` |
+| Bundle identifier | `com.coke1120.Statelet` |
+| `CFBundleName` | `Statelet` |
+| Executable | `Statelet` |
+| Application Support | `~/Library/Application Support/Statelet` |
+| LaunchAgents | `com.coke1120.statelet.state-aggregator`, `com.coke1120.statelet.mac-player` |
+| Managed marker | `statelet-v2` |
+| App version | `1.7.0` |
+| Build number | `12` |
 
 ## Uninstall
 

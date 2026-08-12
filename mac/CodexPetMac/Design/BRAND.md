@@ -16,9 +16,10 @@ Why it fits:
 - It stays character-agnostic, so users can import their own animation style.
 - It can grow beyond one generator, one character, or one animation format.
 
-Use **Statelet** as the Finder and Settings display name. Keep the existing
-bundle identifier and executable name during a rename so installed-user and
-LaunchAgent upgrades remain compatible.
+Use **Statelet** throughout the visible and installed identity. New builds use
+bundle identifier `com.coke1120.Statelet`, executable and `CFBundleName`
+`Statelet`, Statelet Application Support, `com.coke1120.statelet.*`
+LaunchAgents, and the `statelet-v2` managed marker.
 
 ## Icon concept: Living State Orbit
 
@@ -62,11 +63,20 @@ The integrated display-brand boundary is:
 1. Copy `Statelet.icns` into `Contents/Resources` during `build_app.sh`.
 2. Set `CFBundleIconFile` to `Statelet.icns` and `CFBundleDisplayName` to
    `Statelet`.
-3. Use the user-visible bundle filename `Statelet.app`. The installer migrates
-   only a legacy `CodexPetMac.app` carrying the expected bundle ID and managed
-   marker, with transactional rollback and unmanaged-file preservation.
-4. Keep `CFBundleIdentifier`, `CFBundleName`, executable, LaunchAgent labels,
-   runtime paths, and preference keys unchanged for upgrade compatibility.
+3. Use bundle filename `Statelet.app`, bundle identifier
+   `com.coke1120.Statelet`, `CFBundleName` and executable `Statelet`, Application
+   Support directory `Statelet`, `com.coke1120.statelet.*` LaunchAgent labels,
+   and managed marker `statelet-v2`.
+
+## Upgrade compatibility boundary
+
+The installer may recognize a legacy `CodexPetMac.app`, bundle identifier
+`com.coke1120.CodexPetMac`, `CodexPetManaged`/`CodexPetMacManaged` plist keys,
+`~/Library/Application Support/CodexPet`, `com.coke1120.codex-pet.*`
+LaunchAgents, and marker `mac-widget-v1` only to perform a transactional,
+ownership-checked migration. These values are not the identity for new builds,
+installations, or repaired startup items. Unmanaged legacy artifacts remain
+untouched.
 
 ## Alternate names
 

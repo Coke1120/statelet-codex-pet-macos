@@ -774,7 +774,10 @@ def validate_aggregator_process(pid: int) -> None:
         result.returncode != 0
         or len(fields) != 2
         or fields[0] != str(os.getuid())
-        or "codex_pet_state_aggregator.py" not in fields[1]
+        or not any(
+            name in fields[1]
+            for name in ("statelet_state_aggregator.py", "codex_pet_state_aggregator.py")
+        )
     ):
         raise HarnessError("invalid_aggregator_pid")
 
@@ -851,7 +854,7 @@ def build_log_command(process_id: int) -> List[str]:
         "compact",
         "--info",
         "--predicate",
-        'processID == {} AND subsystem == "com.coke1120.CodexPetMac"'.format(
+        'processID == {} AND subsystem == "com.coke1120.Statelet"'.format(
             process_id
         ),
     ]
@@ -1013,7 +1016,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--aggregator-pid",
         type=positive_pid,
-        help="Optional owned codex_pet_state_aggregator.py PID to sample",
+        help="Optional owned statelet_state_aggregator.py PID to sample",
     )
     return parser
 

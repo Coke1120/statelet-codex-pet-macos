@@ -799,23 +799,25 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         ):
             self.assertNotIn(sensitive_expression, log_calls)
 
-    def test_statelet_compatibility_identifiers_remain_unchanged(self) -> None:
+    def test_statelet_identity_and_legacy_migration_values_are_explicit(self) -> None:
         expected = {
             "appBundleName": "Statelet.app",
-            "executableName": "CodexPetMac",
-            "bundleIdentifier": "com.coke1120.CodexPetMac",
-            "applicationSupportRelativePath": "Library/Application Support/CodexPet",
-            "playerLaunchAgentLabel": "com.coke1120.codex-pet.mac-player",
-            "aggregatorLaunchAgentLabel": "com.coke1120.codex-pet.state-aggregator",
-            "appManagedPlistKey": "CodexPetManaged",
-            "launchAgentManagedPlistKey": "CodexPetMacManaged",
-            "managedMarker": "mac-widget-v1",
+            "executableName": "Statelet",
+            "bundleIdentifier": "com.coke1120.Statelet",
+            "applicationSupportRelativePath": "Library/Application Support/Statelet",
+            "playerLaunchAgentLabel": "com.coke1120.statelet.mac-player",
+            "aggregatorLaunchAgentLabel": "com.coke1120.statelet.state-aggregator",
+            "appManagedPlistKey": "StateletManaged",
+            "launchAgentManagedPlistKey": "StateletManaged",
+            "managedMarker": "statelet-v2",
         }
+        canonical = self.identity.split("enum Legacy", 1)[0]
         actual = dict(
-            re.findall(r'static let\s+(\w+)\s*=\s*"([^"]+)"', self.identity)
+            re.findall(r'static let\s+(\w+)\s*=\s*"([^"]+)"', canonical)
         )
         for key, value in expected.items():
             self.assertEqual(actual.get(key), value, key)
+        self.assertIn('static let bundleIdentifier = "com.coke1120.CodexPetMac"', self.identity)
 
 
 if __name__ == "__main__":

@@ -44,6 +44,8 @@ Use only media the user owns or is authorized to adapt and distribute.
 Use default quality thresholds unless a repository change explicitly updates
 the contract and tests. Never weaken a gate merely to make a candidate pass.
 
-Preserve the stable legacy bundle identifier, executable, Application Support
-directory, preference keys, and LaunchAgent labels; they remain intentionally
-unchanged for Statelet upgrade compatibility.
+Verify new builds and installations against Statelet's canonical bundle
+identifier, executable, Application Support directory, preference keys,
+`com.coke1120.statelet.*` LaunchAgent labels, and `statelet-v2` managed marker.
+Treat the old installed identity only as input to the ownership-checked upgrade
+migration; do not use it for a fresh install or repaired startup item.

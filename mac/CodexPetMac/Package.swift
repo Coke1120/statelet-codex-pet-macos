@@ -3,13 +3,13 @@
 import PackageDescription
 
 let package = Package(
-    name: "CodexPetMac",
+    name: "Statelet",
     platforms: [
         .macOS(.v13),
     ],
     products: [
         .library(name: "CodexPetCore", targets: ["CodexPetCore"]),
-        .executable(name: "codex-pet-mac", targets: ["CodexPetMac"]),
+        .executable(name: "statelet", targets: ["Statelet"]),
         .executable(name: "codex-pet-core-self-test", targets: ["CodexPetCoreSelfTest"]),
     ],
     targets: [
@@ -18,7 +18,7 @@ let package = Package(
             path: "Sources/CodexPetCore"
         ),
         .executableTarget(
-            name: "CodexPetMac",
+            name: "Statelet",
             dependencies: ["CodexPetCore"],
             path: "Sources/CodexPetMac"
         ),
@@ -33,8 +33,8 @@ let package = Package(
             path: "Tests/CodexPetCoreTests"
         ),
         .testTarget(
-            name: "CodexPetMacTests",
-            dependencies: ["CodexPetMac", "CodexPetCore"],
+            name: "StateletTests",
+            dependencies: ["Statelet", "CodexPetCore"],
             path: "Tests/CodexPetMacTests"
         ),
     ]

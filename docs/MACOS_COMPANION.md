@@ -1,7 +1,7 @@
 # Statelet lifecycle and media reference
 
-This reference documents the internal contracts behind Statelet 1.6.0 (build
-11), the native Codex lifecycle companion for macOS. Start with
+This reference documents the internal contracts behind Statelet 1.7.0 (build
+12), the native Codex lifecycle companion for macOS. Start with
 [Deployment](DEPLOYMENT.md) for installation or [Using Statelet](USAGE.md) for
 daily operation.
 
@@ -23,9 +23,9 @@ app for personal local use; it is not Developer ID signed or notarized.
 ```text
 Codex hook event on stdin
   -> mac/codex_pet_hook.py
-  -> ~/Library/Application Support/CodexPet/sessions/<hashed-session>.json
+  -> ~/Library/Application Support/Statelet/sessions/<hashed-session>.json
   -> mac/codex_pet_state_aggregator.py
-  -> ~/Library/Application Support/CodexPet/runtime/current_state.json
+  -> ~/Library/Application Support/Statelet/runtime/current_state.json
   -> Swift state watcher
   -> lifecycle badge and animation library
 ```
@@ -90,7 +90,7 @@ liveness without rebuilding playback or advancing a playlist.
 The installed map is:
 
 ```text
-~/Library/Application Support/CodexPet/media/media-map.json
+~/Library/Application Support/Statelet/media/media-map.json
 ```
 
 The complete example is
@@ -154,7 +154,7 @@ notices; none of them bypasses a delivery acceptance gate.
 Imported files live under:
 
 ```text
-~/Library/Application Support/CodexPet/media/
+~/Library/Application Support/Statelet/media/
 ```
 
 Statelet offers file-moving deletion only for an unshared regular movie inside
@@ -179,21 +179,29 @@ local permissions. Diagnostics intentionally report categories and counts
 rather than private content, but users should still review copied text before
 sharing it.
 
-## Stable compatibility identifiers
+## Canonical installed identity
 
-The Finder-visible name is Statelet. These identifiers remain unchanged for
-managed upgrades:
+New builds, installations, and repaired startup items use these identifiers:
 
 | Field | Value |
 | --- | --- |
 | Bundle filename | `Statelet.app` |
 | Display name | `Statelet` |
-| Bundle identifier | `com.coke1120.CodexPetMac` |
-| `CFBundleName` | `CodexPetMac` |
-| Executable | `CodexPetMac` |
-| Player LaunchAgent | `com.coke1120.codex-pet.mac-player` |
-| Aggregator LaunchAgent | `com.coke1120.codex-pet.state-aggregator` |
-| Managed marker | `mac-widget-v1` |
+| Bundle identifier | `com.coke1120.Statelet` |
+| `CFBundleName` | `Statelet` |
+| Executable | `Statelet` |
+| Application Support | `~/Library/Application Support/Statelet` |
+| Player LaunchAgent | `com.coke1120.statelet.mac-player` |
+| Aggregator LaunchAgent | `com.coke1120.statelet.state-aggregator` |
+| Managed marker | `statelet-v2` |
+
+### Legacy upgrade compatibility
+
+The installer accepts the old `CodexPetMac.app`, bundle ID
+`com.coke1120.CodexPetMac`, Application Support directory `CodexPet`,
+`com.coke1120.codex-pet.*` LaunchAgents, legacy managed plist keys, and marker
+`mac-widget-v1` only as ownership-checked migration input. They are not used for
+fresh installations or repaired startup items.
 
 ## Further reading
 

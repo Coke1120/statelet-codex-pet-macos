@@ -15,6 +15,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -145,6 +146,14 @@ class StateletVoiceSkillTests(unittest.TestCase):
     def verify(self) -> None:
         with redirect_stdout(io.StringIO()):
             VOICE_VERIFIER.verify(self.arguments())
+
+    def test_default_support_root_uses_statelet_identity(self) -> None:
+        with patch("sys.argv", [str(SCRIPT)]):
+            arguments = VOICE_VERIFIER.parse_args()
+        self.assertEqual(
+            arguments.support_root,
+            Path.home() / "Library" / "Application Support" / "Statelet",
+        )
 
     def test_accepts_ready_non_silent_audio_for_every_state(self) -> None:
         self.write_library()

@@ -4,13 +4,15 @@ Statelet is a personal-local Codex lifecycle companion for macOS 13 or newer.
 It is an AppKit accessory application: the transparent panel can be moved by dragging
 its body and resized from any border or corner without taking keyboard focus,
 AVFoundation owns exactly one decoder, and the menu-bar item keeps click-through
-recoverable. The current app version is 1.6.0. The visible bundle filename is
-`Statelet.app`; the stable bundle identifier, `CFBundleName`, executable,
-LaunchAgent labels, preferences, and Application Support paths remain unchanged.
+recoverable. The current app version is 1.7.0. New builds and installations use
+`Statelet.app`, bundle identifier `com.coke1120.Statelet`, `CFBundleName` and
+executable `Statelet`, Application Support under
+`~/Library/Application Support/Statelet`, `com.coke1120.statelet.*`
+LaunchAgent labels, and the `statelet-v2` managed marker.
 
 The application is independent of the ESP32 board. Its state aggregator uses
 only the Python standard library and does not import `pyserial`, open a USB
-device, or replace the existing `com.coke1120.codex-pet` board LaunchAgent.
+device, or replace the existing board LaunchAgent.
 
 For the complete personal-local workflow—from prerequisites through first run,
 Settings, MP4 conversion, daily use, troubleshooting, upgrade, and uninstall—
@@ -174,7 +176,7 @@ discard previously configured clips.
 File-moving removal fails closed. **Remove & Move Files to Trash** appears only
 when `media-map.json` is in the canonical managed media folder and the selected
 movie is an unshared regular file inside
-`~/Library/Application Support/CodexPet/media`. Missing or external movies,
+`~/Library/Application Support/Statelet/media`. Missing or external movies,
 shared targets, symbolic links, unsafe sibling reports, and noncanonical media
 maps leave only **Remove from State** available. When file removal is eligible,
 the app moves the MOV and an existing sibling `.report.json` to recoverable
@@ -220,7 +222,7 @@ remain for recovery.
 The app bundle includes the maintained converter source, but not a private
 Python runtime or Homebrew binaries. Settings therefore reports conversion-tool
 readiness honestly. It requires `ffmpeg`, `ffprobe`, Apple's `avconvert`, and a
-Python 3 executable with NumPy and Pillow; set `CODEX_PET_ALPHA_PYTHON` before
+Python 3 executable with NumPy and Pillow; set `STATELET_ALPHA_PYTHON` before
 launch when the desired Python is not found automatically.
 
 Version 1.5.0 renames the former **Help** pane to **Prompts**. It includes
@@ -318,9 +320,9 @@ It installs:
 
 - `~/Applications/Statelet.app`
 - board-independent Python modules under
-  `~/Library/Application Support/CodexPet/mac-widget/python/`
-- `com.coke1120.codex-pet.state-aggregator.plist`
-- `com.coke1120.codex-pet.mac-player.plist`
+  `~/Library/Application Support/Statelet/Statelet/python/`
+- `com.coke1120.statelet.state-aggregator.plist`
+- `com.coke1120.statelet.mac-player.plist`
 - an example media map only when the user has no existing map
 
 The installed application is a normal `.app` at
@@ -343,12 +345,18 @@ controls future logins. Turning it off updates only the marked player startup
 item and leaves the current app open. A later managed installer upgrade
 preserves this choice.
 
-On upgrade, a legacy `~/Applications/CodexPetMac.app` is migrated only when its
-bundle identifier is `com.coke1120.CodexPetMac` and its `CodexPetManaged`
-marker is `mac-widget-v1`. An unmanaged legacy bundle is left untouched. An
-unmanaged item already occupying `~/Applications/Statelet.app` causes a
-fail-closed refusal. Installation rollback restores both bundle paths and the
-previous launchd loaded state.
+### Upgrade compatibility from the legacy identity
+
+On upgrade, the installer recognizes the old `~/Applications/CodexPetMac.app`
+only when its bundle identifier is `com.coke1120.CodexPetMac` and its
+`CodexPetManaged` marker is `mac-widget-v1`. It also recognizes the corresponding
+managed `~/Library/Application Support/CodexPet` data and
+`com.coke1120.codex-pet.*` LaunchAgents. The installer migrates owned data into
+the canonical Statelet locations, removes owned legacy startup files, and
+leaves unmanaged legacy artifacts untouched. An unmanaged item already
+occupying `~/Applications/Statelet.app` causes a fail-closed refusal.
+Installation rollback restores both identities and the previous launchd loaded
+state.
 
 To install the app and aggregator without launching the player at login:
 
@@ -360,7 +368,7 @@ No animation media is bundled, and the installer never copies `.mp4` or `.mov`
 media. Settings imports authorized media into:
 
 ```text
-~/Library/Application Support/CodexPet/media/
+~/Library/Application Support/Statelet/media/
 ```
 
 The installer preserves `media-map.json`, `character-library.json`, hidden
@@ -403,7 +411,7 @@ boundary and are never installed by this repository.
 Lifecycle priority is `waiting > review > running > idle`. The player reads:
 
 ```text
-~/Library/Application Support/CodexPet/runtime/current_state.json
+~/Library/Application Support/Statelet/runtime/current_state.json
 ```
 
 The complete serial-free state path is:
@@ -484,15 +492,15 @@ forced record, and restart it when finished:
 
 ```bash
 launchctl bootout gui/$(id -u) \
-  "$HOME/Library/LaunchAgents/com.coke1120.codex-pet.state-aggregator.plist"
+  "$HOME/Library/LaunchAgents/com.coke1120.statelet.state-aggregator.plist"
 
-python3 "$HOME/Library/Application Support/CodexPet/mac-widget/python/codex_pet_state_aggregator.py" \
+python3 "$HOME/Library/Application Support/Statelet/Statelet/python/statelet_state_aggregator.py" \
   --once --force-state running \
-  --state-dir "$HOME/Library/Application Support/CodexPet/sessions" \
-  --output "$HOME/Library/Application Support/CodexPet/runtime/current_state.json"
+  --state-dir "$HOME/Library/Application Support/Statelet/sessions" \
+  --output "$HOME/Library/Application Support/Statelet/runtime/current_state.json"
 
 launchctl bootstrap gui/$(id -u) \
-  "$HOME/Library/LaunchAgents/com.coke1120.codex-pet.state-aggregator.plist"
+  "$HOME/Library/LaunchAgents/com.coke1120.statelet.state-aggregator.plist"
 ```
 
 Click-through is disabled by default. Right-click the pet to open its context
@@ -547,7 +555,7 @@ raw errors. Publisher source values are restricted to recognized status labels.
 **Reveal Logs** opens the managed logs folder.
 
 **Repair Startup…** validates the installed managed app and will create or
-replace only the `mac-widget-v1`-marked player LaunchAgent. It refuses an
+replace only the `statelet-v2`-marked player LaunchAgent. It refuses an
 unmarked or malformed destination and never edits lifecycle hooks, the state
 aggregator, or the board/Serial service. If the stale player job is already
 loaded, the repaired on-disk settings take effect at the next login so the
@@ -563,15 +571,15 @@ outside the managed media directory is rejected.
 Logs are kept outside the installed code:
 
 ```bash
-tail -f "$HOME/Library/Application Support/CodexPet/logs/state-aggregator.err.log"
-tail -f "$HOME/Library/Application Support/CodexPet/logs/mac-player.err.log"
+tail -f "$HOME/Library/Application Support/Statelet/logs/state-aggregator.err.log"
+tail -f "$HOME/Library/Application Support/Statelet/logs/mac-player.err.log"
 ```
 
 Inspect services with:
 
 ```bash
-launchctl print gui/$(id -u)/com.coke1120.codex-pet.state-aggregator
-launchctl print gui/$(id -u)/com.coke1120.codex-pet.mac-player
+launchctl print gui/$(id -u)/com.coke1120.statelet.state-aggregator
+launchctl print gui/$(id -u)/com.coke1120.statelet.mac-player
 ```
 
 Missing or invalid media fails softly in the transparent panel. If a valid
@@ -584,18 +592,12 @@ decoder.
 bash mac/CodexPetMac/scripts/uninstall.sh
 ```
 
-Uninstall preflights ownership before staging or changing launchd. It removes a
-managed `Statelet.app` and any managed legacy
-`CodexPetMac.app`, and preserves an unmanaged bundle at either path. It removes
-modules and LaunchAgents only when they carry the `mac-widget-v1` marker, and
-preserves user media, `media-map.json`, `character-library.json`, hidden
-per-character maps/assets, aggregate state, session records, logs, and the board
-daemon/runtime. Unmarked component or LaunchAgent targets cause a fail-closed
-refusal instead of deletion.
-Uninstall removes only exact commands pointing at the deleted `mac-widget`
-hook. If a valid shared board-runtime hook exists, it migrates lifecycle events
-to that command; existing board hooks are otherwise left untouched. Unrelated
-commands and settings remain unchanged.
+Uninstall preflights ownership before staging or changing launchd. It removes
+only the canonical `statelet-v2`-managed `Statelet.app`, component, LaunchAgents,
+and exact Statelet hook commands. It preserves user media, voice, characters,
+state, sessions, logs, and all legacy artifacts. Unmarked canonical targets
+cause a fail-closed refusal instead of deletion. Unrelated commands and settings
+remain unchanged.
 
 ## Isolated packaging tests
 

@@ -16,6 +16,23 @@ SOURCES = ROOT / "mac" / "CodexPetMac" / "Sources" / "CodexPetMac"
 
 
 class MacPetStartupTests(unittest.TestCase):
+    def test_preferences_migrate_before_app_and_defaults_consumers_are_created(self) -> None:
+        main = (SOURCES / "main.swift").read_text(encoding="utf-8")
+        delegate = (SOURCES / "PetAppDelegate.swift").read_text(encoding="utf-8")
+        migration = main.index("let preferencesMigrationStatus = PreferencesMigration().migrate()")
+        application = main.index("let application = NSApplication.shared")
+        delegate_creation = main.index("let delegate = PetAppDelegate(")
+        self.assertLess(migration, application)
+        self.assertLess(migration, delegate_creation)
+        failure_guard = main.index("guard preferencesMigrationStatus != .failed")
+        self.assertLess(failure_guard, application)
+        self.assertIn("exit(EXIT_FAILURE)", main[failure_guard:application])
+        self.assertIn(
+            "PetAppDelegate(preferencesMigrationStatus: preferencesMigrationStatus)",
+            main,
+        )
+        self.assertNotIn("PreferencesMigration().migrate()", delegate.split("init(", 1)[1])
+
     def test_managed_startup_repair_toggle_and_diagnostics_are_safe(self) -> None:
         swiftc = shutil.which("swiftc")
         self.assertIsNotNone(swiftc, "swiftc is required for the native macOS companion tests")
@@ -29,6 +46,7 @@ class MacPetStartupTests(unittest.TestCase):
             harness.write_text(
                 textwrap.dedent(
                     r'''
+                    import CoreFoundation
                     import Foundation
 
                     enum HarnessFailure: Error { case failed(String) }
@@ -36,19 +54,28 @@ class MacPetStartupTests(unittest.TestCase):
                     @main
                     struct StartupHarness {
                         static func main() throws {
+                            if CommandLine.arguments.count == 3,
+                               CommandLine.arguments[1] == "--lock-check" {
+                                let home = URL(
+                                    fileURLWithPath: CommandLine.arguments[2],
+                                    isDirectory: true
+                                )
+                                exit(SingletonLock(homeURL: home) == nil ? 0 : 1)
+                            }
                             guard StateletIdentity.appBundleName == "Statelet.app",
-                                  StateletIdentity.executableName == "CodexPetMac",
-                                  StateletIdentity.bundleIdentifier == "com.coke1120.CodexPetMac",
+                                  StateletIdentity.executableName == "Statelet",
+                                  StateletIdentity.bundleIdentifier == "com.coke1120.Statelet",
                                   StateletIdentity.applicationSupportRelativePath
-                                      == "Library/Application Support/CodexPet",
+                                      == "Library/Application Support/Statelet",
                                   StateletIdentity.playerLaunchAgentLabel
-                                      == "com.coke1120.codex-pet.mac-player",
+                                      == "com.coke1120.statelet.mac-player",
                                   StateletIdentity.aggregatorLaunchAgentLabel
-                                      == "com.coke1120.codex-pet.state-aggregator",
-                                  StateletIdentity.appManagedPlistKey == "CodexPetManaged",
-                                  StateletIdentity.launchAgentManagedPlistKey == "CodexPetMacManaged",
-                                  StateletIdentity.managedMarker == "mac-widget-v1" else {
-                                throw HarnessFailure.failed("compatibility identifiers")
+                                      == "com.coke1120.statelet.state-aggregator",
+                                  StateletIdentity.appManagedPlistKey == "StateletManaged",
+                                  StateletIdentity.launchAgentManagedPlistKey == "StateletManaged",
+                                  StateletIdentity.managedMarker == "statelet-v2",
+                                  StateletIdentity.Legacy.bundleIdentifier == "com.coke1120.CodexPetMac" else {
+                                throw HarnessFailure.failed("identity identifiers")
                             }
                             let home = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
                             let fm = FileManager.default
@@ -161,6 +188,173 @@ class MacPetStartupTests(unittest.TestCase):
                                 throw HarnessFailure.failed("partial rollback evidence was lost")
                             }
 
+                            let legacyPlist = launchAgents.appendingPathComponent(
+                                "\(StateletIdentity.Legacy.playerLaunchAgentLabel).plist"
+                            )
+                            try PropertyListSerialization.data(
+                                fromPropertyList: [
+                                    StateletIdentity.Legacy.launchAgentManagedPlistKey:
+                                        StateletIdentity.Legacy.managedMarker,
+                                    "Label": StateletIdentity.Legacy.playerLaunchAgentLabel,
+                                    "RunAtLoad": true,
+                                ],
+                                format: .xml,
+                                options: 0
+                            ).write(to: legacyPlist)
+                            guard manager.status().state == .legacyManaged else {
+                                throw HarnessFailure.failed("legacy startup classification")
+                            }
+                            try fm.removeItem(at: legacyPlist)
+
+                            let legacySupport = home.appendingPathComponent(
+                                StateletIdentity.Legacy.applicationSupportRelativePath,
+                                isDirectory: true
+                            )
+                            let currentSupport = home.appendingPathComponent(
+                                StateletIdentity.applicationSupportRelativePath,
+                                isDirectory: true
+                            )
+                            var freshLock = SingletonLock(homeURL: home)
+                            guard freshLock != nil,
+                                  fm.fileExists(atPath: currentSupport.path),
+                                  !fm.fileExists(atPath: legacySupport.path) else {
+                                throw HarnessFailure.failed("fresh singleton identity")
+                            }
+                            freshLock = nil
+                            try fm.createDirectory(at: legacySupport, withIntermediateDirectories: true)
+                            guard let firstLock = SingletonLock(homeURL: home) else {
+                                throw HarnessFailure.failed("dual identity singleton lock")
+                            }
+                            let competitor = Process()
+                            competitor.executableURL = URL(
+                                fileURLWithPath: CommandLine.arguments[0]
+                            )
+                            competitor.arguments = ["--lock-check", home.path]
+                            try competitor.run()
+                            competitor.waitUntilExit()
+                            guard competitor.terminationStatus == 0 else {
+                                throw HarnessFailure.failed("dual identity singleton exclusion")
+                            }
+                            guard fm.fileExists(
+                                atPath: legacySupport.appendingPathComponent(".mac-player.lock").path
+                            ), fm.fileExists(
+                                atPath: currentSupport.appendingPathComponent(".mac-player.lock").path
+                            ) else {
+                                throw HarnessFailure.failed("dual identity lock files")
+                            }
+                            withExtendedLifetime(firstLock) {}
+
+                            let preferences = home.appendingPathComponent("Library/Preferences", isDirectory: true)
+                            try fm.createDirectory(at: preferences, withIntermediateDirectories: true)
+                            let legacyPreferences = preferences.appendingPathComponent(
+                                "\(StateletIdentity.Legacy.bundleIdentifier).plist"
+                            )
+                            let currentPreferences = preferences.appendingPathComponent(
+                                "\(StateletIdentity.bundleIdentifier).plist"
+                            )
+                            let legacyDefaults: [String: Any] = [
+                                "unknown-key": "preserved",
+                                "shared-key": "legacy",
+                                "CodexPetMac.lastWindowFrame.v2": ["x": 1.0],
+                                "CodexPetAlphaConversionProfile": "fit",
+                                "CodexPetAlphaPythonPath": "/private/interpreter",
+                            ]
+                            let currentDefaults: [String: Any] = ["shared-key": "current"]
+                            try PropertyListSerialization.data(
+                                fromPropertyList: legacyDefaults,
+                                format: .binary,
+                                options: 0
+                            ).write(to: legacyPreferences)
+                            try PropertyListSerialization.data(
+                                fromPropertyList: currentDefaults,
+                                format: .binary,
+                                options: 0
+                            ).write(to: currentPreferences)
+                            let migration = PreferencesMigration(homeURL: home)
+                            guard migration.migrate() == .migrated else {
+                                throw HarnessFailure.failed("preferences migration")
+                            }
+                            let migratedData = try Data(contentsOf: currentPreferences)
+                            let migrated = try PropertyListSerialization.propertyList(
+                                from: migratedData,
+                                options: [],
+                                format: nil
+                            ) as! [String: Any]
+                            guard migrated["unknown-key"] as? String == "preserved",
+                                  migrated["shared-key"] as? String == "current",
+                                  migrated["CodexPetMac.lastWindowFrame.v2"] == nil,
+                                  migrated["Statelet.lastWindowFrame.v2"] != nil,
+                                  migrated["StateletAlphaConversionProfile"] as? String == "fit",
+                                  migrated["StateletAlphaPythonPath"] as? String == "/private/interpreter",
+                                  migration.migrate() == .alreadyCurrent,
+                                  fm.fileExists(atPath: legacyPreferences.path) else {
+                                throw HarnessFailure.failed("preferences preservation")
+                            }
+
+                            let nativeLegacyID = "com.coke1120.StateletHarness.Legacy"
+                            let nativeDestinationID = "com.coke1120.StateletHarness.Current"
+                            CFPreferencesSetValue(
+                                "native-key" as CFString,
+                                "cfpreferences" as CFString,
+                                nativeLegacyID as CFString,
+                                kCFPreferencesCurrentUser,
+                                kCFPreferencesAnyHost
+                            )
+                            guard CFPreferencesSynchronize(
+                                nativeLegacyID as CFString,
+                                kCFPreferencesCurrentUser,
+                                kCFPreferencesAnyHost
+                            ) else {
+                                throw HarnessFailure.failed("native preferences seed")
+                            }
+                            defer {
+                                CFPreferencesSetValue(
+                                    "native-key" as CFString,
+                                    nil,
+                                    nativeLegacyID as CFString,
+                                    kCFPreferencesCurrentUser,
+                                    kCFPreferencesAnyHost
+                                )
+                                CFPreferencesSetValue(
+                                    "native-key" as CFString,
+                                    nil,
+                                    nativeDestinationID as CFString,
+                                    kCFPreferencesCurrentUser,
+                                    kCFPreferencesAnyHost
+                                )
+                                CFPreferencesSynchronize(
+                                    nativeLegacyID as CFString,
+                                    kCFPreferencesCurrentUser,
+                                    kCFPreferencesAnyHost
+                                )
+                                CFPreferencesSynchronize(
+                                    nativeDestinationID as CFString,
+                                    kCFPreferencesCurrentUser,
+                                    kCFPreferencesAnyHost
+                                )
+                            }
+                            let nativeMigration = PreferencesMigration(
+                                homeURL: home,
+                                legacyIdentifier: nativeLegacyID,
+                                destinationIdentifier: nativeDestinationID,
+                                useNativePreferences: true
+                            )
+                            guard nativeMigration.migrate() == .migrated,
+                                  (CFPreferencesCopyMultiple(
+                                      nil,
+                                      nativeDestinationID as CFString,
+                                      kCFPreferencesCurrentUser,
+                                      kCFPreferencesAnyHost
+                                  ) as? [String: Any])?["native-key"] as? String
+                                      == "cfpreferences",
+                                  CFPreferencesSynchronize(
+                                      nativeDestinationID as CFString,
+                                      kCFPreferencesCurrentUser,
+                                      kCFPreferencesAnyHost
+                                  ) else {
+                                throw HarnessFailure.failed("native preferences publication")
+                            }
+
                             let report = PetDiagnostics(homeURL: home).build(
                                 input: PetDiagnosticsInput(
                                     appVersion: "1.1.0",
@@ -171,7 +365,8 @@ class MacPetStartupTests(unittest.TestCase):
                                     playbackMode: "random",
                                     selectedClipName: "/Users/private/media/clip.mov",
                                     previewStatus: "presented",
-                                    toolchainStatus: "ready"
+                                    toolchainStatus: "ready",
+                                    preferencesMigrationStatus: .migrated
                                 )
                             )
                             guard !report.contains(home.path),
@@ -193,6 +388,8 @@ class MacPetStartupTests(unittest.TestCase):
                 [
                     swiftc,
                     str(SOURCES / "StateletIdentity.swift"),
+                    str(SOURCES / "PreferencesMigration.swift"),
+                    str(SOURCES / "SingletonLock.swift"),
                     str(SOURCES / "LaunchAtLoginManager.swift"),
                     str(SOURCES / "PetDiagnostics.swift"),
                     str(harness),

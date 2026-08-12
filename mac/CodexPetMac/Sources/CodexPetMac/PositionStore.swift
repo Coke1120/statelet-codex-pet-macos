@@ -4,8 +4,8 @@ import CoreGraphics
 
 final class PositionStore {
     private let defaults: UserDefaults
-    private let key = "CodexPetMac.windowFrames.v2"
-    private let lastFrameKey = "CodexPetMac.lastWindowFrame.v2"
+    private let key = "Statelet.windowFrames.v2"
+    private let lastFrameKey = "Statelet.lastWindowFrame.v2"
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults

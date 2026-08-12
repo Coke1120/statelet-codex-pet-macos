@@ -15,6 +15,7 @@ struct LaunchAtLoginManager {
         case managedEnabled
         case managedDisabled
         case staleManaged
+        case legacyManaged
         case malformed
         case unmanaged
     }
@@ -50,6 +51,8 @@ struct LaunchAtLoginManager {
                 return appIsValid
                     ? "Managed startup item is stale; Startup Repair is available."
                     : "Managed startup item is stale and the installed app could not be verified."
+            case .legacyManaged:
+                return "A legacy Statelet startup item remains; finish the managed upgrade before changing login settings."
             case .malformed:
                 return "Startup item is malformed; ownership cannot be verified, so it was not changed."
             case .unmanaged:
@@ -140,6 +143,8 @@ struct LaunchAtLoginManager {
             throw ManagerError.malformedPlist
         case .staleManaged:
             throw ManagerError.stalePlist
+        case .legacyManaged:
+            throw ManagerError.stalePlist
         case .missing:
             guard enabled else { return status() }
             try repairStartup(enabled: true)
@@ -168,6 +173,8 @@ struct LaunchAtLoginManager {
             enabled = true
         case .managedDisabled:
             enabled = false
+        case .legacyManaged:
+            throw ManagerError.stalePlist
         case .unmanaged:
             throw ManagerError.unmanagedPlist
         case .malformed:
@@ -190,6 +197,12 @@ struct LaunchAtLoginManager {
 
     private var playerPlistURL: URL {
         launchAgentsURL.appendingPathComponent("\(Self.playerLabel).plist")
+    }
+
+    private var legacyPlayerPlistURL: URL {
+        launchAgentsURL.appendingPathComponent(
+            "\(StateletIdentity.Legacy.playerLaunchAgentLabel).plist"
+        )
     }
 
     private var installedAppURL: URL {
@@ -223,7 +236,7 @@ struct LaunchAtLoginManager {
 
     private func inspectPlist() -> PlistInspection {
         guard fileManager.fileExists(atPath: playerPlistURL.path) else {
-            return PlistInspection(state: .missing, payload: nil)
+            return inspectLegacyPlist()
         }
         guard
             let data = try? Data(contentsOf: playerPlistURL),
@@ -248,6 +261,30 @@ struct LaunchAtLoginManager {
             state: runAtLoad ? .managedEnabled : .managedDisabled,
             payload: payload
         )
+    }
+
+    private func inspectLegacyPlist() -> PlistInspection {
+        guard fileManager.fileExists(atPath: legacyPlayerPlistURL.path) else {
+            return PlistInspection(state: .missing, payload: nil)
+        }
+        guard
+            let data = try? Data(contentsOf: legacyPlayerPlistURL),
+            let object = try? PropertyListSerialization.propertyList(
+                from: data,
+                options: [],
+                format: nil
+            ),
+            let payload = object as? [String: Any]
+        else { return PlistInspection(state: .malformed, payload: nil) }
+        guard
+            payload[StateletIdentity.Legacy.launchAgentManagedPlistKey] as? String
+                == StateletIdentity.Legacy.managedMarker
+        else { return PlistInspection(state: .unmanaged, payload: payload) }
+        guard
+            payload["Label"] as? String == StateletIdentity.Legacy.playerLaunchAgentLabel,
+            payload["RunAtLoad"] is Bool
+        else { return PlistInspection(state: .malformed, payload: payload) }
+        return PlistInspection(state: .legacyManaged, payload: payload)
     }
 
     private func plistMatchesInstallerSchema(_ payload: [String: Any]) -> Bool {
@@ -318,6 +355,7 @@ struct LaunchAtLoginManager {
         let inspection = inspectPlist()
         guard inspection.state != .unmanaged else { throw ManagerError.unmanagedPlist }
         guard inspection.state != .malformed else { throw ManagerError.malformedPlist }
+        guard inspection.state != .legacyManaged else { throw ManagerError.stalePlist }
         try transact(payload: installerPayload(enabled: enabled), bootstrapWhenEnabled: enabled)
     }
 

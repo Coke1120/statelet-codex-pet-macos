@@ -14,6 +14,9 @@ versioning for the public source release.
 
 ### Changed
 
+- macOS now uses the canonical Statelet bundle, process, preferences,
+  Application Support, and LaunchAgent identity while preserving owned legacy
+  installations through a crash-recoverable migration.
 - Voice settings now separate dialogue text and generated-line controls from
   local GPT-SoVITS model, reference-audio, and profile setup.
 - MP4 authoring now uses a stable even 320×480 pixel canvas independent of the
@@ -63,7 +66,7 @@ for macOS.
 - This release is source-only. The local builder produces an ad-hoc-signed app;
   a public binary still requires Developer ID signing, notarization, stapling,
   and clean-Mac Gatekeeper verification.
-- The internal bundle identifier, executable, LaunchAgent labels, preferences,
-  and Application Support paths retain their legacy compatibility values.
+- Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
+  migrates those values to the canonical Statelet identity.
 
 [1.6.0]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.6.0

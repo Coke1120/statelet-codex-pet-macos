@@ -36,19 +36,14 @@ bash mac/CodexPetMac/scripts/build_app.sh
 codesign --verify --deep --strict mac/CodexPetMac/dist/Statelet.app
 ```
 
-## Compatibility contract
+## Identity and compatibility contract
 
-The user-visible product name is Statelet. The existing technical identifiers
-remain intentionally stable so Statelet-compatible installations upgrade
-without losing preferences, runtime data, or managed services. Do not rename
-these without an explicit migration design and regression coverage:
-
-- bundle identifier `com.coke1120.CodexPetMac`
-- executable and Swift target `CodexPetMac`
-- Application Support directory `CodexPet`
-- LaunchAgent labels `com.coke1120.codex-pet.mac-player` and
-  `com.coke1120.codex-pet.state-aggregator`
-- existing preference keys and managed markers
+The macOS-facing identity is Statelet throughout: bundle identifier
+`com.coke1120.Statelet`, executable and Swift target `Statelet`, Application
+Support directory `Statelet`, and `com.coke1120.statelet.*` LaunchAgents.
+Legacy CodexPet identifiers may appear only in ownership-checked migration,
+rollback, removal, and regression-test paths. Changes to either side of this
+boundary require representative upgrade and data-preservation coverage.
 
 ## Pull requests
 

@@ -44,8 +44,8 @@ are readable:
 ```bash
 swift build -c release --package-path mac/CodexPetMac
 python3 mac/CodexPetMac/scripts/measure_runtime.py \
-  --executable "$(pwd)/mac/CodexPetMac/.build/release/codex-pet-mac" \
-  --media-map "$HOME/Library/Application Support/CodexPet/media/media-map.json" \
+  --executable "$(pwd)/mac/CodexPetMac/.build/release/statelet" \
+  --media-map "$HOME/Library/Application Support/Statelet/media/media-map.json" \
   --duration 60 \
   --interval 1 \
   --transition-interval 8
@@ -55,13 +55,13 @@ To measure the already-running state aggregator as well, pass its positive PID:
 
 ```bash
 python3 mac/CodexPetMac/scripts/measure_runtime.py \
-  --executable "$(pwd)/mac/CodexPetMac/.build/release/codex-pet-mac" \
-  --media-map "$HOME/Library/Application Support/CodexPet/media/media-map.json" \
+  --executable "$(pwd)/mac/CodexPetMac/.build/release/statelet" \
+  --media-map "$HOME/Library/Application Support/Statelet/media/media-map.json" \
   --aggregator-pid 12345
 ```
 
 The PID is accepted only while it belongs to the current user and its process
-command identifies `codex_pet_state_aggregator.py`; identity is checked before
+command identifies the installed Statelet state aggregator; identity is checked before
 and after sampling. This is a best-effort local process-identity check, not
 cryptographic attestation. If no PID is supplied, aggregator metrics are
 reported as unavailable and do not affect acceptance.

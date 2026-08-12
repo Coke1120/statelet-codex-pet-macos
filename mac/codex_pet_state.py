@@ -19,10 +19,10 @@ MAX_FUTURE_SKEW = 60.0
 
 
 def default_state_dir() -> Path:
-    override = os.environ.get("CODEX_PET_STATE_DIR")
+    override = os.environ.get("STATELET_STATE_DIR") or os.environ.get("CODEX_PET_STATE_DIR")
     if override:
         return Path(override).expanduser()
-    return Path.home() / "Library" / "Application Support" / "CodexPet" / "sessions"
+    return Path.home() / "Library" / "Application Support" / "Statelet" / "sessions"
 
 
 def _file_identity(path: Path) -> Optional[Tuple[int, int, int, int]]:

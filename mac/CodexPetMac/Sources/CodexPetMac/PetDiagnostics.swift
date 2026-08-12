@@ -20,6 +20,7 @@ struct PetDiagnosticsInput {
     var lastFailureCategory: String?
     var conversionFailureCategory: String?
     var conversionFailureStage: String?
+    var preferencesMigrationStatus: PreferencesMigration.Status
 
     init(
         appVersion: String,
@@ -36,7 +37,8 @@ struct PetDiagnosticsInput {
         toolchainStatus: String,
         lastFailureCategory: String? = nil,
         conversionFailureCategory: String? = nil,
-        conversionFailureStage: String? = nil
+        conversionFailureStage: String? = nil,
+        preferencesMigrationStatus: PreferencesMigration.Status = .notRun
     ) {
         self.appVersion = appVersion
         self.appBuild = appBuild
@@ -53,6 +55,7 @@ struct PetDiagnosticsInput {
         self.lastFailureCategory = lastFailureCategory
         self.conversionFailureCategory = conversionFailureCategory
         self.conversionFailureStage = conversionFailureStage
+        self.preferencesMigrationStatus = preferencesMigrationStatus
     }
 }
 
@@ -104,6 +107,7 @@ struct PetDiagnostics {
             "failure.category: \(safeOptionalLabel(input.lastFailureCategory))",
             "conversion.failure_category: \(safeOptionalLabel(input.conversionFailureCategory))",
             "conversion.failure_stage: \(safeOptionalLabel(input.conversionFailureStage))",
+            "preferences.migration: \(input.preferencesMigrationStatus.diagnosticLabel)",
             "startup.player_plist: \(stateLabel(startup.state))",
             "startup.player_job: \(startupJobLabel(startup))",
             "startup.aggregator_plist: \(aggregator)",
@@ -122,6 +126,7 @@ struct PetDiagnostics {
         case .managedEnabled: return "managed-enabled"
         case .managedDisabled: return "managed-disabled"
         case .staleManaged: return "managed-stale"
+        case .legacyManaged: return "legacy-managed"
         case .malformed: return "malformed-unverified"
         case .unmanaged: return "unmanaged"
         }

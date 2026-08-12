@@ -3,6 +3,7 @@
 
 import importlib.util
 import json
+import os
 import stat
 import tempfile
 import unittest
@@ -19,6 +20,28 @@ SPEC.loader.exec_module(hook)
 
 
 class HookHardeningTests(unittest.TestCase):
+    def test_default_path_uses_statelet_identity_with_legacy_environment_fallback(self) -> None:
+        previous_statelet = os.environ.pop("STATELET_STATE_DIR", None)
+        previous_legacy = os.environ.pop("CODEX_PET_STATE_DIR", None)
+        try:
+            self.assertEqual(
+                hook.default_state_dir(),
+                Path.home() / "Library" / "Application Support" / "Statelet" / "sessions",
+            )
+            os.environ["CODEX_PET_STATE_DIR"] = "/tmp/legacy-statelet-compat"
+            self.assertEqual(hook.default_state_dir(), Path("/tmp/legacy-statelet-compat"))
+            os.environ["STATELET_STATE_DIR"] = "/tmp/canonical-statelet"
+            self.assertEqual(hook.default_state_dir(), Path("/tmp/canonical-statelet"))
+        finally:
+            if previous_statelet is None:
+                os.environ.pop("STATELET_STATE_DIR", None)
+            else:
+                os.environ["STATELET_STATE_DIR"] = previous_statelet
+            if previous_legacy is None:
+                os.environ.pop("CODEX_PET_STATE_DIR", None)
+            else:
+                os.environ["CODEX_PET_STATE_DIR"] = previous_legacy
+
     def test_plain_check_text_is_not_misclassified_as_review_work(self) -> None:
         payload = {
             "hook_event_name": "PreToolUse",
