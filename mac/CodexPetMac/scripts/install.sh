@@ -295,39 +295,80 @@ def rename_exclusive(source_parent, source_name, target_parent, target_name):
         error = ctypes.get_errno()
         raise OSError(error, "exclusive rename failed")
 
-def entry_digest(parent_fd, name):
-    status = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    if stat.S_ISLNK(status.st_mode):
-        raise ValueError("unsafe entry")
-    value = hashlib.sha256()
-    def visit(directory_fd, entry_name, relative):
-        current = os.stat(entry_name, dir_fd=directory_fd, follow_symlinks=False)
+def entry_digests_and_identity(parent_fd, name, exclusion_sets):
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+    status = os.fstat(descriptor)
+    values = [hashlib.sha256() for _ in exclusion_sets]
+    excluded_parts = [
+        {tuple(Path(relative).parts) for relative in excluded}
+        for excluded in exclusion_sets
+    ]
+    def validate_stable(fd, before):
+        after = os.fstat(fd)
+        fields = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if any(getattr(before, field) != getattr(after, field) for field in fields):
+            raise ValueError("entry changed while reading")
+    def visit(directory_fd, entry_name, relative_parts):
+        included = [
+            not any(relative_parts[:len(parts)] == parts for parts in excluded)
+            for excluded in excluded_parts
+        ]
+        if not any(included):
+            return
+        current_fd = os.open(
+            entry_name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=directory_fd,
+        )
+        current = os.fstat(current_fd)
+        relative = "/".join(relative_parts)
         if stat.S_ISREG(current.st_mode):
-            value.update(b"F\0" + relative.encode() + b"\0")
-            descriptor = os.open(entry_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+            for value, include in zip(values, included):
+                if include: value.update(b"F\0" + relative.encode() + b"\0")
             try:
-                while chunk := os.read(descriptor, 1024 * 1024): value.update(chunk)
-            finally: os.close(descriptor)
+                while chunk := os.read(current_fd, 1024 * 1024):
+                    for value, include in zip(values, included):
+                        if include: value.update(chunk)
+                validate_stable(current_fd, current)
+            finally: os.close(current_fd)
         elif stat.S_ISDIR(current.st_mode):
-            value.update(b"D\0" + relative.encode() + b"\0")
-            child = os.open(entry_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
+            for value, include in zip(values, included):
+                if include: value.update(b"D\0" + relative.encode() + b"\0")
             try:
-                for child_name in sorted(os.listdir(child)):
-                    child_relative = child_name if relative == "." else f"{relative}/{child_name}"
-                    visit(child, child_name, child_relative)
-            finally: os.close(child)
+                for child_name in sorted(os.listdir(current_fd)):
+                    visit(current_fd, child_name, relative_parts + (child_name,))
+                validate_stable(current_fd, current)
+            finally: os.close(current_fd)
+        else:
+            os.close(current_fd)
+            raise ValueError("unsafe entry")
+    try:
+        if stat.S_ISDIR(status.st_mode):
+            for child_name in sorted(os.listdir(descriptor)):
+                visit(descriptor, child_name, (child_name,))
+            validate_stable(descriptor, status)
+        elif stat.S_ISREG(status.st_mode):
+            if any(excluded_parts):
+                raise ValueError("file install cannot own descendants")
+            for value in values: value.update(b"F\0.\0")
+            while chunk := os.read(descriptor, 1024 * 1024):
+                for value in values: value.update(chunk)
+            validate_stable(descriptor, status)
         else:
             raise ValueError("unsafe entry")
-    if stat.S_ISDIR(status.st_mode):
-        child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
-        try:
-            for child_name in sorted(os.listdir(child)):
-                visit(child, child_name, child_name)
-        finally:
-            os.close(child)
-    else:
-        visit(parent_fd, name, ".")
-    return value.hexdigest()
+    finally:
+        os.close(descriptor)
+    rebound = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if [rebound.st_dev, rebound.st_ino] != [status.st_dev, status.st_ino]:
+        raise ValueError("entry identity changed while reading")
+    return [value.hexdigest() for value in values], [status.st_dev, status.st_ino]
+
+def entry_digest_and_identity(parent_fd, name, excluded=()):
+    digests, current_identity = entry_digests_and_identity(parent_fd, name, [excluded])
+    return digests[0], current_identity
+
+def entry_digest(parent_fd, name):
+    return entry_digest_and_identity(parent_fd, name)[0]
 
 def remove_entry(parent_fd, name):
     status = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -345,6 +386,132 @@ def remove_entry(parent_fd, name):
 def open_parent(path, base):
     relative = relative_to(path, base)
     return open_directory_chain(base, relative.parts[:-1]), relative.name
+
+def entry_identity(status):
+    return [status.st_dev, status.st_ino]
+
+def is_within(path, parent):
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+def active_install_indices(operations):
+    active = []
+    for index, operation in enumerate(operations):
+        kind = operation.get("kind")
+        if kind not in {"backup", "install"}:
+            continue
+        target = Path(operation.get("target", ""))
+        active = [
+            owner_index
+            for owner_index in active
+            if not is_within(Path(operations[owner_index]["target"]), target)
+        ]
+        if kind == "install":
+            active.append(index)
+    return active
+
+def active_install_owner(operations, active_indices, target):
+    candidates = []
+    for index in active_indices:
+        operation = operations[index]
+        owner_target = Path(operation["target"])
+        if not is_within(target, owner_target):
+            continue
+        relative = target.relative_to(owner_target)
+        if relative.parts and any(
+            is_within(relative, Path(excluded))
+            for excluded in operation.get("owned_exclusions", [])
+        ):
+            continue
+        candidates.append(index)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda index: len(Path(operations[index]["target"]).parts))
+
+def open_recorded_target_parent(operations, operation_index):
+    operation = operations[operation_index]
+    target_parent_path = Path(operation["target"]).parent
+    expected = operation.get("target_parent")
+    candidates = [(home, relative_to(target_parent_path, home).parts)]
+    for later in operations[operation_index + 1:]:
+        if later.get("kind") != "backup":
+            continue
+        later_target = Path(later["target"])
+        if not is_within(target_parent_path, later_target):
+            continue
+        relocated = Path(later["source"]) / target_parent_path.relative_to(later_target)
+        candidates.append((root, relative_to(relocated, root).parts))
+    for base, parts in candidates:
+        try:
+            descriptor = open_directory_chain(base, parts)
+        except OSError:
+            continue
+        if entry_identity(os.fstat(descriptor)) == expected:
+            return descriptor
+        os.close(descriptor)
+    raise ValueError("transaction parent changed")
+
+def strict_install_ancestors(operations, target):
+    return [
+        index
+        for index in active_install_indices(operations)
+        if Path(operations[index]["target"]) != target
+        and is_within(target, Path(operations[index]["target"]))
+    ]
+
+def validate_install_at(operation, parent, name, expected_parent=None):
+    if expected_parent is not None and entry_identity(os.fstat(parent)) != expected_parent:
+        raise ValueError("transaction parent changed")
+    digest_value, current_identity = entry_digest_and_identity(
+        parent, name, operation.get("owned_exclusions", [])
+    )
+    if current_identity != operation.get("target_entry"):
+        raise ValueError("installed entry identity changed")
+    if digest_value != operation.get("owned_digest", operation["digest"]):
+        raise ValueError("installed entry changed")
+
+def validate_live_install(operation):
+    parent, name = open_parent(Path(operation["target"]), home)
+    try:
+        validate_install_at(operation, parent, name, operation.get("target_parent"))
+    finally:
+        os.close(parent)
+
+def prepare_install_ancestor_mutations(data, target):
+    indices = strict_install_ancestors(data["operations"], target)
+    for index in indices:
+        operation = data["operations"][index]
+        parent, name = open_parent(Path(operation["target"]), home)
+        try:
+            if entry_identity(os.fstat(parent)) != operation.get("target_parent"):
+                raise ValueError("transaction parent changed")
+            relative = str(target.relative_to(Path(operation["target"])))
+            existing = [Path(value) for value in operation.get("owned_exclusions", [])]
+            if not any(is_within(Path(relative), value) for value in existing):
+                existing = [value for value in existing if not is_within(value, Path(relative))]
+                existing.append(Path(relative))
+            updated_exclusions = sorted(str(value) for value in existing)
+            digests, current_identity = entry_digests_and_identity(
+                parent,
+                name,
+                [operation.get("owned_exclusions", []), updated_exclusions],
+            )
+            if current_identity != operation.get("target_entry"):
+                raise ValueError("installed entry identity changed")
+            if digests[0] != operation.get("owned_digest", operation["digest"]):
+                raise ValueError("installed entry changed")
+            operation["owned_exclusions"] = updated_exclusions
+            operation["owned_digest"] = digests[1]
+        finally:
+            os.close(parent)
+    return indices
+
+def validate_install_ancestor_mutations(data, indices):
+    for index in indices:
+        validate_live_install(data["operations"][index])
 
 def sync_directory(path):
     descriptor = os.open(path, os.O_RDONLY)
@@ -398,6 +565,7 @@ elif command == "install-move":
     target_path = Path(target)
     source_relative = relative_to(source_path, root)
     target_relative = relative_to(target_path, home)
+    ancestor_indices = prepare_install_ancestor_mutations(data, target_path)
     source_parent = open_directory_chain(root, source_relative.parts[:-1])
     target_parent = open_directory_chain(home, target_relative.parts[:-1])
     try:
@@ -407,7 +575,9 @@ elif command == "install-move":
         target_identity = os.fstat(target_parent)
         data["operations"].append({"kind": "install", "source": source, "target": target, "digest": expected,
                                    "source_parent": [source_identity.st_dev, source_identity.st_ino],
-                                   "target_parent": [target_identity.st_dev, target_identity.st_ino]})
+                                   "target_parent": [target_identity.st_dev, target_identity.st_ino],
+                                   "target_entry": None, "owned_digest": expected,
+                                   "owned_exclusions": []})
         write(data)
         gate = os.environ.get("STATELET_INSTALL_TEST_PARENT_FD_GATE")
         if gate:
@@ -439,6 +609,10 @@ elif command == "install-move":
             rename_exclusive(target_parent, target_relative.name, source_parent, source_relative.name)
             os.fsync(target_parent); os.fsync(source_parent)
             raise
+        installed = os.stat(target_relative.name, dir_fd=target_parent, follow_symlinks=False)
+        data["operations"][-1]["target_entry"] = entry_identity(installed)
+        validate_install_ancestor_mutations(data, ancestor_indices)
+        write(data)
     finally:
         os.close(source_parent)
         os.close(target_parent)
@@ -446,6 +620,7 @@ elif command == "backup-move":
     target, source, expected = map(str, args)
     data = load()
     target_path, source_path = Path(target), Path(source)
+    ancestor_indices = prepare_install_ancestor_mutations(data, target_path)
     target_parent, target_name = open_parent(target_path, home)
     source_parent, source_name = open_parent(source_path, root)
     try:
@@ -454,15 +629,21 @@ elif command == "backup-move":
         source_identity, target_identity = os.fstat(source_parent), os.fstat(target_parent)
         data["operations"].append({"kind": "backup", "source": source, "target": target, "digest": expected,
                                    "source_parent": [source_identity.st_dev, source_identity.st_ino],
-                                   "target_parent": [target_identity.st_dev, target_identity.st_ino]})
+                                   "target_parent": [target_identity.st_dev, target_identity.st_ino],
+                                   "source_entry": None})
         write(data)
         rename_exclusive(target_parent, target_name, source_parent, source_name)
         os.fsync(target_parent); os.fsync(source_parent)
+        saved = os.stat(source_name, dir_fd=source_parent, follow_symlinks=False)
+        data["operations"][-1]["source_entry"] = entry_identity(saved)
+        validate_install_ancestor_mutations(data, ancestor_indices)
+        write(data)
     finally:
         os.close(target_parent); os.close(source_parent)
 elif command == "mkdir-make":
     target, mode = args
     data = load()
+    ancestor_indices = prepare_install_ancestor_mutations(data, Path(target))
     parent, name = open_parent(Path(target), home)
     try:
         identity = os.fstat(parent)
@@ -475,6 +656,7 @@ elif command == "mkdir-make":
         if not stat.S_ISDIR(created.st_mode):
             raise ValueError("created entry is not directory")
         data["operations"][-1]["created"] = [created.st_dev, created.st_ino]
+        validate_install_ancestor_mutations(data, ancestor_indices)
         write(data)
     finally:
         os.close(parent)
@@ -503,28 +685,93 @@ elif command == "launch-phase":
     write(data)
 elif command == "commit":
     data = load()
-    for operation in data.get("operations", []):
+    gate = os.environ.get("STATELET_INSTALL_TEST_COMMIT_GATE")
+    if gate:
+        gate_path = Path(gate)
+        relative_to(gate_path, home)
+        Path(str(gate_path) + ".ready").touch()
+        for _ in range(3000):
+            if Path(str(gate_path) + ".release").exists():
+                break
+            time.sleep(0.01)
+        else:
+            raise ValueError("test gate timeout")
+    operations = data.get("operations", [])
+    active_installs = active_install_indices(operations)
+    replayed_installs = []
+    displaced_installs = set()
+    for index, operation in enumerate(operations):
+        kind = operation.get("kind")
+        target = Path(operation.get("target", ""))
+        if kind == "backup":
+            displaced = [
+                owner_index
+                for owner_index in replayed_installs
+                if is_within(Path(operations[owner_index]["target"]), target)
+            ]
+            for owner_index in displaced:
+                owner = operations[owner_index]
+                relative = Path(owner["target"]).relative_to(target)
+                saved_path = Path(operation["source"]) / relative
+                saved_parent, saved_name = open_parent(saved_path, root)
+                try:
+                    validate_install_at(owner, saved_parent, saved_name)
+                finally:
+                    os.close(saved_parent)
+                displaced_installs.add(owner_index)
+            replayed_installs = [owner for owner in replayed_installs if owner not in displaced]
+        elif kind == "install":
+            displaced = [
+                owner_index
+                for owner_index in replayed_installs
+                if is_within(Path(operations[owner_index]["target"]), target)
+            ]
+            if displaced:
+                raise ValueError("install ownership graph is ambiguous")
+            replayed_installs.append(index)
+
+    if replayed_installs != active_installs:
+        raise ValueError("install ownership graph is invalid")
+
+    for operation_index, operation in enumerate(operations):
         kind = operation.get("kind")
         if kind in {"install", "backup"}:
-            source_parent, _ = open_parent(Path(operation["source"]), root)
-            target_parent, _ = open_parent(Path(operation["target"]), home)
+            source_parent, source_name = open_parent(Path(operation["source"]), root)
+            recorded_target_parent = open_recorded_target_parent(operations, operation_index)
+            live_target_parent = None
             try:
-                source_status, target_status = os.fstat(source_parent), os.fstat(target_parent)
-                if ([source_status.st_dev, source_status.st_ino] != operation.get("source_parent") or
-                    [target_status.st_dev, target_status.st_ino] != operation.get("target_parent")):
+                source_status = os.fstat(source_parent)
+                if entry_identity(source_status) != operation.get("source_parent"):
                     raise ValueError("transaction parent changed")
-                try: os.stat(Path(operation["source"]).name, dir_fd=source_parent, follow_symlinks=False); source_exists = True
+                try: source_digest, source_entry_identity = entry_digest_and_identity(source_parent, source_name)
                 except FileNotFoundError: source_exists = False
-                try: os.stat(Path(operation["target"]).name, dir_fd=target_parent, follow_symlinks=False); target_exists = True
-                except FileNotFoundError: target_exists = False
+                else: source_exists = True
+                try:
+                    live_target_parent, target_name = open_parent(Path(operation["target"]), home)
+                    os.stat(target_name, dir_fd=live_target_parent, follow_symlinks=False)
+                except (FileNotFoundError, NotADirectoryError):
+                    target_exists = False
+                else:
+                    target_exists = True
                 if kind == "install":
-                    if source_exists or not target_exists or entry_digest(target_parent, Path(operation["target"]).name) != operation["digest"]:
+                    if (source_exists or
+                        (operation_index in active_installs and not target_exists) or
+                        (operation_index not in active_installs and operation_index not in displaced_installs)):
                         raise ValueError("installed entry changed")
                 else:
-                    if target_exists or not source_exists or entry_digest(source_parent, Path(operation["source"]).name) != operation["digest"]:
+                    later_owner = active_install_owner(
+                        operations, active_installs, Path(operation["target"])
+                    )
+                    if ((later_owner is None and target_exists) or
+                        (later_owner is not None and later_owner <= operation_index) or
+                        not source_exists or source_entry_identity != operation.get("source_entry") or
+                        source_digest != operation["digest"]):
                         raise ValueError("backup entry changed")
             finally:
-                os.close(source_parent); os.close(target_parent)
+                os.close(source_parent)
+                os.close(recorded_target_parent)
+                if live_target_parent is not None:
+                    os.close(live_target_parent)
         elif kind == "mkdir":
             parent, _ = open_parent(Path(operation["target"]), home)
             try:
@@ -536,6 +783,8 @@ elif command == "commit":
                     raise ValueError("transaction directory changed")
             finally:
                 os.close(parent)
+    for index in active_installs:
+        validate_live_install(operations[index])
     data["state"] = "committed"
     write(data)
 elif command == "recover":
@@ -595,11 +844,15 @@ elif command == "recover":
                 if source_exists and target_exists:
                     raise ValueError(f"install state is ambiguous: {target}")
                 if target_exists:
-                    if entry_digest(target_parent, target_name) != expected:
+                    target_digest, target_entry_identity = entry_digest_and_identity(target_parent, target_name)
+                    if (target_digest != expected or
+                        (operation.get("target_entry") is not None and target_entry_identity != operation["target_entry"])):
                         raise ValueError(f"installed target changed after interruption: {target}")
                     rename_exclusive(target_parent, target_name, source_parent, source_name)
                 elif source_exists:
-                    if entry_digest(source_parent, source_name) != expected:
+                    source_digest, source_entry_identity = entry_digest_and_identity(source_parent, source_name)
+                    if (source_digest != expected or
+                        (operation.get("target_entry") is not None and source_entry_identity != operation["target_entry"])):
                         raise ValueError(f"restored staged target changed after interruption: {source}")
                 else:
                     raise ValueError(f"installed target and staged source are both missing: {target}")
@@ -607,11 +860,18 @@ elif command == "recover":
                 if source_exists and target_exists:
                     raise ValueError(f"backup state is ambiguous: {target}")
                 if source_exists:
-                    if entry_digest(source_parent, source_name) != expected:
+                    source_digest, source_entry_identity = entry_digest_and_identity(source_parent, source_name)
+                    if (source_digest != expected or
+                        (operation.get("source_entry") is not None and source_entry_identity != operation["source_entry"])):
                         raise ValueError(f"backup changed after interruption: {source}")
                     rename_exclusive(source_parent, source_name, target_parent, target_name)
-                elif not target_exists or entry_digest(target_parent, target_name) != expected:
-                    raise ValueError(f"original target changed after interruption: {target}")
+                elif target_exists:
+                    target_digest, target_entry_identity = entry_digest_and_identity(target_parent, target_name)
+                    if (target_digest != expected or
+                        (operation.get("source_entry") is not None and target_entry_identity != operation["source_entry"])):
+                        raise ValueError(f"original target changed after interruption: {target}")
+                else:
+                    raise ValueError(f"original target is missing after interruption: {target}")
             os.fsync(source_parent); os.fsync(target_parent)
             os.close(source_parent); os.close(target_parent)
             recovered_operations += 1

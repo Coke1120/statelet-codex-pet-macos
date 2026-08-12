@@ -120,6 +120,27 @@ class MacPetPackagingTests(unittest.TestCase):
             env=env,
         )
 
+    def journal_command(self, root: Path, command: str, *args: str) -> subprocess.CompletedProcess[str]:
+        source = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        start = source.index("import ctypes,", source.index("journal_command()"))
+        end = source.index("\nPY\n}", start)
+        return subprocess.run(
+            [sys.executable, "-", str(root), str(self.home), command, *args],
+            input=source[start:end],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    def safe_tree_digest(self, path: Path) -> str:
+        result = subprocess.run(
+            [sys.executable, str(PACKAGE / "scripts" / "merge_hooks.py"), "--safe-tree-digest", str(path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
     def fake_launchctl_environment(
         self,
         *loaded_labels: str,
@@ -2511,6 +2532,229 @@ struct WatchdogHarness {
         recovered = self.install(second, env=environment)
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
         self.assertFalse(transaction.exists())
+
+    def test_commit_accepts_later_ancestor_install_owning_nested_backup_target(self) -> None:
+        target = self.home / "owned"
+        nested = target / "nested"
+        nested.parent.mkdir(parents=True)
+        nested.write_bytes(b"original-nested")
+        (target / "retained.txt").write_bytes(b"original-retained")
+        transaction = self.home / ".statelet-install-transaction"
+        initialized = self.journal_command(transaction, "init")
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        staged = transaction / "stage" / "owned"
+        staged.mkdir()
+        (staged / "nested").write_bytes(b"replacement-nested")
+        (staged / "retained.txt").write_bytes(b"replacement-retained")
+
+        backup_nested = transaction / "backup" / "nested"
+        moved_nested = self.journal_command(
+            transaction,
+            "backup-move",
+            str(nested),
+            str(backup_nested),
+            self.safe_tree_digest(nested),
+        )
+        self.assertEqual(moved_nested.returncode, 0, moved_nested.stderr)
+        backup_parent = transaction / "backup" / "owned"
+        moved_parent = self.journal_command(
+            transaction,
+            "backup-move",
+            str(target),
+            str(backup_parent),
+            self.safe_tree_digest(target),
+        )
+        self.assertEqual(moved_parent.returncode, 0, moved_parent.stderr)
+        installed = self.journal_command(
+            transaction,
+            "install-move",
+            str(staged),
+            str(target),
+            self.safe_tree_digest(staged),
+        )
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+
+        committed = self.journal_command(transaction, "commit")
+
+        self.assertEqual(committed.returncode, 0, committed.stderr)
+        self.assertEqual((target / "nested").read_bytes(), b"replacement-nested")
+        self.assertEqual((backup_nested).read_bytes(), b"original-nested")
+        self.assertEqual(json.loads((transaction / "journal.json").read_text())["state"], "committed")
+
+    def test_commit_rejects_changed_final_install_and_retains_journal(self) -> None:
+        self.assertEqual(self.install(self.make_bundle("CommitTargetFirst", "first")).returncode, 0)
+        gate = self.home / "commit-target-gate"
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_TEST_COMMIT_GATE"] = str(gate)
+        process = subprocess.Popen(
+            [
+                "bash",
+                str(INSTALL_SCRIPT),
+                "--home",
+                str(self.home),
+                "--app-bundle",
+                str(self.make_bundle("CommitTargetSecond", "second")),
+                "--skip-launchctl",
+            ],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        import time
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
+            if process.poll() is not None:
+                _, stderr = process.communicate()
+                self.fail(f"installer exited before commit gate: {stderr}")
+            time.sleep(0.01)
+        if not Path(f"{gate}.ready").exists():
+            process.terminate()
+            _, stderr = process.communicate(timeout=5)
+            self.fail(f"commit gate was not reached: {stderr}")
+        executable = self.home / "Applications" / "Statelet.app" / "Contents" / "MacOS" / "Statelet"
+        executable.write_bytes(executable.read_bytes() + b"\n# changed after publication\n")
+        Path(f"{gate}.release").touch()
+
+        _, stderr = process.communicate(timeout=30)
+
+        self.assertEqual(process.returncode, 74, stderr)
+        self.assertIn("file rollback was ambiguous", stderr)
+        self.assertTrue((self.home / ".statelet-install-transaction" / "journal.json").is_file())
+
+    def test_commit_rejects_same_content_replacement_and_retains_journal(self) -> None:
+        self.assertEqual(self.install(self.make_bundle("CommitIdentityFirst", "first")).returncode, 0)
+        gate = self.home / "commit-identity-gate"
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_TEST_COMMIT_GATE"] = str(gate)
+        process = subprocess.Popen(
+            [
+                "bash",
+                str(INSTALL_SCRIPT),
+                "--home",
+                str(self.home),
+                "--app-bundle",
+                str(self.make_bundle("CommitIdentitySecond", "second")),
+                "--skip-launchctl",
+            ],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        import time
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
+            if process.poll() is not None:
+                _, stderr = process.communicate()
+                self.fail(f"installer exited before commit gate: {stderr}")
+            time.sleep(0.01)
+        if not Path(f"{gate}.ready").exists():
+            process.terminate()
+            _, stderr = process.communicate(timeout=5)
+            self.fail(f"commit gate was not reached: {stderr}")
+        applications = self.home / "Applications"
+        installed = applications / "Statelet.app"
+        replacement = applications / "replacement.app"
+        displaced = applications / "displaced.app"
+        shutil.copytree(installed, replacement)
+        installed.rename(displaced)
+        replacement.rename(installed)
+        Path(f"{gate}.release").touch()
+
+        _, stderr = process.communicate(timeout=30)
+
+        self.assertEqual(process.returncode, 74, stderr)
+        self.assertIn("file rollback was ambiguous", stderr)
+        self.assertTrue((self.home / ".statelet-install-transaction" / "journal.json").is_file())
+
+    def test_commit_rejects_changed_backup_and_retains_journal(self) -> None:
+        self.assertEqual(self.install(self.make_bundle("CommitBackupFirst", "first")).returncode, 0)
+        gate = self.home / "commit-backup-gate"
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_TEST_COMMIT_GATE"] = str(gate)
+        process = subprocess.Popen(
+            [
+                "bash",
+                str(INSTALL_SCRIPT),
+                "--home",
+                str(self.home),
+                "--app-bundle",
+                str(self.make_bundle("CommitBackupSecond", "second")),
+                "--skip-launchctl",
+            ],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        import time
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
+            if process.poll() is not None:
+                _, stderr = process.communicate()
+                self.fail(f"installer exited before commit gate: {stderr}")
+            time.sleep(0.01)
+        if not Path(f"{gate}.ready").exists():
+            process.terminate()
+            _, stderr = process.communicate(timeout=5)
+            self.fail(f"commit gate was not reached: {stderr}")
+        backup = self.home / ".statelet-install-transaction" / "backup" / "app" / "Contents" / "MacOS" / "Statelet"
+        backup.write_bytes(backup.read_bytes() + b"\n# changed after backup\n")
+        Path(f"{gate}.release").touch()
+
+        _, stderr = process.communicate(timeout=30)
+
+        self.assertEqual(process.returncode, 74, stderr)
+        self.assertIn("file rollback was ambiguous", stderr)
+        self.assertTrue((self.home / ".statelet-install-transaction" / "journal.json").is_file())
+
+    def test_commit_rejects_changed_nested_install_owner_and_retains_journal(self) -> None:
+        legacy_media = self.home / "Library" / "Application Support" / "CodexPet" / "media" / "idle.mov"
+        legacy_media.parent.mkdir(parents=True)
+        legacy_media.write_bytes(b"private-migrated-media")
+        gate = self.home / "commit-nested-owner-gate"
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_TEST_COMMIT_GATE"] = str(gate)
+        process = subprocess.Popen(
+            [
+                "bash",
+                str(INSTALL_SCRIPT),
+                "--home",
+                str(self.home),
+                "--app-bundle",
+                str(self.make_bundle("CommitNestedOwner")),
+                "--skip-launchctl",
+            ],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        import time
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
+            if process.poll() is not None:
+                _, stderr = process.communicate()
+                self.fail(f"installer exited before commit gate: {stderr}")
+            time.sleep(0.01)
+        if not Path(f"{gate}.ready").exists():
+            process.terminate()
+            _, stderr = process.communicate(timeout=5)
+            self.fail(f"commit gate was not reached: {stderr}")
+        installed_media = self.home / "Library" / "Application Support" / "Statelet" / "media" / "idle.mov"
+        installed_media.write_bytes(b"changed-after-nested-publication")
+        Path(f"{gate}.release").touch()
+
+        _, stderr = process.communicate(timeout=30)
+
+        self.assertEqual(process.returncode, 74, stderr)
+        self.assertIn("file rollback was ambiguous", stderr)
+        self.assertTrue((self.home / ".statelet-install-transaction" / "journal.json").is_file())
 
     def test_legacy_source_mutation_after_copy_aborts_before_publication(self) -> None:
         legacy = self.home / "Library" / "Application Support" / "CodexPet"
