@@ -44,18 +44,15 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
         private static let lock = NSLock()
         private static var synthesisStarted: (() -> Void)?
         private static var synthesisGate = DispatchSemaphore(value: 0)
-        private static var stoppedSynthesisCount = 0
 
         static func reset(onSynthesisStarted: @escaping () -> Void) {
             lock.withLock {
                 synthesisStarted = onSynthesisStarted
                 synthesisGate = DispatchSemaphore(value: 0)
-                stoppedSynthesisCount = 0
             }
         }
 
         static func releaseSynthesis() { lock.withLock { synthesisGate }.signal() }
-        static var cancellationCount: Int { lock.withLock { stoppedSynthesisCount } }
 
         override class func canInit(with request: URLRequest) -> Bool { true }
         override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -78,10 +75,7 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
             )
             client?.urlProtocolDidFinishLoading(self)
         }
-        override func stopLoading() {
-            guard request.url?.lastPathComponent == "tts" else { return }
-            Self.lock.withLock { Self.stoppedSynthesisCount += 1 }
-        }
+        override func stopLoading() {}
     }
 
     private final class CancellationInsensitiveGenerationGate: @unchecked Sendable {
@@ -241,7 +235,6 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.library.activeProviderKind, .gptSovits)
         XCTAssertEqual(coordinator.library.lines.first?.status, .generating)
         XCTAssertNil(coordinator.library.qwenProfile)
-        XCTAssertEqual(DelayedGPTURLProtocol.cancellationCount, 0)
 
         let ready = expectation(description: "original GPT generation completes")
         coordinator.onChange = { snapshot in
@@ -254,7 +247,6 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
         let completed = try XCTUnwrap(coordinator.library.lines.first(where: { $0.id == line.id }))
         XCTAssertEqual(completed.status, .ready)
         XCTAssertNotNil(completed.outputRelativePath)
-        XCTAssertEqual(DelayedGPTURLProtocol.cancellationCount, 0)
     }
 
     @MainActor

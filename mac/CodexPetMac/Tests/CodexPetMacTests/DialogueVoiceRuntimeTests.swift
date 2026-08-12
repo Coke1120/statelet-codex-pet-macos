@@ -585,6 +585,7 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         let source = root.appendingPathComponent("handover", isDirectory: true)
         let support = root.appendingPathComponent("support", isDirectory: true)
         let outside = root.appendingPathComponent("outside.txt")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try Data("outside-sentinel".utf8).write(to: outside)
         try makeSyntheticQwenHandover(at: source)
         try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)

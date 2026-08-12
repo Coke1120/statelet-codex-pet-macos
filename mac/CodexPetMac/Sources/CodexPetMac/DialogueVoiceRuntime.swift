@@ -278,12 +278,12 @@ struct Qwen3TTSPackageInstaller: Sendable {
     }
 
     private func enumerate(_ root: URL) throws -> [SourceFile] {
-        guard let enumerator = FileManager.default.enumerator(
-            at: root, includingPropertiesForKeys: nil,
-            options: [.skipsPackageDescendants]
-        ) else { throw DialogueVoiceRuntimeError.invalidSource }
+        guard let enumerator = FileManager.default.enumerator(atPath: root.path) else {
+            throw DialogueVoiceRuntimeError.invalidSource
+        }
         var result: [SourceFile] = []
-        while let url = enumerator.nextObject() as? URL {
+        while let relative = enumerator.nextObject() as? String {
+            let url = try qwenPackageURL(relativePath: relative, root: root)
             var status = stat()
             guard Darwin.lstat(url.path, &status) == 0 else { throw DialogueVoiceRuntimeError.invalidSource }
             let kind = status.st_mode & mode_t(S_IFMT)
@@ -291,7 +291,6 @@ struct Qwen3TTSPackageInstaller: Sendable {
             guard kind == mode_t(S_IFREG), status.st_size > 0 else {
                 throw DialogueVoiceRuntimeError.invalidSource
             }
-            let relative = String(url.path.dropFirst(root.path.count + 1))
             result.append(SourceFile(relativePath: relative, url: url,
                                      identity: DialogueVoiceFileIdentity(status), size: UInt64(status.st_size)))
         }
@@ -519,13 +518,13 @@ enum Qwen3TTSProfileValidator {
         var rootStatus = stat()
         guard Darwin.lstat(packageRoot.path, &rootStatus) == 0,
               rootStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
-              let enumerator = FileManager.default.enumerator(
-                at: packageRoot, includingPropertiesForKeys: nil,
-                options: [.skipsPackageDescendants]
-              ) else { throw DialogueVoiceRuntimeError.invalidManagedPath }
+              let enumerator = FileManager.default.enumerator(atPath: packageRoot.path) else {
+            throw DialogueVoiceRuntimeError.invalidManagedPath
+        }
         var entries: [(String, URL, UInt64)] = []
         var total: UInt64 = 0
-        while let url = enumerator.nextObject() as? URL {
+        while let relative = enumerator.nextObject() as? String {
+            let url = try qwenPackageURL(relativePath: relative, root: packageRoot)
             var status = stat()
             guard Darwin.lstat(url.path, &status) == 0 else {
                 throw DialogueVoiceRuntimeError.invalidManagedPath
@@ -540,7 +539,6 @@ enum Qwen3TTSProfileValidator {
             guard total <= Qwen3TTSPackageInstaller.maximumPackageBytes else {
                 throw DialogueVoiceRuntimeError.invalidManagedPath
             }
-            let relative = String(url.path.dropFirst(packageRoot.path.count + 1))
             entries.append((relative, url, size))
         }
         var hasher = SHA256()
@@ -559,13 +557,13 @@ enum Qwen3TTSProfileValidator {
         var rootStatus = stat()
         guard Darwin.lstat(packageRoot.path, &rootStatus) == 0,
               rootStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
-              let enumerator = FileManager.default.enumerator(
-                at: packageRoot, includingPropertiesForKeys: nil,
-                options: [.skipsPackageDescendants]
-              ) else { throw DialogueVoiceRuntimeError.invalidManagedPath }
+              let enumerator = FileManager.default.enumerator(atPath: packageRoot.path) else {
+            throw DialogueVoiceRuntimeError.invalidManagedPath
+        }
         var tokens = ["root:\(DialogueVoiceFileIdentity(rootStatus).token)"]
         var total: UInt64 = 0
-        while let url = enumerator.nextObject() as? URL {
+        while let relative = enumerator.nextObject() as? String {
+            let url = try qwenPackageURL(relativePath: relative, root: packageRoot)
             var status = stat()
             guard Darwin.lstat(url.path, &status) == 0 else {
                 throw DialogueVoiceRuntimeError.invalidManagedPath
@@ -579,7 +577,6 @@ enum Qwen3TTSProfileValidator {
             guard total <= Qwen3TTSPackageInstaller.maximumPackageBytes else {
                 throw DialogueVoiceRuntimeError.invalidManagedPath
             }
-            let relative = String(url.path.dropFirst(packageRoot.path.count + 1))
             tokens.append("\(relative):\(DialogueVoiceFileIdentity(status).token)")
         }
         return tokens.sorted()
@@ -615,6 +612,16 @@ enum Qwen3TTSProfileValidator {
               DialogueVoiceFileIdentity(final) == identity else { throw DialogueVoiceRuntimeError.sourceChanged }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
+}
+
+private func qwenPackageURL(relativePath: String, root: URL) throws -> URL {
+    let components = relativePath.split(separator: "/", omittingEmptySubsequences: false)
+    guard !relativePath.isEmpty,
+          !relativePath.hasPrefix("/"),
+          components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+        throw DialogueVoiceRuntimeError.invalidManagedPath
+    }
+    return root.appendingPathComponent(relativePath)
 }
 
 struct DialogueVoiceInstalledAsset: Sendable {
