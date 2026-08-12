@@ -616,6 +616,7 @@ backup_target "$component_dir" component
 migration_relatives=()
 migration_digests=()
 migration_present_relatives=()
+migration_copy_relatives=()
 # Snapshot legacy data only after all managed legacy/canonical writers are
 # quiesced. Completed provenance makes canonical authoritative only when the
 # retained legacy source still matches the attested digest.
@@ -628,12 +629,16 @@ for relative in media voice characters sessions alpha-runtime runtime/current_st
     source_digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$source")" || { printf 'Refusing unsafe legacy Statelet data.\n' >&2; exit 1; }
     migration_digests+=("$source_digest")
     migration_present_relatives+=("$relative")
+    attested=0
+    if migration_attests "$relative" "$source_digest"; then attested=1; fi
     if [[ -e "$destination" ]]; then
       destination_digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$destination")" || { printf 'Refusing unsafe Statelet destination data.\n' >&2; exit 1; }
-      if [[ "$source_digest" != "$destination_digest" ]] && ! migration_attests "$relative" "$source_digest"; then
+      if [[ "$source_digest" != "$destination_digest" && "$attested" -eq 0 ]]; then
         printf 'Refusing to overwrite conflicting Statelet data.\n' >&2
         exit 1
       fi
+    elif [[ "$attested" -eq 0 ]]; then
+      migration_copy_relatives+=("$relative")
     fi
   else
     migration_digests+=("__absent__")
@@ -672,13 +677,12 @@ with path.open("w", encoding="utf-8") as handle:
 os.chmod(path, 0o600)
 PY
 
-for relative in media voice characters sessions alpha-runtime runtime/current_state.json; do
+for ((index=0; index<${#migration_copy_relatives[@]}; index++)); do
+  relative="${migration_copy_relatives[$index]}"
   source="$legacy_support/$relative"
   destination="$support_dir/$relative"
-  if [[ -e "$source" && ! -e "$destination" ]]; then
-    mkdir -p "$(dirname "$stage_root/migration/$relative")"
-    "$python_bin" "$script_dir/merge_hooks.py" --safe-copy-source "$source" --safe-copy-destination "$stage_root/migration/$relative"
-  fi
+  mkdir -p "$(dirname "$stage_root/migration/$relative")"
+  "$python_bin" "$script_dir/merge_hooks.py" --safe-copy-source "$source" --safe-copy-destination "$stage_root/migration/$relative"
 done
 
 # Hooks can still write while launchd is quiesced. Revalidate every selected

@@ -286,7 +286,7 @@ Statelet uses one canonical identity for new builds and installations:
 | LaunchAgents | `com.coke1120.statelet.state-aggregator`, `com.coke1120.statelet.mac-player` |
 | Managed marker | `statelet-v2` |
 | App version | `1.7.0` |
-| Build number | `11` |
+| Build number | `12` |
 
 ## Uninstall
 

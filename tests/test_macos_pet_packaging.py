@@ -1856,6 +1856,41 @@ struct WatchdogHarness {
         self.assertTrue(manifest.is_file())
         self.assertEqual(manifest.stat().st_mode & 0o777, 0o600)
 
+    def test_completed_migration_preserves_intentional_canonical_subtree_absence(self) -> None:
+        legacy = self.home / "Library" / "Application Support" / "CodexPet"
+        legacy_voice = legacy / "voice" / "profile.json"
+        legacy_voice.parent.mkdir(parents=True)
+        legacy_voice.write_bytes(b"retained-legacy-voice")
+        bundle = self.make_bundle("MigrationAttestedDeletion")
+        self.assertEqual(self.install(bundle).returncode, 0)
+        canonical_voice = self.home / "Library" / "Application Support" / "Statelet" / "voice"
+        shutil.rmtree(canonical_voice)
+
+        reinstalled = self.install(bundle)
+
+        self.assertEqual(reinstalled.returncode, 0, reinstalled.stderr)
+        self.assertFalse(canonical_voice.exists())
+        self.assertEqual(legacy_voice.read_bytes(), b"retained-legacy-voice")
+
+    def test_tampered_attestation_with_absent_destination_uses_first_migration_copy(self) -> None:
+        legacy = self.home / "Library" / "Application Support" / "CodexPet"
+        legacy_voice = legacy / "voice" / "profile.json"
+        legacy_voice.parent.mkdir(parents=True)
+        legacy_voice.write_bytes(b"retained-legacy-voice")
+        bundle = self.make_bundle("MigrationTamperedAbsent")
+        self.assertEqual(self.install(bundle).returncode, 0)
+        canonical = self.home / "Library" / "Application Support" / "Statelet"
+        shutil.rmtree(canonical / "voice")
+        manifest = canonical / ".legacy-migration-v1.json"
+        manifest.write_text('{"version":1,"source_identity":"tampered","subtrees":{}}\n', encoding="utf-8")
+        manifest.chmod(0o600)
+
+        reinstalled = self.install(bundle)
+
+        self.assertEqual(reinstalled.returncode, 0, reinstalled.stderr)
+        self.assertEqual((canonical / "voice" / "profile.json").read_bytes(), b"retained-legacy-voice")
+        self.assertEqual(legacy_voice.read_bytes(), b"retained-legacy-voice")
+
     def test_tampered_migration_manifest_forces_safe_conflict_comparison(self) -> None:
         legacy = self.home / "Library" / "Application Support" / "CodexPet"
         legacy_voice = legacy / "voice" / "profile.json"
