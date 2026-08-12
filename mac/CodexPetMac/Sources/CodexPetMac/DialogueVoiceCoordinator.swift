@@ -588,9 +588,13 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         audioPlayer.stop()
 
         let priorOutputs = library.lines.compactMap(\.outputRelativePath)
-        let replacedPackage = previous.map(\.packageRootRelativePath).flatMap { path in
-            path == profile.packageRootRelativePath ? [] : [path]
-        } ?? []
+        let replacedPackage: [String]
+        if let previousPath = previous?.packageRootRelativePath,
+           previousPath != profile.packageRootRelativePath {
+            replacedPackage = [previousPath]
+        } else {
+            replacedPackage = []
+        }
         var updated = library
         try updated.replacePendingCleanupPaths(
             updated.pendingCleanupPaths.filter { $0 != profile.packageRootRelativePath }
