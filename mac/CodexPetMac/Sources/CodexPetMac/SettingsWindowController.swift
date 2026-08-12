@@ -128,6 +128,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     var onPreviewDialogueLine: ((DialogueLine) -> Void)?
     var onRetryDialogueLine: ((DialogueLine) -> Void)?
     var onRegenerateDialogueLine: ((DialogueLine) -> Void)?
+    var onDialogueVoicePlaybackSettingsChange: ((DialogueVoicePlaybackSettings) -> Void)?
     var onCharacterSelection: ((String) -> Void)?
     var onCreateCharacter: ((String) -> Void)?
     var onRenameCharacter: ((String, String) -> Void)?
@@ -606,6 +607,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         }
         dialogueVoiceView.onRegenerateLine = { [weak self] line in
             self?.onRegenerateDialogueLine?(line)
+        }
+        dialogueVoiceView.onPlaybackSettingsChange = { [weak self] settings in
+            self?.onDialogueVoicePlaybackSettingsChange?(settings)
         }
     }
 

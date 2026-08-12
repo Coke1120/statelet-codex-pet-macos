@@ -1204,16 +1204,34 @@ enum DialoguePlaybackResult: Equatable, Sendable {
 
 protocol DialogueAudioPlaying: AnyObject {
     var isPlaying: Bool { get }
-    func play(relativePath: String, applicationSupportRoot: URL) throws
+    var volume: Float { get set }
+    func play(
+        relativePath: String,
+        applicationSupportRoot: URL,
+        onFinished: @escaping () -> Void
+    ) throws
     func stop()
 }
 
-final class DialogueAudioPlayer: DialogueAudioPlaying {
+final class DialogueAudioPlayer: NSObject, DialogueAudioPlaying, AVAudioPlayerDelegate {
     private var player: AVAudioPlayer?
+    private var playbackCompletion: (() -> Void)?
+    private var configuredVolume: Float = 1
 
     var isPlaying: Bool { player?.isPlaying == true }
+    var volume: Float {
+        get { configuredVolume }
+        set {
+            configuredVolume = min(max(newValue, 0), 1)
+            player?.volume = configuredVolume
+        }
+    }
 
-    func play(relativePath: String, applicationSupportRoot: URL) throws {
+    func play(
+        relativePath: String,
+        applicationSupportRoot: URL,
+        onFinished: @escaping () -> Void
+    ) throws {
         let data = try DialogueVoiceAssetInstaller.readManagedFile(
             relativePath: relativePath,
             root: applicationSupportRoot,
@@ -1225,9 +1243,13 @@ final class DialogueAudioPlayer: DialogueAudioPlaying {
         let next = try AVAudioPlayer(data: data)
         guard next.prepareToPlay() else { throw DialogueVoiceRuntimeError.invalidAudio }
         stop()
+        next.delegate = self
+        next.volume = configuredVolume
         player = next
+        playbackCompletion = onFinished
         guard next.play() else {
             player = nil
+            playbackCompletion = nil
             throw DialogueVoiceRuntimeError.invalidAudio
         }
     }
@@ -1235,6 +1257,19 @@ final class DialogueAudioPlayer: DialogueAudioPlaying {
     func stop() {
         player?.stop()
         player = nil
+        playbackCompletion = nil
+    }
+
+    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        guard player === self.player else { return }
+        self.player = nil
+        let completion = playbackCompletion
+        playbackCompletion = nil
+        completion?()
+    }
+
+    func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
+        audioPlayerDidFinishPlaying(player, successfully: false)
     }
 }
 
@@ -1242,7 +1277,11 @@ struct DialogueReadyPlaybackService {
     let applicationSupportRoot: URL
     let player: DialogueAudioPlaying
 
-    func playReadyLine(id: UUID, in library: DialogueVoiceLibrary) -> DialoguePlaybackResult {
+    func playReadyLine(
+        id: UUID,
+        in library: DialogueVoiceLibrary,
+        onFinished: @escaping () -> Void = {}
+    ) -> DialoguePlaybackResult {
         guard library.profileStatus == .ready || library.profileStatus == .unavailable else {
             return .unavailable(.notReady)
         }
@@ -1253,7 +1292,11 @@ struct DialogueReadyPlaybackService {
             return .unavailable(.notReady)
         }
         do {
-            try player.play(relativePath: output, applicationSupportRoot: applicationSupportRoot)
+            try player.play(
+                relativePath: output,
+                applicationSupportRoot: applicationSupportRoot,
+                onFinished: onFinished
+            )
             return .played
         } catch {
             return .unavailable(.missingOrInvalidAudio)

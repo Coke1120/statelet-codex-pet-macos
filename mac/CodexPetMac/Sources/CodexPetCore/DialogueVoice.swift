@@ -43,6 +43,7 @@ public enum DialogueVoiceError: Error, Equatable, LocalizedError {
     case invalidText
     case invalidManagedPath
     case invalidFailureCode
+    case invalidPlaybackSettings
     case invalidState
     case lineNotFound
     case profileNotConfigured
@@ -66,6 +67,8 @@ public enum DialogueVoiceError: Error, Equatable, LocalizedError {
             return "A managed file path is invalid."
         case .invalidFailureCode:
             return "The generation failure code is invalid."
+        case .invalidPlaybackSettings:
+            return "The voice playback settings are invalid."
         case .invalidState:
             return "The dialogue generation state is invalid."
         case .lineNotFound:
@@ -425,6 +428,51 @@ public struct DialogueGenerationTicket: Codable, Equatable, Sendable {
     }
 }
 
+public struct DialogueVoicePlaybackSettings: Codable, Equatable, Sendable {
+    public static let minimumRepeatIntervalSeconds: TimeInterval = 5
+    public static let maximumRepeatIntervalSeconds: TimeInterval = 3_600
+    public static let defaults = try! DialogueVoicePlaybackSettings()
+
+    public let automaticPlaybackEnabled: Bool
+    public let volume: Double
+    public let repeatIntervalSeconds: TimeInterval?
+
+    public init(
+        automaticPlaybackEnabled: Bool = true,
+        volume: Double = 1,
+        repeatIntervalSeconds: TimeInterval? = nil
+    ) throws {
+        guard volume.isFinite, (0...1).contains(volume) else {
+            throw DialogueVoiceError.invalidPlaybackSettings
+        }
+        if let repeatIntervalSeconds {
+            guard repeatIntervalSeconds.isFinite,
+                  (Self.minimumRepeatIntervalSeconds...Self.maximumRepeatIntervalSeconds)
+                    .contains(repeatIntervalSeconds) else {
+                throw DialogueVoiceError.invalidPlaybackSettings
+            }
+        }
+        self.automaticPlaybackEnabled = automaticPlaybackEnabled
+        self.volume = volume
+        self.repeatIntervalSeconds = repeatIntervalSeconds
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case automaticPlaybackEnabled = "automatic_playback_enabled"
+        case volume
+        case repeatIntervalSeconds = "repeat_interval_seconds"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            automaticPlaybackEnabled: container.decode(Bool.self, forKey: .automaticPlaybackEnabled),
+            volume: container.decode(Double.self, forKey: .volume),
+            repeatIntervalSeconds: container.decodeIfPresent(TimeInterval.self, forKey: .repeatIntervalSeconds)
+        )
+    }
+}
+
 public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
     public static let schemaVersion = 1
 
@@ -433,6 +481,7 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
     public private(set) var profileStatus: DialogueVoiceProfileStatus
     public private(set) var lines: [DialogueLine]
     public private(set) var pendingCleanupPaths: [String]
+    public private(set) var playbackSettings: DialogueVoicePlaybackSettings
 
     public var referencedManagedPaths: Set<String> {
         Self.referencedPaths(profile: profile, lines: lines)
@@ -443,7 +492,8 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
         profile: GPTSoVITSVoiceProfile? = nil,
         profileStatus: DialogueVoiceProfileStatus? = nil,
         lines: [DialogueLine] = [],
-        pendingCleanupPaths: [String] = []
+        pendingCleanupPaths: [String] = [],
+        playbackSettings: DialogueVoicePlaybackSettings = .defaults
     ) throws {
         guard version == Self.schemaVersion else {
             throw DialogueVoiceError.unsupportedSchemaVersion(version)
@@ -463,7 +513,12 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
         self.profileStatus = profileStatus ?? (profile == nil ? .notConfigured : .ready)
         self.lines = lines
         self.pendingCleanupPaths = validatedCleanupPaths
+        self.playbackSettings = playbackSettings
         try validateProfileRelationships()
+    }
+
+    public mutating func updatePlaybackSettings(_ settings: DialogueVoicePlaybackSettings) {
+        playbackSettings = settings
     }
 
     public mutating func replaceActiveProfile(_ profile: GPTSoVITSVoiceProfile) throws {
@@ -901,6 +956,7 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
         case profileStatus = "profile_status"
         case lines
         case pendingCleanupPaths = "pending_cleanup_paths"
+        case playbackSettings = "playback_settings"
     }
 
     public init(from decoder: Decoder) throws {
@@ -912,7 +968,11 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
             profileStatus: container.decodeIfPresent(DialogueVoiceProfileStatus.self, forKey: .profileStatus)
                 ?? (profile == nil ? .notConfigured : .ready),
             lines: container.decode([DialogueLine].self, forKey: .lines),
-            pendingCleanupPaths: container.decodeIfPresent([String].self, forKey: .pendingCleanupPaths) ?? []
+            pendingCleanupPaths: container.decodeIfPresent([String].self, forKey: .pendingCleanupPaths) ?? [],
+            playbackSettings: container.decodeIfPresent(
+                DialogueVoicePlaybackSettings.self,
+                forKey: .playbackSettings
+            ) ?? .defaults
         )
     }
 }

@@ -145,13 +145,97 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         var playedPaths: [String] = []
         var error: Error?
         var isPlaying = false
+        var volume: Float = 1
+        var validatesManagedAudio = false
+        private var completion: (() -> Void)?
 
-        func play(relativePath: String, applicationSupportRoot: URL) throws {
+        func play(
+            relativePath: String,
+            applicationSupportRoot: URL,
+            onFinished: @escaping () -> Void
+        ) throws {
             if let error { throw error }
+            if validatesManagedAudio {
+                let data = try DialogueVoiceAssetInstaller.readManagedFile(
+                    relativePath: relativePath,
+                    root: applicationSupportRoot,
+                    maximumBytes: 67_108_864
+                )
+                guard GPTSoVITSAPIClient.isValidWAV(data) else {
+                    throw FakeError.playback
+                }
+            }
+            stop()
             playedPaths.append(relativePath)
+            completion = onFinished
+            isPlaying = true
         }
 
-        func stop() {}
+        func stop() {
+            completion = nil
+            isPlaying = false
+        }
+
+        func finishCurrentPlayback() {
+            let callback = completion
+            completion = nil
+            isPlaying = false
+            callback?()
+        }
+    }
+
+    private final class ControlledSleeper: @unchecked Sendable {
+        private let lock = NSLock()
+        private var recordedValues: [TimeInterval] = []
+        private var waiters: [CheckedContinuation<Void, Error>] = []
+        private var observer: ((Int) -> Void)?
+
+        var values: [TimeInterval] {
+            lock.lock()
+            defer { lock.unlock() }
+            return recordedValues
+        }
+
+        func sleep(for interval: TimeInterval) async throws {
+            try await withCheckedThrowingContinuation { continuation in
+                lock.lock()
+                recordedValues.append(interval)
+                waiters.append(continuation)
+                let count = recordedValues.count
+                let observer = observer
+                lock.unlock()
+                observer?(count)
+            }
+        }
+
+        func setObserver(_ observer: @escaping (Int) -> Void) {
+            lock.lock()
+            self.observer = observer
+            lock.unlock()
+        }
+
+        func resumeNext() {
+            lock.lock()
+            let continuation = waiters.isEmpty ? nil : waiters.removeFirst()
+            lock.unlock()
+            continuation?.resume(returning: ())
+        }
+    }
+
+    private final class DeterministicRandomIndex: @unchecked Sendable {
+        private let lock = NSLock()
+        private var values: [Int]
+
+        init(_ values: [Int]) {
+            self.values = values
+        }
+
+        func next(upperBound: Int) -> Int {
+            lock.lock()
+            let value = values.isEmpty ? 0 : values.removeFirst()
+            lock.unlock()
+            return value % upperBound
+        }
     }
 
     private enum FakeError: Error { case playback }
@@ -207,6 +291,65 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             service.playReadyLine(id: lineID, in: ready),
             .unavailable(.missingOrInvalidAudio)
         )
+    }
+
+    func testStateDialoguePresentationFollowsTheExactSpokenLineUntilPlaybackFinishes() throws {
+        let requestID = UUID()
+        let fallbackLine = try DialogueLine(state: .idle, text: "Fallback", textLanguage: "en")
+        let spokenLine = try DialogueLine(state: .idle, text: "Random choice", textLanguage: "en")
+        var presentation = StateDialoguePresentation(
+            id: requestID,
+            state: .idle,
+            lineID: fallbackLine.id,
+            lineRevision: fallbackLine.revision,
+            text: fallbackLine.text,
+            audioDisposition: .pending
+        )
+
+        XCTAssertTrue(presentation.recordAutomaticPlaybackStarted(spokenLine))
+        XCTAssertEqual(presentation.lineID, spokenLine.id)
+        XCTAssertEqual(presentation.text, spokenLine.text)
+        XCTAssertEqual(presentation.audioDisposition, .delivered)
+
+        let editedSpokenLine = try DialogueLine(
+            id: spokenLine.id,
+            state: .idle,
+            text: "Edited while old audio was playing",
+            textLanguage: "en",
+            revision: spokenLine.revision + 1,
+            status: .draft
+        )
+        XCTAssertEqual(
+            presentation.recordAutomaticPlaybackFinished(
+                requestID: requestID,
+                lineID: spokenLine.id,
+                replacementLine: editedSpokenLine
+            ),
+            .updated
+        )
+        XCTAssertEqual(presentation.text, editedSpokenLine.text)
+        XCTAssertEqual(presentation.audioDisposition, .pending)
+
+        let nextRequestID = UUID()
+        let runningLine = try DialogueLine(state: .running, text: "New state", textLanguage: "en")
+        var nextPresentation = StateDialoguePresentation(
+            id: nextRequestID,
+            state: .running,
+            lineID: runningLine.id,
+            lineRevision: runningLine.revision,
+            text: runningLine.text,
+            audioDisposition: .deferred
+        )
+        XCTAssertEqual(
+            nextPresentation.recordAutomaticPlaybackFinished(
+                requestID: requestID,
+                lineID: spokenLine.id,
+                replacementLine: runningLine
+            ),
+            .revealCurrent
+        )
+        XCTAssertEqual(nextPresentation.text, runningLine.text)
+        XCTAssertEqual(nextPresentation.audioDisposition, .deferred)
     }
 
     func testWAVValidationRejectsMalformedGeometryAndTrailingData() {
@@ -808,6 +951,18 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         _ = try library.addLine(text: "Hello from the queue", id: lineID)
         let runningLineID = UUID(uuidString: "66666666-7777-8888-9999-AAAAAAAAAAAA")!
         _ = try library.addLine(text: "Running now", state: .running, id: runningLineID)
+        let alternateRunningLineID = UUID(uuidString: "BBBBBBBB-CCCC-DDDD-EEEE-FFFFFFFFFFFF")!
+        _ = try library.addLine(
+            text: "Still running",
+            state: .running,
+            id: alternateRunningLineID
+        )
+        let corruptWaitingLineID = UUID(uuidString: "CCCCCCCC-DDDD-EEEE-FFFF-000000000000")!
+        _ = try library.addLine(
+            text: "Waiting with corrupt audio",
+            state: .waiting,
+            id: corruptWaitingLineID
+        )
         let store = DialogueVoiceStore(
             rootURL: root.appendingPathComponent("voice", isDirectory: true)
         )
@@ -816,17 +971,26 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [SuccessfulGPTSoVITSURLProtocol.self]
         let player = FakePlayer()
+        player.validatesManagedAudio = true
+        let intervalRecorder = ControlledSleeper()
+        let randomIndex = DeterministicRandomIndex([0, 1, 0, 0])
         let coordinator = DialogueVoiceCoordinator(
             applicationSupportRoot: root,
             client: GPTSoVITSAPIClient(configuration: configuration),
-            audioPlayer: player
+            audioPlayer: player,
+            randomIndex: { upperBound in
+                randomIndex.next(upperBound: upperBound)
+            },
+            sleepForInterval: { interval in
+                try await intervalRecorder.sleep(for: interval)
+            }
         )
         defer { coordinator.shutdown() }
         let generated = expectation(description: "queued dialogue becomes ready")
         var fulfilled = false
         coordinator.onChange = { snapshot in
             guard !fulfilled,
-                  snapshot.library.lines.count == 2,
+                  snapshot.library.lines.count == 4,
                   snapshot.library.lines.allSatisfy({ $0.status == .ready }) else {
                 return
             }
@@ -845,6 +1009,13 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         let runningOutputPath = try XCTUnwrap(
             coordinator.library.lines.first(where: { $0.id == runningLineID })?.outputRelativePath
         )
+        let alternateRunningOutputPath = try XCTUnwrap(
+            coordinator.library.lines.first(where: { $0.id == alternateRunningLineID })?.outputRelativePath
+        )
+        let corruptWaitingOutputPath = try XCTUnwrap(
+            coordinator.library.lines.first(where: { $0.id == corruptWaitingLineID })?.outputRelativePath
+        )
+        try Data("not a wave".utf8).write(to: root.appendingPathComponent(corruptWaitingOutputPath))
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(outputPath).path))
         let ttsBody = try GPTSoVITSAPIClient.encodedTTSRequestBody(
             text: readyLine.text,
@@ -870,38 +1041,211 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         try assertJSONNumber(ttsJSON["repetition_penalty"], equals: 1.35)
         try assertJSONNumber(ttsJSON["seed"], equals: 24_681)
 
-        player.isPlaying = true
-        let firstIdleRequest = UUID()
+        try coordinator.updatePlaybackSettings(try DialogueVoicePlaybackSettings(
+            automaticPlaybackEnabled: true,
+            volume: 0.25,
+            repeatIntervalSeconds: 15
+        ))
+        XCTAssertEqual(player.volume, 0.25, accuracy: 0.000_001)
+        XCTAssertEqual(try store.load().playbackSettings.volume, 0.25, accuracy: 0.000_001)
+
+        let idleRequest = UUID()
         let runningRequest = UUID()
-        let latestIdleRequest = UUID()
-        XCTAssertEqual(
-            coordinator.playReadyLineAutomatically(id: lineID, requestID: firstIdleRequest),
-            .deferred
-        )
-        XCTAssertEqual(
-            coordinator.playReadyLineAutomatically(id: runningLineID, requestID: runningRequest),
-            .deferred
-        )
-        XCTAssertEqual(
-            coordinator.playReadyLineAutomatically(id: lineID, requestID: latestIdleRequest),
-            .deferred
-        )
-        XCTAssertTrue(player.playedPaths.isEmpty)
-        XCTAssertEqual(coordinator.preferredLine(for: .idle)?.id, lineID)
-
-        let deferredStarted = expectation(description: "latest deferred state voice starts")
-        coordinator.onAutomaticPlaybackStarted = { requestID, startedLineID in
-            XCTAssertEqual(requestID, latestIdleRequest)
-            XCTAssertEqual(startedLineID, self.lineID)
-            deferredStarted.fulfill()
+        var automaticStarts: [(UUID, UUID)] = []
+        var automaticFinishes: [(UUID, UUID)] = []
+        let firstRunningStart = expectation(description: "latest state starts after preview")
+        let repeatedRunningStart = expectation(description: "same state repeats after interval")
+        let firstIntervalScheduled = expectation(description: "repeat interval scheduled after finish")
+        let libraryStaleIntervalScheduled = expectation(description: "interval scheduled before settings change")
+        let stateStaleIntervalScheduled = expectation(description: "interval scheduled before state change")
+        let shutdownStaleIntervalScheduled = expectation(description: "interval scheduled before shutdown")
+        intervalRecorder.setObserver { count in
+            if count == 1 {
+                firstIntervalScheduled.fulfill()
+            } else if count == 2 {
+                libraryStaleIntervalScheduled.fulfill()
+            } else if count == 3 {
+                stateStaleIntervalScheduled.fulfill()
+            } else if count == 4 {
+                shutdownStaleIntervalScheduled.fulfill()
+            }
         }
-        player.isPlaying = false
-        await fulfillment(of: [deferredStarted], timeout: 2)
-        XCTAssertEqual(player.playedPaths, [outputPath])
-        XCTAssertFalse(player.playedPaths.contains(runningOutputPath))
+        coordinator.onAutomaticPlaybackStarted = { requestID, line in
+            automaticStarts.append((requestID, line.id))
+            if requestID == runningRequest {
+                if automaticStarts.filter({ $0.0 == runningRequest }).count == 1 {
+                    firstRunningStart.fulfill()
+                } else {
+                    repeatedRunningStart.fulfill()
+                }
+            }
+        }
+        coordinator.onAutomaticPlaybackFinished = { requestID, lineID in
+            automaticFinishes.append((requestID, lineID))
+        }
 
+        XCTAssertEqual(
+            coordinator.beginAutomaticPlayback(for: .idle, requestID: idleRequest),
+            .played
+        )
+        XCTAssertEqual(automaticStarts.map(\.1), [lineID])
+        XCTAssertEqual(player.playedPaths, [outputPath])
+        XCTAssertTrue(intervalRecorder.values.isEmpty, "Repeat timing starts only after audio finishes")
+
+        XCTAssertEqual(
+            coordinator.beginAutomaticPlayback(for: .running, requestID: runningRequest),
+            .deferred
+        )
+
+        // Preview replaces the current automatic clip immediately, but the
+        // newest lifecycle session resumes only after the preview finishes.
         XCTAssertEqual(coordinator.playReadyLine(id: lineID), .played)
         XCTAssertEqual(player.playedPaths, [outputPath, outputPath])
+        XCTAssertTrue(automaticFinishes.isEmpty, "An interrupted automatic clip did not finish")
+        player.finishCurrentPlayback()
+        await fulfillment(of: [firstRunningStart], timeout: 2)
+        XCTAssertEqual(automaticStarts[1].0, runningRequest)
+        XCTAssertEqual(automaticStarts[1].1, alternateRunningLineID)
+        XCTAssertEqual(player.playedPaths, [outputPath, outputPath, alternateRunningOutputPath])
+
+        // A completed automatic clip waits for the configured quiet interval,
+        // then selects another currently playable line for the same state.
+        player.finishCurrentPlayback()
+        await fulfillment(of: [firstIntervalScheduled], timeout: 2)
+        XCTAssertEqual(intervalRecorder.values, [15])
+        XCTAssertEqual(automaticStarts.map(\.1), [lineID, alternateRunningLineID])
+        intervalRecorder.resumeNext()
+        await fulfillment(of: [repeatedRunningStart], timeout: 2)
+        XCTAssertEqual(automaticFinishes.map(\.1), [alternateRunningLineID])
+        XCTAssertEqual(automaticStarts.map(\.1), [lineID, alternateRunningLineID, runningLineID])
+        XCTAssertEqual(
+            player.playedPaths,
+            [outputPath, outputPath, alternateRunningOutputPath, runningOutputPath]
+        )
+
+        player.finishCurrentPlayback()
+        await fulfillment(of: [libraryStaleIntervalScheduled], timeout: 2)
+        let noLibraryStaleStart = expectation(description: "settings change invalidates stale timer")
+        noLibraryStaleStart.isInverted = true
+        coordinator.onAutomaticPlaybackStarted = { _, _ in noLibraryStaleStart.fulfill() }
+        try coordinator.updatePlaybackSettings(try DialogueVoicePlaybackSettings(
+            automaticPlaybackEnabled: true,
+            volume: 0,
+            repeatIntervalSeconds: nil
+        ))
+        intervalRecorder.resumeNext()
+        await fulfillment(of: [noLibraryStaleStart], timeout: 0.1)
+        XCTAssertEqual(intervalRecorder.values, [15, 15])
+
+        try coordinator.updatePlaybackSettings(try DialogueVoicePlaybackSettings(
+            automaticPlaybackEnabled: false,
+            volume: 0,
+            repeatIntervalSeconds: nil
+        ))
+        let noFurtherAutomaticStart = expectation(description: "disabled automatic playback stays cancelled")
+        noFurtherAutomaticStart.isInverted = true
+        coordinator.onAutomaticPlaybackStarted = { _, _ in noFurtherAutomaticStart.fulfill() }
+        XCTAssertEqual(player.volume, 0, accuracy: 0.000_001)
+        await fulfillment(of: [noFurtherAutomaticStart], timeout: 0.1)
+
+        // Automatic playback being off does not disable explicit Preview.
+        XCTAssertEqual(coordinator.playReadyLine(id: lineID), .played)
+        XCTAssertEqual(player.playedPaths.last, outputPath)
+        player.stop()
+
+        try coordinator.updatePlaybackSettings(try DialogueVoicePlaybackSettings(
+            automaticPlaybackEnabled: true,
+            volume: 1,
+            repeatIntervalSeconds: nil
+        ))
+        let neverRequest = UUID()
+        let entryStarted = expectation(description: "Never still permits state-entry playback")
+        coordinator.onAutomaticPlaybackStarted = { requestID, _ in
+            if requestID == neverRequest { entryStarted.fulfill() }
+        }
+        XCTAssertEqual(
+            coordinator.beginAutomaticPlayback(for: .running, requestID: neverRequest),
+            .played
+        )
+        await fulfillment(of: [entryStarted], timeout: 1)
+        let noNeverRepeat = expectation(description: "Never does not repeat")
+        noNeverRepeat.isInverted = true
+        coordinator.onAutomaticPlaybackStarted = { _, _ in noNeverRepeat.fulfill() }
+        player.finishCurrentPlayback()
+        await fulfillment(of: [noNeverRepeat], timeout: 0.1)
+        XCTAssertEqual(intervalRecorder.values, [15, 15])
+
+        let playbackCount = player.playedPaths.count
+        XCTAssertEqual(
+            coordinator.beginAutomaticPlayback(for: .waiting, requestID: UUID()),
+            .unavailable(.missingOrInvalidAudio)
+        )
+        XCTAssertEqual(player.playedPaths.count, playbackCount)
+
+        let beforeStateChangeRequest = UUID()
+        let beforeStateChangeStarted = expectation(description: "clip starts before state cancellation")
+        coordinator.onAutomaticPlaybackStarted = { requestID, _ in
+            if requestID == beforeStateChangeRequest { beforeStateChangeStarted.fulfill() }
+        }
+        XCTAssertEqual(
+            coordinator.beginAutomaticPlayback(for: .running, requestID: beforeStateChangeRequest),
+            .played
+        )
+        await fulfillment(of: [beforeStateChangeStarted], timeout: 1)
+        try coordinator.updatePlaybackSettings(try DialogueVoicePlaybackSettings(
+            automaticPlaybackEnabled: true,
+            volume: 1,
+            repeatIntervalSeconds: 15
+        ))
+        player.finishCurrentPlayback()
+        await fulfillment(of: [stateStaleIntervalScheduled], timeout: 2)
+        let noStateStaleStart = expectation(description: "state change invalidates stale timer")
+        noStateStaleStart.isInverted = true
+        coordinator.onAutomaticPlaybackStarted = { _, _ in noStateStaleStart.fulfill() }
+        XCTAssertEqual(
+            coordinator.beginAutomaticPlayback(for: .review, requestID: UUID()),
+            .unavailable(.notReady)
+        )
+        intervalRecorder.resumeNext()
+        await fulfillment(of: [noStateStaleStart], timeout: 0.1)
+
+        let beforeShutdownRequest = UUID()
+        let beforeShutdownStarted = expectation(description: "clip starts before shutdown cancellation")
+        coordinator.onAutomaticPlaybackStarted = { requestID, _ in
+            if requestID == beforeShutdownRequest { beforeShutdownStarted.fulfill() }
+        }
+        XCTAssertEqual(
+            coordinator.beginAutomaticPlayback(for: .running, requestID: beforeShutdownRequest),
+            .played
+        )
+        await fulfillment(of: [beforeShutdownStarted], timeout: 1)
+        player.finishCurrentPlayback()
+        await fulfillment(of: [shutdownStaleIntervalScheduled], timeout: 2)
+        let noShutdownStaleStart = expectation(description: "shutdown invalidates stale timer")
+        noShutdownStaleStart.isInverted = true
+        coordinator.onAutomaticPlaybackStarted = { _, _ in noShutdownStaleStart.fulfill() }
+        coordinator.shutdown()
+        intervalRecorder.resumeNext()
+        await fulfillment(of: [noShutdownStaleStart], timeout: 0.1)
+        XCTAssertEqual(intervalRecorder.values, [15, 15, 15, 15])
+
+        let restartedPlayer = FakePlayer()
+        let restartedCoordinator = DialogueVoiceCoordinator(
+            applicationSupportRoot: root,
+            client: GPTSoVITSAPIClient(configuration: configuration),
+            audioPlayer: restartedPlayer
+        )
+        restartedCoordinator.start()
+        XCTAssertEqual(
+            restartedCoordinator.library.playbackSettings,
+            try DialogueVoicePlaybackSettings(
+                automaticPlaybackEnabled: true,
+                volume: 1,
+                repeatIntervalSeconds: 15
+            )
+        )
+        XCTAssertEqual(restartedPlayer.volume, 1, accuracy: 0.000_001)
+        restartedCoordinator.shutdown()
     }
 
     private func assertJSONBoolean(

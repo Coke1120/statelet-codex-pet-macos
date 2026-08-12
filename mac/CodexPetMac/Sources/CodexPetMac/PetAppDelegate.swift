@@ -191,10 +191,42 @@ enum StateDialogueAudioDisposition: Equatable {
 struct StateDialoguePresentation: Equatable {
     let id: UUID
     let state: PetState
-    let lineID: UUID?
+    var lineID: UUID?
     var lineRevision: Int?
     var text: String?
     var audioDisposition: StateDialogueAudioDisposition
+
+    mutating func recordAutomaticPlaybackStarted(_ line: DialogueLine) -> Bool {
+        guard line.state == state else { return false }
+        lineID = line.id
+        lineRevision = line.revision
+        text = line.text
+        audioDisposition = .delivered
+        return true
+    }
+
+    mutating func recordAutomaticPlaybackFinished(
+        requestID: UUID,
+        lineID finishedLineID: UUID,
+        replacementLine: DialogueLine?
+    ) -> StateDialogueFinishOutcome {
+        guard id == requestID else {
+            return audioDisposition == .delivered ? .ignored : .revealCurrent
+        }
+        guard lineID == finishedLineID else { return .ignored }
+        guard replacementLine?.state == state || replacementLine == nil else { return .ignored }
+        lineID = replacementLine?.id
+        lineRevision = replacementLine?.revision
+        text = replacementLine?.text
+        audioDisposition = .pending
+        return .updated
+    }
+}
+
+enum StateDialogueFinishOutcome: Equatable {
+    case updated
+    case revealCurrent
+    case ignored
 }
 
 private enum StatusMenuTag: Int {
@@ -297,8 +329,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             self.settingsController?.update(dialogueVoice: snapshot)
             self.refreshStateOwnedDialogue(using: snapshot)
         }
-        dialogueVoiceCoordinator.onAutomaticPlaybackStarted = { [weak self] requestID, lineID in
-            self?.markStateOwnedDialogueAudioDelivered(requestID: requestID, lineID: lineID)
+        dialogueVoiceCoordinator.onAutomaticPlaybackStarted = { [weak self] requestID, line in
+            self?.markStateOwnedDialogueAudioDelivered(requestID: requestID, line: line)
+        }
+        dialogueVoiceCoordinator.onAutomaticPlaybackFinished = { [weak self] requestID, lineID in
+            self?.finishStateOwnedDialogueAudio(requestID: requestID, lineID: lineID)
         }
         dialogueVoiceCoordinator.start()
         refreshCharacterClipCounts()
@@ -820,9 +855,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         explicitUserAdvance: Bool = false
     ) {
         if stateDialoguePresentation?.state != state {
-            dialogueVoiceCoordinator.cancelPendingAutomaticPlayback()
+            let keepSpokenMessage = dialogueVoiceCoordinator.isAutomaticPlaybackActive
+            dialogueVoiceCoordinator.cancelAutomaticPlayback()
             stateDialoguePresentation = nil
-            player?.view.showDialogueMessage(nil)
+            if !keepSpokenMessage {
+                player?.view.showDialogueMessage(nil)
+            }
         }
         let started = DispatchTime.now().uptimeNanoseconds
         transitionSequence &+= 1
@@ -912,12 +950,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
 
     private func presentStateOwnedDialogueIfNeeded(for state: PetState) {
         if stateDialoguePresentation?.state == state {
-            retryStateOwnedDialogueAudioIfReady()
+            ensureStateOwnedDialoguePlayback()
             return
         }
-        dialogueVoiceCoordinator.cancelPendingAutomaticPlayback()
+        dialogueVoiceCoordinator.cancelAutomaticPlayback()
         let line = dialogueVoiceCoordinator.preferredLine(for: state)
-        stateDialoguePresentation = StateDialoguePresentation(
+        let presentation = StateDialoguePresentation(
             id: UUID(),
             state: state,
             lineID: line?.id,
@@ -925,78 +963,104 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             text: line?.text,
             audioDisposition: .pending
         )
-        player?.view.showDialogueMessage(line?.text)
-        retryStateOwnedDialogueAudioIfReady()
+        let keepSpokenMessage = dialogueVoiceCoordinator.isAutomaticPlaybackActive
+        stateDialoguePresentation = presentation
+        if !keepSpokenMessage {
+            player?.view.showDialogueMessage(line?.text)
+        }
+        applyStateOwnedDialoguePlaybackResult(
+            dialogueVoiceCoordinator.beginAutomaticPlayback(
+                for: state,
+                requestID: presentation.id
+            ),
+            requestID: presentation.id
+        )
     }
 
     private func refreshStateOwnedDialogue(using snapshot: DialogueVoiceCoordinatorSnapshot) {
         guard player != nil,
               var presentation = stateDialoguePresentation,
-              presentation.state == effectivePresentationState,
-              let lineID = presentation.lineID else {
+              presentation.state == effectivePresentationState else {
             return
         }
-        guard let line = snapshot.library.lines.first(where: { $0.id == lineID }),
-              line.state == presentation.state else {
-            dialogueVoiceCoordinator.cancelPendingAutomaticPlayback()
-            stateDialoguePresentation = nil
-            player.view.showDialogueMessage(nil)
+        guard !dialogueVoiceCoordinator.isAutomaticPlaybackActive else {
             return
         }
-
-        if presentation.lineRevision != line.revision {
-            dialogueVoiceCoordinator.cancelPendingAutomaticPlayback()
-            presentation.lineRevision = line.revision
-            presentation.audioDisposition = .pending
-        } else if line.status != .ready, presentation.audioDisposition == .deferred {
-            dialogueVoiceCoordinator.cancelPendingAutomaticPlayback()
+        let selectedLine = presentation.lineID.flatMap { lineID in
+            snapshot.library.lines.first { line in
+                line.id == lineID && line.state == presentation.state
+            }
+        } ?? snapshot.library.preferredLine(for: presentation.state)
+        if presentation.lineID != selectedLine?.id || presentation.lineRevision != selectedLine?.revision {
+            presentation.lineID = selectedLine?.id
+            presentation.lineRevision = selectedLine?.revision
+            presentation.text = selectedLine?.text
             presentation.audioDisposition = .pending
         }
-        presentation.text = line.text
         stateDialoguePresentation = presentation
-        player.view.showDialogueMessage(line.text)
-        retryStateOwnedDialogueAudioIfReady()
+        player.view.showDialogueMessage(presentation.text)
+        ensureStateOwnedDialoguePlayback()
     }
 
-    private func retryStateOwnedDialogueAudioIfReady() {
-        guard var presentation = stateDialoguePresentation,
-              presentation.state == effectivePresentationState,
-              presentation.audioDisposition == .pending,
-              let lineID = presentation.lineID,
-              let line = dialogueVoiceCoordinator.library.lines.first(where: { $0.id == lineID }),
-              line.revision == presentation.lineRevision,
-              line.state == presentation.state,
-              line.status == .ready else {
-            return
-        }
-
-        switch dialogueVoiceCoordinator.playReadyLineAutomatically(
-            id: lineID,
+    private func ensureStateOwnedDialoguePlayback() {
+        guard let presentation = stateDialoguePresentation,
+              presentation.state == effectivePresentationState else { return }
+        applyStateOwnedDialoguePlaybackResult(
+            dialogueVoiceCoordinator.ensureAutomaticPlayback(
+                for: presentation.state,
+                requestID: presentation.id
+            ),
             requestID: presentation.id
-        ) {
-        case .played:
-            // The coordinator's start callback records delivery synchronously.
-            break
-        case .deferred:
-            presentation.audioDisposition = .deferred
-            stateDialoguePresentation = presentation
-            logger.info("event=state_dialogue_deferred state=\(presentation.state.rawValue, privacy: .public)")
-        case .unavailable:
-            break
-        }
+        )
     }
 
-    private func markStateOwnedDialogueAudioDelivered(requestID: UUID, lineID: UUID) {
+    private func applyStateOwnedDialoguePlaybackResult(
+        _ result: DialoguePlaybackResult,
+        requestID: UUID
+    ) {
+        guard result == .deferred,
+              var presentation = stateDialoguePresentation,
+              presentation.id == requestID,
+              presentation.audioDisposition != .delivered else { return }
+        presentation.audioDisposition = .deferred
+        stateDialoguePresentation = presentation
+        logger.info("event=state_dialogue_deferred state=\(presentation.state.rawValue, privacy: .public)")
+    }
+
+    private func markStateOwnedDialogueAudioDelivered(requestID: UUID, line: DialogueLine) {
         guard var presentation = stateDialoguePresentation,
               presentation.id == requestID,
               presentation.state == effectivePresentationState,
-              presentation.lineID == lineID,
-              presentation.audioDisposition != .delivered else {
+              presentation.recordAutomaticPlaybackStarted(line) else {
             return
         }
-        presentation.audioDisposition = .delivered
         stateDialoguePresentation = presentation
+        player?.view.showDialogueMessage(line.text)
         logger.info("event=state_dialogue_started state=\(presentation.state.rawValue, privacy: .public)")
+    }
+
+    private func finishStateOwnedDialogueAudio(requestID: UUID, lineID: UUID) {
+        guard var presentation = stateDialoguePresentation,
+              presentation.state == effectivePresentationState else {
+            player?.view.showDialogueMessage(nil)
+            return
+        }
+        let selectedLine = dialogueVoiceCoordinator.library.lines.first { line in
+            line.id == lineID && line.state == presentation.state
+        } ?? dialogueVoiceCoordinator.preferredLine(for: presentation.state)
+        switch presentation.recordAutomaticPlaybackFinished(
+            requestID: requestID,
+            lineID: lineID,
+            replacementLine: selectedLine
+        ) {
+        case .updated:
+            stateDialoguePresentation = presentation
+            player?.view.showDialogueMessage(presentation.text)
+        case .revealCurrent:
+            player?.view.showDialogueMessage(presentation.text)
+        case .ignored:
+            break
+        }
     }
 
     private func selectedEntry(
@@ -1489,6 +1553,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
         controller.onSaveVoiceProfile = { [weak self] draft in self?.saveVoiceProfile(draft) }
         controller.onRemoveVoiceProfile = { [weak self] profile in self?.confirmVoiceProfileRemoval(profile) }
+        controller.onDialogueVoicePlaybackSettingsChange = { [weak self] settings in
+            self?.updateDialogueVoicePlaybackSettings(settings)
+        }
         controller.onAddDialogueLine = { [weak self] text, language, state in
             self?.addDialogueLine(text: text, language: language, state: state)
         }
@@ -2016,6 +2083,16 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private func addDialogueLine(text: String, language: String, state: PetState) {
         do {
             try dialogueVoiceCoordinator.addLine(text: text, language: language, state: state)
+        } catch {
+            presentSettingsError(error.localizedDescription)
+        }
+    }
+
+    private func updateDialogueVoicePlaybackSettings(
+        _ settings: DialogueVoicePlaybackSettings
+    ) {
+        do {
+            try dialogueVoiceCoordinator.updatePlaybackSettings(settings)
         } catch {
             presentSettingsError(error.localizedDescription)
         }

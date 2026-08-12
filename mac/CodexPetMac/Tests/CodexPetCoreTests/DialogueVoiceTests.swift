@@ -33,6 +33,11 @@ final class DialogueVoiceTests: XCTestCase {
 
     func testRoundTripAndStoreUsesPrivatePermissions() throws {
         var library = try libraryWithQueuedLine(state: .review)
+        library.updatePlaybackSettings(try DialogueVoicePlaybackSettings(
+            automaticPlaybackEnabled: false,
+            volume: 0.35,
+            repeatIntervalSeconds: 45
+        ))
         let ticket = try library.beginGeneration(for: lineID)
         try library.completeGeneration(ticket: ticket, outputPath: "audio/line.wav")
 
@@ -54,6 +59,101 @@ final class DialogueVoiceTests: XCTestCase {
         ).intValue & 0o777
         XCTAssertEqual(rootMode, 0o700)
         XCTAssertEqual(fileMode, 0o600)
+    }
+
+    func testPlaybackSettingsDefaultsAndValidation() throws {
+        XCTAssertEqual(
+            try DialogueVoicePlaybackSettings(),
+            DialogueVoicePlaybackSettings.defaults
+        )
+        XCTAssertTrue(DialogueVoicePlaybackSettings.defaults.automaticPlaybackEnabled)
+        XCTAssertEqual(DialogueVoicePlaybackSettings.defaults.volume, 1)
+        XCTAssertNil(DialogueVoicePlaybackSettings.defaults.repeatIntervalSeconds)
+
+        for automaticPlaybackEnabled in [false, true] {
+            XCTAssertNoThrow(try DialogueVoicePlaybackSettings(
+                automaticPlaybackEnabled: automaticPlaybackEnabled,
+                volume: 0,
+                repeatIntervalSeconds: DialogueVoicePlaybackSettings.minimumRepeatIntervalSeconds
+            ))
+            XCTAssertNoThrow(try DialogueVoicePlaybackSettings(
+                automaticPlaybackEnabled: automaticPlaybackEnabled,
+                volume: 1,
+                repeatIntervalSeconds: DialogueVoicePlaybackSettings.maximumRepeatIntervalSeconds
+            ))
+        }
+
+        for volume in [Double.nan, -.infinity, .infinity, -0.000_001, 1.000_001] {
+            XCTAssertThrowsError(try DialogueVoicePlaybackSettings(volume: volume)) {
+                XCTAssertEqual($0 as? DialogueVoiceError, .invalidPlaybackSettings)
+            }
+        }
+        for interval in [Double.nan, -.infinity, .infinity, 4.999_999, 3_600.000_001] {
+            XCTAssertThrowsError(try DialogueVoicePlaybackSettings(repeatIntervalSeconds: interval)) {
+                XCTAssertEqual($0 as? DialogueVoiceError, .invalidPlaybackSettings)
+            }
+        }
+    }
+
+    func testPlaybackSettingsRoundTripAndRejectBooleanNumericFields() throws {
+        let settings = try DialogueVoicePlaybackSettings(
+            automaticPlaybackEnabled: false,
+            volume: 0.25,
+            repeatIntervalSeconds: 120
+        )
+        let encoded = try JSONEncoder().encode(settings)
+        XCTAssertEqual(try JSONDecoder().decode(DialogueVoicePlaybackSettings.self, from: encoded), settings)
+
+        for key in ["volume", "repeat_interval_seconds"] {
+            var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+            object[key] = true
+            let malformed = try JSONSerialization.data(withJSONObject: object)
+            XCTAssertThrowsError(
+                try JSONDecoder().decode(DialogueVoicePlaybackSettings.self, from: malformed),
+                "accepted a Boolean for \(key)"
+            )
+        }
+    }
+
+    func testLegacyLibraryJSONMigratesPlaybackSettingsWithoutVersionChange() throws {
+        let library = try libraryWithQueuedLine()
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(library)) as? [String: Any]
+        )
+        object.removeValue(forKey: "playback_settings")
+        let legacyData = try JSONSerialization.data(withJSONObject: object)
+        let migrated = try JSONDecoder().decode(DialogueVoiceLibrary.self, from: legacyData)
+
+        XCTAssertEqual(migrated.version, DialogueVoiceLibrary.schemaVersion)
+        XCTAssertEqual(migrated.playbackSettings, .defaults)
+        XCTAssertEqual(migrated.lines, library.lines)
+        XCTAssertEqual(migrated.profile, library.profile)
+    }
+
+    func testUpdatingPlaybackSettingsPreservesDialogueAndSynthesisPolicy() throws {
+        var library = try libraryWithQueuedLine(state: .waiting)
+        let ticket = try library.beginGeneration(for: lineID)
+        _ = try library.completeGeneration(ticket: ticket, outputPath: "voice/generated/ready.wav")
+        let originalProfile = library.profile
+        let originalLines = library.lines
+        let originalPolicyVersion = library.lines[0].generatedSynthesisPolicyVersion
+        let settings = try DialogueVoicePlaybackSettings(
+            automaticPlaybackEnabled: false,
+            volume: 0.6,
+            repeatIntervalSeconds: 30
+        )
+
+        library.updatePlaybackSettings(settings)
+
+        XCTAssertEqual(library.playbackSettings, settings)
+        XCTAssertEqual(library.profile, originalProfile)
+        XCTAssertEqual(library.lines, originalLines)
+        XCTAssertEqual(library.lines[0].generatedSynthesisPolicyVersion, originalPolicyVersion)
+        XCTAssertEqual(originalPolicyVersion, DialogueSynthesisPolicy.currentVersion)
+
+        try library.setProfileStatus(.unavailable)
+        XCTAssertEqual(library.playbackSettings, settings)
+        XCTAssertEqual(library.lines, originalLines)
     }
 
     func testDialogueStateRoundTripsAndLegacyLinesMigrateToIdle() throws {

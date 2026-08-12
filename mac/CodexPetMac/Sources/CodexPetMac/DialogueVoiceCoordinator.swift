@@ -73,6 +73,18 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         var requiresNotice: Bool { issue != nil }
     }
 
+    private struct AutomaticPlaybackSession {
+        let sequence: UInt64
+        let state: PetState
+        let requestID: UUID
+        var pendingOpportunity: Bool
+    }
+
+    private enum ActiveVoicePlayback {
+        case automatic(requestID: UUID, lineID: UUID)
+        case manual
+    }
+
     private let logger = Logger(subsystem: StateletIdentity.bundleIdentifier, category: "dialogue-voice")
     private let applicationSupportRoot: URL
     private let store: DialogueVoiceStore
@@ -81,6 +93,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     private let client: GPTSoVITSAPIClient
     private let audioPlayer: DialogueAudioPlaying
     private let playbackService: DialogueReadyPlaybackService
+    private let randomIndex: @Sendable (Int) -> Int
+    private let sleepForInterval: @Sendable (TimeInterval) async throws -> Void
 
     private(set) var library: DialogueVoiceLibrary
     private(set) var draft: DialogueVoiceProfileDraft
@@ -88,8 +102,15 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     private(set) var activityMessage: String?
 
     private var activeGenerationTask: Task<Void, Never>?
-    private var pendingAutomaticPlaybackTask: Task<Void, Never>?
+    private var automaticPlaybackTask: Task<Void, Never>?
+    private var automaticPlaybackSession: AutomaticPlaybackSession?
     private var automaticPlaybackSequence: UInt64 = 0
+    private var automaticPlaybackTimerSequence: UInt64 = 0
+    private var voicePlaybackSequence: UInt64 = 0
+    private var activeVoicePlayback: ActiveVoicePlayback?
+    private var lastAutomaticLineIDByState: [PetState: UUID] = [:]
+    private var lastFailedAutomaticLineIDByState: [PetState: UUID] = [:]
+    private var lastNotifiedLibrary: DialogueVoiceLibrary?
     private var activeTicket: DialogueGenerationTicket?
     private var activeImportTask: Task<Void, Never>?
     private var profileValidationTask: Task<Void, Never>?
@@ -100,13 +121,27 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     private var started = false
 
     var onChange: ((DialogueVoiceCoordinatorSnapshot) -> Void)?
-    var onAutomaticPlaybackStarted: ((UUID, UUID) -> Void)?
+    var onAutomaticPlaybackStarted: ((UUID, DialogueLine) -> Void)?
+    var onAutomaticPlaybackFinished: ((UUID, UUID) -> Void)?
+
+    var isAutomaticPlaybackActive: Bool {
+        guard audioPlayer.isPlaying,
+              case .automatic = activeVoicePlayback else { return false }
+        return true
+    }
 
     init(
         applicationSupportRoot: URL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(StateletIdentity.applicationSupportRelativePath, isDirectory: true),
         client: GPTSoVITSAPIClient = GPTSoVITSAPIClient(),
-        audioPlayer: DialogueAudioPlaying = DialogueAudioPlayer()
+        audioPlayer: DialogueAudioPlaying = DialogueAudioPlayer(),
+        randomIndex: @escaping @Sendable (Int) -> Int = { upperBound in
+            Int.random(in: 0..<upperBound)
+        },
+        sleepForInterval: @escaping @Sendable (TimeInterval) async throws -> Void = { seconds in
+            let nanoseconds = UInt64((seconds * 1_000_000_000).rounded())
+            try await Task.sleep(nanoseconds: nanoseconds)
+        }
     ) {
         self.applicationSupportRoot = applicationSupportRoot
         let voiceRoot = applicationSupportRoot.appendingPathComponent("voice", isDirectory: true)
@@ -115,6 +150,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         publisher = DialogueVoiceAudioPublisher(applicationSupportRoot: applicationSupportRoot)
         self.client = client
         self.audioPlayer = audioPlayer
+        self.randomIndex = randomIndex
+        self.sleepForInterval = sleepForInterval
         playbackService = DialogueReadyPlaybackService(
             applicationSupportRoot: applicationSupportRoot,
             player: audioPlayer
@@ -128,6 +165,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             referenceText: ""
         )
         importedAssets = DialogueVoiceImportedAssets()
+        audioPlayer.volume = Float(library.playbackSettings.volume)
     }
 
     var snapshot: DialogueVoiceCoordinatorSnapshot {
@@ -154,6 +192,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                 return
             }
         }
+        audioPlayer.volume = Float(library.playbackSettings.volume)
         importedAssets = DialogueVoiceImportedAssets(profile: library.profile)
         if let profile = library.profile {
             draft = DialogueVoiceProfileDraft(
@@ -229,7 +268,9 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         activeGenerationTask?.cancel()
         activeGenerationTask = nil
         activeTicket = nil
-        cancelPendingAutomaticPlayback()
+        cancelAutomaticPlayback()
+        voicePlaybackSequence &+= 1
+        activeVoicePlayback = nil
         audioPlayer.stop()
         if !persistenceBlocked {
             _ = retryPendingCleanup(preserving: [])
@@ -349,6 +390,9 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         profileValidationTask = nil
         validatedAssetIdentities = nil
         activeGenerationTask?.cancel()
+        cancelAutomaticPlayback()
+        voicePlaybackSequence &+= 1
+        activeVoicePlayback = nil
         audioPlayer.stop()
         let priorGeneratedPaths = library.lines.compactMap(\.outputRelativePath)
         let replacedAssetPaths = replacedAssets(
@@ -395,6 +439,9 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         profileValidationTask = nil
         validatedAssetIdentities = nil
         activeGenerationTask?.cancel()
+        cancelAutomaticPlayback()
+        voicePlaybackSequence &+= 1
+        activeVoicePlayback = nil
         audioPlayer.stop()
         let profile = library.profile
         let managedAssetPaths = Set([
@@ -419,7 +466,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         var updated = try DialogueVoiceLibrary(
             profile: nil,
             lines: resetLines,
-            pendingCleanupPaths: library.pendingCleanupPaths
+            pendingCleanupPaths: library.pendingCleanupPaths,
+            playbackSettings: library.playbackSettings
         )
         try updated.enqueueCleanup(paths: generatedPaths + managedAssetPaths.sorted())
         try store.save(updated)
@@ -546,7 +594,22 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     @discardableResult
     func playReadyLine(id: UUID) -> DialoguePlaybackResult {
         assertMainThread()
-        return playbackService.playReadyLine(id: id, in: library)
+        let playbackToken = voicePlaybackSequence &+ 1
+        let result = playbackService.playReadyLine(
+            id: id,
+            in: library,
+            onFinished: playbackCompletion(for: playbackToken)
+        )
+        if result == .played {
+            cancelAutomaticPlaybackTimer()
+            voicePlaybackSequence = playbackToken
+            activeVoicePlayback = .manual
+        } else if !audioPlayer.isPlaying {
+            voicePlaybackSequence = playbackToken
+            activeVoicePlayback = nil
+            resumeAutomaticPlaybackAfterAudioFinishes()
+        }
+        return result
     }
 
     func preferredLine(for state: PetState) -> DialogueLine? {
@@ -554,71 +617,219 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         return library.preferredLine(for: state)
     }
 
-    /// Automatic lifecycle playback never interrupts an existing preview or
-    /// lifecycle clip. If audio is busy, only the latest state-entry request is
-    /// retained and played when the current clip finishes. Manual preview
-    /// continues to use `playReadyLine(id:)`.
-    @discardableResult
-    func playPreferredReadyLine(for state: PetState) -> DialoguePlaybackResult {
+    func updatePlaybackSettings(_ settings: DialogueVoicePlaybackSettings) throws {
         assertMainThread()
-        guard let line = library.preferredLine(for: state) else {
-            cancelPendingAutomaticPlayback()
-            return .unavailable(.notReady)
+        guard !persistenceBlocked else { throw DialogueVoiceError.storeFailure }
+        _ = try commit { library in
+            library.updatePlaybackSettings(settings)
         }
-        return playReadyLineAutomatically(id: line.id)
+        audioPlayer.volume = Float(settings.volume)
+        activityMessage = "Voice playback settings saved."
+        notify()
     }
 
+    /// Starts a new state-entry opportunity. Existing voice audio may finish,
+    /// but it can never schedule work for the replaced state session.
     @discardableResult
-    func playReadyLineAutomatically(
-        id: UUID,
+    func beginAutomaticPlayback(
+        for state: PetState,
         requestID: UUID = UUID()
     ) -> DialoguePlaybackResult {
         assertMainThread()
-        cancelPendingAutomaticPlayback()
-        guard let line = library.lines.first(where: { $0.id == id }),
-              line.status == .ready else {
+        cancelAutomaticPlaybackTimer()
+        automaticPlaybackSequence &+= 1
+        guard library.playbackSettings.automaticPlaybackEnabled else {
+            automaticPlaybackSession = nil
             return .unavailable(.notReady)
         }
-        guard audioPlayer.isPlaying else {
-            let result = playbackService.playReadyLine(id: id, in: library)
-            if result == .played {
-                onAutomaticPlaybackStarted?(requestID, id)
-            }
-            return result
-        }
+        automaticPlaybackSession = AutomaticPlaybackSession(
+            sequence: automaticPlaybackSequence,
+            state: state,
+            requestID: requestID,
+            pendingOpportunity: true
+        )
+        return attemptAutomaticPlayback()
+    }
 
-        automaticPlaybackSequence &+= 1
-        let sequence = automaticPlaybackSequence
-        pendingAutomaticPlaybackTask = Task { @MainActor [weak self] in
-            while let self, !Task.isCancelled {
-                guard sequence == self.automaticPlaybackSequence else { return }
-                if !self.audioPlayer.isPlaying {
-                    self.pendingAutomaticPlaybackTask = nil
-                    guard let current = self.library.lines.first(where: { $0.id == id }),
-                          current.status == .ready else {
-                        return
-                    }
-                    let result = self.playbackService.playReadyLine(id: id, in: self.library)
-                    if result == .played {
-                        self.onAutomaticPlaybackStarted?(requestID, id)
-                    }
-                    return
-                }
-                do {
-                    try await Task.sleep(nanoseconds: 50_000_000)
-                } catch {
-                    return
-                }
-            }
+    /// Keeps the current state session alive across non-library snapshot
+    /// updates, while allowing a cancelled or newly enabled session to resume.
+    @discardableResult
+    func ensureAutomaticPlayback(
+        for state: PetState,
+        requestID: UUID
+    ) -> DialoguePlaybackResult {
+        assertMainThread()
+        guard library.playbackSettings.automaticPlaybackEnabled else {
+            cancelAutomaticPlayback()
+            return .unavailable(.notReady)
         }
-        return .deferred
+        guard let session = automaticPlaybackSession,
+              session.state == state,
+              session.requestID == requestID else {
+            return beginAutomaticPlayback(for: state, requestID: requestID)
+        }
+        if session.pendingOpportunity {
+            return attemptAutomaticPlayback()
+        }
+        if audioPlayer.isPlaying || automaticPlaybackTask != nil {
+            return .deferred
+        }
+        scheduleAutomaticRepeatIfNeeded()
+        return library.playbackSettings.repeatIntervalSeconds == nil
+            ? .unavailable(.notReady)
+            : .deferred
+    }
+
+    @discardableResult
+    func playPreferredReadyLine(for state: PetState) -> DialoguePlaybackResult {
+        beginAutomaticPlayback(for: state)
+    }
+
+    func cancelAutomaticPlayback() {
+        assertMainThread()
+        cancelAutomaticPlaybackTimer()
+        automaticPlaybackSequence &+= 1
+        automaticPlaybackSession = nil
     }
 
     func cancelPendingAutomaticPlayback() {
+        cancelAutomaticPlayback()
+    }
+
+    private func attemptAutomaticPlayback() -> DialoguePlaybackResult {
+        guard var session = automaticPlaybackSession,
+              session.pendingOpportunity,
+              library.playbackSettings.automaticPlaybackEnabled else {
+            return .unavailable(.notReady)
+        }
+        guard !audioPlayer.isPlaying else { return .deferred }
+
+        guard let line = automaticCandidate(for: session.state) else {
+            return .unavailable(.notReady)
+        }
+
+        let playbackToken = voicePlaybackSequence &+ 1
+        let result = playbackService.playReadyLine(
+            id: line.id,
+            in: library,
+            onFinished: playbackCompletion(for: playbackToken)
+        )
+        if result == .played {
+            voicePlaybackSequence = playbackToken
+            activeVoicePlayback = .automatic(requestID: session.requestID, lineID: line.id)
+            session.pendingOpportunity = false
+            automaticPlaybackSession = session
+            lastAutomaticLineIDByState[session.state] = line.id
+            lastFailedAutomaticLineIDByState[session.state] = nil
+            onAutomaticPlaybackStarted?(session.requestID, line)
+            logger.info("event=automatic_dialogue_started state=\(session.state.rawValue, privacy: .public) line_id=\(line.id.uuidString, privacy: .public)")
+            return .played
+        }
+        lastFailedAutomaticLineIDByState[session.state] = line.id
+        session.pendingOpportunity = false
+        automaticPlaybackSession = session
+        scheduleAutomaticRepeatIfNeeded()
+        return result
+    }
+
+    private func automaticCandidate(for state: PetState) -> DialogueLine? {
+        guard library.profileStatus == .ready || library.profileStatus == .unavailable else {
+            return nil
+        }
+        var candidates = library.lines.filter { line in
+            line.state == state && line.status == .ready && line.outputRelativePath != nil
+        }
+        if candidates.count >= 2, let failedID = lastFailedAutomaticLineIDByState[state] {
+            candidates.removeAll { $0.id == failedID }
+        }
+        if candidates.count >= 2, let previousID = lastAutomaticLineIDByState[state] {
+            candidates.removeAll { $0.id == previousID }
+        }
+        guard !candidates.isEmpty else { return nil }
+        let rawIndex = randomIndex(candidates.count)
+        let index = ((rawIndex % candidates.count) + candidates.count) % candidates.count
+        return candidates[index]
+    }
+
+    private func playbackCompletion(for token: UInt64) -> () -> Void {
+        { [weak self] in
+            DispatchQueue.main.async { [weak self] in
+                self?.voicePlaybackFinished(token: token)
+            }
+        }
+    }
+
+    private func voicePlaybackFinished(token: UInt64) {
         assertMainThread()
-        automaticPlaybackSequence &+= 1
-        pendingAutomaticPlaybackTask?.cancel()
-        pendingAutomaticPlaybackTask = nil
+        guard token == voicePlaybackSequence else { return }
+        let completedPlayback = activeVoicePlayback
+        activeVoicePlayback = nil
+        if case let .automatic(requestID, lineID) = completedPlayback {
+            onAutomaticPlaybackFinished?(requestID, lineID)
+        }
+        resumeAutomaticPlaybackAfterAudioFinishes()
+    }
+
+    private func resumeAutomaticPlaybackAfterAudioFinishes() {
+        guard let session = automaticPlaybackSession,
+              library.playbackSettings.automaticPlaybackEnabled else { return }
+        if session.pendingOpportunity {
+            _ = attemptAutomaticPlayback()
+        } else {
+            scheduleAutomaticRepeatIfNeeded()
+        }
+    }
+
+    private func scheduleAutomaticRepeatIfNeeded() {
+        cancelAutomaticPlaybackTimer()
+        guard let session = automaticPlaybackSession,
+              !session.pendingOpportunity,
+              !audioPlayer.isPlaying,
+              library.playbackSettings.automaticPlaybackEnabled,
+              let interval = library.playbackSettings.repeatIntervalSeconds else { return }
+        let sequence = session.sequence
+        let sleeper = sleepForInterval
+        let timerSequence = automaticPlaybackTimerSequence
+        automaticPlaybackTask = Task { @MainActor [weak self] in
+            do {
+                try await sleeper(interval)
+            } catch {
+                return
+            }
+            guard let self,
+                  !Task.isCancelled,
+                  self.automaticPlaybackTimerSequence == timerSequence,
+                  var current = self.automaticPlaybackSession,
+                  current.sequence == sequence,
+                  current.state == session.state,
+                  current.requestID == session.requestID else { return }
+            self.automaticPlaybackTask = nil
+            current.pendingOpportunity = true
+            self.automaticPlaybackSession = current
+            _ = self.attemptAutomaticPlayback()
+        }
+    }
+
+    private func cancelAutomaticPlaybackTimer() {
+        automaticPlaybackTimerSequence &+= 1
+        automaticPlaybackTask?.cancel()
+        automaticPlaybackTask = nil
+    }
+
+    private func reconcileAutomaticPlaybackAfterLibraryChange() {
+        audioPlayer.volume = Float(library.playbackSettings.volume)
+        lastFailedAutomaticLineIDByState = [:]
+        guard library.playbackSettings.automaticPlaybackEnabled else {
+            cancelAutomaticPlayback()
+            return
+        }
+        cancelAutomaticPlaybackTimer()
+        guard let session = automaticPlaybackSession else { return }
+        if session.pendingOpportunity, !audioPlayer.isPlaying {
+            _ = attemptAutomaticPlayback()
+        } else if !audioPlayer.isPlaying {
+            scheduleAutomaticRepeatIfNeeded()
+        }
     }
 
     private func validatePersistedProfile(_ profile: GPTSoVITSVoiceProfile) {
@@ -938,6 +1149,10 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     }
 
     private func notify() {
+        if lastNotifiedLibrary != library {
+            lastNotifiedLibrary = library
+            reconcileAutomaticPlaybackAfterLibraryChange()
+        }
         onChange?(snapshot)
     }
 

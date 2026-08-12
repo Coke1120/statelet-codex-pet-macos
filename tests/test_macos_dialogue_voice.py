@@ -252,6 +252,95 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         self.assertIn("lastAppliedProfileDraft", self.voice_view)
         self.assertIn("lastAppliedEditorLine", self.voice_view)
 
+    def test_dialogue_page_exposes_accessible_voice_playback_controls(self) -> None:
+        self.assertIn('checkboxWithTitle: "Automatic playback"', self.voice_view)
+        self.assertIn("NSSlider(value: 100, minValue: 0, maxValue: 100", self.voice_view)
+        self.assertIn('fieldLabel("Voice volume")', self.voice_view)
+        self.assertIn('fieldLabel("Repeat interval")', self.voice_view)
+        self.assertIn(
+            '"Never", "15s", "30s", "60s", "120s", "300s", "600s"',
+            self.voice_view,
+        )
+        self.assertIn(
+            "private let repeatIntervalValues: [TimeInterval?] = [nil, 15, 30, 60, 120, 300, 600]",
+            self.voice_view,
+        )
+        for label in (
+            "Automatic voice playback",
+            "Voice volume",
+            "Voice volume value",
+            "Automatic voice repeat interval",
+        ):
+            self.assertIn(f'AccessibilityLabel("{label}")', self.voice_view)
+        self.assertIn("voiceVolumeSlider.setAccessibilityValue", self.voice_view)
+
+    def test_playback_snapshot_refresh_is_silent_and_preserves_dialogue_drafts(self) -> None:
+        update = method_body(self.voice_view, "    func update")
+        self.assertIn("let preserveProfileEdits = profileEditorIsDirty", update)
+        self.assertIn("let preserveNewDialogueText = newDialogueTextIsDirty", update)
+        self.assertIn("isRefreshing = true", update)
+        self.assertIn("applyPlaybackSettings(library.playbackSettings)", update)
+        self.assertLess(
+            update.index("isRefreshing = true"),
+            update.index("applyPlaybackSettings(library.playbackSettings)"),
+        )
+        apply_settings = method_body(
+            self.voice_view,
+            "    private func applyPlaybackSettings",
+        )
+        self.assertNotIn("onPlaybackSettingsChange", apply_settings)
+        action = method_body(
+            self.voice_view,
+            "    @objc private func playbackSettingsChanged()",
+        )
+        self.assertIn("guard !isRefreshing", action)
+        self.assertIn("let settings = validatedPlaybackSettings()", action)
+        self.assertIn("onPlaybackSettingsChange?(settings)", action)
+
+    def test_playback_controls_emit_validated_settings_through_window_controller(self) -> None:
+        validated = method_body(
+            self.voice_view,
+            "    private func validatedPlaybackSettings",
+        )
+        self.assertIn("return try? DialogueVoicePlaybackSettings(", validated)
+        self.assertIn("automaticPlaybackEnabled: automaticPlaybackCheckbox.state == .on", validated)
+        self.assertIn("volume: min(max(voiceVolumeSlider.doubleValue / 100, 0), 1)", validated)
+        self.assertIn("repeatIntervalSeconds: repeatInterval", validated)
+        self.assertIn("let customRepeatInterval", validated)
+        apply_settings = method_body(
+            self.voice_view,
+            "    private func applyPlaybackSettings",
+        )
+        self.assertIn("customRepeatInterval = customInterval", apply_settings)
+        self.assertIn("(Custom)", apply_settings)
+        self.assertNotIn("?? 0", apply_settings)
+        self.assertIn(
+            "var onPlaybackSettingsChange: ((DialogueVoicePlaybackSettings) -> Void)?",
+            self.voice_view,
+        )
+        self.assertIn(
+            "var onDialogueVoicePlaybackSettingsChange: ((DialogueVoicePlaybackSettings) -> Void)?",
+            self.settings,
+        )
+        wiring = method_body(self.settings, "    private func configureDialogueVoicePane")
+        self.assertIn("dialogueVoiceView.onPlaybackSettingsChange", wiring)
+        self.assertIn("onDialogueVoicePlaybackSettingsChange?(settings)", wiring)
+        app_wiring = method_body(self.app_delegate, "    private func makeSettingsController")
+        self.assertIn("controller.onDialogueVoicePlaybackSettingsChange", app_wiring)
+        self.assertIn("updateDialogueVoicePlaybackSettings(settings)", app_wiring)
+        persistence = method_body(
+            self.app_delegate,
+            "    private func updateDialogueVoicePlaybackSettings",
+        )
+        self.assertIn("dialogueVoiceCoordinator.updatePlaybackSettings(settings)", persistence)
+
+    def test_manual_preview_enablement_is_independent_of_automatic_playback(self) -> None:
+        enablement = method_body(self.voice_view, "    private func refreshButtonEnablement")
+        self.assertIn("previewButton.isEnabled = line?.status == .ready", enablement)
+        self.assertNotIn("automaticPlaybackCheckbox", enablement)
+        preview_action = method_body(self.voice_view, "    @objc private func previewLine()")
+        self.assertNotIn("automaticPlaybackCheckbox", preview_action)
+
     def test_background_refresh_preserves_an_unselected_new_dialogue_draft(self) -> None:
         text_dirty = re.search(
             r"private var newDialogueTextIsDirty: Bool \{(?P<body>[\s\S]*?)\n    \}",
@@ -365,38 +454,93 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         )
         self.assertIn("stateDialoguePresentation?.state == state", presentation)
         self.assertIn("lineID: line?.id", presentation)
-        self.assertIn("retryStateOwnedDialogueAudioIfReady()", presentation)
+        self.assertIn("keepSpokenMessage", presentation)
+        self.assertIn("if !keepSpokenMessage", presentation)
+        self.assertIn("beginAutomaticPlayback(", presentation)
+        self.assertIn("requestID: presentation.id", presentation)
         lifecycle_start = method_body(
             self.app_delegate,
             "    private func startLifecyclePresentation",
         )
         self.assertIn("stateDialoguePresentation?.state != state", lifecycle_start)
+        self.assertIn("let keepSpokenMessage = dialogueVoiceCoordinator.isAutomaticPlaybackActive", lifecycle_start)
+        self.assertIn("if !keepSpokenMessage", lifecycle_start)
         self.assertLess(
-            lifecycle_start.index("cancelPendingAutomaticPlayback()"),
+            lifecycle_start.index("cancelAutomaticPlayback()"),
             lifecycle_start.index("let started = DispatchTime.now()"),
         )
         refresh = method_body(
             self.app_delegate,
             "    private func refreshStateOwnedDialogue",
         )
+        self.assertIn("guard !dialogueVoiceCoordinator.isAutomaticPlaybackActive", refresh)
+        self.assertLess(
+            refresh.index("guard !dialogueVoiceCoordinator.isAutomaticPlaybackActive"),
+            refresh.index("let selectedLine"),
+        )
         self.assertIn("presentation.lineID", refresh)
         self.assertIn("line.state == presentation.state", refresh)
-        self.assertNotIn("preferredLine(for:", refresh)
+        self.assertIn("preferredLine(for: presentation.state)", refresh)
         self.assertIn("presentation.audioDisposition = .pending", refresh)
-        retry = method_body(
+        ensure = method_body(
             self.app_delegate,
-            "    private func retryStateOwnedDialogueAudioIfReady",
+            "    private func ensureStateOwnedDialoguePlayback",
         )
-        self.assertIn("line.state == presentation.state", retry)
-        automatic = method_body(
+        self.assertIn("ensureAutomaticPlayback(", ensure)
+        automatic_entry = method_body(
             self.coordinator,
-            "    func playReadyLineAutomatically",
+            "    func beginAutomaticPlayback",
         )
-        self.assertIn("cancelPendingAutomaticPlayback()", automatic)
-        self.assertIn("while let self, !Task.isCancelled", automatic)
-        self.assertIn("!self.audioPlayer.isPlaying", automatic)
-        self.assertIn("return .deferred", automatic)
-        self.assertIn("onAutomaticPlaybackStarted?(requestID, id)", automatic)
+        self.assertIn("pendingOpportunity: true", automatic_entry)
+        self.assertIn("attemptAutomaticPlayback()", automatic_entry)
+        automatic_attempt = method_body(
+            self.coordinator,
+            "    private func attemptAutomaticPlayback",
+        )
+        self.assertIn("automaticCandidate", automatic_attempt)
+        self.assertIn("guard !audioPlayer.isPlaying", automatic_attempt)
+        self.assertIn("playbackService.playReadyLine", automatic_attempt)
+        self.assertIn("onAutomaticPlaybackStarted?(session.requestID, line)", automatic_attempt)
+        self.assertNotIn("synthesize", automatic_attempt)
+        scheduler = method_body(
+            self.coordinator,
+            "    private func scheduleAutomaticRepeatIfNeeded",
+        )
+        self.assertIn("sleepForInterval", scheduler)
+        self.assertNotIn("while", scheduler)
+        candidates = method_body(
+            self.coordinator,
+            "    private func automaticCandidate",
+        )
+        self.assertIn("line.status == .ready", candidates)
+        self.assertIn("line.outputRelativePath != nil", candidates)
+        self.assertNotIn("readManagedFile", candidates)
+        self.assertIn("candidates.count >= 2", candidates)
+        self.assertIn("lastAutomaticLineIDByState", candidates)
+        self.assertIn("lastFailedAutomaticLineIDByState", candidates)
+        finished = method_body(
+            self.coordinator,
+            "    private func voicePlaybackFinished",
+        )
+        self.assertIn("onAutomaticPlaybackFinished?(requestID, lineID)", finished)
+        self.assertLess(
+            finished.index("onAutomaticPlaybackFinished?(requestID, lineID)"),
+            finished.index("resumeAutomaticPlaybackAfterAudioFinishes()"),
+        )
+        bubble_finish = method_body(
+            self.app_delegate,
+            "    private func finishStateOwnedDialogueAudio",
+        )
+        self.assertIn("line.id == lineID && line.state == presentation.state", bubble_finish)
+        self.assertIn("presentation.recordAutomaticPlaybackFinished(", bubble_finish)
+        self.assertIn("showDialogueMessage(presentation.text)", bubble_finish)
+        finish_reducer = method_body(
+            self.app_delegate,
+            "    mutating func recordAutomaticPlaybackFinished",
+        )
+        self.assertIn("guard id == requestID", finish_reducer)
+        self.assertIn("guard lineID == finishedLineID", finish_reducer)
+        self.assertIn("audioDisposition = .pending", finish_reducer)
 
     def test_voice_page_default_and_user_selection_are_preserved(self) -> None:
         update = method_body(self.voice_view, "    func update")

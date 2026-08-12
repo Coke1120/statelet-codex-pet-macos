@@ -26,6 +26,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     var onPreviewLine: ((DialogueLine) -> Void)?
     var onRetryLine: ((DialogueLine) -> Void)?
     var onRegenerateLine: ((DialogueLine) -> Void)?
+    var onPlaybackSettingsChange: ((DialogueVoicePlaybackSettings) -> Void)?
 
     private enum Column {
         static let dialogue = NSUserInterfaceItemIdentifier("dialogue-voice.dialogue")
@@ -88,7 +89,18 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     private let regenerateButton = NSButton(title: "Regenerate", target: nil, action: nil)
     private let dialogueSetupHint = NSStackView()
     private let openVoiceSetupButton = NSButton(title: "Open Voice Setup", target: nil, action: nil)
+    private let automaticPlaybackCheckbox = NSButton(
+        checkboxWithTitle: "Automatic playback",
+        target: nil,
+        action: nil
+    )
+    private let voiceVolumeSlider = NSSlider(value: 100, minValue: 0, maxValue: 100, target: nil, action: nil)
+    private let voiceVolumeValueLabel = NSTextField(labelWithString: "100%")
+    private let repeatIntervalPopup = NSPopUpButton()
     private let activityLabel = NSTextField(wrappingLabelWithString: "")
+
+    private let repeatIntervalValues: [TimeInterval?] = [nil, 15, 30, 60, 120, 300, 600]
+    private var customRepeatInterval: TimeInterval?
 
     private var profile: GPTSoVITSVoiceProfile?
     private var profileStatus: DialogueVoiceProfileStatus = .notConfigured
@@ -158,6 +170,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         lines = library.lines
         importedAssets = snapshot.importedAssets
         draftDefaultTextLanguage = snapshot.draft.defaultTextLanguage
+        applyPlaybackSettings(library.playbackSettings)
         if !hasSelectedVoiceSection {
             selectVoiceSection(profile == nil ? .voiceSetup : .dialogue, userInitiated: false)
         }
@@ -328,6 +341,23 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         dialogueSetupHint.addArrangedSubview(openVoiceSetupButton)
         dialogueSetupText.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
+        let playbackTitle = sectionTitle("VOICE PLAYBACK")
+        let playbackHelp = helpLabel("Choose whether ready state-owned dialogue plays automatically. Preview remains available whenever a selected line is ready.")
+        let volumeRow = NSStackView(views: [voiceVolumeSlider, voiceVolumeValueLabel])
+        volumeRow.orientation = .horizontal
+        volumeRow.alignment = .centerY
+        volumeRow.spacing = 8
+        let playbackGrid = NSGridView(views: [
+            [fieldLabel("Playback"), automaticPlaybackCheckbox],
+            [fieldLabel("Voice volume"), volumeRow],
+            [fieldLabel("Repeat interval"), repeatIntervalPopup],
+        ])
+        playbackGrid.translatesAutoresizingMaskIntoConstraints = false
+        playbackGrid.rowSpacing = 7
+        playbackGrid.columnSpacing = 10
+        playbackGrid.column(at: 0).xPlacement = .trailing
+        playbackGrid.column(at: 1).xPlacement = .fill
+
         configurePage(
             voiceSetupPage,
             views: [profileTitle, profileHelp, profileGridRow, profileActions],
@@ -339,6 +369,9 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
                 dialogueTitle,
                 dialogueHelp,
                 dialogueSetupHint,
+                playbackTitle,
+                playbackHelp,
+                playbackGrid,
                 textLabel,
                 dialogueTextScrollView(),
                 languageRow,
@@ -350,6 +383,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         )
         voiceSetupPage.setCustomSpacing(4, after: profileTitle)
         dialoguePage.setCustomSpacing(4, after: dialogueTitle)
+        dialoguePage.setCustomSpacing(4, after: playbackTitle)
 
         activityLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         activityLabel.textColor = .secondaryLabelColor
@@ -379,6 +413,9 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             linesScrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 190),
             dialogueLanguageField.widthAnchor.constraint(greaterThanOrEqualToConstant: 150),
             dialogueStatePopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 110),
+            voiceVolumeSlider.widthAnchor.constraint(greaterThanOrEqualToConstant: 220),
+            voiceVolumeValueLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 44),
+            repeatIntervalPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 140),
         ])
         selectVoiceSection(.voiceSetup, userInitiated: false)
     }
@@ -431,6 +468,18 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         dialogueStatePopup.action = #selector(dialogueStateChanged)
         dialogueStatePopup.setAccessibilityLabel("Owning lifecycle state")
         dialogueStatePopup.setAccessibilityHelp("Choose which Statelet lifecycle state owns this message and generated voice.")
+        repeatIntervalPopup.addItems(withTitles: [
+            "Never", "15s", "30s", "60s", "120s", "300s", "600s",
+        ])
+        repeatIntervalPopup.setAccessibilityLabel("Automatic voice repeat interval")
+        repeatIntervalPopup.setAccessibilityHelp("Choose how often automatic voice may repeat, or Never to disable repeats.")
+        voiceVolumeSlider.numberOfTickMarks = 11
+        voiceVolumeSlider.allowsTickMarkValuesOnly = false
+        voiceVolumeSlider.setAccessibilityLabel("Voice volume")
+        voiceVolumeSlider.setAccessibilityHelp("Set dialogue voice playback volume from 0 to 100 percent.")
+        voiceVolumeValueLabel.setAccessibilityLabel("Voice volume value")
+        automaticPlaybackCheckbox.setAccessibilityLabel("Automatic voice playback")
+        automaticPlaybackCheckbox.setAccessibilityHelp("Play ready dialogue automatically when Statelet enters its owning lifecycle state.")
         for (field, label, help) in [
             (nameField, "Voice profile display name", "A local label for this voice profile."),
             (apiBaseURLField, "GPT-SoVITS API base URL", "Use a loopback URL such as http://127.0.0.1:9880."),
@@ -467,6 +516,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             (previewButton, #selector(previewLine), "Preview selected dialogue line", "Play the selected line when generated audio is ready."),
             (retryButton, #selector(retryLine), "Retry selected dialogue line", "Retry a failed generation without creating another line."),
             (regenerateButton, #selector(regenerateLine), "Regenerate selected dialogue line", "Discard the selected line's generated result and request a fresh one."),
+            (automaticPlaybackCheckbox, #selector(playbackSettingsChanged), "Automatic voice playback", "Play ready dialogue automatically when Statelet enters its owning lifecycle state."),
         ]
         for (button, action, label, help) in actions {
             button.target = self
@@ -474,6 +524,10 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             button.setAccessibilityLabel(label)
             button.setAccessibilityHelp(help)
         }
+        voiceVolumeSlider.target = self
+        voiceVolumeSlider.action = #selector(playbackSettingsChanged)
+        repeatIntervalPopup.target = self
+        repeatIntervalPopup.action = #selector(playbackSettingsChanged)
     }
 
     private func configureTable() {
@@ -674,6 +728,56 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         lastAppliedProfileDraft = draft
     }
 
+    private func applyPlaybackSettings(_ settings: DialogueVoicePlaybackSettings) {
+        automaticPlaybackCheckbox.state = settings.automaticPlaybackEnabled ? .on : .off
+        let volumePercent = Int((settings.volume * 100).rounded())
+        voiceVolumeSlider.integerValue = volumePercent
+        voiceVolumeValueLabel.stringValue = "\(volumePercent)%"
+        voiceVolumeSlider.setAccessibilityValue(voiceVolumeValueLabel.stringValue)
+        while repeatIntervalPopup.numberOfItems > repeatIntervalValues.count {
+            repeatIntervalPopup.removeItem(at: repeatIntervalPopup.numberOfItems - 1)
+        }
+        if let repeatIndex = repeatIntervalValues.firstIndex(where: { candidate in
+            switch (candidate, settings.repeatIntervalSeconds) {
+            case (nil, nil): return true
+            case let (candidate?, selected?): return candidate == selected
+            default: return false
+            }
+        }) {
+            customRepeatInterval = nil
+            repeatIntervalPopup.selectItem(at: repeatIndex)
+        } else if let customInterval = settings.repeatIntervalSeconds {
+            customRepeatInterval = customInterval
+            repeatIntervalPopup.addItem(
+                withTitle: "\(Self.repeatIntervalLabel(customInterval)) (Custom)"
+            )
+            repeatIntervalPopup.selectItem(at: repeatIntervalPopup.numberOfItems - 1)
+        }
+    }
+
+    private func validatedPlaybackSettings() -> DialogueVoicePlaybackSettings? {
+        let repeatIndex = repeatIntervalPopup.indexOfSelectedItem
+        let repeatInterval: TimeInterval?
+        if repeatIntervalValues.indices.contains(repeatIndex) {
+            repeatInterval = repeatIntervalValues[repeatIndex]
+        } else if repeatIndex == repeatIntervalValues.count, let customRepeatInterval {
+            repeatInterval = customRepeatInterval
+        } else {
+            return nil
+        }
+        return try? DialogueVoicePlaybackSettings(
+            automaticPlaybackEnabled: automaticPlaybackCheckbox.state == .on,
+            volume: min(max(voiceVolumeSlider.doubleValue / 100, 0), 1),
+            repeatIntervalSeconds: repeatInterval
+        )
+    }
+
+    private static func repeatIntervalLabel(_ interval: TimeInterval) -> String {
+        interval.rounded() == interval
+            ? "\(Int(interval))s"
+            : "\(interval.formatted(.number.precision(.fractionLength(1))))s"
+    }
+
     private func editorContentChanged(onServer line: DialogueLine) -> Bool {
         guard let lastAppliedEditorLine else { return true }
         return line.id != lastAppliedEditorLine.id
@@ -794,6 +898,11 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     @objc private func regenerateLine() {
         guard let line = selectedLine(), line.status != .queued, line.status != .generating else { return }
         onRegenerateLine?(line)
+    }
+    @objc private func playbackSettingsChanged() {
+        guard !isRefreshing, let settings = validatedPlaybackSettings() else { return }
+        applyPlaybackSettings(settings)
+        onPlaybackSettingsChange?(settings)
     }
     @objc private func voiceSectionChanged() {
         guard let section = VoiceSection(rawValue: voiceSectionControl.selectedSegment) else { return }

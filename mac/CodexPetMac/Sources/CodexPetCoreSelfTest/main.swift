@@ -85,6 +85,48 @@ private func runDialogueVoiceSelfTest() throws {
     )
     var library = try DialogueVoiceLibrary(profile: profile)
     _ = try library.addLine(text: "Hello", id: lineID)
+    try require(
+        library.playbackSettings == .defaults
+            && library.playbackSettings.automaticPlaybackEnabled
+            && library.playbackSettings.volume == 1
+            && library.playbackSettings.repeatIntervalSeconds == nil,
+        "dialogue playback settings did not preserve existing defaults"
+    )
+    try requiresError("dialogue playback settings accepted a non-finite volume") {
+        _ = try DialogueVoicePlaybackSettings(volume: .nan)
+    }
+    let playbackSettings = try DialogueVoicePlaybackSettings(
+        automaticPlaybackEnabled: false,
+        volume: 0.4,
+        repeatIntervalSeconds: 30
+    )
+    let unchangedProfile = library.profile
+    let unchangedLines = library.lines
+    library.updatePlaybackSettings(playbackSettings)
+    try require(
+        library.playbackSettings == playbackSettings
+            && library.profile == unchangedProfile
+            && library.lines == unchangedLines,
+        "updating dialogue playback settings changed voice content"
+    )
+    let roundTripped = try JSONDecoder().decode(
+        DialogueVoiceLibrary.self,
+        from: JSONEncoder().encode(library)
+    )
+    try require(roundTripped == library, "dialogue playback settings did not round-trip")
+    var legacyObject = try JSONSerialization.jsonObject(
+        with: JSONEncoder().encode(library)
+    ) as! [String: Any]
+    legacyObject.removeValue(forKey: "playback_settings")
+    let migrated = try JSONDecoder().decode(
+        DialogueVoiceLibrary.self,
+        from: JSONSerialization.data(withJSONObject: legacyObject)
+    )
+    try require(
+        migrated.version == DialogueVoiceLibrary.schemaVersion
+            && migrated.playbackSettings == .defaults,
+        "legacy dialogue playback settings did not migrate to defaults"
+    )
     let staleTicket = try library.beginGeneration(for: lineID)
     _ = try library.editLine(id: lineID, text: "Hello again")
     try requiresError("late dialogue generation result was accepted") {
