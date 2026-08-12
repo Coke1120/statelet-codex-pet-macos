@@ -435,6 +435,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var cachedLaunchAtLoginStatus: LaunchAtLoginManager.Status?
     private var cachedDiagnosticsReport = "Open Diagnostics and choose Refresh to inspect this Mac."
     private var activeMP4BatchID: UUID?
+    private var activeTransitionConversionID: UUID?
+    private var activeTransitionConversionDestination: PetState?
+    private var transitionConversionCancellationRequested = false
     private var lastFailedMP4Batch: FailedMP4Batch?
     private var lastConversionFailureDiagnostic: (code: String, stage: String)?
     private var pendingRecoveryNotice: (PetState, String)?
@@ -2642,6 +2645,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func importTransitionMP4(_ sourceURL: URL, from source: PetState, to destination: PetState) {
+        guard !mediaMutationInProgress else {
+            settingsController?.update(
+                activity: .failed(destination, "Transition import unavailable · wait for the current media operation to finish")
+            )
+            return
+        }
         guard case let .ready(toolchain) = toolchainState else { return }
         switch MP4ImportURLValidator.validate([sourceURL]) {
         case let .rejected(reason):
@@ -2653,9 +2662,13 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 return
             }
             mediaMutationInProgress = true
+            let conversionID = UUID()
+            activeTransitionConversionID = conversionID
+            transitionConversionCancellationRequested = false
             let token = versionToken()
             let outputURL = mediaMapURL.deletingLastPathComponent().appendingPathComponent("transition-\(source.rawValue)-to-\(destination.rawValue)-\(token).mov")
             let reportURL = outputURL.deletingPathExtension().appendingPathExtension("report.json")
+            activeTransitionConversionDestination = destination
             let challenge: String
             do {
                 challenge = try Self.makeInvocationChallenge()
@@ -2673,6 +2686,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                     )
                 )
             } catch {
+                activeTransitionConversionID = nil
+                activeTransitionConversionDestination = nil
+                transitionConversionCancellationRequested = false
                 mediaMutationInProgress = false
                 settingsController?.update(activity: .failed(destination, "Statelet could not prepare transition conversion."))
                 return
@@ -2686,11 +2702,62 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 toolchain: toolchain,
                 invocationChallenge: challenge,
                 profile: conversionProfile,
-                phase: { [weak self] phase in self?.settingsController?.update(activity: .converting(destination, phase)) },
-                progress: { [weak self] progress in self?.settingsController?.update(activity: .converting(destination, progress.message), progressValue: progress.percent) },
+                phase: { [weak self] phase in
+                    guard let self,
+                          self.activeTransitionConversionID == conversionID,
+                          !self.transitionConversionCancellationRequested else { return }
+                    self.settingsController?.update(activity: .converting(destination, phase))
+                },
+                progress: { [weak self] progress in
+                    guard let self,
+                          self.activeTransitionConversionID == conversionID,
+                          !self.transitionConversionCancellationRequested else { return }
+                    self.settingsController?.update(
+                        activity: .converting(destination, progress.message),
+                        progressValue: progress.percent
+                    )
+                },
                 completion: { [weak self] result in
                     guard let self else { return }
                     Task { @MainActor in
+                        guard self.activeTransitionConversionID == conversionID else {
+                            try? FileManager.default.removeItem(at: outputURL)
+                            try? FileManager.default.removeItem(at: reportURL)
+                            return
+                        }
+                        if self.transitionConversionCancellationRequested {
+                            let outputAbsent = self.removeCancelledTransitionArtifact(outputURL)
+                            let reportAbsent = self.removeCancelledTransitionArtifact(reportURL)
+                            guard outputAbsent, reportAbsent else {
+                                self.settingsController?.update(
+                                    activity: .failed(
+                                        destination,
+                                        "Transition cancellation cleanup could not be verified. Restart Statelet to recover safely."
+                                    )
+                                )
+                                self.refreshSettings()
+                                return
+                            }
+                            guard self.removeCancelledTransitionArtifact(self.conversionJournalURL) else {
+                                self.settingsController?.update(
+                                    activity: .failed(
+                                        destination,
+                                        "Transition recovery record could not be cleared. Restart Statelet to recover safely."
+                                    )
+                                )
+                                self.refreshSettings()
+                                return
+                            }
+                            self.activeTransitionConversionID = nil
+                            self.activeTransitionConversionDestination = nil
+                            self.transitionConversionCancellationRequested = false
+                            self.mediaMutationInProgress = false
+                            self.settingsController?.update(
+                                activity: .failed(destination, "Transition conversion cancelled")
+                            )
+                            self.refreshSettings()
+                            return
+                        }
                         do {
                             let conversion = try result.get()
                             let validation = try Self.validateLocallyAttestedMovie(
@@ -2722,6 +2789,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                             self.clearConversionJournal()
                             self.settingsController?.update(activity: .failed(destination, error.localizedDescription))
                         }
+                        self.activeTransitionConversionID = nil
+                        self.activeTransitionConversionDestination = nil
+                        self.transitionConversionCancellationRequested = false
                         self.mediaMutationInProgress = false
                         self.refreshSettings()
                     }
@@ -3303,9 +3373,62 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func cancelMP4ImportBatch() {
+        if let conversionID = activeTransitionConversionID {
+            cancelTransitionConversion(conversionID)
+            return
+        }
         guard activeMP4BatchID != nil else { return }
         mp4BatchCancellationRequested = true
         conversionCoordinator.cancel()
+    }
+
+    private func cancelTransitionConversion(_ conversionID: UUID) {
+        guard activeTransitionConversionID == conversionID,
+              !transitionConversionCancellationRequested else { return }
+        let destination = activeTransitionConversionDestination ?? currentState
+        transitionConversionCancellationRequested = true
+        conversionCoordinator.cancel()
+        settingsController?.update(
+            activity: .working(destination, "Cancelling transition conversion…")
+        )
+    }
+
+    private func removeCancelledTransitionArtifact(_ artifactURL: URL) -> Bool {
+        let mediaRoot = mediaMapURL.deletingLastPathComponent().standardizedFileURL
+        let standardizedArtifact = artifactURL.standardizedFileURL
+        guard standardizedArtifact.deletingLastPathComponent() == mediaRoot else { return false }
+        let basename = standardizedArtifact.lastPathComponent
+        guard !basename.isEmpty,
+              basename != ".",
+              basename != "..",
+              !basename.contains("/") else { return false }
+
+        let rootDescriptor = Darwin.open(
+            mediaRoot.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard rootDescriptor >= 0 else { return false }
+        defer { Darwin.close(rootDescriptor) }
+
+        var status = stat()
+        let statusResult = basename.withCString {
+            Darwin.fstatat(rootDescriptor, $0, &status, AT_SYMLINK_NOFOLLOW)
+        }
+        if statusResult != 0 {
+            return errno == ENOENT
+        }
+
+        let unlinkResult = basename.withCString {
+            Darwin.unlinkat(rootDescriptor, $0, 0)
+        }
+        if unlinkResult != 0, errno != ENOENT { return false }
+        if unlinkResult == 0, Darwin.fsync(rootDescriptor) != 0 { return false }
+
+        var remainingStatus = stat()
+        let remainingResult = basename.withCString {
+            Darwin.fstatat(rootDescriptor, $0, &remainingStatus, AT_SYMLINK_NOFOLLOW)
+        }
+        return remainingResult != 0 && errno == ENOENT
     }
 
     private func retryLastFailedMP4Batch() {

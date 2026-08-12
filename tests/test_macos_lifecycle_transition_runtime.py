@@ -190,6 +190,88 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         self.assertLess(publish, nested_catch)
         self.assertLess(nested_catch, cleanup)
 
+    def test_transition_mp4_conversion_has_distinct_token_gated_cancellation(self):
+        start = self.app.index("private func importTransitionMP4")
+        end = self.app.index("private func previewTransition", start)
+        source = self.app[start:end]
+        mutation_guard = source.index("guard !mediaMutationInProgress")
+        toolchain_guard = source.index("guard case let .ready(toolchain)")
+        conversion_token = source.index("let conversionID = UUID()")
+        journal = source.index("writeConversionJournal")
+        self.assertLess(mutation_guard, toolchain_guard)
+        self.assertLess(mutation_guard, conversion_token)
+        self.assertLess(mutation_guard, journal)
+        self.assertIn("wait for the current media operation to finish", source[:toolchain_guard])
+        self.assertIn("let conversionID = UUID()", source)
+        self.assertIn("activeTransitionConversionID = conversionID", source)
+        self.assertGreaterEqual(
+            source.count("activeTransitionConversionID == conversionID"),
+            3,
+        )
+        self.assertGreaterEqual(
+            source.count("!self.transitionConversionCancellationRequested"),
+            2,
+        )
+        stale = source.index("guard self.activeTransitionConversionID == conversionID else")
+        stale_source = source[
+            stale:source.index("if self.transitionConversionCancellationRequested", stale)
+        ]
+        self.assertIn("removeItem(at: outputURL)", stale_source)
+        self.assertIn("removeItem(at: reportURL)", stale_source)
+        self.assertNotIn("clearConversionJournal", stale_source)
+
+        cancel = self.app.index("private func cancelMP4ImportBatch")
+        retry = self.app.index("private func retryLastFailedMP4Batch", cancel)
+        cancel_source = self.app[cancel:retry]
+        transition = cancel_source.index("activeTransitionConversionID")
+        batch = cancel_source.index("activeMP4BatchID")
+        self.assertLess(transition, batch)
+        self.assertIn("cancelTransitionConversion(conversionID)", cancel_source)
+        self.assertIn("transitionConversionCancellationRequested = true", cancel_source)
+        self.assertIn("conversionCoordinator.cancel()", cancel_source)
+        self.assertIn('.working(destination, "Cancelling transition conversion…")', cancel_source)
+        self.assertNotIn("activeTransitionConversionID = nil", cancel_source)
+        self.assertNotIn("clearConversionJournal()", cancel_source)
+        self.assertNotIn("mediaMutationInProgress = false", cancel_source)
+
+        cancellation_completion = source.index("if self.transitionConversionCancellationRequested")
+        cancellation_source = source[
+            cancellation_completion:source.index("do {", cancellation_completion)
+        ]
+        self.assertIn("removeCancelledTransitionArtifact(outputURL)", cancellation_source)
+        self.assertIn("removeCancelledTransitionArtifact(reportURL)", cancellation_source)
+        cleanup_guard = cancellation_source.index("guard outputAbsent, reportAbsent")
+        clear_journal_call = cancellation_source.index(
+            "removeCancelledTransitionArtifact(self.conversionJournalURL)"
+        )
+        clear_journal = cancellation_source.rindex("guard self.", 0, clear_journal_call)
+        self.assertLess(cleanup_guard, clear_journal)
+        blocked_source = cancellation_source[cleanup_guard:clear_journal]
+        self.assertIn("cleanup could not be verified", blocked_source)
+        self.assertIn("Restart Statelet to recover safely.", blocked_source)
+        self.assertNotIn("mediaMutationInProgress = false", blocked_source)
+        journal_guard_source = cancellation_source[
+            clear_journal:cancellation_source.index("self.activeTransitionConversionID = nil", clear_journal)
+        ]
+        self.assertIn("guard self.removeCancelledTransitionArtifact", journal_guard_source)
+        self.assertIn("recovery record could not be cleared", journal_guard_source)
+        self.assertNotIn("mediaMutationInProgress = false", journal_guard_source)
+        self.assertIn("activeTransitionConversionID = nil", cancellation_source)
+        self.assertIn("transitionConversionCancellationRequested = false", cancellation_source)
+        self.assertIn("mediaMutationInProgress = false", cancellation_source)
+
+        helper = self.app.index("private func removeCancelledTransitionArtifact")
+        retry = self.app.index("private func retryLastFailedMP4Batch", helper)
+        helper_source = self.app[helper:retry]
+        self.assertIn("standardizedArtifact.deletingLastPathComponent() == mediaRoot", helper_source)
+        self.assertIn("O_NOFOLLOW", helper_source)
+        self.assertIn("O_CLOEXEC", helper_source)
+        self.assertIn("AT_SYMLINK_NOFOLLOW", helper_source)
+        self.assertIn("Darwin.fstatat", helper_source)
+        self.assertIn("Darwin.unlinkat", helper_source)
+        self.assertIn("Darwin.fsync(rootDescriptor)", helper_source)
+        self.assertGreaterEqual(helper_source.count("errno == ENOENT"), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
