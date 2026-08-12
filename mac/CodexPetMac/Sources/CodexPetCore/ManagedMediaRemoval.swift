@@ -27,7 +27,7 @@ public enum ManagedMediaRemovalError: Error, Equatable, LocalizedError {
         case .unsafeTarget:
             return "Statelet refused to move a symbolic link or unsafe media target."
         case .stillReferenced:
-            return "The movie is still used by another Statelet state. Remove those references first."
+            return "The movie is still used by another Statelet mapping. Remove those references first."
         }
     }
 }
@@ -55,10 +55,48 @@ public enum ManagedMediaRemovalPlanner {
         canonicalRoot: URL,
         fileManager: FileManager = .default
     ) throws -> ManagedMediaRemovalPlan {
+        let context = try validateContext(mapURL: mapURL, canonicalRoot: canonicalRoot)
+        guard let entry = mediaMap.playlist(for: state)?.entry(path: path) else {
+            throw ManagedMediaRemovalError.entryNotFound
+        }
+        return try plan(
+            mediaMap: mediaMap,
+            updatedMap: mediaMap.removingEntry(for: state, path: path),
+            entry: entry,
+            context: context,
+            fileManager: fileManager
+        )
+    }
+
+    public static func plan(
+        mediaMap: MediaMap,
+        mapURL: URL,
+        transitionFrom: PetState,
+        transitionTo: PetState,
+        canonicalRoot: URL,
+        fileManager: FileManager = .default
+    ) throws -> ManagedMediaRemovalPlan {
+        let context = try validateContext(mapURL: mapURL, canonicalRoot: canonicalRoot)
+        guard let entry = mediaMap.transition(from: transitionFrom, to: transitionTo) else {
+            throw ManagedMediaRemovalError.entryNotFound
+        }
+        return try plan(
+            mediaMap: mediaMap,
+            updatedMap: mediaMap.removingTransition(from: transitionFrom, to: transitionTo),
+            entry: entry,
+            context: context,
+            fileManager: fileManager
+        )
+    }
+
+    private static func validateContext(
+        mapURL: URL,
+        canonicalRoot: URL
+    ) throws -> (root: URL, configuredMap: URL) {
         let root = canonicalRoot.standardizedFileURL
-        let expectedMap = root.appendingPathComponent("media-map.json").standardizedFileURL
         let configuredMap = mapURL.standardizedFileURL
-        guard configuredMap.path == expectedMap.path else {
+        guard configuredMap.deletingLastPathComponent().path == root.path,
+              isManagedMapBasename(configuredMap.lastPathComponent) else {
             throw ManagedMediaRemovalError.nonCanonicalMediaMap
         }
         let rootValues: URLResourceValues
@@ -69,15 +107,35 @@ public enum ManagedMediaRemovalPlanner {
         } catch {
             throw ManagedMediaRemovalError.nonCanonicalMediaMap
         }
-        guard configuredMap.resolvingSymlinksInPath().standardizedFileURL.path == expectedMap.path,
+        guard configuredMap.resolvingSymlinksInPath().standardizedFileURL.path == configuredMap.path,
               mapValues.isSymbolicLink != true,
               rootValues.isSymbolicLink != true,
               root.resolvingSymlinksInPath().standardizedFileURL.path == root.path else {
             throw ManagedMediaRemovalError.nonCanonicalMediaMap
         }
-        guard let entry = mediaMap.playlist(for: state)?.entry(path: path) else {
-            throw ManagedMediaRemovalError.entryNotFound
-        }
+        return (root, configuredMap)
+    }
+
+    private static func isManagedMapBasename(_ basename: String) -> Bool {
+        if basename == CharacterLibrary.defaultMapPath { return true }
+        let prefix = ".character-"
+        let suffix = ".media-map.json"
+        guard basename.hasPrefix(prefix), basename.hasSuffix(suffix) else { return false }
+        let id = String(basename.dropFirst(prefix.count).dropLast(suffix.count))
+        return (try? CharacterLibraryEntry(id: id, name: "Managed removal"))?.mapPath == basename
+    }
+
+    private static func plan(
+        mediaMap: MediaMap,
+        updatedMap updated: MediaMap,
+        entry: MediaEntry,
+        context: (root: URL, configuredMap: URL),
+        fileManager: FileManager
+    ) throws -> ManagedMediaRemovalPlan {
+        let root = context.root
+        let configuredMap = context.configuredMap
+        let mapURL = configuredMap
+        let expectedMap = configuredMap
 
         let rawMovie = mediaMap.resolvedURL(for: entry, relativeTo: mapURL).standardizedFileURL
         guard rawMovie.path != configuredMap.path,
@@ -108,7 +166,6 @@ public enum ManagedMediaRemovalPlanner {
             throw ManagedMediaRemovalError.unmanagedMovie
         }
 
-        let updated = try mediaMap.removingEntry(for: state, path: path)
         for playlist in updated.states.values {
             for remaining in playlist.entries {
                 let remainingURL = updated.resolvedURL(for: remaining, relativeTo: mapURL)
@@ -117,6 +174,14 @@ public enum ManagedMediaRemovalPlanner {
                 if remainingURL.path == movie.path {
                     throw ManagedMediaRemovalError.stillReferenced
                 }
+            }
+        }
+        for transition in updated.transitions.values {
+            let remainingURL = updated.resolvedURL(for: transition, relativeTo: mapURL)
+                .resolvingSymlinksInPath()
+                .standardizedFileURL
+            if remainingURL.path == movie.path {
+                throw ManagedMediaRemovalError.stillReferenced
             }
         }
 

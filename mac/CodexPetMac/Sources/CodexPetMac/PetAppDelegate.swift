@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import CodexPetCore
 import CryptoKit
 import Darwin
@@ -146,11 +147,26 @@ private enum MediaMapLoadResult: Equatable {
     }
 }
 
+private struct VerifiedMovieCopy: Sendable {
+    let directory: URL
+    let movieURL: URL
+    let reportURL: URL
+    let relativePath: String
+}
+
 private struct VerifiedMovieInstall: Sendable {
     let directory: URL
     let movieURL: URL
     let reportURL: URL
     let relativePath: String
+    let validation: VerifiedMovieValidation
+}
+
+private struct VerifiedMovieValidation: Sendable {
+    let report: ValidatedAlphaConversionReport
+    let movieIdentity: PortableMediaFileIdentity
+    let reportIdentity: PortableMediaFileIdentity
+    let durationSeconds: Double
 }
 
 private struct MP4ImportFailure {
@@ -166,9 +182,56 @@ private struct FailedMP4Batch {
 
 private struct ActiveConversionJournal: Codable {
     let state: String
+    let characterID: String?
+    let mediaMapBasename: String?
+    let mediaMapSHA256: String?
     let outputBasename: String
     let reportBasename: String
     let invocationChallenge: String
+    let transitionFrom: String?
+    let transitionTo: String?
+
+    init(
+        state: String,
+        characterID: String? = nil,
+        mediaMapBasename: String? = nil,
+        mediaMapSHA256: String? = nil,
+        outputBasename: String,
+        reportBasename: String,
+        invocationChallenge: String,
+        transitionFrom: String? = nil,
+        transitionTo: String? = nil
+    ) {
+        self.state = state
+        self.characterID = characterID
+        self.mediaMapBasename = mediaMapBasename
+        self.mediaMapSHA256 = mediaMapSHA256
+        self.outputBasename = outputBasename
+        self.reportBasename = reportBasename
+        self.invocationChallenge = invocationChallenge
+        self.transitionFrom = transitionFrom
+        self.transitionTo = transitionTo
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case state
+        case characterID = "character_id"
+        case mediaMapBasename = "media_map_basename"
+        case mediaMapSHA256 = "media_map_sha256"
+        case outputBasename
+        case reportBasename
+        case invocationChallenge
+        case transitionFrom = "transition_from"
+        case transitionTo = "transition_to"
+    }
+}
+
+private struct RecoveryOwner {
+    let entry: CharacterLibraryEntry
+    let map: MediaMap
+    let encodedData: Data
+    let catalogEncodedData: Data?
+    let isActive: Bool
 }
 
 private struct MP4ImportNotice {
@@ -180,6 +243,74 @@ private struct ActiveOneShotPreview {
     let playback: OneShotPlayback
     let libraryState: PetState
     let transitionID: UInt64
+}
+
+private struct ActiveLifecycleTransition {
+    let id: UInt64
+    let source: PetState
+    let destination: PetState
+    let advanceSelection: Bool
+}
+
+enum LifecycleTransitionCompletionDecision: Equatable {
+    case commit(PetState)
+    case ignore
+
+    static func decide(
+        callbackID: UInt64,
+        currentSequence: UInt64,
+        activeID: UInt64?,
+        activeDestination: PetState?,
+        authoritativeState: PetState,
+        temporaryPreviewActive: Bool
+    ) -> LifecycleTransitionCompletionDecision {
+        guard callbackID == currentSequence,
+              activeID == callbackID,
+              let activeDestination,
+              authoritativeState == activeDestination,
+              !temporaryPreviewActive else { return .ignore }
+        return .commit(activeDestination)
+    }
+}
+
+enum LifecyclePresentationTrigger: Equatable {
+    case authoritativeChange
+    case initialPresentation
+    case sameStateHeartbeat
+    case forcedRefresh
+    case playlistRotation
+    case nextClip
+    case playOnce
+    case temporaryState
+}
+
+struct LifecycleTransitionPolicy {
+    static func trigger(
+        previousLifecycleState: PetState?,
+        incomingState: PetState,
+        forceRefresh: Bool
+    ) -> LifecyclePresentationTrigger {
+        if forceRefresh { return .forcedRefresh }
+        guard let previousLifecycleState else { return .initialPresentation }
+        return previousLifecycleState == incomingState
+            ? .sameStateHeartbeat
+            : .authoritativeChange
+    }
+
+    static func source(
+        lastCommittedState: PetState?,
+        incomingState: PetState,
+        trigger: LifecyclePresentationTrigger,
+        reduceMotion: Bool,
+        hasConfiguredMedia: Bool
+    ) -> PetState? {
+        guard trigger == .authoritativeChange,
+              !reduceMotion,
+              hasConfiguredMedia,
+              let lastCommittedState,
+              lastCommittedState != incomingState else { return nil }
+        return lastCommittedState
+    }
 }
 
 enum StateDialogueAudioDisposition: Equatable {
@@ -279,7 +410,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var lastPublishedSnapshot: CurrentState?
     private var lastLifecycleStateForSelection: PetState?
     private var lastPresentedState: PetState?
+    private var lastCommittedLifecycleState: PetState?
     private var pendingPresentationState: PetState?
+    private var activeLifecycleTransition: ActiveLifecycleTransition?
     private var stateDialoguePresentation: StateDialoguePresentation?
     private var publisherHealth: PublisherHealth = .unknown
     private var mapReadFailureReported = false
@@ -373,6 +506,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
         player.onPlaylistClipEnded = { [weak self] transitionID, state in
             self?.advancePlaylistAfterClipEnd(transitionID: transitionID, state: state)
+        }
+        player.onLifecycleTransitionEnded = { [weak self] transitionID in
+            self?.finishLifecycleTransition(transitionID: transitionID, outcome: "completed")
+        }
+        player.onLifecycleTransitionFailed = { [weak self] transitionID in
+            self?.finishLifecycleTransition(transitionID: transitionID, outcome: "failed")
         }
         player.view.onAdvanceClip = { [weak self] in
             self?.advanceCurrentClip(reason: "pet_button")
@@ -677,6 +816,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         map: MediaMap,
         encodedData: Data
     ) {
+        cancelActiveLifecycleTransition(reason: "character_changed")
         cancelActiveOneShotWithoutRestore(reason: "character_changed")
         _ = temporaryStatePreviewPolicy.cancel()
         player?.clearTransientPresentation()
@@ -684,6 +824,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         manualPreviewSelectionCursor = MediaSelectionCursor()
         lastLifecycleStateForSelection = nil
         lastPresentedState = nil
+        lastCommittedLifecycleState = nil
         pendingPresentationState = nil
         mediaMapURL = entry.resolvedMapURL(relativeTo: configuredMediaMapURL)
         mediaMap = map
@@ -718,6 +859,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 counts[entry.id] = autoreleasepool {
                     guard let loaded = try? storage.loadMediaMap(for: entry) else { return 0 }
                     return loaded.map.states.values.reduce(0) { $0 + $1.entries.count }
+                        + loaded.map.transitions.count
                 }
             }
             DispatchQueue.main.async { [weak self] in
@@ -731,7 +873,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func totalClipCount(in map: MediaMap) -> Int {
-        map.states.values.reduce(0) { $0 + $1.entries.count }
+        map.states.values.reduce(0) { $0 + $1.entries.count } + map.transitions.count
+    }
+
+    private func allMediaEntries(in map: MediaMap) -> [MediaEntry] {
+        map.states.values.flatMap(\.entries) + Array(map.transitions.values)
     }
 
     private func applyConfiguredWindowSize() {
@@ -791,7 +937,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
 
     private func rejectPublisher(_ health: PublisherHealth) {
         setPublisherHealth(health)
-        apply(state: .idle)
+        cancelActiveLifecycleTransition(reason: "publisher_rejected")
+        apply(state: .idle, forceRefresh: true)
     }
 
     private func setPublisherHealth(_ health: PublisherHealth) {
@@ -804,6 +951,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
 
     private func apply(state: PetState, forceRefresh: Bool = false) {
         let previousProducerState = currentState
+        let presentationTrigger = LifecycleTransitionPolicy.trigger(
+            previousLifecycleState: lastLifecycleStateForSelection,
+            incomingState: state,
+            forceRefresh: forceRefresh
+        )
         let shouldAdvanceSelection = MediaSelectionAdvancePolicy.shouldAdvance(
             previousLifecycleState: lastLifecycleStateForSelection,
             incomingState: state,
@@ -836,17 +988,51 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             incomingState: presentationState,
             forceRefresh: forceRefresh
         )
+        let supersedesDifferentPendingPresentation = pendingPresentationState.map {
+            $0 != presentationState
+        } ?? false
         currentState = state
         let shouldRefreshUI = LifecycleUIRefreshPolicy.shouldRefresh(
             previousProducerState: previousProducerState,
             incomingProducerState: state,
             presentationWillRefresh: decision.shouldRefresh
         )
-        guard decision.shouldRefresh else {
+        var cancelledLifecycleTransition = false
+        if let activeLifecycleTransition,
+           forceRefresh || activeLifecycleTransition.destination != state {
+            cancelActiveLifecycleTransition(
+                reason: forceRefresh ? "forced_refresh" : "authoritative_state_changed"
+            )
+            cancelledLifecycleTransition = true
+        }
+        guard decision.shouldRefresh
+                || cancelledLifecycleTransition
+                || supersedesDifferentPendingPresentation else {
             if shouldRefreshUI {
                 updateStatusMenu()
                 refreshSettings()
             }
+            return
+        }
+
+
+        let configuredTransition = lastCommittedLifecycleState.flatMap {
+            mediaMap.transition(from: $0, to: state)
+        }
+        if temporaryStatePreviewPolicy.previewState == nil,
+           activeOneShotPreview == nil,
+           let source = LifecycleTransitionPolicy.source(
+               lastCommittedState: lastCommittedLifecycleState,
+               incomingState: state,
+               trigger: presentationTrigger,
+               reduceMotion: reduceMotion,
+               hasConfiguredMedia: configuredTransition != nil
+           ),
+           startLifecycleTransition(
+               from: source,
+               to: state,
+               advanceSelection: shouldAdvanceSelection
+           ) {
             return
         }
 
@@ -858,6 +1044,83 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             refreshReason: decision.rawValue,
             useManualPreviewCursor: temporaryStatePreviewPolicy.previewState != nil
         )
+    }
+
+    private func startLifecycleTransition(
+        from source: PetState,
+        to destination: PetState,
+        advanceSelection: Bool
+    ) -> Bool {
+        guard !reduceMotion,
+              let entry = mediaMap.transition(from: source, to: destination) else {
+            return false
+        }
+        let url = mediaMap.resolvedURL(for: entry, relativeTo: mediaMapURL)
+        guard FileManager.default.isReadableFile(atPath: url.path) else {
+            logger.error("event=lifecycle_transition_unavailable from=\(source.rawValue, privacy: .public) to=\(destination.rawValue, privacy: .public) reason=unreadable")
+            return false
+        }
+
+        cancelActiveLifecycleTransition(reason: "superseded")
+        if stateDialoguePresentation != nil {
+            dialogueVoiceCoordinator.cancelAutomaticPlayback()
+            stateDialoguePresentation = nil
+            player.view.showDialogueMessage(nil)
+        }
+        transitionSequence &+= 1
+        let transitionID = transitionSequence
+        activeLifecycleTransition = ActiveLifecycleTransition(
+            id: transitionID,
+            source: source,
+            destination: destination,
+            advanceSelection: advanceSelection
+        )
+        pendingPresentationState = destination
+        let result = player.showLifecycleTransition(
+            destinationState: destination,
+            entry: entry,
+            url: url,
+            transitionID: transitionID,
+            startedAt: DispatchTime.now().uptimeNanoseconds
+        )
+        guard result == .preparing else {
+            activeLifecycleTransition = nil
+            pendingPresentationState = nil
+            return false
+        }
+        logger.info("event=lifecycle_transition_started transition_id=\(transitionID, privacy: .public) from=\(source.rawValue, privacy: .public) to=\(destination.rawValue, privacy: .public)")
+        updateStatusMenu()
+        refreshSettings()
+        return true
+    }
+
+    private func finishLifecycleTransition(transitionID: UInt64, outcome: String) {
+        guard let active = activeLifecycleTransition,
+              LifecycleTransitionCompletionDecision.decide(
+                  callbackID: transitionID,
+                  currentSequence: transitionSequence,
+                  activeID: active.id,
+                  activeDestination: active.destination,
+                  authoritativeState: currentState,
+                  temporaryPreviewActive: temporaryStatePreviewPolicy.previewState != nil
+              ) == .commit(active.destination) else { return }
+        activeLifecycleTransition = nil
+        pendingPresentationState = nil
+        player.clearTransientPresentation()
+        logger.info("event=lifecycle_transition_finished transition_id=\(transitionID, privacy: .public) from=\(active.source.rawValue, privacy: .public) to=\(active.destination.rawValue, privacy: .public) outcome=\(outcome, privacy: .public)")
+        startLifecyclePresentation(
+            state: active.destination,
+            advanceSelection: active.advanceSelection,
+            refreshReason: "lifecycle_transition_\(outcome)"
+        )
+    }
+
+    private func cancelActiveLifecycleTransition(reason: String) {
+        guard let active = activeLifecycleTransition else { return }
+        activeLifecycleTransition = nil
+        pendingPresentationState = nil
+        player.clearTransientPresentation()
+        logger.info("event=lifecycle_transition_cancelled transition_id=\(active.id, privacy: .public) from=\(active.source.rawValue, privacy: .public) to=\(active.destination.rawValue, privacy: .public) reason=\(reason, privacy: .public)")
     }
 
     private func startLifecyclePresentation(
@@ -899,6 +1162,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         switch startResult {
         case .presented:
             lastPresentedState = state
+            if temporaryStatePreviewPolicy.previewState == nil, activeOneShotPreview == nil {
+                lastCommittedLifecycleState = state
+            }
             pendingPresentationState = nil
             presentStateOwnedDialogueIfNeeded(for: state)
         case .preparing:
@@ -952,6 +1218,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         switch event {
         case .ready:
             lastPresentedState = state
+            if temporaryStatePreviewPolicy.previewState == nil, activeOneShotPreview == nil {
+                lastCommittedLifecycleState = state
+            }
             presentStateOwnedDialogueIfNeeded(for: state)
             logger.info("event=presentation_committed transition_id=\(transitionID, privacy: .public) state=\(state.rawValue, privacy: .public)")
         case .failed:
@@ -1166,6 +1435,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             updateStatusMenu()
             return
         }
+        cancelActiveLifecycleTransition(reason: "next_clip")
         cancelActiveOneShotWithoutRestore(reason: "next_clip")
         pendingPresentationState = nil
         logger.info("event=playlist_advance_triggered state=\(state.rawValue, privacy: .public) reason=\(reason, privacy: .public)")
@@ -1192,6 +1462,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             return
         }
 
+        cancelActiveLifecycleTransition(reason: "temporary_state_changed")
         cancelActiveOneShotWithoutRestore(reason: "temporary_state_changed")
         if temporaryStatePreviewPolicy.previewState == nil {
             manualPreviewSelectionCursor = mediaSelectionCursor
@@ -1231,6 +1502,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         previousPreview: PetState?,
         reason: String
     ) {
+        cancelActiveLifecycleTransition(reason: "temporary_state_relinquished")
         cancelActiveOneShotWithoutRestore(reason: "temporary_state_relinquished")
         player.clearTransientPresentation()
         lastPresentedState = nil
@@ -1537,6 +1809,18 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         controller.onImportMP4 = { [weak self] state in self?.chooseMP4(for: state) }
         controller.onDropMP4s = { [weak self] state, urls in self?.importMP4s(urls, for: state) }
         controller.onUseMovie = { [weak self] state in self?.chooseTransparentMovie(for: state) }
+        controller.onImportTransitionMP4 = { [weak self] source, destination in
+            self?.chooseTransitionMP4(from: source, to: destination)
+        }
+        controller.onUseTransitionMovie = { [weak self] source, destination in
+            self?.chooseTransitionMovie(from: source, to: destination)
+        }
+        controller.onPreviewTransition = { [weak self] source, destination, path in
+            self?.previewTransition(from: source, to: destination, path: path)
+        }
+        controller.onRemoveTransition = { [weak self] source, destination, path in
+            self?.removeTransition(from: source, to: destination, path: path)
+        }
         controller.onPlaybackModeChange = { [weak self] state, mode in
             self?.changePlaybackMode(for: state, to: mode)
         }
@@ -2276,6 +2560,321 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
     }
 
+    private func chooseTransitionMP4(from source: PetState, to destination: PetState) {
+        guard !mediaMutationInProgress, let settingsWindow = settingsController?.window else { return }
+        guard toolchainState.isReady else {
+            presentSettingsError("Conversion tools aren’t ready. Use Setup Guide, then Check Again.")
+            return
+        }
+        let openPanel = NSOpenPanel()
+        openPanel.title = "Import \(source.rawValue.capitalized) → \(destination.rawValue.capitalized) Transition MP4"
+        openPanel.prompt = "Import Transition"
+        openPanel.allowedContentTypes = [.mpeg4Movie]
+        openPanel.allowsMultipleSelection = false
+        openPanel.canChooseDirectories = false
+        openPanel.beginSheetModal(for: settingsWindow) { [weak self] response in
+            guard response == .OK, let url = openPanel.url else { return }
+            self?.importTransitionMP4(url, from: source, to: destination)
+        }
+    }
+
+    private func chooseTransitionMovie(from source: PetState, to destination: PetState) {
+        guard !mediaMutationInProgress, let settingsWindow = settingsController?.window else { return }
+        let openPanel = NSOpenPanel()
+        openPanel.title = "Choose \(source.rawValue.capitalized) → \(destination.rawValue.capitalized) Transition"
+        openPanel.prompt = "Import Transition"
+        openPanel.allowedContentTypes = [.quickTimeMovie]
+        openPanel.allowsMultipleSelection = false
+        openPanel.canChooseDirectories = false
+        openPanel.beginSheetModal(for: settingsWindow) { [weak self] response in
+            guard response == .OK, let url = openPanel.url else { return }
+            self?.confirmPortableTransitionImport(url, from: source, to: destination)
+        }
+    }
+
+    private func confirmPortableTransitionImport(_ url: URL, from source: PetState, to destination: PetState) {
+        guard let window = settingsController?.window else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Trust portable verification for this transition?"
+        alert.informativeText = "Statelet will verify the report hash, transparency, duration, and AVFoundation playback, but cannot prove the report was produced on this Mac."
+        alert.addButton(withTitle: "Import Portable MOV")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.importTransitionMovie(url, from: source, to: destination)
+        }
+    }
+
+    private func importTransitionMovie(_ sourceURL: URL, from source: PetState, to destination: PetState) {
+        guard !mediaMutationInProgress else { return }
+        mediaMutationInProgress = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let installed = try await prepareVerifiedMovie(sourceURL, allowPortableClaim: true)
+                do {
+                    let duration = installed.validation.durationSeconds
+                    guard duration.isFinite, duration > 0,
+                          duration <= LifecycleTransitionMediaPolicy.maximumDuration else {
+                        throw PetContractError.invalidValue("Transition movies must be no longer than \(Int(LifecycleTransitionMediaPolicy.maximumDuration)) seconds.")
+                    }
+                    try Self.requireValidatedFilesUnchanged(
+                        installed.validation,
+                        outputURL: installed.movieURL,
+                        reportURL: installed.reportURL
+                    )
+                    let entry = try MediaEntry(path: installed.relativePath, loop: false)
+                    let updated = try mediaMap.settingTransition(from: source, to: destination, entry: entry)
+                    try publishMediaMap(updated)
+                    applyPublishedMediaMap(updated)
+                    settingsController?.update(activity: .succeeded(destination, "Transition imported"))
+                } catch {
+                    try? FileManager.default.removeItem(at: installed.directory)
+                    throw error
+                }
+            } catch {
+                settingsController?.update(activity: .failed(destination, error.localizedDescription))
+            }
+            mediaMutationInProgress = false
+            refreshSettings()
+        }
+    }
+
+    private func importTransitionMP4(_ sourceURL: URL, from source: PetState, to destination: PetState) {
+        guard case let .ready(toolchain) = toolchainState else { return }
+        switch MP4ImportURLValidator.validate([sourceURL]) {
+        case let .rejected(reason):
+            settingsController?.update(activity: .failed(destination, reason))
+        case let .accepted(urls, _):
+            guard let validatedSource = urls.first else { return }
+            do { try prepareMediaDirectory() } catch {
+                settingsController?.update(activity: .failed(destination, "Statelet couldn’t prepare the Media folder."))
+                return
+            }
+            mediaMutationInProgress = true
+            let token = versionToken()
+            let outputURL = mediaMapURL.deletingLastPathComponent().appendingPathComponent("transition-\(source.rawValue)-to-\(destination.rawValue)-\(token).mov")
+            let reportURL = outputURL.deletingPathExtension().appendingPathExtension("report.json")
+            let challenge: String
+            do {
+                challenge = try Self.makeInvocationChallenge()
+                try writeConversionJournal(
+                    ActiveConversionJournal(
+                        state: destination.rawValue,
+                        characterID: characterLibrary.activeCharacterID,
+                        mediaMapBasename: mediaMapURL.lastPathComponent,
+                        mediaMapSHA256: try currentMediaMapSHA256(),
+                        outputBasename: outputURL.lastPathComponent,
+                        reportBasename: reportURL.lastPathComponent,
+                        invocationChallenge: challenge,
+                        transitionFrom: source.rawValue,
+                        transitionTo: destination.rawValue
+                    )
+                )
+            } catch {
+                mediaMutationInProgress = false
+                settingsController?.update(activity: .failed(destination, "Statelet could not prepare transition conversion."))
+                return
+            }
+            conversionCoordinator.convert(
+                sourceURL: validatedSource,
+                outputURL: outputURL,
+                reportURL: reportURL,
+                width: AlphaAuthoringCanvas.width,
+                height: AlphaAuthoringCanvas.height,
+                toolchain: toolchain,
+                invocationChallenge: challenge,
+                profile: conversionProfile,
+                phase: { [weak self] phase in self?.settingsController?.update(activity: .converting(destination, phase)) },
+                progress: { [weak self] progress in self?.settingsController?.update(activity: .converting(destination, progress.message), progressValue: progress.percent) },
+                completion: { [weak self] result in
+                    guard let self else { return }
+                    Task { @MainActor in
+                        do {
+                            let conversion = try result.get()
+                            let validation = try Self.validateLocallyAttestedMovie(
+                                outputURL: conversion.outputURL,
+                                reportURL: conversion.reportURL,
+                                expectedOutputBasename: conversion.outputURL.lastPathComponent,
+                                invocationChallenge: challenge,
+                                expectedInitialReportData: conversion.reportData
+                            )
+                            let duration = validation.durationSeconds
+                            guard duration.isFinite, duration > 0,
+                                  duration <= LifecycleTransitionMediaPolicy.maximumDuration else {
+                                throw PetContractError.invalidValue("Transition movies must be no longer than \(Int(LifecycleTransitionMediaPolicy.maximumDuration)) seconds.")
+                            }
+                            try Self.requireValidatedFilesUnchanged(
+                                validation,
+                                outputURL: conversion.outputURL,
+                                reportURL: conversion.reportURL
+                            )
+                            let entry = try MediaEntry(path: conversion.outputURL.lastPathComponent, loop: false)
+                            let updated = try self.mediaMap.settingTransition(from: source, to: destination, entry: entry)
+                            try self.publishMediaMap(updated)
+                            self.applyPublishedMediaMap(updated)
+                            self.clearConversionJournal()
+                            self.settingsController?.update(activity: .succeeded(destination, "Transition imported"))
+                        } catch {
+                            try? FileManager.default.removeItem(at: outputURL)
+                            try? FileManager.default.removeItem(at: reportURL)
+                            self.clearConversionJournal()
+                            self.settingsController?.update(activity: .failed(destination, error.localizedDescription))
+                        }
+                        self.mediaMutationInProgress = false
+                        self.refreshSettings()
+                    }
+                }
+            )
+        }
+    }
+
+    private func previewTransition(from source: PetState, to destination: PetState, path: String) {
+        guard !reduceMotion,
+              let entry = mediaMap.transition(from: source, to: destination),
+              entry.path == path else { return }
+        cancelActiveLifecycleTransition(reason: "transition_preview")
+        cancelActiveOneShotWithoutRestore(reason: "transition_preview")
+        transitionSequence &+= 1
+        let transitionID = transitionSequence
+        let url = mediaMap.resolvedURL(for: entry, relativeTo: mediaMapURL)
+        guard FileManager.default.isReadableFile(atPath: url.path) else {
+            settingsController?.update(
+                activity: .failed(destination, "The transition movie is missing or unreadable.")
+            )
+            apply(state: currentState, forceRefresh: true)
+            return
+        }
+        let oneShot = try? MediaEntry(path: entry.path, posterPath: entry.posterPath, loop: false, playbackRate: entry.playbackRate.value)
+        guard let oneShot else { return }
+        guard let playback = try? oneShotArbiter.start(state: currentState, path: entry.path) else { return }
+        activeOneShotPreview = ActiveOneShotPreview(
+            playback: playback,
+            libraryState: destination,
+            transitionID: transitionID
+        )
+        let result = player.show(
+            state: effectivePresentationState,
+            entry: oneShot,
+            url: url,
+            posterURL: nil,
+            transitionID: transitionID,
+            startedAt: DispatchTime.now().uptimeNanoseconds,
+            previewName: url.lastPathComponent,
+            notifyWhenEnded: true
+        )
+        if result == .failed {
+            _ = oneShotArbiter.cancel(token: playback.token)
+            activeOneShotPreview = nil
+            apply(state: currentState, forceRefresh: true)
+        }
+    }
+
+    private func removeTransition(from source: PetState, to destination: PetState, path: String) {
+        guard !mediaMutationInProgress,
+              mediaMap.transition(from: source, to: destination)?.path == path else { return }
+        guard let window = settingsController?.window else { return }
+        let requestedCharacterID = characterLibrary.activeCharacterID
+        let requestedMapURL = mediaMapURL.standardizedFileURL
+        let requestedMapData = mediaMapEncodedData
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Remove this transition?"
+        alert.informativeText = "Remove only the transition mapping, or also move managed files to Trash after Statelet revalidates every character map."
+        alert.addButton(withTitle: "Remove and Trash Managed Files")
+        alert.addButton(withTitle: "Remove from Library Only")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self, response != .alertThirdButtonReturn else { return }
+            let catalogSnapshot = try? self.characterLibraryStorage.loadCatalog()
+            guard !self.mediaMutationInProgress,
+                  catalogSnapshot?.library == self.characterLibrary,
+                  catalogSnapshot?.encodedData == self.characterLibraryEncodedData,
+                  self.characterLibrary.activeCharacterID == requestedCharacterID,
+                  self.mediaMapURL.standardizedFileURL == requestedMapURL,
+                  self.mediaMapEncodedData == requestedMapData,
+                  self.mediaMap.transition(from: source, to: destination)?.path == path else {
+                self.settingsController?.update(
+                    activity: .failed(destination, "The character or transition changed before removal. Nothing was removed.")
+                )
+                return
+            }
+            self.mediaMutationInProgress = true
+            defer {
+                self.mediaMutationInProgress = false
+                self.refreshSettings()
+            }
+            do {
+                let updated: MediaMap
+                if response == .alertFirstButtonReturn {
+                    let originalMap = self.mediaMap
+                    let plan = try ManagedMediaRemovalPlanner.plan(
+                        mediaMap: self.mediaMap,
+                        mapURL: self.mediaMapURL,
+                        transitionFrom: source,
+                        transitionTo: destination,
+                        canonicalRoot: self.canonicalManagedMediaRoot
+                    )
+                    let libraryMaps = try self.allCharacterMediaMaps()
+                    guard !plan.trashURLs.contains(where: { target in
+                        libraryMaps.contains { character, map, mapURL in
+                            guard character.id != self.characterLibrary.activeCharacterID else { return false }
+                            return self.mediaMap(map, at: mapURL, references: target)
+                        }
+                    }) else {
+                        throw PetContractError.invalidValue("This transition media is shared by another character. Remove only the library entry.")
+                    }
+                    let snapshot = try ManagedMediaTrashRevalidator.captureLibrary(
+                        targetURLs: plan.trashURLs,
+                        maps: libraryMaps.map { _, map, mapURL in ManagedMediaTrashMap(url: mapURL, map: map) },
+                        catalogURL: self.characterLibraryStorage.catalogURL,
+                        canonicalRoot: self.canonicalManagedMediaRoot
+                    )
+                    try ManagedMediaTrashRevalidator.validateLibraryUnchanged(
+                        snapshot: snapshot,
+                        canonicalRoot: self.canonicalManagedMediaRoot
+                    )
+                    updated = plan.updatedMap
+                    try self.publishMediaMap(updated)
+                    self.applyPublishedMediaMap(updated)
+                    let quarantine: ManagedMediaTrashQuarantine
+                    do {
+                        quarantine = try ManagedMediaTrashRevalidator.quarantineLibraryAfterPublish(
+                            snapshot: snapshot,
+                            publishedMap: ManagedMediaTrashMap(url: self.mediaMapURL, map: updated),
+                            canonicalRoot: self.canonicalManagedMediaRoot
+                        )
+                    } catch {
+                        try ManagedMediaTrashRevalidator.validateLibraryReadyForMapRestore(
+                            snapshot: snapshot,
+                            publishedMap: ManagedMediaTrashMap(url: self.mediaMapURL, map: updated),
+                            canonicalRoot: self.canonicalManagedMediaRoot
+                        )
+                        try self.publishMediaMap(originalMap)
+                        self.applyPublishedMediaMap(originalMap)
+                        throw error
+                    }
+                    do {
+                        try FileManager.default.trashItem(at: quarantine.directoryURL, resultingItemURL: nil)
+                    } catch {
+                        self.settingsController?.update(
+                            activity: .failed(destination, "The transition was removed, but its quarantined managed files could not be moved to Trash.")
+                        )
+                        return
+                    }
+                } else {
+                    updated = try self.mediaMap.removingTransition(from: source, to: destination)
+                    try self.publishMediaMap(updated)
+                    self.applyPublishedMediaMap(updated)
+                }
+                self.settingsController?.update(activity: .succeeded(destination, "Transition removed"))
+            } catch {
+                self.settingsController?.update(activity: .failed(destination, error.localizedDescription))
+            }
+        }
+    }
+
     private func importMP4s(_ sourceURLs: [URL], for state: PetState) {
         guard !mediaMutationInProgress else {
             settingsController?.update(activity: .failed(state, "Nothing imported · wait for the current media operation to finish"))
@@ -2387,6 +2986,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             try writeConversionJournal(
                 ActiveConversionJournal(
                     state: state.rawValue,
+                    characterID: characterLibrary.activeCharacterID,
+                    mediaMapBasename: mediaMapURL.lastPathComponent,
+                    mediaMapSHA256: try currentMediaMapSHA256(),
                     outputBasename: outputURL.lastPathComponent,
                     reportBasename: reportURL.lastPathComponent,
                     invocationChallenge: invocationChallenge
@@ -2552,8 +3154,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                                     )
                                 )
                                 self.logger.error("event=animation_import_failed state=\(state.rawValue, privacy: .public) batch_index=\(position, privacy: .public) batch_count=\(sourceURLs.count, privacy: .public) stage=report_validation")
-                            case let .success(report):
+                            case let .success(validation):
                                 do {
+                                    let report = validation.report
                                     guard report.trust == .locallyAttested else {
                                         throw AlphaConversionFailure.converterFailed(
                                             "The converted movie was not locally attested."
@@ -2569,6 +3172,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                                             total: sourceURLs.count,
                                             clipPercent: 99
                                         )
+                                    )
+                                    try Self.requireValidatedFilesUnchanged(
+                                        validation,
+                                        outputURL: conversion.outputURL,
+                                        reportURL: conversion.reportURL
                                     )
                                     try self.installMediaEntry(
                                         for: state,
@@ -2736,6 +3344,13 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         )
     }
 
+    private func currentMediaMapSHA256() throws -> String {
+        guard let data = mediaMapEncodedData else {
+            throw PetContractError.invalidValue("media map snapshot is unavailable")
+        }
+        return Self.sha256Hex(of: data)
+    }
+
     private func clearConversionJournal() {
         try? FileManager.default.removeItem(at: conversionJournalURL)
     }
@@ -2753,22 +3368,23 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
 
     private func recoverInterruptedConversionIfPresent() {
         let journalURL = conversionJournalURL
-        let mediaDirectory = mediaMapURL.deletingLastPathComponent()
+        var journalStatus = stat()
+        guard Darwin.lstat(journalURL.path, &journalStatus) == 0 else { return }
         guard let data = try? PortableMediaSecureCopier.readRegularFile(
                   at: journalURL,
                   maximumBytes: PortableMediaCopyLimits().maxReportBytes
               ),
               let journal = try? JSONDecoder().decode(ActiveConversionJournal.self, from: data),
               let state = PetState(rawValue: journal.state),
+              let owner = try? recoveryOwner(for: journal),
+              Self.isValidRecoveryRoute(journal),
               AlphaRecoveryArtifactPolicy.accepts(
-                  stateRawValue: state.rawValue,
+                  artifactStem: Self.recoveryArtifactStem(journal, state: state),
                   outputBasename: journal.outputBasename,
                   reportBasename: journal.reportBasename
               ),
-              Self.isValidInvocationChallenge(journal.invocationChallenge) else {
-            try? FileManager.default.removeItem(at: journalURL)
-            return
-        }
+              Self.isValidInvocationChallenge(journal.invocationChallenge) else { return }
+        let mediaDirectory = configuredMediaMapURL.deletingLastPathComponent()
         mediaMutationInProgress = true
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -2783,39 +3399,57 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                     expectedInitialReportData: nil
                 )
             }.result
-                switch validation {
+            switch validation {
                 case .failure:
-                    let outputReferenced = self.isMediaPathReferenced(outputURL)
-                    let reportReferenced = self.isMediaPathReferenced(reportURL)
-                    let shouldQuarantine = AlphaRecoveryArtifactPolicy.shouldQuarantine(
-                        outputReferenced: outputReferenced,
-                        reportReferenced: reportReferenced
-                    )
-                    let quarantined = shouldQuarantine
-                        ? self.quarantineFailedRecoveryArtifacts(
+                    // Failed validation does not prove that these names remain
+                    // unowned. Keep both artifacts and the journal untouched so
+                    // a later retry can re-evaluate the complete library graph.
+                    let notice = "Interrupted conversion could not be recovered safely. Its recovery journal and artifacts were retained for retry."
+                    self.pendingRecoveryNotice = (state, notice)
+                    self.settingsController?.update(activity: .failed(state, notice))
+                    self.logger.error("event=animation_recovery_deferred state=\(state.rawValue, privacy: .public) action=retain_journal_and_artifacts")
+                case let .success(validation):
+                    do {
+                        var updated = owner.map
+                        if let rawFrom = journal.transitionFrom,
+                           let rawTo = journal.transitionTo,
+                           let from = PetState(rawValue: rawFrom),
+                           let to = PetState(rawValue: rawTo) {
+                            let duration = validation.durationSeconds
+                            guard duration.isFinite, duration > 0,
+                                  duration <= LifecycleTransitionMediaPolicy.maximumDuration else {
+                                throw PetContractError.invalidValue("Recovered transition exceeds the duration limit.")
+                            }
+                            if updated.transition(from: from, to: to)?.path != journal.outputBasename {
+                                let entry = try MediaEntry(path: journal.outputBasename, loop: false)
+                                updated = try updated.settingTransition(from: from, to: to, entry: entry)
+                            }
+                        } else {
+                            let alreadyInstalled = updated.playlist(for: state)?
+                                .entries.contains(where: { $0.path == journal.outputBasename }) == true
+                            if !alreadyInstalled {
+                                updated = try updated.appendingEntry(
+                                    MediaEntry(path: journal.outputBasename),
+                                    for: state
+                                )
+                            }
+                        }
+                        try Self.requireValidatedFilesUnchanged(
+                            validation,
                             outputURL: outputURL,
                             reportURL: reportURL
                         )
-                        : 0
-                    let isReferenced = outputReferenced || reportReferenced
-                    self.clearConversionJournal()
-                    let notice: String
-                    if isReferenced {
-                        notice = "Interrupted conversion could not be recovered. Existing library media was left unchanged."
-                    } else if quarantined > 0 {
-                        notice = "Interrupted conversion could not be recovered. \(quarantined) file\(quarantined == 1 ? " was" : "s were") moved to private recovery quarantine; Clean Unused Media can remove them later."
-                    } else {
-                        notice = "Interrupted conversion could not be recovered. No managed media files were changed."
-                    }
-                    self.pendingRecoveryNotice = (state, notice)
-                    self.settingsController?.update(activity: .failed(state, notice))
-                    self.logger.error("event=animation_recovery_quarantined state=\(state.rawValue, privacy: .public) files=\(quarantined, privacy: .public) referenced=\(isReferenced, privacy: .public) cleanup=unused_media")
-                case .success:
-                    do {
-                        let alreadyInstalled = self.mediaMap.playlist(for: state)?
-                            .entries.contains(where: { $0.path == journal.outputBasename }) == true
-                        if !alreadyInstalled {
-                            try self.installMediaEntry(for: state, path: journal.outputBasename)
+                        let encoded = try self.characterLibraryStorage.saveRecoveredMediaMap(
+                            updated,
+                            for: owner.entry,
+                            expectedData: owner.encodedData,
+                            expectedCatalogData: owner.catalogEncodedData
+                        )
+                        if owner.isActive {
+                            self.mediaMapEncodedData = encoded
+                            self.applyPublishedMediaMap(updated)
+                        } else {
+                            self.characterClipCounts[owner.entry.id] = self.totalClipCount(in: updated)
                         }
                         self.clearConversionJournal()
                         self.logger.info("event=animation_recovered state=\(state.rawValue, privacy: .public)")
@@ -2828,16 +3462,69 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
     }
 
+    private func recoveryOwner(for journal: ActiveConversionJournal) throws -> RecoveryOwner {
+        let catalogSnapshot = try characterLibraryStorage.loadCatalog()
+        let catalog = catalogSnapshot.library
+        let entry: CharacterLibraryEntry
+        switch (journal.characterID, journal.mediaMapBasename, journal.mediaMapSHA256) {
+        case (nil, nil, nil):
+            throw PetContractError.invalidValue("legacy recovery owner is ambiguous")
+        case let (.some(characterID), .some(mapBasename), .some(mapSHA256)):
+            guard mapSHA256.count == 64,
+                  mapSHA256.allSatisfy({ $0.isHexDigit && !$0.isUppercase }),
+                  let matched = catalog.character(id: characterID),
+                  matched.mapPath == mapBasename else {
+                throw PetContractError.invalidValue("conversion recovery owner changed")
+            }
+            entry = matched
+            let loaded = try characterLibraryStorage.loadMediaMap(for: entry)
+            let catalogAfterLoad = try characterLibraryStorage.loadCatalog()
+            guard catalogAfterLoad.encodedData == catalogSnapshot.encodedData,
+                  catalogAfterLoad.library.character(id: entry.id)?.mapPath == entry.mapPath,
+                  Self.sha256Hex(of: loaded.encodedData) == mapSHA256 else {
+                throw PetContractError.invalidValue("conversion recovery ownership changed")
+            }
+            let catalogMatchesLiveState = catalogSnapshot.encodedData == characterLibraryEncodedData
+                && catalog.activeCharacterID == characterLibrary.activeCharacterID
+            return RecoveryOwner(
+                entry: entry,
+                map: loaded.map,
+                encodedData: loaded.encodedData,
+                catalogEncodedData: catalogSnapshot.encodedData,
+                isActive: catalogMatchesLiveState && entry.id == catalog.activeCharacterID
+            )
+        default:
+            throw PetContractError.invalidValue("conversion recovery owner is incomplete")
+        }
+    }
+
     private static func isValidInvocationChallenge(_ value: String) -> Bool {
         value.count == 64 && value.allSatisfy { $0.isHexDigit && !$0.isUppercase }
+    }
+
+    private static func isValidRecoveryRoute(_ journal: ActiveConversionJournal) -> Bool {
+        if journal.transitionFrom == nil, journal.transitionTo == nil { return true }
+        guard let rawFrom = journal.transitionFrom,
+              let rawTo = journal.transitionTo,
+              let from = PetState(rawValue: rawFrom),
+              let to = PetState(rawValue: rawTo) else { return false }
+        return from != to && journal.state == to.rawValue
+    }
+
+    private static func recoveryArtifactStem(
+        _ journal: ActiveConversionJournal,
+        state: PetState
+    ) -> String {
+        guard let from = journal.transitionFrom,
+              let to = journal.transitionTo else { return state.rawValue }
+        return "transition-\(from)-to-\(to)"
     }
 
     private func isMediaPathReferenced(_ url: URL) -> Bool {
         let target = url.standardizedFileURL.path
         do {
             return try allCharacterMediaMaps().contains { _, map, mapURL in
-                map.states.values.contains { playlist in
-                    playlist.entries.contains { entry in
+                allMediaEntries(in: map).contains { entry in
                         let movie = map.resolvedURL(for: entry, relativeTo: mapURL)
                             .standardizedFileURL
                         return movie.path == target
@@ -2846,7 +3533,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                                 .standardizedFileURL.path == target
                             || map.resolvedPosterURL(for: entry, relativeTo: mapURL)?
                                 .standardizedFileURL.path == target
-                    }
                 }
             }
         } catch {
@@ -2861,8 +3547,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         do {
             return try allCharacterMediaMaps().contains { character, map, mapURL in
                 guard character.id != characterLibrary.activeCharacterID else { return false }
-                return map.states.values.contains { playlist in
-                    playlist.entries.contains { entry in
+                return allMediaEntries(in: map).contains { entry in
                         let movie = map.resolvedURL(for: entry, relativeTo: mapURL)
                             .standardizedFileURL
                         return movie.path == target
@@ -2871,7 +3556,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                                 .standardizedFileURL.path == target
                             || map.resolvedPosterURL(for: entry, relativeTo: mapURL)?
                                 .standardizedFileURL.path == target
-                    }
                 }
             }
         } catch {
@@ -2881,15 +3565,13 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
 
     private func mediaMap(_ map: MediaMap, at mapURL: URL, references url: URL) -> Bool {
         let target = url.standardizedFileURL.path
-        return map.states.values.contains { playlist in
-            playlist.entries.contains { entry in
+        return allMediaEntries(in: map).contains { entry in
                 let movie = map.resolvedURL(for: entry, relativeTo: mapURL).standardizedFileURL
                 return movie.path == target
                     || movie.deletingPathExtension().appendingPathExtension("report.json")
                         .standardizedFileURL.path == target
                     || map.resolvedPosterURL(for: entry, relativeTo: mapURL)?
                         .standardizedFileURL.path == target
-            }
         }
     }
 
@@ -2902,70 +3584,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             let loaded = try characterLibraryStorage.loadMediaMap(for: entry)
             return (entry, loaded.map, mapURL)
         }
-    }
-
-    private func quarantineFailedRecoveryArtifacts(outputURL: URL, reportURL: URL) -> Int {
-        let mediaDirectory = mediaMapURL.deletingLastPathComponent()
-        let quarantineDirectory = mediaDirectory.appendingPathComponent(
-            ".recovery-quarantine",
-            isDirectory: true
-        )
-        do {
-            try FileManager.default.createDirectory(
-                at: quarantineDirectory,
-                withIntermediateDirectories: false,
-                attributes: [.posixPermissions: 0o700]
-            )
-        } catch CocoaError.fileWriteFileExists {
-            // Existing quarantine is accepted only after the no-follow open below.
-        } catch {
-            return 0
-        }
-        let sourceDirectoryDescriptor = Darwin.open(
-            mediaDirectory.path,
-            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
-        )
-        guard sourceDirectoryDescriptor >= 0 else { return 0 }
-        defer { Darwin.close(sourceDirectoryDescriptor) }
-        let quarantineDescriptor = Darwin.open(
-            quarantineDirectory.path,
-            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
-        )
-        guard quarantineDescriptor >= 0 else { return 0 }
-        defer { Darwin.close(quarantineDescriptor) }
-        guard Darwin.fchmod(quarantineDescriptor, mode_t(S_IRWXU)) == 0 else { return 0 }
-
-        var moved = 0
-        let suffix = versionToken()
-        for sourceURL in [outputURL, reportURL] {
-            let sourceName = sourceURL.lastPathComponent
-            guard sourceURL.deletingLastPathComponent().standardizedFileURL == mediaDirectory.standardizedFileURL else {
-                continue
-            }
-            let sourceDescriptor = Darwin.openat(
-                sourceDirectoryDescriptor,
-                sourceName,
-                O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
-            )
-            guard sourceDescriptor >= 0 else { continue }
-            var sourceStatus = stat()
-            let isRegular = Darwin.fstat(sourceDescriptor, &sourceStatus) == 0
-                && sourceStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG)
-            if isRegular { _ = Darwin.fchmod(sourceDescriptor, mode_t(S_IRUSR | S_IWUSR)) }
-            Darwin.close(sourceDescriptor)
-            guard isRegular else { continue }
-            let destinationName = "\(suffix)-\(sourceName)"
-            guard Darwin.renameat(
-                sourceDirectoryDescriptor,
-                sourceName,
-                quarantineDescriptor,
-                destinationName
-            ) == 0 else { continue }
-            moved += 1
-        }
-        _ = Darwin.fsync(sourceDirectoryDescriptor)
-        _ = Darwin.fsync(quarantineDescriptor)
-        return moved
     }
 
     private func chooseTransparentMovie(for state: PetState) {
@@ -3098,12 +3716,21 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             )
         }
         do {
-            try await validatePortableMovie(installed, allowPortableClaim: allowPortableClaim)
+            let validation = try await validatePortableMovie(
+                installed,
+                allowPortableClaim: allowPortableClaim
+            )
+            return VerifiedMovieInstall(
+                directory: installed.directory,
+                movieURL: installed.movieURL,
+                reportURL: installed.reportURL,
+                relativePath: installed.relativePath,
+                validation: validation
+            )
         } catch {
             try? FileManager.default.removeItem(at: installed.directory)
             throw error
         }
-        return installed
     }
 
     private static func validateLocallyAttestedMovie(
@@ -3112,7 +3739,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         expectedOutputBasename: String,
         invocationChallenge: String,
         expectedInitialReportData: Data?
-    ) throws -> ValidatedAlphaConversionReport {
+    ) throws -> VerifiedMovieValidation {
         let limits = PortableMediaCopyLimits()
         let movieIdentity = try PortableMediaSecureCopier.regularFileIdentity(
             at: outputURL,
@@ -3144,7 +3771,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         guard report.trust == .locallyAttested else {
             throw AlphaConversionFailure.converterFailed("Local conversion attestation was missing.")
         }
-        _ = try AlphaPlaybackProcessValidator.validate(url: outputURL, expected: report)
+        let probe = try AlphaPlaybackProcessValidator.validate(url: outputURL, expected: report)
 
         let reportDataAfterPlayback = try PortableMediaSecureCopier.readRegularFile(
             at: reportURL,
@@ -3173,13 +3800,36 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
               directoryIdentityAfterPlayback.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
             throw PortableMediaCopyError.sourceChanged
         }
-        return report
+        return VerifiedMovieValidation(
+            report: report,
+            movieIdentity: movieIdentityAfterPlayback,
+            reportIdentity: reportIdentityAfterPlayback,
+            durationSeconds: probe.durationSeconds
+        )
+    }
+
+    private static func requireValidatedFilesUnchanged(
+        _ validation: VerifiedMovieValidation,
+        outputURL: URL,
+        reportURL: URL
+    ) throws {
+        let limits = PortableMediaCopyLimits()
+        guard try PortableMediaSecureCopier.regularFileIdentity(
+                  at: outputURL,
+                  maximumBytes: limits.maxMovieBytes
+              ) == validation.movieIdentity,
+              try PortableMediaSecureCopier.regularFileIdentity(
+                  at: reportURL,
+                  maximumBytes: limits.maxReportBytes
+              ) == validation.reportIdentity else {
+            throw PortableMediaCopyError.sourceChanged
+        }
     }
 
     private func validatePortableMovie(
-        _ installed: VerifiedMovieInstall,
+        _ installed: VerifiedMovieCopy,
         allowPortableClaim: Bool
-    ) async throws {
+    ) async throws -> VerifiedMovieValidation {
         try await PortableMediaOperationRunner.run(
             timeoutSeconds: Self.portableValidationTimeoutSeconds
         ) { token in
@@ -3224,7 +3874,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                     "Legacy portable reports are not accepted. Reconvert the source MP4 with the current Statelet converter."
                 )
             }
-            _ = try AlphaPlaybackProcessValidator.validate(
+            let probe = try AlphaPlaybackProcessValidator.validate(
                 url: installed.movieURL,
                 expected: report
             )
@@ -3259,6 +3909,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 throw PortableMediaCopyError.sourceChanged
             }
             try token.check()
+            return VerifiedMovieValidation(
+                report: report,
+                movieIdentity: movieIdentityAfterPlayback,
+                reportIdentity: reportIdentityAfterPlayback,
+                durationSeconds: probe.durationSeconds
+            )
         }
     }
 
@@ -3279,6 +3935,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             return
         }
 
+        cancelActiveLifecycleTransition(reason: "play_once")
         cancelActiveOneShotWithoutRestore(reason: "superseded")
         do {
             let presentationState = effectivePresentationState
@@ -3730,7 +4387,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         _ sourceURL: URL,
         reportURL: URL,
         operationToken: PortableMediaOperationToken
-    ) throws -> VerifiedMovieInstall {
+    ) throws -> VerifiedMovieCopy {
         let root = mediaMapURL.deletingLastPathComponent()
         let importsRoot = root.appendingPathComponent("imports", isDirectory: true)
         try FileManager.default.createDirectory(
@@ -3753,7 +4410,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 reportSource: reportURL,
                 destinationDirectory: destinationDirectory
             )
-            return VerifiedMovieInstall(
+            return VerifiedMovieCopy(
                 directory: destinationDirectory,
                 movieURL: copied.movieURL,
                 reportURL: copied.reportURL,
@@ -4106,8 +4763,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 character.resolvedMapURL(relativeTo: configuredMediaMapURL)
                     .resolvingSymlinksInPath().standardizedFileURL.path
             )
-            for playlist in map.states.values {
-                for entry in playlist.entries {
+            for entry in allMediaEntries(in: map) {
                     let movie = map.resolvedURL(for: entry, relativeTo: mapURL)
                     .resolvingSymlinksInPath().standardizedFileURL
                     if isInsideManagedMedia(movie, root: root) {
@@ -4123,7 +4779,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                        isInsideManagedMedia(poster, root: root) {
                         referenced.insert(poster.path)
                     }
-                }
             }
         }
 
@@ -4217,6 +4872,10 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
         try operationCheck()
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func sha256Hex(of data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     @objc private func revealMediaFolder() {

@@ -32,6 +32,22 @@ enum PlaybackPresentationEvent {
     case failed
 }
 
+enum LifecycleTransitionDeadline {
+    static func uptimeNanoseconds(
+        startedAt: UInt64,
+        maximumDuration: TimeInterval = LifecycleTransitionMediaPolicy.maximumDuration
+    ) -> UInt64 {
+        guard maximumDuration.isFinite, maximumDuration > 0 else { return startedAt }
+        let boundedDuration = maximumDuration
+        let durationNanoseconds = UInt64(min(
+            Double(UInt64.max),
+            boundedDuration * 1_000_000_000
+        ))
+        let (deadline, overflow) = startedAt.addingReportingOverflow(durationNanoseconds)
+        return overflow ? UInt64.max : deadline
+    }
+}
+
 enum PlaybackPresentationStatus: Equatable {
     case awaiting
     case preparing(PetState)
@@ -882,6 +898,7 @@ final class PetPlayerController {
     private var failedToEndObserver: NSObjectProtocol?
     private var didPlayToEndObserver: NSObjectProtocol?
     private var readinessTimeoutWorkItem: DispatchWorkItem?
+    private var lifecycleTransitionTimeoutWorkItem: DispatchWorkItem?
     private var fpsLoadingTask: Task<Void, Never>?
     private var fpsCache = BoundedLRUCache<LocalFileRevision, Double>(
         capacity: maximumCachedFrameRates
@@ -894,6 +911,7 @@ final class PetPlayerController {
     private var activeItemIdentifiers: Set<ObjectIdentifier> = []
     private var oneShotEndTransitionID: UInt64?
     private var playlistEndTransitionID: UInt64?
+    private var lifecycleTransitionEndID: UInt64?
     private(set) var currentState: PetState = .idle
     private(set) var currentURL: URL?
     private var currentPresentationIsOneShot = false
@@ -905,6 +923,8 @@ final class PetPlayerController {
     var onPresentationEvent: ((UInt64, PetState, PlaybackPresentationEvent) -> Void)?
     var onOneShotEnded: ((UInt64) -> Void)?
     var onPlaylistClipEnded: ((UInt64, PetState) -> Void)?
+    var onLifecycleTransitionEnded: ((UInt64) -> Void)?
+    var onLifecycleTransitionFailed: ((UInt64) -> Void)?
 
     init(view: PetPlayerView) {
         self.view = view
@@ -952,12 +972,19 @@ final class PetPlayerController {
                 self.currentURL = nil
                 self.logger.info("event=playlist_clip_ended transition_id=\(transition.id, privacy: .public) state=\(transition.state.rawValue, privacy: .public)")
                 self.onPlaylistClipEnded?(transition.id, transition.state)
+            } else if self.lifecycleTransitionEndID == transition.id {
+                self.lifecycleTransitionTimeoutWorkItem?.cancel()
+                self.lifecycleTransitionTimeoutWorkItem = nil
+                self.lifecycleTransitionEndID = nil
+                self.logger.info("event=lifecycle_transition_ended transition_id=\(transition.id, privacy: .public)")
+                self.onLifecycleTransitionEnded?(transition.id)
             }
         }
     }
 
     deinit {
         readinessTimeoutWorkItem?.cancel()
+        lifecycleTransitionTimeoutWorkItem?.cancel()
         fpsLoadingTask?.cancel()
         if let failedToEndObserver {
             NotificationCenter.default.removeObserver(failedToEndObserver)
@@ -1047,6 +1074,42 @@ final class PetPlayerController {
         scheduleReadinessTimeout(transitionID: transitionID)
         applyPlaybackDirective(suspensionPolicy.replacePlayback(rate: playbackRate))
         return .preparing
+    }
+
+    /// Plays one validated lifecycle transition once on the existing queue
+    /// player. The destination remains uncommitted until the end callback.
+    @discardableResult
+    func showLifecycleTransition(
+        destinationState: PetState,
+        entry: MediaEntry,
+        url: URL,
+        transitionID: UInt64,
+        startedAt: UInt64
+    ) -> PlaybackStartDisposition {
+        guard let oneShotEntry = try? MediaEntry(
+            path: entry.path,
+            posterPath: entry.posterPath,
+            loop: false,
+            playbackRate: entry.playbackRate.value
+        ) else { return .failed }
+        let result = show(
+            state: destinationState,
+            entry: oneShotEntry,
+            url: url,
+            posterURL: nil,
+            transitionID: transitionID,
+            startedAt: startedAt
+        )
+        if result == .preparing {
+            lifecycleTransitionEndID = transitionID
+            readinessTimeoutWorkItem?.cancel()
+            readinessTimeoutWorkItem = nil
+            scheduleLifecycleTransitionTimeout(
+                transitionID: transitionID,
+                startedAt: startedAt
+            )
+        }
+        return result
     }
 
     func setReduceMotion(_ enabled: Bool) {
@@ -1230,15 +1293,26 @@ final class PetPlayerController {
         )
         let duration = Self.elapsedMilliseconds(since: transition.startedAt)
         logger.info("event=display_ready transition_id=\(transition.id, privacy: .public) state=\(transition.state.rawValue, privacy: .public) duration_ms=\(duration, format: .fixed(precision: 3), privacy: .public)")
-        onPresentationEvent?(transition.id, transition.state, .ready)
+        if lifecycleTransitionEndID == transition.id {
+            // The lifecycle deadline was anchored at the authoritative state
+            // change, so decoder readiness consumes the same bounded budget.
+        } else {
+            onPresentationEvent?(transition.id, transition.state, .ready)
+        }
     }
 
     private func failActiveTransition(reason: PlaybackFailureReason) {
         guard var transition = activeTransition,
               transition.readiness.receive(.failure) == .becameFailed else { return }
+        let failedLifecycleTransitionID = lifecycleTransitionEndID == transition.id
+            ? transition.id
+            : nil
         activeTransition = nil
         oneShotEndTransitionID = nil
         playlistEndTransitionID = nil
+        lifecycleTransitionEndID = nil
+        lifecycleTransitionTimeoutWorkItem?.cancel()
+        lifecycleTransitionTimeoutWorkItem = nil
         readinessTimeoutWorkItem?.cancel()
         readinessTimeoutWorkItem = nil
         fpsLoadingTask?.cancel()
@@ -1259,7 +1333,11 @@ final class PetPlayerController {
             presentationSummary: "media unavailable, transparent placeholder"
         )
         logger.error("event=playback_unavailable transition_id=\(transition.id, privacy: .public) state=\(transition.state.rawValue, privacy: .public) reason=\(reason.rawValue, privacy: .public)")
-        onPresentationEvent?(transition.id, transition.state, .failed)
+        if let failedLifecycleTransitionID {
+            onLifecycleTransitionFailed?(failedLifecycleTransitionID)
+        } else {
+            onPresentationEvent?(transition.id, transition.state, .failed)
+        }
     }
 
     private func scheduleReadinessTimeout(transitionID: UInt64) {
@@ -1275,6 +1353,38 @@ final class PetPlayerController {
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.readinessTimeout, execute: workItem)
     }
 
+    private func scheduleLifecycleTransitionTimeout(transitionID: UInt64, startedAt: UInt64) {
+        lifecycleTransitionTimeoutWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.lifecycleTransitionEndID == transitionID,
+                  self.activeTransition?.id == transitionID else { return }
+            self.abortLifecycleTransition(transitionID: transitionID)
+        }
+        lifecycleTransitionTimeoutWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: DispatchTime(uptimeNanoseconds: LifecycleTransitionDeadline.uptimeNanoseconds(
+                startedAt: startedAt
+            )),
+            execute: workItem
+        )
+    }
+
+    private func abortLifecycleTransition(transitionID: UInt64) {
+        guard lifecycleTransitionEndID == transitionID,
+              activeTransition?.id == transitionID else { return }
+        invalidateActiveTransition()
+        stopQueuePlayback()
+        currentURL = nil
+        currentPresentationIsOneShot = false
+        presentationStatus = .awaiting
+        view.showPoster(nil)
+        view.showPlaceholder(nil)
+        view.hideFPSBadge()
+        logger.error("event=lifecycle_transition_timeout transition_id=\(transitionID, privacy: .public)")
+        onLifecycleTransitionFailed?(transitionID)
+    }
+
     private func invalidateActiveTransition() {
         readinessTimeoutWorkItem?.cancel()
         readinessTimeoutWorkItem = nil
@@ -1283,6 +1393,9 @@ final class PetPlayerController {
         activeTransition = nil
         oneShotEndTransitionID = nil
         playlistEndTransitionID = nil
+        lifecycleTransitionEndID = nil
+        lifecycleTransitionTimeoutWorkItem?.cancel()
+        lifecycleTransitionTimeoutWorkItem = nil
         itemStatusObservation = nil
         observedCurrentItemIdentifier = nil
         readyItemIdentifier = nil

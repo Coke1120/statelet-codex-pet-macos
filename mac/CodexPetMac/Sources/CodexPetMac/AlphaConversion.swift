@@ -104,17 +104,14 @@ enum AlphaConversionProfile: String, CaseIterable {
 }
 
 enum AlphaRecoveryArtifactPolicy {
-    static func shouldQuarantine(outputReferenced: Bool, reportReferenced: Bool) -> Bool {
-        !outputReferenced && !reportReferenced
-    }
-
     static func accepts(
-        stateRawValue: String,
+        artifactStem: String,
         outputBasename: String,
         reportBasename: String
     ) -> Bool {
-        let prefix = "\(stateRawValue)-"
-        guard !stateRawValue.isEmpty,
+        let prefix = "\(artifactStem)-"
+        guard !artifactStem.isEmpty,
+              artifactStem.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "-" }),
               outputBasename.hasPrefix(prefix),
               outputBasename.hasSuffix(".mov"),
               outputBasename == URL(fileURLWithPath: outputBasename).lastPathComponent,
@@ -165,7 +162,7 @@ struct PortableMediaCopyResult: Sendable {
     let reportURL: URL
 }
 
-struct PortableMediaFileIdentity: Equatable {
+struct PortableMediaFileIdentity: Equatable, Sendable {
     let device: UInt64
     let inode: UInt64
     let size: Int64

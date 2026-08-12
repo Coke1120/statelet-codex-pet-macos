@@ -21,6 +21,14 @@ ANIMATION_LIBRARY = (
     / "CodexPetMac"
     / "AnimationLibraryView.swift"
 )
+SETTINGS_CONTROLLER = (
+    ROOT
+    / "mac"
+    / "CodexPetMac"
+    / "Sources"
+    / "CodexPetMac"
+    / "SettingsWindowController.swift"
+)
 CORE_SOURCES = sorted(
     (ROOT / "mac" / "CodexPetMac" / "Sources" / "CodexPetCore").glob("*.swift")
 )
@@ -30,6 +38,7 @@ class MacAnimationLibraryUISourceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.source = ANIMATION_LIBRARY.read_text(encoding="utf-8")
+        cls.controller = SETTINGS_CONTROLLER.read_text(encoding="utf-8")
 
     def test_drop_target_is_a_compact_import_strip(self) -> None:
         self.assertIn("static let importStripHeight: CGFloat = 48", self.source)
@@ -70,6 +79,50 @@ class MacAnimationLibraryUISourceTests(unittest.TestCase):
         self.assertIn("rejections.append(", self.source)
         self.assertIn("Skipped \\(rejected.count)", self.source)
         self.assertIn("onImport?(urls)", self.source)
+
+    def test_transition_editor_lists_ordered_distinct_direction_pairs(self) -> None:
+        self.assertIn("final class TransitionLibraryView", self.source)
+        self.assertIn("PetState.allCases.flatMap { source in", self.source)
+        self.assertIn("source == destination ? nil", self.source)
+        self.assertIn('labelWithString: "LIFECYCLE TRANSITIONS"', self.source)
+        self.assertIn('labels: ["State Animations", "Transitions"]', self.controller)
+
+    def test_transition_editor_exposes_import_preview_replace_and_remove(self) -> None:
+        for callback in (
+            "onImportTransitionMP4",
+            "onUseTransitionMovie",
+            "onPreviewTransition",
+            "onRemoveTransition",
+        ):
+            self.assertIn(callback, self.controller)
+        self.assertIn('NSMenuItem(title: "Import MP4…"', self.source)
+        self.assertIn('NSMenuItem(title: "Verified MOV…"', self.source)
+        self.assertIn('title: clip == nil ? "Import…" : "Replace…"', self.source)
+        self.assertIn('title: "Remove…"', self.source)
+
+    def test_transition_preview_is_disabled_under_reduce_motion(self) -> None:
+        self.assertIn("clip?.exists == true && !reduceMotion && !busy", self.source)
+        self.assertIn(
+            '"Preview is unavailable while Reduce Motion is on."',
+            self.source,
+        )
+        self.assertIn("if shouldStop", self.controller)
+        self.assertIn("self?.onStopPreview?()", self.controller)
+
+    def test_missing_transition_file_is_visible_and_cannot_be_previewed(self) -> None:
+        self.assertIn("let exists: Bool", self.source)
+        self.assertIn('configurationStatus = clip.map { $0.exists ? "Configured" : "Missing" }', self.source)
+        self.assertIn('clipStatus = "Movie file is missing"', self.source)
+        self.assertIn("clip?.exists == false ? .systemRed", self.source)
+        self.assertIn('"The transition movie file is missing. Replace or remove it."', self.source)
+        self.assertIn("FileManager.default.isReadableFile(", self.controller)
+        self.assertIn("snapshot.mediaMap.resolvedURL(for: entry", self.controller)
+
+    def test_transition_editor_documents_duration_and_destination_commit(self) -> None:
+        self.assertIn("Maximum duration: 4 seconds.", self.source)
+        self.assertIn("Plays once, then commits destination", self.source)
+        self.assertIn("Destination animation is used directly", self.source)
+        self.assertIn('setAccessibilityLabel("Directional lifecycle transitions")', self.source)
 
 
 class MacAnimationLibraryUILayoutTests(unittest.TestCase):

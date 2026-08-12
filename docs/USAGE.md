@@ -202,6 +202,28 @@ The Actions menu can:
 - set the fixed clip; and
 - move a clip up or down in display and Sequential order.
 
+### Directional lifecycle transitions
+
+Choose **Transitions** in Settings → Animations to configure the active
+character's optional source → destination clips. All 12 distinct ordered pairs
+are available: `Idle → Running` and `Running → Idle`, for example, are separate
+settings. Each row offers **Import…** or **Replace…**, **Preview**, and
+**Remove…**. Import accepts an MP4 for conversion or a verified transparent
+MOV/report pair using the same validation and managed-media safety boundary as
+state animation clips.
+
+A transition clip is decorative and must be no longer than 4 seconds. It plays
+once, then Statelet commits the destination state's normal animation. The same
+single AVFoundation decoder is reused; there is no cross-fade or second warmed
+decoder. With Reduce Motion enabled, preview is unavailable and runtime
+transition video is skipped so the destination fallback appears immediately.
+
+Transitions are stored per character and round-trip in secure
+`.statelet-character` bundles. Removing a transition first removes only the
+active character's reference; managed-file Trash eligibility is revalidated
+before any file move. Maps and imported character bundles without transitions
+remain compatible and continue switching directly to destination animations.
+
 ## Import MP4 animations
 
 Use only media you own or have permission to adapt and distribute. Keep private

@@ -7,6 +7,26 @@ private enum AnimationLibraryLayout {
     static let minimumClipListHeight: CGFloat = 160
 }
 
+struct SettingsTransitionClip: Equatable {
+    let source: PetState
+    let destination: PetState
+    let path: String
+    let exists: Bool
+}
+
+private struct SettingsTransitionPair: Hashable {
+    let source: PetState
+    let destination: PetState
+}
+
+private enum TransitionColumn {
+    static let route = NSUserInterfaceItemIdentifier("animation-library.transition.route")
+    static let clip = NSUserInterfaceItemIdentifier("animation-library.transition.clip")
+    static let preview = NSUserInterfaceItemIdentifier("animation-library.transition.preview")
+    static let replace = NSUserInterfaceItemIdentifier("animation-library.transition.replace")
+    static let remove = NSUserInterfaceItemIdentifier("animation-library.transition.remove")
+}
+
 enum MP4ImportURLValidation {
     case accepted([URL], rejected: [MP4ImportRejection])
     case rejected(String)
@@ -949,5 +969,268 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
         if model.isPreviewing || (model.exists && !model.reduceMotion && !model.busy) {
             onPlayOrStop?(model.entry, model.isPreviewing)
         }
+    }
+}
+
+final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDelegate {
+    var onImportMP4: ((PetState, PetState) -> Void)?
+    var onUseMovie: ((PetState, PetState) -> Void)?
+    var onPreviewOrStop: ((SettingsTransitionClip, Bool) -> Void)?
+    var onRemove: ((SettingsTransitionClip) -> Void)?
+
+    private let tableView = NSTableView()
+    private let scrollView = NSScrollView()
+    private let guidance = NSTextField(
+        wrappingLabelWithString: "Optional directional clips play once before the destination animation. Maximum duration: 4 seconds."
+    )
+    private var pairs: [SettingsTransitionPair] = []
+    private var clipsByPair: [SettingsTransitionPair: SettingsTransitionClip] = [:]
+    private var previewPath: String?
+    private var reduceMotion = false
+    private var busy = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+        build()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    private func build() {
+        let title = NSTextField(labelWithString: "LIFECYCLE TRANSITIONS")
+        title.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
+        title.textColor = .secondaryLabelColor
+        guidance.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        guidance.textColor = .secondaryLabelColor
+        guidance.maximumNumberOfLines = 2
+        guidance.setAccessibilityLabel("Lifecycle transition guidance")
+
+        tableView.delegate = self
+        tableView.dataSource = self
+        tableView.rowHeight = 36
+        tableView.intercellSpacing = NSSize(width: 4, height: 1)
+        tableView.selectionHighlightStyle = .regular
+        tableView.allowsMultipleSelection = false
+        tableView.usesAlternatingRowBackgroundColors = true
+        tableView.headerView = NSTableHeaderView()
+        tableView.setAccessibilityLabel("Directional lifecycle transitions")
+        addColumn(identifier: TransitionColumn.route, title: "Direction", width: 138, minimumWidth: 120)
+        addColumn(identifier: TransitionColumn.clip, title: "Clip", width: 170, minimumWidth: 120, flexible: true)
+        addColumn(identifier: TransitionColumn.preview, title: "Preview", width: 70, minimumWidth: 66)
+        addColumn(identifier: TransitionColumn.replace, title: "Import / Replace", width: 118, minimumWidth: 110)
+        addColumn(identifier: TransitionColumn.remove, title: "Remove", width: 70, minimumWidth: 66)
+
+        scrollView.borderType = .bezelBorder
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.documentView = tableView
+
+        for view in [title, guidance, scrollView] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(view)
+        }
+        NSLayoutConstraint.activate([
+            title.topAnchor.constraint(equalTo: topAnchor),
+            title.leadingAnchor.constraint(equalTo: leadingAnchor),
+            title.trailingAnchor.constraint(equalTo: trailingAnchor),
+            guidance.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 5),
+            guidance.leadingAnchor.constraint(equalTo: leadingAnchor),
+            guidance.trailingAnchor.constraint(equalTo: trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: guidance.bottomAnchor, constant: 8),
+            scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 280),
+        ])
+    }
+
+    private func addColumn(
+        identifier: NSUserInterfaceItemIdentifier,
+        title: String,
+        width: CGFloat,
+        minimumWidth: CGFloat,
+        flexible: Bool = false
+    ) {
+        let column = NSTableColumn(identifier: identifier)
+        column.title = title
+        column.width = width
+        column.minWidth = minimumWidth
+        column.resizingMask = flexible ? [.autoresizingMask, .userResizingMask] : []
+        tableView.addTableColumn(column)
+    }
+
+    func update(
+        clips: [SettingsTransitionClip],
+        previewPath: String?,
+        reduceMotion: Bool,
+        busy: Bool,
+        characterName: String
+    ) {
+        pairs = PetState.allCases.flatMap { source in
+            PetState.allCases.compactMap { destination in
+                source == destination ? nil : SettingsTransitionPair(source: source, destination: destination)
+            }
+        }
+        clipsByPair = Dictionary(uniqueKeysWithValues: clips.map {
+            (SettingsTransitionPair(source: $0.source, destination: $0.destination), $0)
+        })
+        self.previewPath = previewPath
+        self.reduceMotion = reduceMotion
+        self.busy = busy
+        guidance.stringValue = reduceMotion
+            ? "Reduce Motion is on. Transition video preview and playback are skipped; the destination fallback is presented."
+            : "Optional directional clips for \(characterName) play once before the destination animation. Maximum duration: 4 seconds."
+        guidance.setAccessibilityHelp(guidance.stringValue)
+        tableView.setAccessibilityLabel("\(characterName) directional lifecycle transitions")
+        tableView.reloadData()
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { pairs.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard row >= 0, row < pairs.count, let tableColumn else { return nil }
+        let pair = pairs[row]
+        let clip = clipsByPair[pair]
+        let filename = clip.map { URL(fileURLWithPath: $0.path).lastPathComponent } ?? "Not configured"
+        switch tableColumn.identifier {
+        case TransitionColumn.route:
+            let configurationStatus = clip.map { $0.exists ? "Configured" : "Missing" } ?? "Optional"
+            return textCell(
+                identifier: TransitionColumn.route,
+                primary: "\(pair.source.displayName) → \(pair.destination.displayName)",
+                secondary: configurationStatus,
+                secondaryColor: clip?.exists == false ? .systemRed : .secondaryLabelColor,
+                accessibilityLabel: "\(pair.source.displayName) to \(pair.destination.displayName), \(configurationStatus.lowercased())"
+            )
+        case TransitionColumn.clip:
+            let clipStatus: String
+            if clip == nil {
+                clipStatus = "Destination animation is used directly"
+            } else if clip?.exists == false {
+                clipStatus = "Movie file is missing"
+            } else {
+                clipStatus = "Plays once, then commits destination"
+            }
+            return textCell(
+                identifier: TransitionColumn.clip,
+                primary: filename,
+                secondary: clipStatus,
+                primaryColor: clip?.exists == false ? .systemRed : .labelColor,
+                secondaryColor: clip?.exists == false ? .systemRed : .secondaryLabelColor,
+                accessibilityLabel: "\(filename), \(clipStatus.lowercased())"
+            )
+        case TransitionColumn.preview:
+            let cell = actionCell(identifier: TransitionColumn.preview, title: "Preview", action: #selector(previewTransition(_:)))
+            let isPreviewing = clip?.path == previewPath
+            cell.button.title = isPreviewing ? "Stop" : "Preview"
+            cell.button.isEnabled = isPreviewing || (clip?.exists == true && !reduceMotion && !busy)
+            let disabledReason: String?
+            if reduceMotion {
+                disabledReason = "Preview is unavailable while Reduce Motion is on."
+            } else if clip == nil {
+                disabledReason = "Import a transition clip first."
+            } else if clip?.exists == false {
+                disabledReason = "The transition movie file is missing. Replace or remove it."
+            } else {
+                disabledReason = nil
+            }
+            cell.button.toolTip = disabledReason
+            cell.button.setAccessibilityHelp(disabledReason)
+            cell.button.setAccessibilityLabel("\(isPreviewing ? "Stop preview" : "Preview") \(pair.source.displayName) to \(pair.destination.displayName) transition")
+            return cell
+        case TransitionColumn.replace:
+            let cell = actionCell(identifier: TransitionColumn.replace, title: clip == nil ? "Import…" : "Replace…", action: #selector(importOrReplace(_:)))
+            cell.button.isEnabled = !busy
+            cell.button.setAccessibilityLabel("\(clip == nil ? "Import" : "Replace") \(pair.source.displayName) to \(pair.destination.displayName) transition")
+            cell.button.toolTip = "Import an MP4 to convert, or choose a verified transparent MOV."
+            return cell
+        case TransitionColumn.remove:
+            let cell = actionCell(identifier: TransitionColumn.remove, title: "Remove…", action: #selector(removeTransition(_:)))
+            cell.button.isEnabled = clip != nil && !busy
+            cell.button.setAccessibilityLabel("Remove \(pair.source.displayName) to \(pair.destination.displayName) transition")
+            return cell
+        default:
+            return nil
+        }
+    }
+
+    private func textCell(
+        identifier: NSUserInterfaceItemIdentifier,
+        primary: String,
+        secondary: String,
+        primaryColor: NSColor = .labelColor,
+        secondaryColor: NSColor = .secondaryLabelColor,
+        accessibilityLabel: String
+    ) -> LibraryTextCell {
+        let cell = (tableView.makeView(withIdentifier: identifier, owner: self) as? LibraryTextCell) ?? LibraryTextCell()
+        cell.identifier = identifier
+        cell.update(
+            primary: primary,
+            secondary: secondary,
+            primaryColor: primaryColor,
+            secondaryColor: secondaryColor,
+            accessibilityLabel: accessibilityLabel
+        )
+        return cell
+    }
+
+    private func actionCell(identifier: NSUserInterfaceItemIdentifier, title: String, action: Selector) -> LibraryActionCell {
+        if let cell = tableView.makeView(withIdentifier: identifier, owner: self) as? LibraryActionCell {
+            cell.button.title = title
+            return cell
+        }
+        let cell = LibraryActionCell(title: title, target: self, action: action)
+        cell.identifier = identifier
+        return cell
+    }
+
+    private func pair(for sender: NSView) -> SettingsTransitionPair? {
+        let row = tableView.row(for: sender)
+        guard row >= 0, row < pairs.count else { return nil }
+        return pairs[row]
+    }
+
+    @objc private func previewTransition(_ sender: NSButton) {
+        guard let pair = pair(for: sender), let clip = clipsByPair[pair] else { return }
+        onPreviewOrStop?(clip, clip.path == previewPath)
+    }
+
+    @objc private func importOrReplace(_ sender: NSButton) {
+        guard let pair = pair(for: sender) else { return }
+        let menu = NSMenu()
+        let mp4 = NSMenuItem(title: "Import MP4…", action: #selector(importTransitionMP4(_:)), keyEquivalent: "")
+        mp4.target = self
+        mp4.representedObject = rowIndex(for: pair)
+        menu.addItem(mp4)
+        let movie = NSMenuItem(title: "Verified MOV…", action: #selector(useTransitionMovie(_:)), keyEquivalent: "")
+        movie.target = self
+        movie.representedObject = rowIndex(for: pair)
+        menu.addItem(movie)
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.maxY + 4), in: sender)
+    }
+
+    private func rowIndex(for pair: SettingsTransitionPair) -> Int { pairs.firstIndex(of: pair) ?? -1 }
+
+    private func representedPair(_ sender: NSMenuItem) -> SettingsTransitionPair? {
+        guard let row = sender.representedObject as? Int, row >= 0, row < pairs.count else { return nil }
+        return pairs[row]
+    }
+
+    @objc private func importTransitionMP4(_ sender: NSMenuItem) {
+        guard let pair = representedPair(sender) else { return }
+        onImportMP4?(pair.source, pair.destination)
+    }
+
+    @objc private func useTransitionMovie(_ sender: NSMenuItem) {
+        guard let pair = representedPair(sender) else { return }
+        onUseMovie?(pair.source, pair.destination)
+    }
+
+    @objc private func removeTransition(_ sender: NSButton) {
+        guard let pair = pair(for: sender), let clip = clipsByPair[pair] else { return }
+        onRemove?(clip)
     }
 }

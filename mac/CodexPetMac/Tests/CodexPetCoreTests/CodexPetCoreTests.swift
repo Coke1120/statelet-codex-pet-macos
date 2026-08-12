@@ -244,6 +244,14 @@ final class CodexPetCoreTests: XCTestCase {
         )
         XCTAssertEqual(
             StatePresentationDecision.decide(
+                lastPresentedState: .idle,
+                pendingState: .running,
+                incomingState: .idle
+            ),
+            .stateChanged
+        )
+        XCTAssertEqual(
+            StatePresentationDecision.decide(
                 lastPresentedState: .running,
                 incomingState: .running,
                 forceRefresh: true
@@ -816,6 +824,18 @@ final class CodexPetCoreTests: XCTestCase {
         XCTAssertFalse(MediaMapChangeImpact.decide(previous: original, incoming: withWindow).shouldRefreshPlayback)
         XCTAssertEqual(MediaMapChangeImpact.decide(previous: original, incoming: withImport), .playback)
         XCTAssertTrue(MediaMapChangeImpact.decide(previous: original, incoming: withImport).shouldRefreshPlayback)
+
+        let withTransition = try original.settingTransition(
+            from: .idle,
+            to: .running,
+            entry: try MediaEntry(path: "idle-running.mov", loop: false)
+        )
+        XCTAssertEqual(MediaMapChangeImpact.decide(previous: original, incoming: withTransition), .playback)
+        XCTAssertEqual(try withTransition.replacingWindow(appearanceWindow).transitions, withTransition.transitions)
+        XCTAssertEqual(
+            try withTransition.replacingEntry(for: .idle, with: try MediaEntry(path: "replacement.mov")).transitions,
+            withTransition.transitions
+        )
     }
 
     func testMediaPlaylistLegacyDecodeAndNewShapeRoundTrip() throws {
@@ -851,6 +871,77 @@ final class CodexPetCoreTests: XCTestCase {
             try JSONDecoder.codexPet.decode(StateMediaPlaylist.self, from: playlistWithoutPolicy).advanceOn,
             .stateEntry
         )
+    }
+
+    func testDirectionalTransitionsRoundTripAndLegacyMapsRemainEmpty() throws {
+        let forward = try MediaEntry(path: "transitions/idle-running.mov", loop: false)
+        let reverse = try MediaEntry(path: "transitions/running-idle.mov", loop: false)
+        let map = try MediaMap()
+            .settingTransition(from: .idle, to: .running, entry: forward)
+            .settingTransition(from: .running, to: .idle, entry: reverse)
+
+        XCTAssertEqual(map.transition(from: .idle, to: .running), forward)
+        XCTAssertEqual(map.transition(from: .running, to: .idle), reverse)
+        XCTAssertNil(map.transition(from: .idle, to: .idle))
+        XCTAssertEqual(LifecycleTransitionMediaPolicy.maximumDuration, 4)
+        XCTAssertFalse(
+            try MediaMap().settingTransition(
+                from: .idle,
+                to: .review,
+                entry: try MediaEntry(path: "transition.mov", loop: true)
+            ).transition(from: .idle, to: .review)!.loop
+        )
+
+        let decoded = try JSONDecoder.codexPet.decode(MediaMap.self, from: JSONEncoder().encode(map))
+        XCTAssertEqual(decoded, map)
+        XCTAssertEqual(
+            try decoded.removingTransition(from: .idle, to: .running)
+                .transition(from: .running, to: .idle),
+            reverse
+        )
+        XCTAssertThrowsError(try decoded.settingTransition(from: .idle, to: .idle, entry: forward))
+
+        let legacy = #"{"version":1,"states":{}}"#.data(using: .utf8)!
+        XCTAssertTrue(try JSONDecoder.codexPet.decode(MediaMap.self, from: legacy).transitions.isEmpty)
+    }
+
+    func testCharacterBundleTransitionsRewriteAndRequireReferencedAssets() throws {
+        let hash = String(repeating: "a", count: 64)
+        let transition = try MediaEntry(
+            path: "movies/idle-running.mov",
+            posterPath: "posters/idle-running.png",
+            loop: false
+        )
+        let map = try MediaMap().settingTransition(from: .idle, to: .running, entry: transition)
+        let manifest = try CharacterBundleManifest(
+            characterID: "transition-character",
+            characterName: "Transition Character",
+            mediaMap: map,
+            assets: [
+                CharacterBundleAsset(role: .movie, path: transition.path, size: 1, sha256: hash),
+                CharacterBundleAsset(role: .poster, path: transition.posterPath!, size: 1, sha256: hash),
+            ]
+        )
+        let rewritten = try manifest.mediaMap(rewritingPaths: { "installed/\($0)" })
+        XCTAssertEqual(rewritten.transition(from: .idle, to: .running)?.path, "installed/movies/idle-running.mov")
+        XCTAssertEqual(rewritten.transition(from: .idle, to: .running)?.posterPath, "installed/posters/idle-running.png")
+
+        XCTAssertThrowsError(try CharacterBundleManifest(
+            characterID: "transition-character",
+            characterName: "Transition Character",
+            mediaMap: map,
+            assets: [CharacterBundleAsset(role: .poster, path: transition.posterPath!, size: 1, sha256: hash)]
+        ))
+        XCTAssertThrowsError(try CharacterBundleManifest(
+            characterID: "transition-character",
+            characterName: "Transition Character",
+            mediaMap: map,
+            assets: [
+                CharacterBundleAsset(role: .movie, path: transition.path, size: 1, sha256: hash),
+                CharacterBundleAsset(role: .movie, path: "movies/unused.mov", size: 1, sha256: hash),
+                CharacterBundleAsset(role: .poster, path: transition.posterPath!, size: 1, sha256: hash),
+            ]
+        ))
     }
 
     func testMediaPlaylistValidationAndNormalizedPaths() throws {

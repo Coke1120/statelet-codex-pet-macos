@@ -4,6 +4,7 @@ import Darwin
 import Foundation
 
 typealias CharacterPlaybackVerifier = (_ movieURL: URL, _ reportData: Data?) throws -> Void
+typealias CharacterTransitionDurationVerifier = (_ movieURL: URL) throws -> Void
 typealias CharacterAvailableDiskBytes = (_ destination: URL) throws -> UInt64
 
 struct CharacterLibraryCatalogSnapshot {
@@ -150,18 +151,21 @@ final class CharacterLibraryStorage {
     let catalogURL: URL
     private let rootURL: URL
     private let playbackVerifier: CharacterPlaybackVerifier
+    private let transitionDurationVerifier: CharacterTransitionDurationVerifier
     private let availableDiskBytes: CharacterAvailableDiskBytes
 
     init(
         mediaMapURL: URL,
         catalogURL: URL? = nil,
         playbackVerifier: @escaping CharacterPlaybackVerifier = CharacterLibraryStorage.defaultPlaybackVerifier,
+        transitionDurationVerifier: @escaping CharacterTransitionDurationVerifier = CharacterLibraryStorage.defaultTransitionDurationVerifier,
         availableDiskBytes: @escaping CharacterAvailableDiskBytes = CharacterStorageFiles.systemAvailableDiskBytes
     ) {
         rootMediaMapURL = mediaMapURL
         rootURL = rootMediaMapURL.deletingLastPathComponent()
         self.catalogURL = catalogURL ?? rootURL.appendingPathComponent("character-library.json")
         self.playbackVerifier = playbackVerifier
+        self.transitionDurationVerifier = transitionDurationVerifier
         self.availableDiskBytes = availableDiskBytes
     }
 
@@ -225,6 +229,44 @@ final class CharacterLibraryStorage {
         return data
     }
 
+    @discardableResult
+    func saveRecoveredMediaMap(
+        _ map: MediaMap,
+        for entry: CharacterLibraryEntry,
+        expectedData: Data,
+        expectedCatalogData: Data?
+    ) throws -> Data {
+        let url = try mapURL(for: entry)
+        let data = try Self.encoder.encode(map)
+        guard UInt64(data.count) <= Self.maximumMediaMapBytes else {
+            throw CharacterLibraryStorageError.fileTooLarge
+        }
+        return try CharacterStorageFiles.withExclusiveLock(
+            in: rootURL,
+            name: ".character-library.lock"
+        ) {
+            let currentCatalog: Data?
+            if CharacterStorageFiles.pathExistsNoFollow(catalogURL) {
+                currentCatalog = try CharacterStorageFiles.readRegularFile(
+                    catalogURL,
+                    maximumBytes: Self.maximumCatalogBytes
+                )
+            } else {
+                currentCatalog = nil
+            }
+            guard currentCatalog == expectedCatalogData else {
+                throw CharacterLibraryStorageError.catalogConflict
+            }
+            return try CharacterStorageFiles.withExclusiveLock(
+                in: rootURL,
+                name: ".character-map-write.lock"
+            ) {
+                try CharacterStorageFiles.atomicWrite(data, to: url, expectedData: expectedData)
+                return data
+            }
+        }
+    }
+
     func exportCharacter(_ entry: CharacterLibraryEntry, to packageURL: URL) throws {
         try requireLocal(packageURL)
         guard packageURL.pathExtension == "statelet-character" else {
@@ -266,6 +308,10 @@ final class CharacterLibraryStorage {
                 if let poster = media.posterPath { _ = try register(poster, role: .poster) }
             }
         }
+        for transition in loaded.map.transitions.values {
+            _ = try register(transition.path, role: .movie)
+            if let poster = transition.posterPath { _ = try register(poster, role: .poster) }
+        }
 
         var reports: [(source: URL, path: String, moviePath: String)] = []
         for item in sourceByBundlePath where item.role == .movie {
@@ -291,6 +337,7 @@ final class CharacterLibraryStorage {
             }
             return bundled
         }
+        let transitionMoviePaths = Set(rewrittenMap.transitions.values.map(\.path))
 
         var expectedAggregate: UInt64 = 0
         for item in sourceByBundlePath {
@@ -371,6 +418,9 @@ final class CharacterLibraryStorage {
                 )
             }
             try playbackVerifier(movieURL, reportData)
+            if transitionMoviePaths.contains(movie.path) {
+                try transitionDurationVerifier(movieURL)
+            }
             let movieAfter = try CharacterStorageFiles.hashRegularFile(
                 movieURL,
                 maximumBytes: CharacterBundleManifest.maximumMovieSize,
@@ -521,6 +571,9 @@ final class CharacterLibraryStorage {
                 reportData = nil
             }
             try playbackVerifier(movieURL, reportData)
+            if manifest.mediaMap.transitions.values.contains(where: { $0.path == movie.path }) {
+                try transitionDurationVerifier(movieURL)
+            }
             let after = try CharacterStorageFiles.hashRegularFile(
                 movieURL,
                 maximumBytes: CharacterBundleManifest.maximumMovieSize,
@@ -591,6 +644,15 @@ final class CharacterLibraryStorage {
                   probe.decodedFirstFrame else {
                 throw CharacterLibraryStorageError.invalidPlayback
             }
+        }
+    }
+
+    static func defaultTransitionDurationVerifier(movieURL: URL) throws {
+        let duration = try AlphaPlaybackProcessValidator.probe(url: movieURL).durationSeconds
+        guard duration.isFinite,
+              duration > 0,
+              duration <= LifecycleTransitionMediaPolicy.maximumDuration else {
+            throw CharacterLibraryStorageError.invalidPlayback
         }
     }
 
@@ -682,7 +744,24 @@ private extension MediaMap {
                 entries: entries
             )
         }
-        return try MediaMap(version: version, defaultFormat: defaultFormat, window: window, states: states)
+        let transitions = try Dictionary(uniqueKeysWithValues: self.transitions.map { key, entry in
+            (
+                key,
+                try MediaEntry(
+                    path: transform(entry.path),
+                    posterPath: try entry.posterPath.map(transform),
+                    loop: entry.loop,
+                    playbackRate: entry.playbackRate.value
+                )
+            )
+        })
+        return try MediaMap(
+            version: version,
+            defaultFormat: defaultFormat,
+            window: window,
+            states: states,
+            transitions: transitions
+        )
     }
 }
 

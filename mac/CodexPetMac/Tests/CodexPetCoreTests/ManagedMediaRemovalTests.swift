@@ -127,6 +127,72 @@ final class ManagedMediaRemovalTests: XCTestCase {
         }
     }
 
+    func testRejectsMovieStillReferencedByTransition() throws {
+        let fixture = try makeFixture(includeSecondEntry: true)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let transition = try MediaEntry(path: fixture.relativeMoviePath, loop: false)
+        let map = try fixture.map.settingTransition(from: .idle, to: .running, entry: transition)
+
+        XCTAssertThrowsError(
+            try ManagedMediaRemovalPlanner.plan(
+                mediaMap: map,
+                mapURL: fixture.mapURL,
+                state: .running,
+                path: fixture.relativeMoviePath,
+                canonicalRoot: fixture.root
+            )
+        ) { error in
+            XCTAssertEqual(error as? ManagedMediaRemovalError, .stillReferenced)
+        }
+    }
+
+    func testPlansTransitionRemovalWithoutChangingStatePlaylist() throws {
+        let fixture = try makeFixture(includeSecondEntry: false)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let transitionMap = try MediaMap().settingTransition(
+            from: .idle,
+            to: .running,
+            entry: try MediaEntry(path: fixture.relativeMoviePath, loop: false)
+        )
+
+        let plan = try ManagedMediaRemovalPlanner.plan(
+            mediaMap: transitionMap,
+            mapURL: fixture.mapURL,
+            transitionFrom: .idle,
+            transitionTo: .running,
+            canonicalRoot: fixture.root
+        )
+
+        XCTAssertNil(plan.updatedMap.transition(from: .idle, to: .running))
+        XCTAssertTrue(plan.updatedMap.states.isEmpty)
+        XCTAssertEqual(plan.trashURLs.map(\.lastPathComponent), ["clip.mov", "clip.report.json"])
+    }
+
+    func testPlansTransitionRemovalForNonDefaultCharacterMap() throws {
+        let fixture = try makeFixture(includeSecondEntry: false)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let characterMapURL = fixture.root.appendingPathComponent(
+            ".character-chloe.media-map.json"
+        )
+        try FileManager.default.moveItem(at: fixture.mapURL, to: characterMapURL)
+        let transitionMap = try MediaMap().settingTransition(
+            from: .idle,
+            to: .running,
+            entry: try MediaEntry(path: fixture.relativeMoviePath, loop: false)
+        )
+
+        let plan = try ManagedMediaRemovalPlanner.plan(
+            mediaMap: transitionMap,
+            mapURL: characterMapURL,
+            transitionFrom: .idle,
+            transitionTo: .running,
+            canonicalRoot: fixture.root
+        )
+
+        XCTAssertNil(plan.updatedMap.transition(from: .idle, to: .running))
+        XCTAssertEqual(plan.trashURLs.map(\.lastPathComponent), ["clip.mov", "clip.report.json"])
+    }
+
     func testAcceptsUppercaseMOVExtension() throws {
         let fixture = try makeFixture(includeSecondEntry: false)
         defer { try? FileManager.default.removeItem(at: fixture.root) }

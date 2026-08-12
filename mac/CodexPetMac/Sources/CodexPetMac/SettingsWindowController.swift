@@ -139,6 +139,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     var onDeleteCharacter: ((String) -> Void)?
     var onImportCharacterBundle: (() -> Void)?
     var onExportCharacterBundle: ((String) -> Void)?
+    var onImportTransitionMP4: ((PetState, PetState) -> Void)?
+    var onUseTransitionMovie: ((PetState, PetState) -> Void)?
+    var onPreviewTransition: ((PetState, PetState, String) -> Void)?
+    var onRemoveTransition: ((PetState, PetState, String) -> Void)?
 
     private let tabs = NSSegmentedControl(labels: ["Animations", "Voice", "Appearance", "General", "Diagnostics", "Prompts", "Recommendation"], trackingMode: .selectOne, target: nil, action: nil)
     private let paneHost = NSView()
@@ -194,6 +198,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let launchAtLoginLabel = NSTextField(wrappingLabelWithString: "Checking…")
     private let repairButton = NSButton(title: "Repair Startup…", target: nil, action: nil)
     private let animationLibrary = AnimationLibraryView()
+    private let transitionLibrary = TransitionLibraryView()
+    private let animationsMode = NSSegmentedControl(
+        labels: ["State Animations", "Transitions"],
+        trackingMode: .selectOne,
+        target: nil,
+        action: nil
+    )
     private var snapshot: SettingsSnapshot?
     private var selectedAnimationState: PetState = .idle
     private var toolchainState: AlphaToolchainState = .checking
@@ -491,6 +502,26 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             guard let self else { return }
             self.confirmClipRemoval(state: self.selectedAnimationState, path: entry.path)
         }
+        transitionLibrary.onImportMP4 = { [weak self] source, destination in
+            self?.onImportTransitionMP4?(source, destination)
+        }
+        transitionLibrary.onUseMovie = { [weak self] source, destination in
+            self?.onUseTransitionMovie?(source, destination)
+        }
+        transitionLibrary.onPreviewOrStop = { [weak self] clip, shouldStop in
+            if shouldStop {
+                self?.onStopPreview?()
+            } else {
+                self?.onPreviewTransition?(clip.source, clip.destination, clip.path)
+            }
+        }
+        transitionLibrary.onRemove = { [weak self] clip in
+            self?.onRemoveTransition?(clip.source, clip.destination, clip.path)
+        }
+        animationsMode.selectedSegment = 0
+        animationsMode.target = self
+        animationsMode.action = #selector(changeAnimationsMode)
+        animationsMode.setAccessibilityLabel("Animation library mode")
 
         toolsLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         toolsLabel.lineBreakMode = .byTruncatingTail
@@ -561,15 +592,25 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         activityRow.widthAnchor.constraint(equalTo: footer.widthAnchor).isActive = true
 
         animationsPane.addSubview(statusBox)
+        animationsPane.addSubview(animationsMode)
         animationsPane.addSubview(animationLibrary)
+        animationsPane.addSubview(transitionLibrary)
         animationsPane.addSubview(footer)
+        transitionLibrary.isHidden = true
         NSLayoutConstraint.activate([
             statusBox.topAnchor.constraint(equalTo: animationsPane.topAnchor),
             statusBox.leadingAnchor.constraint(equalTo: animationsPane.leadingAnchor),
             statusBox.trailingAnchor.constraint(equalTo: animationsPane.trailingAnchor),
-            animationLibrary.topAnchor.constraint(equalTo: statusBox.bottomAnchor, constant: 10),
+            animationsMode.topAnchor.constraint(equalTo: statusBox.bottomAnchor, constant: 8),
+            animationsMode.leadingAnchor.constraint(equalTo: animationsPane.leadingAnchor),
+            animationsMode.widthAnchor.constraint(equalToConstant: 270),
+            animationLibrary.topAnchor.constraint(equalTo: animationsMode.bottomAnchor, constant: 8),
             animationLibrary.leadingAnchor.constraint(equalTo: animationsPane.leadingAnchor),
             animationLibrary.trailingAnchor.constraint(equalTo: animationsPane.trailingAnchor),
+            transitionLibrary.topAnchor.constraint(equalTo: animationsMode.bottomAnchor, constant: 8),
+            transitionLibrary.leadingAnchor.constraint(equalTo: animationsPane.leadingAnchor),
+            transitionLibrary.trailingAnchor.constraint(equalTo: animationsPane.trailingAnchor),
+            transitionLibrary.bottomAnchor.constraint(equalTo: animationLibrary.bottomAnchor),
             footer.topAnchor.constraint(equalTo: animationLibrary.bottomAnchor, constant: 10),
             footer.leadingAnchor.constraint(equalTo: animationsPane.leadingAnchor),
             footer.trailingAnchor.constraint(equalTo: animationsPane.trailingAnchor),
@@ -1177,6 +1218,29 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             importEnabled: toolchainState.isReady,
             characterName: activeCharacterName
         )
+        let transitionClips = snapshot.mediaMap.transitions.map { key, entry in
+            SettingsTransitionClip(
+                source: key.from,
+                destination: key.to,
+                path: entry.path,
+                exists: FileManager.default.isReadableFile(
+                    atPath: snapshot.mediaMap.resolvedURL(for: entry, relativeTo: snapshot.mediaMapURL).path
+                )
+            )
+        }
+        transitionLibrary.update(
+            clips: transitionClips,
+            previewPath: snapshot.preview?.path,
+            reduceMotion: snapshot.reduceMotion,
+            busy: globallyBusy,
+            characterName: activeCharacterName
+        )
+    }
+
+    @objc private func changeAnimationsMode() {
+        let showingTransitions = animationsMode.selectedSegment == 1
+        animationLibrary.isHidden = showingTransitions
+        transitionLibrary.isHidden = !showingTransitions
     }
 
     private var activeCharacterName: String {

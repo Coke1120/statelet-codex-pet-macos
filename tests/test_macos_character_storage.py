@@ -47,6 +47,7 @@ class CharacterStorageHarnessTests(unittest.TestCase):
         harness_source = textwrap.dedent(
             r'''
             import CodexPetCore
+            import CryptoKit
             import Darwin
             import Foundation
 
@@ -84,7 +85,8 @@ class CharacterStorageHarnessTests(unittest.TestCase):
                         playbackVerifier: { movie, _ in
                             let data = try Data(contentsOf: movie)
                             guard !data.isEmpty else { throw HarnessFailure.failed("empty movie") }
-                        }
+                        },
+                        transitionDurationVerifier: { _ in }
                     )
                 }
 
@@ -224,6 +226,135 @@ class CharacterStorageHarnessTests(unittest.TestCase):
                         reexportedManifest.assets.filter({ $0.role == .report }).count == 1,
                         "import did not retain the report beside its installed movie"
                     )
+
+                    // Directional transition assets survive the same secure bundle round trip.
+                    let transitionMovie = roundtripRoot.appendingPathComponent("Idle to Running.mov")
+                    let transitionReport = roundtripRoot.appendingPathComponent("Idle to Running.report.json")
+                    try write(Data("transition".utf8), to: transitionMovie)
+                    try write(Data("transition-report".utf8), to: transitionReport)
+                    let transitionMap = try (try storage.loadMediaMap(for: sourceEntry).map)
+                        .settingTransition(
+                            from: .idle,
+                            to: .running,
+                            entry: try MediaEntry(path: transitionMovie.path, loop: false)
+                        )
+                    let existingMapData = try storage.loadMediaMap(for: sourceEntry).encodedData
+                    _ = try storage.saveMediaMap(transitionMap, for: sourceEntry, expectedData: existingMapData)
+                    let recoveryCatalogBootstrap = try storage.loadCatalog()
+                    let recoveryLibrary = try recoveryCatalogBootstrap.library
+                        .addingCharacter(id: sourceEntry.id, name: sourceEntry.name)
+                        .selectingCharacter(id: sourceEntry.id)
+                    _ = try storage.saveCatalog(
+                        recoveryLibrary,
+                        expectedData: recoveryCatalogBootstrap.encodedData
+                    )
+                    let ownerSnapshot = try storage.loadCatalog()
+                    let recoveredTransitionMap = try transitionMap.settingTransition(
+                        from: .running,
+                        to: .idle,
+                        entry: try MediaEntry(path: transitionMovie.path, loop: false)
+                    )
+                    let recoveredBytes = try storage.saveRecoveredMediaMap(
+                        recoveredTransitionMap,
+                        for: sourceEntry,
+                        expectedData: try storage.loadMediaMap(for: sourceEntry).encodedData,
+                        expectedCatalogData: ownerSnapshot.encodedData
+                    )
+                    try require(!recoveredBytes.isEmpty, "recovery CAS did not publish owner map")
+                    let changedCatalog = try ownerSnapshot.library.renamingCharacter(id: sourceEntry.id, to: "Chloe Changed")
+                    let changedCatalogBytes = try storage.saveCatalog(changedCatalog, expectedData: ownerSnapshot.encodedData)
+                    let currentRecoveredBytes = try storage.loadMediaMap(for: sourceEntry).encodedData
+                    try expectFailure("recovery ignored catalog ownership change") {
+                        _ = try storage.saveRecoveredMediaMap(
+                            transitionMap,
+                            for: sourceEntry,
+                            expectedData: currentRecoveredBytes,
+                            expectedCatalogData: ownerSnapshot.encodedData
+                        )
+                    }
+                    _ = try storage.saveCatalog(ownerSnapshot.library, expectedData: changedCatalogBytes)
+                    let restoredCatalog = try storage.loadCatalog()
+                    let staleMapBytes = try storage.loadMediaMap(for: sourceEntry).encodedData
+                    let externallyChangedMap = try recoveredTransitionMap.settingTransition(
+                        from: .idle,
+                        to: .waiting,
+                        entry: try MediaEntry(path: transitionMovie.path, loop: false)
+                    )
+                    _ = try storage.saveMediaMap(
+                        externallyChangedMap,
+                        for: sourceEntry,
+                        expectedData: staleMapBytes
+                    )
+                    try expectFailure("recovery ignored owner map change") {
+                        _ = try storage.saveRecoveredMediaMap(
+                            transitionMap,
+                            for: sourceEntry,
+                            expectedData: staleMapBytes,
+                            expectedCatalogData: restoredCatalog.encodedData
+                        )
+                    }
+                    let transitionPackage = base.appendingPathComponent("transition.statelet-character", isDirectory: true)
+                    try storage.exportCharacter(sourceEntry, to: transitionPackage)
+                    let transitionManifest = try CharacterBundleManifest.decode(
+                        Data(contentsOf: transitionPackage.appendingPathComponent("manifest.json"))
+                    )
+                    guard let bundledTransition = transitionManifest.mediaMap.transition(from: .idle, to: .running) else {
+                        throw HarnessFailure.failed("export omitted directional transition")
+                    }
+                    try require(
+                        transitionManifest.assets.contains(where: { $0.role == .movie && $0.path == bundledTransition.path }),
+                        "transition movie was not declared"
+                    )
+                    let transitionReportAsset = transitionManifest.assets.first(where: {
+                        $0.role == .report && $0.moviePath == bundledTransition.path
+                    })
+                    try require(transitionReportAsset != nil, "transition report role/movie_path was not preserved")
+                    if let transitionReportAsset {
+                        let reportBytes = try Data(contentsOf: transitionPackage.appendingPathComponent(transitionReportAsset.path))
+                        let reportDigest = SHA256.hash(data: reportBytes).map { String(format: "%02x", $0) }.joined()
+                        try require(reportDigest == transitionReportAsset.sha256, "transition report hash did not bind bytes")
+                    }
+                    let durationRejectingStorage = CharacterLibraryStorage(
+                        mediaMapURL: storage.rootMediaMapURL,
+                        playbackVerifier: { _, _ in },
+                        transitionDurationVerifier: { _ in throw HarnessFailure.failed("transition too long") }
+                    )
+                    let tooLongPackage = base.appendingPathComponent("transition-too-long.statelet-character", isDirectory: true)
+                    try expectFailure("transition duration hook was not enforced") {
+                        try durationRejectingStorage.exportCharacter(sourceEntry, to: tooLongPackage)
+                    }
+                    try require(
+                        !FileManager.default.fileExists(atPath: tooLongPackage.path),
+                        "failed duration verification published a package"
+                    )
+                    let transitionStage = try storage.stageImport(
+                        from: transitionPackage,
+                        against: existing,
+                        allowLegacyTrust: true
+                    )
+                    guard let installedTransition = transitionStage.mediaMap.transition(from: .idle, to: .running) else {
+                        throw HarnessFailure.failed("import omitted directional transition")
+                    }
+                    try require(
+                        installedTransition.path.hasPrefix(".character-"),
+                        "import did not rewrite transition path"
+                    )
+                    transitionStage.discard()
+                    let rejectingImportStorage = CharacterLibraryStorage(
+                        mediaMapURL: storage.rootMediaMapURL,
+                        playbackVerifier: { _, _ in },
+                        transitionDurationVerifier: { _ in throw HarnessFailure.failed("transition too long") }
+                    )
+                    let beforeDurationImport = Set(try FileManager.default.contentsOfDirectory(atPath: roundtripRoot.path))
+                    try expectFailure("import ignored transition duration hook") {
+                        _ = try rejectingImportStorage.stageImport(
+                            from: transitionPackage,
+                            against: existing,
+                            allowLegacyTrust: true
+                        )
+                    }
+                    let afterDurationImport = Set(try FileManager.default.contentsOfDirectory(atPath: roundtripRoot.path))
+                    try require(beforeDurationImport == afterDurationImport, "failed duration import leaked staging or final artifacts")
 
                     // A committed import can be rolled back when the caller's catalog CAS fails.
                     let rollbackStage = try storage.stageImport(from: package, against: existing, allowLegacyTrust: true)
