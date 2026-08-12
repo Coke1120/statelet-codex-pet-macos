@@ -223,7 +223,7 @@ final class ManagedMediaTrashRevalidationTests: XCTestCase {
         let published = try MediaMap(states: [PetState: StateMediaPlaylist]())
         try writeMap(published, to: fixture.mapURL)
         try writeMap(
-            try MediaMap(states: [.review: try MediaEntry(path: fixture.relativeMoviePath)]),
+            try MediaMap(states: [.review: try MediaEntry(path: "unrelated.mov")]),
             to: inactiveURL
         )
 
