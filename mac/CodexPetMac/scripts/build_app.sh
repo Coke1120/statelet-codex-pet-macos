@@ -121,7 +121,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$stage/Contents/MacOS" "$stage/Contents/Resources/AlphaTools"
+mkdir -p \
+  "$stage/Contents/MacOS" \
+  "$stage/Contents/Resources/AlphaTools" \
+  "$stage/Contents/Resources/QwenTTS"
 install -m 0755 "$executable" "$stage/Contents/MacOS/CodexPetMac"
 install -m 0644 "$package_dir/Resources/Info.plist" "$stage/Contents/Info.plist"
 install -m 0644 "$icon" "$stage/Contents/Resources/Statelet.icns"
@@ -133,6 +136,10 @@ install -m 0644 "$repo_root/tools/codex_pet_alpha.py" \
   "$stage/Contents/Resources/AlphaTools/codex_pet_alpha.py"
 install -m 0644 "$repo_root/mac/requirements-alpha.txt" \
   "$stage/Contents/Resources/AlphaTools/requirements-alpha.txt"
+install -m 0644 "$package_dir/Resources/QwenTTS/qwen3_tts_generate.py" \
+  "$stage/Contents/Resources/QwenTTS/qwen3_tts_generate.py"
+install -m 0644 "$package_dir/Resources/QwenTTS/qwen3_tts_probe.py" \
+  "$stage/Contents/Resources/QwenTTS/qwen3_tts_probe.py"
 
 if [[ "$release_build" -eq 1 ]]; then
   command -v xcrun >/dev/null || { printf 'xcrun is required to preserve crash symbols.\n' >&2; exit 1; }

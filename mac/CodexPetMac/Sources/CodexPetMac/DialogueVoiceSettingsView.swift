@@ -19,6 +19,9 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     var onImportReferenceAudio: ((DialogueVoiceProfileDraft) -> Void)?
     var onSaveProfile: ((DialogueVoiceProfileDraft) -> Void)?
     var onRemoveProfile: ((GPTSoVITSVoiceProfile) -> Void)?
+    var onConfigureQwenProfile: (() -> Void)?
+    var onSelectVoiceProvider: ((DialogueVoiceProviderKind) -> Void)?
+    var onRemoveQwenProfile: ((Qwen3TTSVoiceProfile) -> Void)?
     var onAddLine: ((String, String, PetState) -> Void)?
     var onUpdateLine: ((DialogueLine, String, String, PetState) -> Void)?
     var onClearEditor: (() -> Void)?
@@ -60,6 +63,14 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     )
     private let dialoguePage = NSStackView()
     private let voiceSetupPage = NSStackView()
+    private let voiceProviderControl = NSSegmentedControl(
+        labels: ["GPT-SoVITS", "Qwen3-TTS"],
+        trackingMode: .selectOne,
+        target: nil,
+        action: nil
+    )
+    private let gptProfilePage = NSStackView()
+    private let qwenProfilePage = NSStackView()
     private let nameField = NSTextField()
     private let apiBaseURLField = NSTextField()
     private let promptLanguageField = NSTextField()
@@ -73,7 +84,15 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     private let importSoVITSButton = NSButton(title: "Import SoVITS Weight…", target: nil, action: nil)
     private let importReferenceAudioButton = NSButton(title: "Import Reference Audio…", target: nil, action: nil)
     private let saveProfileButton = NSButton(title: "Save Profile", target: nil, action: nil)
-    private let removeProfileButton = NSButton(title: "Remove Profile…", target: nil, action: nil)
+    private let useGPTButton = NSButton(title: "Use GPT-SoVITS", target: nil, action: nil)
+    private let removeProfileButton = NSButton(title: "Remove GPT Profile…", target: nil, action: nil)
+    private let qwenStatusLabel = NSTextField(labelWithString: "Not configured")
+    private let qwenPackageLabel = NSTextField(labelWithString: "Not imported")
+    private let qwenRuntimeLabel = NSTextField(labelWithString: "Not selected")
+    private let qwenConfigurationLabel = NSTextField(wrappingLabelWithString: "Japanese zero-shot · 24 kHz PCM16")
+    private let importQwenButton = NSButton(title: "Import Qwen Handover…", target: nil, action: nil)
+    private let useQwenButton = NSButton(title: "Use Qwen3-TTS", target: nil, action: nil)
+    private let removeQwenButton = NSButton(title: "Remove Qwen Profile…", target: nil, action: nil)
 
     private let dialogueTextView = NSTextView()
     private let dialogueStatePopup = NSPopUpButton()
@@ -103,6 +122,8 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     private var customRepeatInterval: TimeInterval?
 
     private var profile: GPTSoVITSVoiceProfile?
+    private var qwenProfile: Qwen3TTSVoiceProfile?
+    private var activeProviderKind: DialogueVoiceProviderKind?
     private var profileStatus: DialogueVoiceProfileStatus = .notConfigured
     private var lines: [DialogueLine] = []
     private var importedAssets = DialogueVoiceImportedAssets()
@@ -115,6 +136,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     private var pendingNewDialogueSubmission: PendingNewDialogueSubmission?
     private var isRefreshing = false
     private var hasSelectedVoiceSection = false
+    private var hasSelectedVoiceProvider = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -166,13 +188,21 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             pendingNewDialogueSubmission = nil
         }
         profile = library.profile
+        qwenProfile = library.qwenProfile
+        activeProviderKind = library.activeProviderKind
         profileStatus = library.profileStatus
         lines = library.lines
         importedAssets = snapshot.importedAssets
         draftDefaultTextLanguage = snapshot.draft.defaultTextLanguage
         applyPlaybackSettings(library.playbackSettings)
         if !hasSelectedVoiceSection {
-            selectVoiceSection(profile == nil ? .voiceSetup : .dialogue, userInitiated: false)
+            selectVoiceSection(library.activeProviderKind == nil ? .voiceSetup : .dialogue, userInitiated: false)
+        }
+        if !hasSelectedVoiceProvider {
+            selectDisplayedProvider(
+                library.activeProviderKind ?? (library.qwenProfile == nil ? .gptSovits : .qwen3TTS),
+                userInitiated: false
+            )
         }
         dialogueSetupHint.isHidden = library.profileStatus == .ready
         if !preserveProfileEdits {
@@ -184,7 +214,12 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             .map(safeBasename) ?? "Not imported"
         referenceAudioLabel.stringValue = snapshot.importedAssets.referenceAudioRelativePath
             .map(safeBasename) ?? "Not imported"
-        profileStatusLabel.stringValue = profileStatusTitle(library.profileStatus)
+        profileStatusLabel.stringValue = providerStatusTitle(
+            configured: library.profile != nil,
+            active: library.activeProviderKind == .gptSovits,
+            activeStatus: library.profileStatus
+        )
+        applyQwenSummary(profile: library.qwenProfile, activeProviderKind: library.activeProviderKind)
 
         activityLabel.stringValue = snapshot.activityMessage ?? ""
         activityLabel.isHidden = snapshot.activityMessage?.isEmpty != false
@@ -297,7 +332,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         configureTable()
         configureVoiceSections()
 
-        let profileTitle = sectionTitle("VOICE PROFILE")
+        let profileTitle = sectionTitle("GPT-SOVITS PROFILE")
         let profileHelp = helpLabel("Connect to a GPT-SoVITS API running only on this Mac. Statelet stores managed copies of the selected model files and reference audio.")
         let profileGrid = NSGridView(views: [
             [fieldLabel("Display name"), nameField],
@@ -316,7 +351,33 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         profileGrid.column(at: 0).xPlacement = .trailing
         profileGrid.column(at: 1).xPlacement = .fill
         let profileGridRow = centeredRow(profileGrid)
-        let profileActions = buttonRow([saveProfileButton, removeProfileButton])
+        let profileActions = buttonRow([saveProfileButton, useGPTButton, removeProfileButton])
+
+        let qwenTitle = sectionTitle("QWEN3-TTS PROFILE")
+        let qwenHelp = helpLabel("Import a trusted, self-contained Qwen handover package for private local generation. Statelet displays only managed basenames and never reveals the reference transcript here.")
+        let qwenGrid = NSGridView(views: [
+            [fieldLabel("Provider status"), qwenStatusLabel],
+            [fieldLabel("Managed package"), qwenPackageLabel],
+            [fieldLabel("Python runtime"), qwenRuntimeLabel],
+            [fieldLabel("Generation recipe"), qwenConfigurationLabel],
+        ])
+        qwenGrid.translatesAutoresizingMaskIntoConstraints = false
+        qwenGrid.rowSpacing = 7
+        qwenGrid.columnSpacing = 10
+        qwenGrid.column(at: 0).xPlacement = .trailing
+        qwenGrid.column(at: 1).xPlacement = .fill
+        let qwenActions = buttonRow([importQwenButton, useQwenButton, removeQwenButton])
+
+        configurePage(
+            gptProfilePage,
+            views: [profileTitle, profileHelp, profileGridRow, profileActions],
+            accessibilityLabel: "GPT-SoVITS profile setup"
+        )
+        configurePage(
+            qwenProfilePage,
+            views: [qwenTitle, qwenHelp, centeredRow(qwenGrid), qwenActions],
+            accessibilityLabel: "Qwen3-TTS profile setup"
+        )
 
         let dialogueTitle = sectionTitle("STATE-OWNED MESSAGES & VOICE")
         let dialogueHelp = helpLabel("Each message and its generated voice belongs to one Statelet lifecycle state. Adding or updating a message requests background pre-generation.")
@@ -360,7 +421,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
 
         configurePage(
             voiceSetupPage,
-            views: [profileTitle, profileHelp, profileGridRow, profileActions],
+            views: [centeredRow(voiceProviderControl), gptProfilePage, qwenProfilePage],
             accessibilityLabel: "Voice Setup page"
         )
         configurePage(
@@ -381,7 +442,8 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             ],
             accessibilityLabel: "Dialogue page"
         )
-        voiceSetupPage.setCustomSpacing(4, after: profileTitle)
+        gptProfilePage.setCustomSpacing(4, after: profileTitle)
+        qwenProfilePage.setCustomSpacing(4, after: qwenTitle)
         dialoguePage.setCustomSpacing(4, after: dialogueTitle)
         dialoguePage.setCustomSpacing(4, after: playbackTitle)
 
@@ -430,6 +492,11 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         openVoiceSetupButton.action = #selector(openVoiceSetup)
         openVoiceSetupButton.setAccessibilityLabel("Open Voice Setup")
         openVoiceSetupButton.setAccessibilityHelp("Open the voice profile and model import page without discarding this dialogue draft.")
+        voiceProviderControl.target = self
+        voiceProviderControl.action = #selector(voiceProviderChanged)
+        voiceProviderControl.segmentStyle = .rounded
+        voiceProviderControl.setAccessibilityLabel("Voice provider")
+        voiceProviderControl.setAccessibilityHelp("Choose which local voice provider profile to view and configure. This does not discard dialogue or GPT profile drafts.")
     }
 
     private func configurePage(_ page: NSStackView, views: [NSView], accessibilityLabel: String) {
@@ -452,6 +519,16 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         voiceSetupPage.isHidden = section != .voiceSetup
         if userInitiated {
             hasSelectedVoiceSection = true
+        }
+    }
+
+    private func selectDisplayedProvider(_ provider: DialogueVoiceProviderKind, userInitiated: Bool) {
+        let segment = provider == .gptSovits ? 0 : 1
+        voiceProviderControl.selectedSegment = segment
+        gptProfilePage.isHidden = provider != .gptSovits
+        qwenProfilePage.isHidden = provider != .qwen3TTS
+        if userInitiated {
+            hasSelectedVoiceProvider = true
         }
     }
 
@@ -500,6 +577,17 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         }
         profileStatusLabel.textColor = .secondaryLabelColor
         profileStatusLabel.setAccessibilityLabel("Voice profile validation status")
+        for label in [qwenStatusLabel, qwenPackageLabel, qwenRuntimeLabel, qwenConfigurationLabel] {
+            label.textColor = .secondaryLabelColor
+            label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        }
+        qwenPackageLabel.lineBreakMode = .byTruncatingMiddle
+        qwenRuntimeLabel.lineBreakMode = .byTruncatingMiddle
+        qwenStatusLabel.setAccessibilityLabel("Qwen3-TTS provider status")
+        qwenPackageLabel.setAccessibilityLabel("Qwen3-TTS managed package")
+        qwenRuntimeLabel.setAccessibilityLabel("Qwen3-TTS Python runtime")
+        qwenConfigurationLabel.setAccessibilityLabel("Qwen3-TTS generation recipe")
+        qwenConfigurationLabel.setAccessibilityHelp("Fixed local Japanese zero-shot output and sampling parameters. The private reference transcript is not displayed.")
     }
 
     private func configureButtons() {
@@ -508,7 +596,11 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             (importSoVITSButton, #selector(importSoVITSWeight), "Import SoVITS weight", "Select the trusted SoVITS checkpoint used by the local API."),
             (importReferenceAudioButton, #selector(importReferenceAudio), "Import reference audio", "Select the local reference recording for this voice."),
             (saveProfileButton, #selector(saveProfile), "Save voice profile", "Save the profile fields shown above."),
-            (removeProfileButton, #selector(removeProfile), "Remove voice profile", "Remove the active profile after confirmation by the app."),
+            (useGPTButton, #selector(useGPTProfile), "Use GPT-SoVITS", "Make the configured GPT-SoVITS profile the active voice provider."),
+            (removeProfileButton, #selector(removeProfile), "Remove GPT-SoVITS profile", "Remove the configured GPT-SoVITS profile after confirmation by the app."),
+            (importQwenButton, #selector(importQwenProfile), "Import Qwen handover package", "Choose a trusted self-contained Qwen3-TTS handover package and Python runtime for private local use."),
+            (useQwenButton, #selector(useQwenProfile), "Use Qwen3-TTS", "Make the configured Qwen3-TTS profile the active voice provider."),
+            (removeQwenButton, #selector(removeQwenProfile), "Remove Qwen profile", "Remove the configured Qwen3-TTS profile after confirmation by the app."),
             (addLineButton, #selector(addLine), "Add dialogue line", "Save this text as a new line and request pre-generation."),
             (updateLineButton, #selector(updateLine), "Update selected dialogue line", "Save changes to the selected line and request new audio."),
             (clearEditorButton, #selector(clearEditor), "Clear dialogue editor", "Clear the editor and selection without deleting a saved line."),
@@ -799,7 +891,13 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             && importedAssets.referenceAudioRelativePath != nil
             && importedAssets.digests != nil
         saveProfileButton.isEnabled = hasProfileFields && hasImportedAssets
+        useGPTButton.isEnabled = profile != nil && activeProviderKind != .gptSovits
+        useGPTButton.isHidden = profile == nil || activeProviderKind == .gptSovits
         removeProfileButton.isEnabled = profile != nil
+        importQwenButton.isEnabled = true
+        useQwenButton.isEnabled = qwenProfile != nil && activeProviderKind != .qwen3TTS
+        useQwenButton.isHidden = qwenProfile == nil || activeProviderKind == .qwen3TTS
+        removeQwenButton.isEnabled = qwenProfile != nil
 
         let hasLineText = !dialogueTextView.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let hasLineLanguage = !dialogueLanguageField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -834,18 +932,61 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         }
     }
 
+    private func providerStatusTitle(
+        configured: Bool,
+        active: Bool,
+        activeStatus: DialogueVoiceProfileStatus
+    ) -> String {
+        guard configured else { return "Not configured" }
+        return active ? "Active · \(profileStatusTitle(activeStatus))" : "Configured"
+    }
+
     private func safeBasename(_ path: String) -> String {
         let basename = URL(fileURLWithPath: path).lastPathComponent
         return basename.isEmpty ? "Imported file" : basename
+    }
+
+    private func applyQwenSummary(
+        profile: Qwen3TTSVoiceProfile?,
+        activeProviderKind: DialogueVoiceProviderKind?
+    ) {
+        guard let profile else {
+            qwenStatusLabel.stringValue = "Not configured"
+            qwenPackageLabel.stringValue = "Not imported"
+            qwenRuntimeLabel.stringValue = "Not selected"
+            qwenConfigurationLabel.stringValue = "Japanese zero-shot · 24 kHz PCM16"
+            return
+        }
+        qwenStatusLabel.stringValue = providerStatusTitle(
+            configured: true,
+            active: activeProviderKind == .qwen3TTS,
+            activeStatus: profileStatus
+        )
+        qwenPackageLabel.stringValue = "\(profile.name) · \(safeBasename(profile.packageRootRelativePath))"
+        qwenRuntimeLabel.stringValue = safeBasename(profile.pythonExecutablePath)
+        qwenConfigurationLabel.stringValue = "Japanese zero-shot · 24 kHz PCM16 · seed \(profile.seed) · temperature \(profile.temperature) · top-k \(profile.topK) · top-p \(profile.topP) · repetition \(profile.repetitionPenalty) · max \(profile.maximumTokens) tokens"
     }
 
     @objc private func importGPTWeight() { onImportGPTWeight?(profileDraft) }
     @objc private func importSoVITSWeight() { onImportSoVITSWeight?(profileDraft) }
     @objc private func importReferenceAudio() { onImportReferenceAudio?(profileDraft) }
     @objc private func saveProfile() { onSaveProfile?(profileDraft) }
+    @objc private func useGPTProfile() {
+        guard profile != nil, activeProviderKind != .gptSovits else { return }
+        onSelectVoiceProvider?(.gptSovits)
+    }
     @objc private func removeProfile() {
         guard let profile else { return }
         onRemoveProfile?(profile)
+    }
+    @objc private func importQwenProfile() { onConfigureQwenProfile?() }
+    @objc private func useQwenProfile() {
+        guard qwenProfile != nil, activeProviderKind != .qwen3TTS else { return }
+        onSelectVoiceProvider?(.qwen3TTS)
+    }
+    @objc private func removeQwenProfile() {
+        guard let qwenProfile else { return }
+        onRemoveQwenProfile?(qwenProfile)
     }
     @objc private func addLine() {
         let submittedText = dialogueTextView.string.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -907,6 +1048,12 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     @objc private func voiceSectionChanged() {
         guard let section = VoiceSection(rawValue: voiceSectionControl.selectedSegment) else { return }
         selectVoiceSection(section, userInitiated: true)
+    }
+    @objc private func voiceProviderChanged() {
+        let provider: DialogueVoiceProviderKind = voiceProviderControl.selectedSegment == 0
+            ? .gptSovits
+            : .qwen3TTS
+        selectDisplayedProvider(provider, userInitiated: true)
     }
     @objc private func openVoiceSetup() {
         selectVoiceSection(.voiceSetup, userInitiated: true)

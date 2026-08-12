@@ -545,7 +545,7 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
     def test_voice_page_default_and_user_selection_are_preserved(self) -> None:
         update = method_body(self.voice_view, "    func update")
         self.assertIn("if !hasSelectedVoiceSection", update)
-        self.assertIn("profile == nil ? .voiceSetup : .dialogue", update)
+        self.assertIn("library.activeProviderKind == nil ? .voiceSetup : .dialogue", update)
         selection = method_body(self.voice_view, "    private func selectVoiceSection")
         self.assertIn("hasSelectedVoiceSection = true", selection)
         self.assertIn("dialoguePage.isHidden = section != .dialogue", selection)
@@ -581,6 +581,61 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         for callback, action in callback_actions.items():
             self.assertIn(callback, self.voice_view)
             self.assertIn(f"#selector({action})", self.voice_view)
+
+    def test_qwen_voice_setup_is_provider_scoped_and_private(self) -> None:
+        self.assertIn('labels: ["GPT-SoVITS", "Qwen3-TTS"]', self.voice_view)
+        self.assertIn('setAccessibilityLabel("Voice provider")', self.voice_view)
+        self.assertIn('NSButton(title: "Import Qwen Handover…"', self.voice_view)
+        self.assertIn('NSButton(title: "Use Qwen3-TTS"', self.voice_view)
+        self.assertIn('NSButton(title: "Use GPT-SoVITS"', self.voice_view)
+        self.assertIn('NSButton(title: "Remove Qwen Profile…"', self.voice_view)
+        self.assertIn("library.activeProviderKind", self.voice_view)
+        self.assertIn("library.qwenProfile", self.voice_view)
+        self.assertIn("profile.packageRootRelativePath", self.voice_view)
+        self.assertIn("profile.pythonExecutablePath", self.voice_view)
+        self.assertIn("24 kHz PCM16", self.voice_view)
+        self.assertIn("profile.seed", self.voice_view)
+        self.assertIn("profile.temperature", self.voice_view)
+        self.assertNotIn("qwenProfile.referenceText", self.voice_view)
+        self.assertNotIn("profile.referenceText", method_body(
+            self.voice_view,
+            "    private func applyQwenSummary",
+        ))
+        selection = method_body(self.voice_view, "    private func selectDisplayedProvider")
+        self.assertIn("gptProfilePage.isHidden", selection)
+        self.assertIn("qwenProfilePage.isHidden", selection)
+        self.assertIn("hasSelectedVoiceProvider = true", selection)
+
+    def test_qwen_settings_callbacks_are_forwarded_for_app_delegate_wiring(self) -> None:
+        callbacks = (
+            "onConfigureQwenProfile",
+            "onSelectVoiceProvider",
+            "onRemoveQwenProfile",
+        )
+        for callback in callbacks:
+            self.assertIn(callback, self.voice_view)
+            self.assertIn(callback, self.settings)
+            self.assertIn(f"dialogueVoiceView.{callback}", self.settings)
+            self.assertIn(f"self?.{callback}?", self.settings)
+        self.assertIn("onSelectVoiceProvider?(.qwen3TTS)", self.voice_view)
+        self.assertIn("onSelectVoiceProvider?(.gptSovits)", self.voice_view)
+        runtime_picker = method_body(
+            self.app_delegate,
+            "    private func chooseQwenPythonRuntime",
+        )
+        self.assertIn("pythonPanel.resolvesAliases = false", runtime_picker)
+
+    def test_qwen_helpers_use_parent_owned_process_group_handshake(self) -> None:
+        helper_root = ROOT / "mac" / "CodexPetMac" / "Resources" / "QwenTTS"
+        generator = (helper_root / "qwen3_tts_generate.py").read_text(encoding="utf-8")
+        probe = (helper_root / "qwen3_tts_probe.py").read_text(encoding="utf-8")
+        for source in (generator, probe):
+            self.assertNotIn("os.setsid()", source)
+            self.assertIn("os.getpgrp() != os.getpid()", source)
+        self.assertLess(
+            probe.index("sys.stdin.buffer.read()"),
+            probe.index("import mlx"),
+        )
 
     def test_profile_state_fingerprint_and_secure_cleanup_are_persisted(self) -> None:
         for status in ("notConfigured", "validating", "ready", "invalid", "unavailable"):
@@ -637,7 +692,10 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         shutdown = method_body(self.coordinator, "    func shutdown")
         self.assertIn("retryPendingCleanup(preserving: [])", shutdown)
 
-        remove_profile = method_body(self.coordinator, "    func removeProfile")
+        remove_profile = method_body(
+            self.coordinator,
+            "    func removeProfile(provider removedProvider: DialogueVoiceProviderKind)",
+        )
         self.assertIn("retryPendingCleanup(preserving: [])", remove_profile)
 
         retry_cleanup = method_body(

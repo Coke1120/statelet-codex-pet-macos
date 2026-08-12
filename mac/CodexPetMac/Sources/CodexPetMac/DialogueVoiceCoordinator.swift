@@ -37,14 +37,19 @@ struct DialogueVoiceCoordinatorSnapshot {
 
 final class DialogueVoiceCoordinator: @unchecked Sendable {
     private enum GenerationResult: Sendable {
-        case success(String, DialogueVoiceAssetIdentities)
+        case success(String, ValidatedProviderIdentity)
         case failure(String)
     }
 
     private enum ProfileValidationResult: Sendable {
-        case valid(DialogueVoiceValidatedAssets, [ReadyOutputValidationTicket])
-        case unavailable(DialogueVoiceValidatedAssets, [ReadyOutputValidationTicket])
+        case valid(ValidatedProviderIdentity, [ReadyOutputValidationTicket])
+        case unavailable(ValidatedProviderIdentity, [ReadyOutputValidationTicket])
         case invalid
+    }
+
+    private enum ValidatedProviderIdentity: Equatable, Sendable {
+        case gptSovits(DialogueVoiceValidatedAssets)
+        case qwen3TTS([String])
     }
 
     private struct ReadyOutputValidationTicket: Sendable {
@@ -91,6 +96,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     private let installer: DialogueVoiceAssetInstaller
     private let publisher: DialogueVoiceAudioPublisher
     private let client: GPTSoVITSAPIClient
+    private let qwenClient: Qwen3TTSClient
     private let audioPlayer: DialogueAudioPlaying
     private let playbackService: DialogueReadyPlaybackService
     private let randomIndex: @Sendable (Int) -> Int
@@ -114,7 +120,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     private var activeTicket: DialogueGenerationTicket?
     private var activeImportTask: Task<Void, Never>?
     private var profileValidationTask: Task<Void, Never>?
-    private var validatedAssetIdentities: DialogueVoiceAssetIdentities?
+    private var validatedProviderIdentity: ValidatedProviderIdentity?
     private var profileValidationSequence: UInt64 = 0
     private var importSequence: UInt64 = 0
     private var persistenceBlocked = false
@@ -134,6 +140,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         applicationSupportRoot: URL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(StateletIdentity.applicationSupportRelativePath, isDirectory: true),
         client: GPTSoVITSAPIClient = GPTSoVITSAPIClient(),
+        qwenClient: Qwen3TTSClient = Qwen3TTSClient(),
         audioPlayer: DialogueAudioPlaying = DialogueAudioPlayer(),
         randomIndex: @escaping @Sendable (Int) -> Int = { upperBound in
             Int.random(in: 0..<upperBound)
@@ -149,6 +156,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         installer = DialogueVoiceAssetInstaller(applicationSupportRoot: applicationSupportRoot)
         publisher = DialogueVoiceAudioPublisher(applicationSupportRoot: applicationSupportRoot)
         self.client = client
+        self.qwenClient = qwenClient
         self.audioPlayer = audioPlayer
         self.randomIndex = randomIndex
         self.sleepForInterval = sleepForInterval
@@ -206,7 +214,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
 
         do {
             var recoveredLibrary = library
-            if recoveredLibrary.profile != nil {
+            if recoveredLibrary.activeProviderKind != nil {
                 try recoveredLibrary.setProfileStatus(.validating)
             }
             let migratedOutputs = try recoveredLibrary.migrateOutdatedSynthesisOutputs()
@@ -226,7 +234,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             if recoveredLibrary != library || recovered > 0 || missingOutputs > 0 || migratedOutputs > 0 {
                 try store.save(recoveredLibrary)
                 library = recoveredLibrary
-                activityMessage = library.profile == nil
+                activityMessage = library.activeProviderKind == nil
                     ? "Recovered \(recovered + missingOutputs) dialogue generation task(s)."
                     : "Validating the saved voice profile before generation and playback…"
                 if migratedOutputs > 0 {
@@ -248,8 +256,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             }
         }
         notify()
-        if !persistenceBlocked, let profile = library.profile {
-            validatePersistedProfile(profile)
+        if !persistenceBlocked, library.activeProviderKind != nil {
+            validatePersistedActiveProfile()
         } else {
             processNextQueuedLine()
         }
@@ -264,7 +272,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         profileValidationTask?.cancel()
         profileValidationSequence &+= 1
         profileValidationTask = nil
-        validatedAssetIdentities = nil
+        validatedProviderIdentity = nil
         activeGenerationTask?.cancel()
         activeGenerationTask = nil
         activeTicket = nil
@@ -337,6 +345,104 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         }
     }
 
+    func configureQwenProfile(sourceURL: URL, pythonExecutableURL: URL) {
+        assertMainThread()
+        guard !persistenceBlocked else { return }
+        activeImportTask?.cancel()
+        importSequence &+= 1
+        let sequence = importSequence
+        activityMessage = "Importing and validating the private Qwen handover package…"
+        notify()
+
+        let root = applicationSupportRoot
+        activeImportTask = Task.detached(priority: .userInitiated) { [self] in
+            var installedPackage: Qwen3TTSImportedPackage?
+            let result: Result<
+                (Qwen3TTSImportedPackage, Qwen3TTSPythonRuntimeIdentity),
+                DialogueVoiceRuntimeError
+            >
+            do {
+                let imported = try Qwen3TTSPackageInstaller(
+                    applicationSupportRoot: root
+                ).install(sourceURL: sourceURL)
+                installedPackage = imported
+                try Task.checkCancellation()
+                let runtime = try Qwen3TTSProfileValidator.validatePythonExecutable(
+                    at: pythonExecutableURL
+                )
+                result = .success((imported, runtime))
+            } catch let error as DialogueVoiceRuntimeError {
+                if let installedPackage {
+                    try? Qwen3TTSPackageInstaller(
+                        applicationSupportRoot: root
+                    ).removeManagedPackage(relativePath: installedPackage.packageRootRelativePath)
+                }
+                result = .failure(error)
+            } catch is CancellationError {
+                if let installedPackage {
+                    try? Qwen3TTSPackageInstaller(
+                        applicationSupportRoot: root
+                    ).removeManagedPackage(relativePath: installedPackage.packageRootRelativePath)
+                }
+                result = .failure(.cancelled)
+            } catch {
+                if let installedPackage {
+                    try? Qwen3TTSPackageInstaller(
+                        applicationSupportRoot: root
+                    ).removeManagedPackage(relativePath: installedPackage.packageRootRelativePath)
+                }
+                result = .failure(.profileRejected)
+            }
+            await MainActor.run {
+                guard sequence == self.importSequence else {
+                    if case let .success((imported, _)) = result {
+                        try? Qwen3TTSPackageInstaller(
+                            applicationSupportRoot: root
+                        ).removeManagedPackage(relativePath: imported.packageRootRelativePath)
+                    }
+                    return
+                }
+                self.activeImportTask = nil
+                switch result {
+                case let .success((imported, runtime)):
+                    do {
+                        try self.activateImportedQwenProfile(imported, runtime: runtime)
+                    } catch {
+                        let persistedLibrary: DialogueVoiceLibrary?
+                        let storeWasReadable: Bool
+                        do {
+                            persistedLibrary = try self.store.load()
+                            storeWasReadable = true
+                        } catch {
+                            persistedLibrary = nil
+                            storeWasReadable = false
+                        }
+                        let wasCommitted = persistedLibrary?.qwenProfile?.packageRootRelativePath
+                            == imported.packageRootRelativePath
+                        if wasCommitted, let persistedLibrary {
+                            self.library = persistedLibrary
+                            self.activityMessage = "The Qwen profile was saved, but storage durability could not be confirmed. Restart Statelet before editing voice settings again."
+                        } else if storeWasReadable {
+                            try? Qwen3TTSPackageInstaller(
+                                applicationSupportRoot: root
+                            ).removeManagedPackage(relativePath: imported.packageRootRelativePath)
+                            self.activityMessage = "The Qwen package was validated but its profile could not be saved. The imported copy was removed."
+                        } else {
+                            self.activityMessage = "Qwen profile storage is unreadable, so the imported package was preserved to avoid data loss. Restore the voice library before editing settings again."
+                        }
+                        self.persistenceBlocked = true
+                        self.logger.error("event=qwen_profile_save_failed code=STORE_FAILURE")
+                        self.notify()
+                    }
+                case let .failure(error):
+                    self.activityMessage = error.localizedDescription
+                    self.logger.error("event=qwen_package_import_failed code=\(error.safeCode, privacy: .public)")
+                    self.notify()
+                }
+            }
+        }
+    }
+
     func saveProfile(_ draft: DialogueVoiceProfileDraft) throws {
         assertMainThread()
         guard !persistenceBlocked else { throw DialogueVoiceError.storeFailure }
@@ -388,7 +494,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         profileValidationTask?.cancel()
         profileValidationSequence &+= 1
         profileValidationTask = nil
-        validatedAssetIdentities = nil
+        validatedProviderIdentity = nil
         activeGenerationTask?.cancel()
         cancelAutomaticPlayback()
         voicePlaybackSequence &+= 1
@@ -428,43 +534,162 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         validatePersistedProfile(profile)
     }
 
-    func removeProfile() throws {
-        assertMainThread()
-        guard !persistenceBlocked else { throw DialogueVoiceError.storeFailure }
-        activeImportTask?.cancel()
-        importSequence &+= 1
-        activeImportTask = nil
+    private func activateImportedQwenProfile(
+        _ imported: Qwen3TTSImportedPackage,
+        runtime: Qwen3TTSPythonRuntimeIdentity
+    ) throws {
+        let previous = library.qwenProfile
+        let profileID = previous?.id ?? UUID()
+        let revision = (previous?.revision ?? 0) + 1
+        let profileName = previous?.name ?? "Qwen3-TTS Voice"
+        let provisional = try Qwen3TTSVoiceProfile(
+            id: profileID,
+            revision: revision,
+            name: profileName,
+            packageRootRelativePath: imported.packageRootRelativePath,
+            pythonExecutablePath: runtime.invocationPath,
+            pythonExecutableSHA256: runtime.finalTargetSHA256,
+            packageTreeSHA256: imported.treeSHA256,
+            manifest: imported.manifest,
+            referenceText: imported.referenceText,
+            referenceLanguage: imported.referenceLanguage,
+            defaultTextLanguage: imported.referenceLanguage,
+            parameters: imported.parameters,
+            inputFingerprint: String(repeating: "0", count: 64)
+        )
+        let profile = try Qwen3TTSVoiceProfile(
+            id: provisional.id,
+            revision: provisional.revision,
+            name: provisional.name,
+            packageRootRelativePath: provisional.packageRootRelativePath,
+            pythonExecutablePath: provisional.pythonExecutablePath,
+            pythonExecutableSHA256: provisional.pythonExecutableSHA256,
+            packageTreeSHA256: provisional.packageTreeSHA256,
+            manifest: provisional.manifest,
+            referenceText: provisional.referenceText,
+            referenceLanguage: provisional.referenceLanguage,
+            defaultTextLanguage: provisional.defaultTextLanguage,
+            parameters: provisional.parameters,
+            inputFingerprint: Qwen3TTSProfileValidator.computeInputFingerprint(
+                components: provisional.inputFingerprintComponents
+            )
+        )
+
         profileValidationTask?.cancel()
         profileValidationSequence &+= 1
         profileValidationTask = nil
-        validatedAssetIdentities = nil
+        validatedProviderIdentity = nil
         activeGenerationTask?.cancel()
+        activeGenerationTask = nil
+        activeTicket = nil
         cancelAutomaticPlayback()
         voicePlaybackSequence &+= 1
         activeVoicePlayback = nil
         audioPlayer.stop()
-        let profile = library.profile
-        let managedAssetPaths = Set([
-            importedAssets.gptWeightRelativePath,
-            importedAssets.sovitsWeightRelativePath,
-            importedAssets.referenceAudioRelativePath,
-            profile?.gptWeightRelativePath,
-            profile?.sovitsWeightRelativePath,
-            profile?.referenceAudioRelativePath,
-        ].compactMap { $0 })
-        let generatedPaths = library.lines.compactMap(\.outputRelativePath)
-        let resetLines = try library.lines.map { line in
-            try DialogueLine(
-                id: line.id,
-                state: line.state,
-                text: line.text,
-                textLanguage: line.textLanguage,
-                revision: line.revision,
-                status: .draft
-            )
+
+        let priorOutputs = library.lines.compactMap(\.outputRelativePath)
+        let replacedPackage: [String]
+        if let previousPath = previous?.packageRootRelativePath,
+           previousPath != profile.packageRootRelativePath {
+            replacedPackage = [previousPath]
+        } else {
+            replacedPackage = []
+        }
+        var updated = library
+        try updated.replacePendingCleanupPaths(
+            updated.pendingCleanupPaths.filter { $0 != profile.packageRootRelativePath }
+        )
+        try updated.replaceActiveProfile(profile)
+        for line in updated.lines where line.status == .stale {
+            _ = try updated.retryLine(id: line.id)
+        }
+        try updated.setProfileStatus(.validating)
+        try updated.enqueueCleanup(paths: priorOutputs + replacedPackage)
+        try store.save(updated)
+        library = updated
+        let cleanup = retryPendingCleanup()
+        activityMessage = cleanupAwareMessage(
+            "Qwen3-TTS profile saved. Validating the private package and local Python runtime…",
+            outcome: cleanup
+        )
+        logger.info("event=profile_saved provider=qwen3_tts revision=\(profile.revision, privacy: .public)")
+        notify()
+        validatePersistedProfile(profile)
+    }
+
+    func removeProfile() throws {
+        guard let provider = library.activeProviderKind else {
+            throw DialogueVoiceError.profileNotConfigured
+        }
+        try removeProfile(provider: provider)
+    }
+
+    func removeProfile(provider removedProvider: DialogueVoiceProviderKind) throws {
+        assertMainThread()
+        guard !persistenceBlocked else { throw DialogueVoiceError.storeFailure }
+        guard (removedProvider == .gptSovits && library.profile != nil)
+                || (removedProvider == .qwen3TTS && library.qwenProfile != nil) else {
+            throw DialogueVoiceError.profileNotConfigured
+        }
+        let removingActiveProvider = library.activeProviderKind == removedProvider
+        activeImportTask?.cancel()
+        importSequence &+= 1
+        activeImportTask = nil
+        if removingActiveProvider {
+            profileValidationTask?.cancel()
+            profileValidationSequence &+= 1
+            profileValidationTask = nil
+            validatedProviderIdentity = nil
+            activeGenerationTask?.cancel()
+            activeGenerationTask = nil
+            activeTicket = nil
+            cancelAutomaticPlayback()
+            voicePlaybackSequence &+= 1
+            activeVoicePlayback = nil
+            audioPlayer.stop()
+        }
+        let managedAssetPaths: Set<String> = switch removedProvider {
+        case .gptSovits:
+            Set([
+                importedAssets.gptWeightRelativePath,
+                importedAssets.sovitsWeightRelativePath,
+                importedAssets.referenceAudioRelativePath,
+                library.profile?.gptWeightRelativePath,
+                library.profile?.sovitsWeightRelativePath,
+                library.profile?.referenceAudioRelativePath,
+            ].compactMap { $0 })
+        case .qwen3TTS:
+            Set([library.qwenProfile?.packageRootRelativePath].compactMap { $0 })
+        }
+        let remainingGPT = removedProvider == .gptSovits ? nil : library.profile
+        let remainingQwen = removedProvider == .qwen3TTS ? nil : library.qwenProfile
+        let remainingProvider: DialogueVoiceProviderKind? = removingActiveProvider
+            ? (remainingGPT != nil ? .gptSovits : (remainingQwen != nil ? .qwen3TTS : nil))
+            : library.activeProviderKind
+        let generatedPaths = removingActiveProvider
+            ? library.lines.compactMap(\.outputRelativePath)
+            : []
+        let resetLines = if removingActiveProvider {
+            try library.lines.map { line in
+                try DialogueLine(
+                    id: line.id,
+                    state: line.state,
+                    text: line.text,
+                    textLanguage: line.textLanguage,
+                    revision: line.revision,
+                    status: remainingProvider == nil ? .draft : .queued
+                )
+            }
+        } else {
+            library.lines
         }
         var updated = try DialogueVoiceLibrary(
-            profile: nil,
+            profile: remainingGPT,
+            qwenProfile: remainingQwen,
+            activeProviderKind: remainingProvider,
+            profileStatus: remainingProvider == nil
+                ? .notConfigured
+                : (removingActiveProvider ? .validating : library.profileStatus),
             lines: resetLines,
             pendingCleanupPaths: library.pendingCleanupPaths,
             playbackSettings: library.playbackSettings
@@ -473,20 +698,52 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         try store.save(updated)
         library = updated
         let cleanup = retryPendingCleanup(preserving: [])
-        importedAssets = DialogueVoiceImportedAssets()
-        draft = DialogueVoiceProfileDraft(
-            name: "",
-            apiBaseURL: "http://127.0.0.1:9880",
-            promptLanguage: "",
-            defaultTextLanguage: "",
-            referenceText: ""
-        )
+        if removedProvider == .gptSovits {
+            importedAssets = DialogueVoiceImportedAssets()
+            draft = DialogueVoiceProfileDraft(
+                name: "",
+                apiBaseURL: "http://127.0.0.1:9880",
+                promptLanguage: "",
+                defaultTextLanguage: "",
+                referenceText: ""
+            )
+        }
         activityMessage = cleanupAwareMessage(
             "Voice profile removed. Dialogue text was kept as drafts.",
             outcome: cleanup
         )
         logger.info("event=profile_removed")
         notify()
+        if removingActiveProvider, remainingProvider != nil { validatePersistedActiveProfile() }
+    }
+
+    func selectActiveProvider(_ provider: DialogueVoiceProviderKind) throws {
+        assertMainThread()
+        guard !persistenceBlocked else { throw DialogueVoiceError.storeFailure }
+        guard library.activeProviderKind != provider else { return }
+        profileValidationTask?.cancel()
+        profileValidationSequence &+= 1
+        profileValidationTask = nil
+        validatedProviderIdentity = nil
+        activeGenerationTask?.cancel()
+        activeGenerationTask = nil
+        activeTicket = nil
+        cancelAutomaticPlayback()
+        voicePlaybackSequence &+= 1
+        activeVoicePlayback = nil
+        audioPlayer.stop()
+        _ = try commit {
+            try $0.selectActiveProvider(provider)
+            try $0.setProfileStatus(.validating)
+        }
+        let cleanup = retryPendingCleanup()
+        activityMessage = cleanupAwareMessage(
+            "Voice provider selected. Validating its local inputs…",
+            outcome: cleanup
+        )
+        logger.info("event=provider_selected provider=\(provider.rawValue, privacy: .public)")
+        notify()
+        validatePersistedActiveProfile()
     }
 
     func addLine(text: String, language: String, state: PetState = .idle) throws {
@@ -495,7 +752,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         _ = try commit { try $0.addLine(text: text, language: language, state: state) }
         activityMessage = library.profileStatus == .ready
             ? "Dialogue queued for voice generation."
-            : library.profile == nil
+            : library.activeProviderKind == nil
             ? "Dialogue saved as a draft. Configure a voice profile to generate speech."
             : "Dialogue saved as a draft until the voice profile is ready."
         notify()
@@ -877,10 +1134,10 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                             profile,
                             applicationSupportRoot: root
                         )
-                        result = .valid(validatedAssets, invalidOutputs)
+                        result = .valid(.gptSovits(validatedAssets), invalidOutputs)
                     } catch let error as DialogueVoiceRuntimeError
                         where error == .inferenceUnavailable || error == .cancelled {
-                        result = .unavailable(validatedAssets, invalidOutputs)
+                        result = .unavailable(.gptSovits(validatedAssets), invalidOutputs)
                     } catch {
                         result = .invalid
                     }
@@ -892,6 +1149,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             }
             await MainActor.run {
                 guard sequence == self.profileValidationSequence,
+                      self.library.activeProviderKind == .gptSovits,
                       self.library.profile?.id == profile.id,
                       self.library.profile?.revision == profile.revision,
                       self.library.profile?.inputFingerprint == profile.inputFingerprint else {
@@ -903,39 +1161,122 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         }
     }
 
+    private func validatePersistedActiveProfile() {
+        switch library.activeProviderKind {
+        case .gptSovits:
+            guard let profile = library.profile else { return }
+            validatePersistedProfile(profile)
+        case .qwen3TTS:
+            guard let profile = library.qwenProfile else { return }
+            validatePersistedProfile(profile)
+        case nil:
+            processNextQueuedLine()
+        }
+    }
+
+    private func validatePersistedProfile(_ profile: Qwen3TTSVoiceProfile) {
+        profileValidationTask?.cancel()
+        profileValidationSequence &+= 1
+        let sequence = profileValidationSequence
+        let root = applicationSupportRoot
+        let readyOutputs = library.lines.compactMap { line -> ReadyOutputValidationTicket? in
+            guard line.status == .ready, let outputRelativePath = line.outputRelativePath else { return nil }
+            return ReadyOutputValidationTicket(
+                lineID: line.id,
+                lineRevision: line.revision,
+                outputRelativePath: outputRelativePath
+            )
+        }
+        let qwenClient = qwenClient
+        profileValidationTask = Task.detached(priority: .utility) { [self] in
+            let result: ProfileValidationResult
+            do {
+                let package = try Qwen3TTSProfileValidator.validate(
+                    profile: profile,
+                    applicationSupportRoot: root
+                )
+                let invalidOutputs = readyOutputs.filter { output in
+                    guard let data = try? DialogueVoiceAssetInstaller.readManagedFile(
+                        relativePath: output.outputRelativePath,
+                        root: root,
+                        maximumBytes: 67_108_864
+                    ) else { return true }
+                    return !Qwen3TTSClient.isValidOutputWAV(data)
+                }
+                do {
+                    try await qwenClient.validateProfile(profile, applicationSupportRoot: root)
+                    result = .valid(.qwen3TTS(package.identityTokens), invalidOutputs)
+                } catch let error as DialogueVoiceRuntimeError
+                    where error == .inferenceUnavailable || error == .cancelled {
+                    result = .unavailable(.qwen3TTS(package.identityTokens), invalidOutputs)
+                } catch {
+                    result = .invalid
+                }
+            } catch let error as DialogueVoiceRuntimeError
+                where error == .inferenceUnavailable || error == .cancelled {
+                result = .invalid
+            } catch {
+                result = .invalid
+            }
+            await MainActor.run {
+                guard sequence == self.profileValidationSequence,
+                      self.library.activeProviderKind == .qwen3TTS,
+                      self.library.qwenProfile?.id == profile.id,
+                      self.library.qwenProfile?.revision == profile.revision,
+                      self.library.qwenProfile?.inputFingerprint == profile.inputFingerprint else { return }
+                self.profileValidationTask = nil
+                self.finishProfileValidation(provider: .qwen3TTS, result: result)
+            }
+        }
+    }
+
     private func finishProfileValidation(
         profile: GPTSoVITSVoiceProfile,
         result: ProfileValidationResult
     ) {
+        finishProfileValidation(provider: .gptSovits, result: result, gptProfile: profile)
+    }
+
+    private func finishProfileValidation(
+        provider: DialogueVoiceProviderKind,
+        result: ProfileValidationResult,
+        gptProfile: GPTSoVITSVoiceProfile? = nil
+    ) {
         do {
             switch result {
-            case let .valid(validatedAssets, invalidOutputs):
+            case let .valid(identity, invalidOutputs):
                 var updated = try libraryAfterInvalidatingOutputs(invalidOutputs)
                 _ = try updated.activateValidatedProfile()
                 let replacedOutputs = obsoleteOutputPaths(before: library, after: updated)
                 try updated.enqueueCleanup(paths: replacedOutputs)
                 try store.save(updated)
                 library = updated
-                mergeValidatedDigests(profile: profile, digests: validatedAssets.digests)
-                validatedAssetIdentities = validatedAssets.identities
+                if case let .gptSovits(validatedAssets) = identity, let gptProfile {
+                    mergeValidatedDigests(profile: gptProfile, digests: validatedAssets.digests)
+                }
+                validatedProviderIdentity = identity
                 let cleanup = retryPendingCleanup()
                 activityMessage = cleanupAwareMessage(
                     "Voice profile validation completed.",
                     outcome: cleanup
                 )
-                logger.info("event=profile_validated revision=\(profile.revision, privacy: .public)")
-            case let .unavailable(validatedAssets, invalidOutputs):
+                logger.info("event=profile_validated provider=\(provider.rawValue, privacy: .public)")
+            case let .unavailable(identity, invalidOutputs):
                 var updated = try libraryAfterInvalidatingOutputs(invalidOutputs)
                 let replacedOutputs = obsoleteOutputPaths(before: library, after: updated)
                 try updated.setProfileStatus(.unavailable)
                 try updated.enqueueCleanup(paths: replacedOutputs)
                 try store.save(updated)
                 library = updated
-                mergeValidatedDigests(profile: profile, digests: validatedAssets.digests)
-                validatedAssetIdentities = validatedAssets.identities
+                if case let .gptSovits(validatedAssets) = identity, let gptProfile {
+                    mergeValidatedDigests(profile: gptProfile, digests: validatedAssets.digests)
+                }
+                validatedProviderIdentity = identity
                 let cleanup = retryPendingCleanup()
                 activityMessage = cleanupAwareMessage(
-                    "Voice assets are valid, but the local GPT-SoVITS service is unavailable. Start API v2 and save the profile again.",
+                    provider == .gptSovits
+                        ? "Voice assets are valid, but the local GPT-SoVITS service is unavailable. Start API v2 and save the profile again."
+                        : "The Qwen voice package is valid, but its local Python runtime is unavailable. Restore the selected runtime and validate again.",
                     outcome: cleanup
                 )
                 logger.error("event=profile_unavailable code=INFERENCE_UNAVAILABLE")
@@ -944,8 +1285,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                 try updated.setProfileStatus(.invalid, invalidatingOutputs: true)
                 try store.save(updated)
                 library = updated
-                clearDigestsForActiveProfile(profile)
-                validatedAssetIdentities = nil
+                if let gptProfile { clearDigestsForActiveProfile(gptProfile) }
+                validatedProviderIdentity = nil
                 activityMessage = "The saved voice assets changed, are missing, or are no longer valid. Re-import them before generating speech."
                 logger.error("event=profile_validation_failed code=INPUT_FINGERPRINT_MISMATCH")
             }
@@ -989,8 +1330,12 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     private func processNextQueuedLine() {
         guard started, !persistenceBlocked, activeGenerationTask == nil,
               library.profileStatus == .ready,
-              let profile = library.profile,
+              let provider = library.activeProviderKind,
               let queued = library.lines.first(where: { $0.status == .queued }) else { return }
+        if provider == .qwen3TTS, !isQwenCompatible(queued) {
+            rejectQueuedQwenLine(queued)
+            return
+        }
         do {
             let ticket = try commit { try $0.beginGeneration(for: queued.id) }
             let line = try requireLine(ticket.lineID)
@@ -1000,53 +1345,80 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             notify()
 
             let client = client
+            let qwenClient = qwenClient
             let publisher = publisher
             let root = applicationSupportRoot
-            let expectedIdentities = validatedAssetIdentities
+            let expectedIdentity = validatedProviderIdentity
+            let gptProfile = library.profile
+            let qwenProfile = library.qwenProfile
             activeGenerationTask = Task.detached(priority: .userInitiated) { [self] in
                 let result: GenerationResult
                 do {
-                    let currentIdentities = try DialogueVoiceProfileFingerprint.assetIdentities(
-                        profile: profile,
-                        applicationSupportRoot: root
-                    )
-                    let generationIdentities: DialogueVoiceAssetIdentities
-                    if currentIdentities == expectedIdentities {
-                        generationIdentities = currentIdentities
-                    } else {
-                        let validatedAssets = try DialogueVoiceProfileFingerprint.validateAssets(
-                            profile: profile,
-                            applicationSupportRoot: root
+                    switch provider {
+                    case .gptSovits:
+                        guard let profile = gptProfile else { throw DialogueVoiceRuntimeError.profileRejected }
+                        let currentIdentities = try DialogueVoiceProfileFingerprint.assetIdentities(
+                            profile: profile, applicationSupportRoot: root
                         )
-                        let fingerprint = DialogueVoiceProfileFingerprint.compute(
-                            apiBaseURL: profile.apiBaseURL,
-                            referenceText: profile.referenceText,
-                            promptLanguage: profile.promptLanguage,
-                            defaultTextLanguage: profile.defaultTextLanguage,
-                            assetDigests: validatedAssets.digests
+                        let generationIdentities: DialogueVoiceAssetIdentities
+                        if case let .gptSovits(expectedAssets) = expectedIdentity,
+                           expectedAssets.identities == currentIdentities {
+                            generationIdentities = currentIdentities
+                        } else {
+                            let validatedAssets = try DialogueVoiceProfileFingerprint.validateAssets(
+                                profile: profile, applicationSupportRoot: root
+                            )
+                            let fingerprint = DialogueVoiceProfileFingerprint.compute(
+                                apiBaseURL: profile.apiBaseURL,
+                                referenceText: profile.referenceText,
+                                promptLanguage: profile.promptLanguage,
+                                defaultTextLanguage: profile.defaultTextLanguage,
+                                assetDigests: validatedAssets.digests
+                            )
+                            guard fingerprint == profile.inputFingerprint else {
+                                throw DialogueVoiceRuntimeError.inputFingerprintMismatch
+                            }
+                            generationIdentities = validatedAssets.identities
+                        }
+                        let data = try await client.synthesize(
+                            profile: profile, line: line, applicationSupportRoot: root
                         )
-                        guard fingerprint == profile.inputFingerprint else {
+                        try Task.checkCancellation()
+                        let finalIdentities = try DialogueVoiceProfileFingerprint.assetIdentities(
+                            profile: profile, applicationSupportRoot: root
+                        )
+                        guard finalIdentities == generationIdentities else {
                             throw DialogueVoiceRuntimeError.inputFingerprintMismatch
                         }
-                        generationIdentities = validatedAssets.identities
+                        result = .success(
+                            try publisher.publish(data: data, ticket: ticket),
+                            .gptSovits(try DialogueVoiceProfileFingerprint.validateAssets(
+                                profile: profile, applicationSupportRoot: root
+                            ))
+                        )
+                    case .qwen3TTS:
+                        guard let profile = qwenProfile else { throw DialogueVoiceRuntimeError.profileRejected }
+                        let expectedTokens: [String]
+                        if case let .qwen3TTS(tokens) = expectedIdentity {
+                            expectedTokens = tokens
+                        } else {
+                            expectedTokens = try Qwen3TTSProfileValidator.validate(
+                                profile: profile,
+                                applicationSupportRoot: root
+                            ).identityTokens
+                        }
+                        let data = try await qwenClient.synthesize(
+                            profile: profile,
+                            line: line,
+                            applicationSupportRoot: root,
+                            expectedIdentityTokens: expectedTokens
+                        )
+                        try Task.checkCancellation()
+                        result = .success(
+                            try publisher.publish(data: data, ticket: ticket),
+                            .qwen3TTS(expectedTokens)
+                        )
                     }
-                    let data = try await client.synthesize(
-                        profile: profile,
-                        line: line,
-                        applicationSupportRoot: root
-                    )
-                    try Task.checkCancellation()
-                    let finalIdentities = try DialogueVoiceProfileFingerprint.assetIdentities(
-                        profile: profile,
-                        applicationSupportRoot: root
-                    )
-                    guard finalIdentities == generationIdentities else {
-                        throw DialogueVoiceRuntimeError.inputFingerprintMismatch
-                    }
-                    result = .success(
-                        try publisher.publish(data: data, ticket: ticket),
-                        finalIdentities
-                    )
                 } catch let error as DialogueVoiceRuntimeError {
                     result = .failure(error.safeCode)
                 } catch is CancellationError {
@@ -1065,6 +1437,36 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         }
     }
 
+    private func isQwenCompatible(_ line: DialogueLine) -> Bool {
+        guard let profile = library.qwenProfile,
+              line.text.count <= 500 else { return false }
+        return Qwen3TTSLanguage.areJapaneseAliases(
+            line.textLanguage,
+            profile.defaultTextLanguage
+        )
+    }
+
+    private func rejectQueuedQwenLine(_ line: DialogueLine) {
+        do {
+            let ticket = try commit { try $0.beginGeneration(for: line.id) }
+            _ = try commit {
+                try $0.failGeneration(
+                    ticket: ticket,
+                    failureCode: DialogueVoiceRuntimeError.requestRejected.safeCode
+                )
+            }
+            activityMessage = line.text.count > 500
+                ? "Qwen dialogue must be 500 characters or fewer. Shorten the line and try again."
+                : "This dialogue language is incompatible with the active Qwen profile. Use the profile language and try again."
+            logger.error("event=generation_rejected provider=qwen3_tts code=REQUEST_REJECTED")
+        } catch {
+            activityMessage = "Dialogue generation could not start."
+            logger.error("event=generation_start_failed code=INVALID_STATE")
+        }
+        notify()
+        processNextQueuedLine()
+    }
+
     private func finishGeneration(ticket: DialogueGenerationTicket, result: GenerationResult) {
         guard started else {
             if case let .success(outputPath, _) = result {
@@ -1072,10 +1474,17 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             }
             return
         }
+        guard activeTicket?.attemptID == ticket.attemptID else {
+            if case let .success(outputPath, _) = result {
+                deferCleanup(paths: [outputPath])
+            }
+            logger.info("event=generation_result_discarded code=STALE_ATTEMPT")
+            return
+        }
         activeGenerationTask = nil
         activeTicket = nil
         switch result {
-        case let .success(outputPath, identities):
+        case let .success(outputPath, identity):
             do {
                 let replacedOutput = library.lines.first(where: { $0.id == ticket.lineID })?
                     .outputRelativePath
@@ -1086,7 +1495,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                     }
                     return completed
                 }
-                validatedAssetIdentities = identities
+                validatedProviderIdentity = identity
                 let cleanup = retryPendingCleanup()
                 activityMessage = cleanupAwareMessage(
                     "Dialogue audio is ready.",
@@ -1116,18 +1525,18 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                 if code == DialogueVoiceRuntimeError.cancelled.safeCode {
                     activityMessage = "Dialogue generation was cancelled."
                 } else if code == DialogueVoiceRuntimeError.profileRejected.safeCode {
-                    validatedAssetIdentities = nil
-                    activityMessage = "GPT-SoVITS rejected the active profile. Review its inputs, re-import if needed, and save the profile again."
+                    validatedProviderIdentity = nil
+                    activityMessage = "The active voice provider rejected its profile. Review the imported inputs and save the profile again."
                 } else if code == DialogueVoiceRuntimeError.inputFingerprintMismatch.safeCode {
-                    validatedAssetIdentities = nil
-                    if let profile = library.profile {
+                    validatedProviderIdentity = nil
+                    if library.activeProviderKind == .gptSovits, let profile = library.profile {
                         clearDigestsForActiveProfile(profile)
                     }
                     activityMessage = "The managed voice inputs changed after validation. Re-import them and save the profile again."
                 } else if code == DialogueVoiceRuntimeError.requestRejected.safeCode {
-                    activityMessage = "GPT-SoVITS rejected this dialogue or language value. Edit the line and try again."
+                    activityMessage = "The active voice provider rejected this dialogue or language value. Edit the line and try again."
                 } else {
-                    activityMessage = "Dialogue generation failed. Use Retry after checking the local GPT-SoVITS service."
+                    activityMessage = "Dialogue generation failed. Use Retry after checking the active local voice provider."
                 }
                 logger.error("event=generation_failed line_id=\(ticket.lineID.uuidString, privacy: .public) code=\(code, privacy: .public)")
             } catch {
@@ -1345,11 +1754,17 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                 )
             }
             do {
-                _ = try DialogueVoiceAssetInstaller.removeManagedFile(
-                    relativePath: path,
-                    root: applicationSupportRoot,
-                    maximumBytes: DialogueVoiceAssetKind.gptWeight.maximumBytes
-                )
+                if path.hasPrefix("voice/packages/qwen/") {
+                    try Qwen3TTSPackageInstaller(
+                        applicationSupportRoot: applicationSupportRoot
+                    ).removeManagedPackage(relativePath: path)
+                } else {
+                    _ = try DialogueVoiceAssetInstaller.removeManagedFile(
+                        relativePath: path,
+                        root: applicationSupportRoot,
+                        maximumBytes: DialogueVoiceAssetKind.gptWeight.maximumBytes
+                    )
+                }
             } catch {
                 remaining.append(path)
                 retryFailureCount += 1

@@ -214,10 +214,24 @@ esac
             path = alpha_tools / resource
             self.assertTrue(os.access(path, os.R_OK))
             self.assertFalse(path.stat().st_mode & 0o111)
+
+        qwen_tools = bundle / "Contents" / "Resources" / "QwenTTS"
+        expected_qwen_resources = {"qwen3_tts_generate.py", "qwen3_tts_probe.py"}
+        self.assertEqual(
+            {path.name for path in qwen_tools.iterdir() if path.is_file()},
+            expected_qwen_resources,
+        )
+        for resource in expected_qwen_resources:
+            path = qwen_tools / resource
+            self.assertTrue(os.access(path, os.R_OK))
+            self.assertFalse(path.stat().st_mode & 0o111)
         self.assertFalse([path for path in bundle.rglob("__pycache__")])
         self.assertFalse([path for path in bundle.rglob("*.pyc")])
 
-        forbidden = {".mp4", ".mov", ".gif", ".apng", ".webm", ".mkv"}
+        forbidden = {
+            ".mp4", ".mov", ".gif", ".apng", ".webm", ".mkv",
+            ".safetensors", ".ckpt", ".pth", ".wav", ".flac", ".mp3",
+        }
         self.assertFalse(
             [path for path in bundle.rglob("*") if path.is_file() and path.suffix.lower() in forbidden]
         )
@@ -226,6 +240,7 @@ esac
         )
         for private_prefix in (str(ROOT), str(Path.home()), "/Users/", "/private/tmp/"):
             self.assertNotIn(private_prefix.encode(), bundle_payload)
+        self.assertNotIn(b"STATELET_PRIVATE_VOICE_FIXTURE", bundle_payload)
 
     def test_default_bundle_and_symbol_destinations_are_statelet(self) -> None:
         source = BUILD_SCRIPT.read_text(encoding="utf-8")

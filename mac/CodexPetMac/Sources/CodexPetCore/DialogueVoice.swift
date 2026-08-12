@@ -122,12 +122,37 @@ private enum DialogueVoiceValidation {
         return value
     }
 
+    static func packageRelativePath(_ value: String) throws -> String {
+        let path = try managedPath(value)
+        guard !path.hasPrefix("voice/") else {
+            throw DialogueVoiceError.invalidManagedPath
+        }
+        return path
+    }
+
+    static func absoluteExecutablePath(_ value: String) throws -> String {
+        guard !value.isEmpty,
+              value.count <= 4_096,
+              value.hasPrefix("/"),
+              !value.hasPrefix("//"),
+              !value.contains("\\"),
+              !value.unicodeScalars.contains(where: { $0.value == 0 }) else {
+            throw DialogueVoiceError.invalidManagedPath
+        }
+        let standardized = URL(fileURLWithPath: value, isDirectory: false).standardizedFileURL.path
+        guard standardized == value, value != "/" else {
+            throw DialogueVoiceError.invalidManagedPath
+        }
+        return value
+    }
+
     static func voiceCleanupPath(_ value: String) throws -> String {
         let path = try managedPath(value)
         guard [
             "voice/assets/gpt/",
             "voice/assets/sovits/",
             "voice/assets/reference/",
+            "voice/packages/qwen/",
             "voice/generated/",
         ].contains(where: { path.hasPrefix($0) }) else {
             throw DialogueVoiceError.invalidManagedPath
@@ -154,6 +179,21 @@ private enum DialogueVoiceValidation {
         }
         return value
     }
+
+    static func sha256(_ value: String) throws -> String {
+        guard value.count == 64,
+              value.unicodeScalars.allSatisfy({ scalar in
+                  (48...57).contains(scalar.value) || (97...102).contains(scalar.value)
+              }) else {
+            throw DialogueVoiceError.invalidProfile
+        }
+        return value
+    }
+}
+
+public enum DialogueVoiceProviderKind: String, Codable, CaseIterable, Sendable {
+    case gptSovits = "gpt_sovits"
+    case qwen3TTS = "qwen3_tts"
 }
 
 public struct GPTSoVITSVoiceProfile: Codable, Equatable, Sendable {
@@ -201,13 +241,7 @@ public struct GPTSoVITSVoiceProfile: Codable, Equatable, Sendable {
         )
         self.promptLanguage = try DialogueVoiceValidation.language(promptLanguage)
         self.defaultTextLanguage = try DialogueVoiceValidation.language(defaultTextLanguage)
-        guard inputFingerprint.count == 64,
-              inputFingerprint.unicodeScalars.allSatisfy({ scalar in
-                  (48...57).contains(scalar.value) || (97...102).contains(scalar.value)
-              }) else {
-            throw DialogueVoiceError.invalidProfile
-        }
-        self.inputFingerprint = inputFingerprint
+        self.inputFingerprint = try DialogueVoiceValidation.sha256(inputFingerprint)
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -236,6 +270,261 @@ public struct GPTSoVITSVoiceProfile: Codable, Equatable, Sendable {
             referenceText: container.decode(String.self, forKey: .referenceText),
             promptLanguage: container.decode(String.self, forKey: .promptLanguage),
             defaultTextLanguage: container.decode(String.self, forKey: .defaultTextLanguage),
+            inputFingerprint: container.decode(String.self, forKey: .inputFingerprint)
+        )
+    }
+}
+
+public struct Qwen3TTSSynthesisParameters: Codable, Equatable, Sendable {
+    public static let verifiedDefaults = try! Qwen3TTSSynthesisParameters()
+
+    public let temperature: Double
+    public let topK: Int
+    public let topP: Double
+    public let repetitionPenalty: Double
+    public let maximumTokens: Int
+    public let seed: Int
+
+    public init(
+        temperature: Double = 0.7,
+        topK: Int = 40,
+        topP: Double = 0.95,
+        repetitionPenalty: Double = 1.05,
+        maximumTokens: Int = 2_048,
+        seed: Int = 1_112
+    ) throws {
+        guard temperature.isFinite, (0...2).contains(temperature),
+              (1...1_000).contains(topK),
+              topP.isFinite, (0...1).contains(topP),
+              repetitionPenalty.isFinite, (0.1...10).contains(repetitionPenalty),
+              (1...8_192).contains(maximumTokens),
+              seed >= 0 else {
+            throw DialogueVoiceError.invalidProfile
+        }
+        self.temperature = temperature
+        self.topK = topK
+        self.topP = topP
+        self.repetitionPenalty = repetitionPenalty
+        self.maximumTokens = maximumTokens
+        self.seed = seed
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case temperature
+        case topK = "top_k"
+        case topP = "top_p"
+        case repetitionPenalty = "repetition_penalty"
+        case maximumTokens = "maximum_tokens"
+        case seed
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            temperature: container.decode(Double.self, forKey: .temperature),
+            topK: container.decode(Int.self, forKey: .topK),
+            topP: container.decode(Double.self, forKey: .topP),
+            repetitionPenalty: container.decode(Double.self, forKey: .repetitionPenalty),
+            maximumTokens: container.decode(Int.self, forKey: .maximumTokens),
+            seed: container.decode(Int.self, forKey: .seed)
+        )
+    }
+}
+
+/// Immutable identities for the private files that make up an imported Qwen
+/// handover package. Paths are relative to `packageRootRelativePath` and never
+/// accept external URLs or model identifiers.
+public struct Qwen3TTSPackageManifest: Codable, Equatable, Sendable {
+    public let modelRelativePath: String
+    public let configRelativePath: String
+    public let handoverGeneratorRelativePath: String
+    public let referenceAudioRelativePath: String
+    public let modelSHA256: String
+    public let configSHA256: String
+    public let handoverGeneratorSHA256: String
+    public let referenceAudioSHA256: String
+
+    public init(
+        modelRelativePath: String = "model/model.safetensors",
+        configRelativePath: String = "config.json",
+        handoverGeneratorRelativePath: String = "generate.py",
+        referenceAudioRelativePath: String,
+        modelSHA256: String,
+        configSHA256: String,
+        handoverGeneratorSHA256: String,
+        referenceAudioSHA256: String
+    ) throws {
+        self.modelRelativePath = try DialogueVoiceValidation.packageRelativePath(modelRelativePath)
+        self.configRelativePath = try DialogueVoiceValidation.packageRelativePath(configRelativePath)
+        self.handoverGeneratorRelativePath = try DialogueVoiceValidation.packageRelativePath(
+            handoverGeneratorRelativePath
+        )
+        self.referenceAudioRelativePath = try DialogueVoiceValidation.packageRelativePath(
+            referenceAudioRelativePath
+        )
+        self.modelSHA256 = try DialogueVoiceValidation.sha256(modelSHA256)
+        self.configSHA256 = try DialogueVoiceValidation.sha256(configSHA256)
+        self.handoverGeneratorSHA256 = try DialogueVoiceValidation.sha256(handoverGeneratorSHA256)
+        self.referenceAudioSHA256 = try DialogueVoiceValidation.sha256(referenceAudioSHA256)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case modelRelativePath = "model_relative_path"
+        case configRelativePath = "config_relative_path"
+        case handoverGeneratorRelativePath = "handover_generator_relative_path"
+        case referenceAudioRelativePath = "reference_audio_relative_path"
+        case modelSHA256 = "model_sha256"
+        case configSHA256 = "config_sha256"
+        case handoverGeneratorSHA256 = "handover_generator_sha256"
+        case referenceAudioSHA256 = "reference_audio_sha256"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            modelRelativePath: container.decode(String.self, forKey: .modelRelativePath),
+            configRelativePath: container.decode(String.self, forKey: .configRelativePath),
+            handoverGeneratorRelativePath: container.decode(String.self, forKey: .handoverGeneratorRelativePath),
+            referenceAudioRelativePath: container.decode(String.self, forKey: .referenceAudioRelativePath),
+            modelSHA256: container.decode(String.self, forKey: .modelSHA256),
+            configSHA256: container.decode(String.self, forKey: .configSHA256),
+            handoverGeneratorSHA256: container.decode(String.self, forKey: .handoverGeneratorSHA256),
+            referenceAudioSHA256: container.decode(String.self, forKey: .referenceAudioSHA256)
+        )
+    }
+}
+
+public struct Qwen3TTSVoiceProfile: Codable, Equatable, Sendable {
+    public let id: UUID
+    public let revision: Int
+    public let name: String
+    public let packageRootRelativePath: String
+    public let pythonExecutablePath: String
+    public let pythonExecutableSHA256: String
+    public let packageTreeSHA256: String
+    public let manifest: Qwen3TTSPackageManifest
+    public let referenceText: String
+    public let referenceLanguage: String
+    public let defaultTextLanguage: String
+    public let parameters: Qwen3TTSSynthesisParameters
+    public let inputFingerprint: String
+
+    public var modelRelativePath: String { manifest.modelRelativePath }
+    public var configRelativePath: String { manifest.configRelativePath }
+    public var handoverGeneratorRelativePath: String { manifest.handoverGeneratorRelativePath }
+    public var referenceAudioRelativePath: String { manifest.referenceAudioRelativePath }
+    public var modelSHA256: String { manifest.modelSHA256 }
+    public var configSHA256: String { manifest.configSHA256 }
+    public var handoverGeneratorSHA256: String { manifest.handoverGeneratorSHA256 }
+    public var referenceAudioSHA256: String { manifest.referenceAudioSHA256 }
+    public var temperature: Double { parameters.temperature }
+    public var topK: Int { parameters.topK }
+    public var topP: Double { parameters.topP }
+    public var repetitionPenalty: Double { parameters.repetitionPenalty }
+    public var maximumTokens: Int { parameters.maximumTokens }
+    public var seed: Int { parameters.seed }
+
+    public init(
+        id: UUID = UUID(),
+        revision: Int = 1,
+        name: String,
+        packageRootRelativePath: String,
+        pythonExecutablePath: String,
+        pythonExecutableSHA256: String,
+        packageTreeSHA256: String,
+        manifest: Qwen3TTSPackageManifest,
+        referenceText: String,
+        referenceLanguage: String,
+        defaultTextLanguage: String,
+        parameters: Qwen3TTSSynthesisParameters = .verifiedDefaults,
+        inputFingerprint: String
+    ) throws {
+        guard revision > 0 else { throw DialogueVoiceError.invalidProfile }
+        let packageRoot = try DialogueVoiceValidation.managedPath(packageRootRelativePath)
+        guard packageRoot.hasPrefix("voice/packages/qwen/") else {
+            throw DialogueVoiceError.invalidManagedPath
+        }
+        self.id = id
+        self.revision = revision
+        self.name = try DialogueVoiceValidation.nonBlank(
+            name,
+            maximum: DialogueVoiceValidation.maximumLabelLength,
+            error: .invalidProfile
+        )
+        self.packageRootRelativePath = packageRoot
+        self.pythonExecutablePath = try DialogueVoiceValidation.absoluteExecutablePath(pythonExecutablePath)
+        self.pythonExecutableSHA256 = try DialogueVoiceValidation.sha256(pythonExecutableSHA256)
+        self.packageTreeSHA256 = try DialogueVoiceValidation.sha256(packageTreeSHA256)
+        self.manifest = manifest
+        self.referenceText = try DialogueVoiceValidation.nonBlank(
+            referenceText,
+            maximum: DialogueVoiceValidation.maximumReferenceTextLength,
+            error: .invalidText
+        )
+        self.referenceLanguage = try DialogueVoiceValidation.language(referenceLanguage)
+        self.defaultTextLanguage = try DialogueVoiceValidation.language(defaultTextLanguage)
+        self.parameters = parameters
+        self.inputFingerprint = try DialogueVoiceValidation.sha256(inputFingerprint)
+    }
+
+    /// Stable UTF-8 material for recomputing `inputFingerprint`. Runtime code
+    /// hashes these length-delimited fields with SHA-256 after validating the
+    /// selected Python executable and imported package files against their
+    /// recorded identities.
+    public var inputFingerprintComponents: [String] {
+        [
+            "statelet-qwen3-tts-profile-v1",
+            packageRootRelativePath,
+            pythonExecutablePath,
+            pythonExecutableSHA256,
+            packageTreeSHA256,
+            manifest.modelRelativePath,
+            manifest.modelSHA256,
+            manifest.configRelativePath,
+            manifest.configSHA256,
+            manifest.handoverGeneratorRelativePath,
+            manifest.handoverGeneratorSHA256,
+            manifest.referenceAudioRelativePath,
+            manifest.referenceAudioSHA256,
+            referenceText,
+            referenceLanguage,
+            defaultTextLanguage,
+            String(parameters.temperature),
+            String(parameters.topK),
+            String(parameters.topP),
+            String(parameters.repetitionPenalty),
+            String(parameters.maximumTokens),
+            String(parameters.seed),
+        ]
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, revision, name, manifest, parameters
+        case packageRootRelativePath = "package_root_relative_path"
+        case pythonExecutablePath = "python_executable_path"
+        case pythonExecutableSHA256 = "python_executable_sha256"
+        case packageTreeSHA256 = "package_tree_sha256"
+        case referenceText = "reference_text"
+        case referenceLanguage = "reference_language"
+        case defaultTextLanguage = "default_text_language"
+        case inputFingerprint = "input_fingerprint"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            id: container.decode(UUID.self, forKey: .id),
+            revision: container.decode(Int.self, forKey: .revision),
+            name: container.decode(String.self, forKey: .name),
+            packageRootRelativePath: container.decode(String.self, forKey: .packageRootRelativePath),
+            pythonExecutablePath: container.decode(String.self, forKey: .pythonExecutablePath),
+            pythonExecutableSHA256: container.decode(String.self, forKey: .pythonExecutableSHA256),
+            packageTreeSHA256: container.decode(String.self, forKey: .packageTreeSHA256),
+            manifest: container.decode(Qwen3TTSPackageManifest.self, forKey: .manifest),
+            referenceText: container.decode(String.self, forKey: .referenceText),
+            referenceLanguage: container.decode(String.self, forKey: .referenceLanguage),
+            defaultTextLanguage: container.decode(String.self, forKey: .defaultTextLanguage),
+            parameters: container.decode(Qwen3TTSSynthesisParameters.self, forKey: .parameters),
             inputFingerprint: container.decode(String.self, forKey: .inputFingerprint)
         )
     }
@@ -389,13 +678,15 @@ public struct DialogueGenerationTicket: Codable, Equatable, Sendable {
     public let profileID: UUID
     public let profileRevision: Int
     public let synthesisPolicyVersion: Int
+    public let attemptID: UUID
 
     public init(
         lineID: UUID,
         lineRevision: Int,
         profileID: UUID,
         profileRevision: Int,
-        synthesisPolicyVersion: Int = DialogueSynthesisPolicy.currentVersion
+        synthesisPolicyVersion: Int = DialogueSynthesisPolicy.currentVersion,
+        attemptID: UUID = UUID()
     ) throws {
         guard lineRevision > 0, profileRevision > 0, synthesisPolicyVersion > 0 else {
             throw DialogueVoiceError.invalidState
@@ -405,6 +696,7 @@ public struct DialogueGenerationTicket: Codable, Equatable, Sendable {
         self.profileID = profileID
         self.profileRevision = profileRevision
         self.synthesisPolicyVersion = synthesisPolicyVersion
+        self.attemptID = attemptID
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -413,6 +705,7 @@ public struct DialogueGenerationTicket: Codable, Equatable, Sendable {
         case profileID = "profile_id"
         case profileRevision = "profile_revision"
         case synthesisPolicyVersion = "synthesis_policy_version"
+        case attemptID = "attempt_id"
     }
 
     public init(from decoder: Decoder) throws {
@@ -423,7 +716,8 @@ public struct DialogueGenerationTicket: Codable, Equatable, Sendable {
             profileID: container.decode(UUID.self, forKey: .profileID),
             profileRevision: container.decode(Int.self, forKey: .profileRevision),
             synthesisPolicyVersion: container.decodeIfPresent(Int.self, forKey: .synthesisPolicyVersion)
-                ?? DialogueSynthesisPolicy.currentVersion
+                ?? DialogueSynthesisPolicy.currentVersion,
+            attemptID: container.decodeIfPresent(UUID.self, forKey: .attemptID) ?? UUID()
         )
     }
 }
@@ -477,19 +771,59 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
     public static let schemaVersion = 1
 
     public private(set) var version: Int
+    public private(set) var activeProviderKind: DialogueVoiceProviderKind?
     public private(set) var profile: GPTSoVITSVoiceProfile?
+    public private(set) var qwenProfile: Qwen3TTSVoiceProfile?
     public private(set) var profileStatus: DialogueVoiceProfileStatus
     public private(set) var lines: [DialogueLine]
     public private(set) var pendingCleanupPaths: [String]
     public private(set) var playbackSettings: DialogueVoicePlaybackSettings
 
     public var referencedManagedPaths: Set<String> {
-        Self.referencedPaths(profile: profile, lines: lines)
+        Self.referencedPaths(profile: profile, qwenProfile: qwenProfile, lines: lines)
     }
+
+    public var activeProfileID: UUID? {
+        switch activeProviderKind {
+        case .gptSovits: profile?.id
+        case .qwen3TTS: qwenProfile?.id
+        case nil: nil
+        }
+    }
+
+    public var activeProfileRevision: Int? {
+        switch activeProviderKind {
+        case .gptSovits: profile?.revision
+        case .qwen3TTS: qwenProfile?.revision
+        case nil: nil
+        }
+    }
+
+    public var activeProfileInputFingerprint: String? {
+        switch activeProviderKind {
+        case .gptSovits: profile?.inputFingerprint
+        case .qwen3TTS: qwenProfile?.inputFingerprint
+        case nil: nil
+        }
+    }
+
+    public var activeProfileDefaultTextLanguage: String? {
+        switch activeProviderKind {
+        case .gptSovits: profile?.defaultTextLanguage
+        case .qwen3TTS: qwenProfile?.defaultTextLanguage
+        case nil: nil
+        }
+    }
+
+    public var profileID: UUID? { activeProfileID }
+    public var profileRevision: Int? { activeProfileRevision }
+    public var inputFingerprint: String? { activeProfileInputFingerprint }
 
     public init(
         version: Int = Self.schemaVersion,
         profile: GPTSoVITSVoiceProfile? = nil,
+        qwenProfile: Qwen3TTSVoiceProfile? = nil,
+        activeProviderKind: DialogueVoiceProviderKind? = nil,
         profileStatus: DialogueVoiceProfileStatus? = nil,
         lines: [DialogueLine] = [],
         pendingCleanupPaths: [String] = [],
@@ -504,13 +838,16 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
             throw DialogueVoiceError.invalidState
         }
         guard Set(validatedCleanupPaths).isDisjoint(
-            with: Self.referencedPaths(profile: profile, lines: lines)
+            with: Self.referencedPaths(profile: profile, qwenProfile: qwenProfile, lines: lines)
         ) else {
             throw DialogueVoiceError.invalidState
         }
         self.version = version
         self.profile = profile
-        self.profileStatus = profileStatus ?? (profile == nil ? .notConfigured : .ready)
+        self.qwenProfile = qwenProfile
+        self.activeProviderKind = activeProviderKind
+            ?? (profile != nil ? .gptSovits : (qwenProfile != nil ? .qwen3TTS : nil))
+        self.profileStatus = profileStatus ?? (self.activeProviderKind == nil ? .notConfigured : .ready)
         self.lines = lines
         self.pendingCleanupPaths = validatedCleanupPaths
         self.playbackSettings = playbackSettings
@@ -522,6 +859,24 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
     }
 
     public mutating func replaceActiveProfile(_ profile: GPTSoVITSVoiceProfile) throws {
+        var candidate = self
+        candidate.profile = profile
+        try candidate.selectActiveProvider(.gptSovits)
+        self = candidate
+    }
+
+    public mutating func replaceActiveProfile(_ profile: Qwen3TTSVoiceProfile) throws {
+        var candidate = self
+        candidate.qwenProfile = profile
+        try candidate.selectActiveProvider(.qwen3TTS)
+        self = candidate
+    }
+
+    public mutating func selectActiveProvider(_ provider: DialogueVoiceProviderKind) throws {
+        guard (provider == .gptSovits && profile != nil)
+                || (provider == .qwen3TTS && qwenProfile != nil) else {
+            throw DialogueVoiceError.profileNotConfigured
+        }
         let updatedLines = try lines.map { line in
             switch line.status {
             case .ready, .stale:
@@ -543,11 +898,11 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
             }
         }
         guard Set(pendingCleanupPaths).isDisjoint(
-            with: Self.referencedPaths(profile: profile, lines: updatedLines)
+            with: Self.referencedPaths(profile: profile, qwenProfile: qwenProfile, lines: updatedLines)
         ) else {
             throw DialogueVoiceError.invalidState
         }
-        self.profile = profile
+        activeProviderKind = provider
         profileStatus = .ready
         lines = updatedLines
     }
@@ -556,7 +911,7 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
         _ status: DialogueVoiceProfileStatus,
         invalidatingOutputs: Bool = false
     ) throws {
-        guard profile != nil, status != .notConfigured else {
+        guard activeProfileID != nil, status != .notConfigured else {
             throw DialogueVoiceError.profileNotConfigured
         }
         guard invalidatingOutputs else {
@@ -602,7 +957,7 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
 
     @discardableResult
     public mutating func activateValidatedProfile() throws -> Int {
-        guard profile != nil else { throw DialogueVoiceError.profileNotConfigured }
+        guard activeProfileID != nil else { throw DialogueVoiceError.profileNotConfigured }
         var count = 0
         let updatedLines = try lines.map { line in
             switch line.status {
@@ -635,14 +990,14 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
               !lines.contains(where: { $0.id == id }) else {
             throw DialogueVoiceError.invalidState
         }
-        let resolvedLanguage = try language ?? profile?.defaultTextLanguage
+        let resolvedLanguage = try language ?? activeProfileDefaultTextLanguage
             ?? { throw DialogueVoiceError.invalidLanguage }()
         let line = try DialogueLine(
             id: id,
             state: state,
             text: text,
             textLanguage: resolvedLanguage,
-            status: profile != nil && profileStatus == .ready ? .queued : .draft
+            status: activeProfileID != nil && profileStatus == .ready ? .queued : .draft
         )
         lines.append(line)
         return line
@@ -663,7 +1018,7 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
             text: text,
             textLanguage: language ?? old.textLanguage,
             revision: old.revision + 1,
-            status: profile != nil && profileStatus == .ready ? .queued : .draft
+            status: activeProfileID != nil && profileStatus == .ready ? .queued : .draft
         )
         lines[index] = line
         return line
@@ -671,7 +1026,7 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
 
     @discardableResult
     public mutating func retryLine(id: UUID) throws -> DialogueLine {
-        guard profile != nil, profileStatus == .ready else {
+        guard activeProfileID != nil, profileStatus == .ready else {
             throw DialogueVoiceError.profileNotConfigured
         }
         let index = try lineIndex(id)
@@ -689,7 +1044,9 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
     }
 
     public mutating func beginGeneration(for id: UUID) throws -> DialogueGenerationTicket {
-        guard let profile, profileStatus == .ready else {
+        guard let profileID = activeProfileID,
+              let profileRevision = activeProfileRevision,
+              profileStatus == .ready else {
             throw DialogueVoiceError.profileNotConfigured
         }
         let index = try lineIndex(id)
@@ -698,8 +1055,8 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
         return try DialogueGenerationTicket(
             lineID: id,
             lineRevision: lines[index].revision,
-            profileID: profile.id,
-            profileRevision: profile.revision,
+            profileID: profileID,
+            profileRevision: profileRevision,
             synthesisPolicyVersion: DialogueSynthesisPolicy.currentVersion
         )
     }
@@ -725,7 +1082,7 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
         var updatedLines = lines
         updatedLines[index] = line
         guard Set(pendingCleanupPaths).isDisjoint(
-            with: Self.referencedPaths(profile: profile, lines: updatedLines)
+            with: Self.referencedPaths(profile: profile, qwenProfile: qwenProfile, lines: updatedLines)
         ) else {
             throw DialogueVoiceError.invalidState
         }
@@ -803,12 +1160,12 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
             if line.outputRelativePath != nil {
                 return try pendingLineRetainingOutput(
                     from: line,
-                    status: profile != nil && profileStatus == .ready ? .queued : .stale
+                    status: activeProfileID != nil && profileStatus == .ready ? .queued : .stale
                 )
             }
             return try pendingLine(
                 from: line,
-                status: profile != nil && profileStatus == .ready ? .queued : .draft
+                status: activeProfileID != nil && profileStatus == .ready ? .queued : .draft
             )
         }
         return count
@@ -875,8 +1232,8 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
               lines[index].revision == ticket.lineRevision,
               lines[index].status == .generating,
               profileStatus == .ready,
-              profile?.id == ticket.profileID,
-              profile?.revision == ticket.profileRevision else {
+              activeProfileID == ticket.profileID,
+              activeProfileRevision == ticket.profileRevision else {
             throw DialogueVoiceError.generationResultRejected
         }
         return index
@@ -914,14 +1271,15 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
     }
 
     private func shouldRetainOutputForSynthesisMigration(_ line: DialogueLine) -> Bool {
-        guard let profile else { return false }
+        guard let profileRevision = activeProfileRevision else { return false }
         return line.outputRelativePath != nil
-            && line.generatedProfileRevision == profile.revision
+            && line.generatedProfileRevision == profileRevision
             && line.generatedSynthesisPolicyVersion != DialogueSynthesisPolicy.currentVersion
     }
 
     private static func referencedPaths(
         profile: GPTSoVITSVoiceProfile?,
+        qwenProfile: Qwen3TTSVoiceProfile?,
         lines: [DialogueLine]
     ) -> Set<String> {
         var paths = Set(lines.compactMap(\.outputRelativePath))
@@ -930,21 +1288,35 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
             paths.insert(profile.sovitsWeightRelativePath)
             paths.insert(profile.referenceAudioRelativePath)
         }
+        if let qwenProfile {
+            paths.insert(qwenProfile.packageRootRelativePath)
+        }
         return paths
     }
 
     private func validateProfileRelationships() throws {
-        if profile == nil {
+        let configuredProfileCount = (profile == nil ? 0 : 1) + (qwenProfile == nil ? 0 : 1)
+        if configuredProfileCount == 0 {
             guard profileStatus == .notConfigured,
+                  activeProviderKind == nil,
                   lines.allSatisfy({ $0.status == .draft }) else {
                 throw DialogueVoiceError.invalidState
             }
             return
         }
+        guard configuredProfileCount > 0,
+              (activeProviderKind != .gptSovits || profile != nil),
+              (activeProviderKind != .qwen3TTS || qwenProfile != nil),
+              activeProviderKind != nil else {
+            throw DialogueVoiceError.invalidState
+        }
+        if let profile, let qwenProfile, profile.id == qwenProfile.id {
+            throw DialogueVoiceError.invalidState
+        }
         guard profileStatus != .notConfigured else { throw DialogueVoiceError.invalidState }
         for line in lines {
             if line.status == .ready,
-               (profile == nil || line.generatedProfileRevision != profile?.revision) {
+               line.generatedProfileRevision != activeProfileRevision {
                 throw DialogueVoiceError.invalidState
             }
         }
@@ -952,7 +1324,9 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case version
+        case activeProviderKind = "active_provider"
         case profile
+        case qwenProfile = "qwen_profile"
         case profileStatus = "profile_status"
         case lines
         case pendingCleanupPaths = "pending_cleanup_paths"
@@ -962,11 +1336,19 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let profile = try container.decodeIfPresent(GPTSoVITSVoiceProfile.self, forKey: .profile)
+        let qwenProfile = try container.decodeIfPresent(Qwen3TTSVoiceProfile.self, forKey: .qwenProfile)
+        let activeProviderKind = try container.decodeIfPresent(
+            DialogueVoiceProviderKind.self,
+            forKey: .activeProviderKind
+        )
+            ?? (profile == nil ? (qwenProfile == nil ? nil : .qwen3TTS) : .gptSovits)
         try self.init(
             version: container.decode(Int.self, forKey: .version),
             profile: profile,
+            qwenProfile: qwenProfile,
+            activeProviderKind: activeProviderKind,
             profileStatus: container.decodeIfPresent(DialogueVoiceProfileStatus.self, forKey: .profileStatus)
-                ?? (profile == nil ? .notConfigured : .ready),
+                ?? (activeProviderKind == nil ? .notConfigured : .ready),
             lines: container.decode([DialogueLine].self, forKey: .lines),
             pendingCleanupPaths: container.decodeIfPresent([String].self, forKey: .pendingCleanupPaths) ?? [],
             playbackSettings: container.decodeIfPresent(

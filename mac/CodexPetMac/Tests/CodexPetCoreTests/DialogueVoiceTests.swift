@@ -25,6 +25,32 @@ final class DialogueVoiceTests: XCTestCase {
         )
     }
 
+    private func qwenProfile(revision: Int = 1) throws -> Qwen3TTSVoiceProfile {
+        try Qwen3TTSVoiceProfile(
+            id: UUID(uuidString: "BBBBBBBB-CCCC-DDDD-EEEE-FFFFFFFFFFFF")!,
+            revision: revision,
+            name: "Qwen Test Voice",
+            packageRootRelativePath: "voice/packages/qwen/test-package",
+            pythonExecutablePath: "/opt/statelet-qwen/bin/python3",
+            pythonExecutableSHA256: String(repeating: "5", count: 64),
+            packageTreeSHA256: String(repeating: "6", count: 64),
+            manifest: try Qwen3TTSPackageManifest(
+                modelRelativePath: "model/model.safetensors",
+                configRelativePath: "config.json",
+                handoverGeneratorRelativePath: "generate.py",
+                referenceAudioRelativePath: "reference/clean.wav",
+                modelSHA256: String(repeating: "1", count: 64),
+                configSHA256: String(repeating: "2", count: 64),
+                handoverGeneratorSHA256: String(repeating: "3", count: 64),
+                referenceAudioSHA256: String(repeating: "4", count: 64)
+            ),
+            referenceText: "Reference text",
+            referenceLanguage: "japanese",
+            defaultTextLanguage: "japanese",
+            inputFingerprint: String(repeating: "b", count: 64)
+        )
+    }
+
     private func libraryWithQueuedLine(state: PetState = .idle) throws -> DialogueVoiceLibrary {
         var library = try DialogueVoiceLibrary(profile: profile())
         try library.addLine(text: "你好", state: state, id: lineID)
@@ -128,6 +154,181 @@ final class DialogueVoiceTests: XCTestCase {
         XCTAssertEqual(migrated.playbackSettings, .defaults)
         XCTAssertEqual(migrated.lines, library.lines)
         XCTAssertEqual(migrated.profile, library.profile)
+        XCTAssertEqual(migrated.activeProviderKind, .gptSovits)
+        XCTAssertNil(migrated.qwenProfile)
+    }
+
+    func testLegacyGPTLibraryWithoutProviderTagMigratesAsGPTSoVITS() throws {
+        let library = try libraryWithQueuedLine()
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(library)) as? [String: Any]
+        )
+        object.removeValue(forKey: "active_provider")
+        object.removeValue(forKey: "qwen_profile")
+
+        let migrated = try JSONDecoder().decode(
+            DialogueVoiceLibrary.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+
+        XCTAssertEqual(migrated.activeProviderKind, .gptSovits)
+        XCTAssertEqual(migrated.activeProfileID, profileID)
+        XCTAssertEqual(migrated.activeProfileRevision, 1)
+        XCTAssertEqual(migrated.activeProfileInputFingerprint, String(repeating: "a", count: 64))
+        XCTAssertEqual(migrated.profile, library.profile)
+        XCTAssertNil(migrated.qwenProfile)
+    }
+
+    func testQwenProfileRoundTripsWithVerifiedPrivatePackageMetadata() throws {
+        let qwen = try qwenProfile()
+        let roundTripped = try JSONDecoder().decode(
+            Qwen3TTSVoiceProfile.self,
+            from: JSONEncoder().encode(qwen)
+        )
+
+        XCTAssertEqual(roundTripped, qwen)
+        XCTAssertEqual(roundTripped.packageRootRelativePath, "voice/packages/qwen/test-package")
+        XCTAssertEqual(roundTripped.pythonExecutablePath, "/opt/statelet-qwen/bin/python3")
+        XCTAssertEqual(roundTripped.modelRelativePath, "model/model.safetensors")
+        XCTAssertEqual(roundTripped.referenceAudioRelativePath, "reference/clean.wav")
+        XCTAssertEqual(roundTripped.temperature, 0.7)
+        XCTAssertEqual(roundTripped.topK, 40)
+        XCTAssertEqual(roundTripped.topP, 0.95)
+        XCTAssertEqual(roundTripped.repetitionPenalty, 1.05)
+        XCTAssertEqual(roundTripped.maximumTokens, 2_048)
+        XCTAssertEqual(roundTripped.seed, 1_112)
+    }
+
+    func testQwenProfileRejectsExternalPackageAndUnsafePythonLocators() throws {
+        let manifest = try qwenProfile().manifest
+        for packageRoot in ["/private/model", "../model", "voice/packages/other/model"] {
+            XCTAssertThrowsError(try Qwen3TTSVoiceProfile(
+                name: "Invalid",
+                packageRootRelativePath: packageRoot,
+                pythonExecutablePath: "/opt/python",
+                pythonExecutableSHA256: String(repeating: "5", count: 64),
+                packageTreeSHA256: String(repeating: "6", count: 64),
+                manifest: manifest,
+                referenceText: "Reference",
+                referenceLanguage: "japanese",
+                defaultTextLanguage: "japanese",
+                inputFingerprint: String(repeating: "a", count: 64)
+            ))
+        }
+        for executable in ["python3", "/opt/../usr/bin/python3", "//server/python"] {
+            XCTAssertThrowsError(try Qwen3TTSVoiceProfile(
+                name: "Invalid",
+                packageRootRelativePath: "voice/packages/qwen/model",
+                pythonExecutablePath: executable,
+                pythonExecutableSHA256: String(repeating: "5", count: 64),
+                packageTreeSHA256: String(repeating: "6", count: 64),
+                manifest: manifest,
+                referenceText: "Reference",
+                referenceLanguage: "japanese",
+                defaultTextLanguage: "japanese",
+                inputFingerprint: String(repeating: "a", count: 64)
+            ))
+        }
+    }
+
+    func testProviderProfilesCoexistAndOnlySelectedProviderDrivesTickets() throws {
+        var library = try DialogueVoiceLibrary(profile: profile(), qwenProfile: qwenProfile())
+        XCTAssertEqual(library.activeProviderKind, .gptSovits)
+        XCTAssertNotNil(library.profile)
+        XCTAssertNotNil(library.qwenProfile)
+        _ = try library.addLine(text: "Hello", id: lineID)
+
+        try library.selectActiveProvider(.qwen3TTS)
+        XCTAssertEqual(library.activeProviderKind, .qwen3TTS)
+        XCTAssertEqual(library.activeProfileID, library.qwenProfile?.id)
+        XCTAssertEqual(library.activeProfileRevision, library.qwenProfile?.revision)
+        XCTAssertEqual(library.activeProfileInputFingerprint, library.qwenProfile?.inputFingerprint)
+        XCTAssertEqual(library.profileID, library.activeProfileID)
+        XCTAssertEqual(library.profileRevision, library.activeProfileRevision)
+        XCTAssertEqual(library.inputFingerprint, library.activeProfileInputFingerprint)
+        let ticket = try library.beginGeneration(for: lineID)
+        XCTAssertEqual(ticket.profileID, library.qwenProfile?.id)
+        XCTAssertEqual(ticket.profileRevision, library.qwenProfile?.revision)
+
+        try library.failGeneration(ticket: ticket, failureCode: "TEST_FAILURE")
+        try library.retryLine(id: lineID)
+        try library.selectActiveProvider(.gptSovits)
+        let gptTicket = try library.beginGeneration(for: lineID)
+        XCTAssertEqual(gptTicket.profileID, library.profile?.id)
+        XCTAssertNotNil(library.qwenProfile)
+    }
+
+    func testProviderSwitchRejectsInFlightCompletionEvenWhenProfileRevisionsMatch() throws {
+        var library = try DialogueVoiceLibrary(profile: profile(), qwenProfile: qwenProfile())
+        _ = try library.addLine(text: "Hello", id: lineID)
+        let gptTicket = try library.beginGeneration(for: lineID)
+        XCTAssertEqual(gptTicket.profileRevision, 1)
+
+        try library.selectActiveProvider(.qwen3TTS)
+        XCTAssertEqual(library.activeProfileRevision, 1)
+        XCTAssertNotEqual(library.activeProfileID, gptTicket.profileID)
+        XCTAssertThrowsError(try library.completeGeneration(
+            ticket: gptTicket,
+            outputPath: "voice/generated/late-gpt.wav"
+        )) {
+            XCTAssertEqual($0 as? DialogueVoiceError, .generationResultRejected)
+        }
+        XCTAssertEqual(library.lines[0].status, .queued)
+    }
+
+    func testSelectingMissingProviderFailsWithoutMutatingLibrary() throws {
+        var library = try DialogueVoiceLibrary(profile: profile())
+        let original = library
+        XCTAssertThrowsError(try library.selectActiveProvider(.qwen3TTS)) {
+            XCTAssertEqual($0 as? DialogueVoiceError, .profileNotConfigured)
+        }
+        XCTAssertEqual(library, original)
+    }
+
+    func testProvidersMustUseDistinctProfileIDs() throws {
+        let qwen = try Qwen3TTSVoiceProfile(
+            id: profileID,
+            name: "Collision",
+            packageRootRelativePath: "voice/packages/qwen/model",
+            pythonExecutablePath: "/opt/python",
+            pythonExecutableSHA256: String(repeating: "5", count: 64),
+            packageTreeSHA256: String(repeating: "6", count: 64),
+            manifest: try qwenProfile().manifest,
+            referenceText: "Reference",
+            referenceLanguage: "japanese",
+            defaultTextLanguage: "japanese",
+            inputFingerprint: String(repeating: "a", count: 64)
+        )
+        XCTAssertThrowsError(try DialogueVoiceLibrary(profile: profile(), qwenProfile: qwen)) {
+            XCTAssertEqual($0 as? DialogueVoiceError, .invalidState)
+        }
+    }
+
+    func testQwenFingerprintComponentsCoverRuntimeIdentityAndOutputParameters() throws {
+        let qwen = try qwenProfile()
+        let material = qwen.inputFingerprintComponents
+        XCTAssertEqual(material.first, "statelet-qwen3-tts-profile-v1")
+        for value in [
+            qwen.packageRootRelativePath,
+            qwen.pythonExecutablePath,
+            qwen.pythonExecutableSHA256,
+            qwen.packageTreeSHA256,
+            qwen.modelSHA256,
+            qwen.configSHA256,
+            qwen.handoverGeneratorSHA256,
+            qwen.referenceAudioSHA256,
+            qwen.referenceText,
+            qwen.referenceLanguage,
+            qwen.defaultTextLanguage,
+            String(qwen.temperature),
+            String(qwen.topK),
+            String(qwen.topP),
+            String(qwen.repetitionPenalty),
+            String(qwen.maximumTokens),
+            String(qwen.seed),
+        ] {
+            XCTAssertTrue(material.contains(value), "fingerprint material omitted \(value)")
+        }
     }
 
     func testUpdatingPlaybackSettingsPreservesDialogueAndSynthesisPolicy() throws {
