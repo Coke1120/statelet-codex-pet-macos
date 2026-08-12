@@ -1,9 +1,32 @@
 import CodexPetCore
+import CryptoKit
 import Foundation
 import XCTest
 @testable import CodexPetMac
 
 final class DialogueVoiceRuntimeTests: XCTestCase {
+    private final class LockedQwenInvocation: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage: Qwen3TTSProcessInvocation?
+
+        func set(_ value: Qwen3TTSProcessInvocation) {
+            lock.lock()
+            storage = value
+            lock.unlock()
+        }
+
+        var value: Qwen3TTSProcessInvocation? {
+            lock.lock()
+            defer { lock.unlock() }
+            return storage
+        }
+    }
+
+    private struct QwenFixture {
+        let profile: Qwen3TTSVoiceProfile
+        let python: URL
+        let helper: URL
+    }
     private final class ChunkedURLProtocol: URLProtocol {
         override class func canInit(with request: URLRequest) -> Bool { true }
         override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -363,6 +386,288 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         var trailing = valid
         trailing.append(0)
         XCTAssertFalse(GPTSoVITSAPIClient.isValidWAV(trailing))
+    }
+
+    func testQwenWAVValidationRequiresPCM16Mono24000AndBoundedDuration() {
+        let valid = qwenPCM24kWAV(sampleFrames: 24_000)
+        XCTAssertTrue(Qwen3TTSClient.isValidOutputWAV(valid))
+
+        var stereo = valid
+        stereo[22] = 2
+        stereo[28] = 0x00
+        stereo[29] = 0x77 // 96,000 byte rate
+        stereo[32] = 4
+        XCTAssertFalse(Qwen3TTSClient.isValidOutputWAV(stereo))
+
+        var wrongRate = valid
+        wrongRate[24] = 0x80
+        wrongRate[25] = 0x3e // 16,000 Hz
+        wrongRate[28] = 0x00
+        wrongRate[29] = 0x7d // 32,000 byte rate
+        XCTAssertFalse(Qwen3TTSClient.isValidOutputWAV(wrongRate))
+        XCTAssertFalse(Qwen3TTSClient.isValidOutputWAV(qwenPCM24kWAV(sampleFrames: 24_000 * 60 + 1)))
+    }
+
+    func testQwenSynthesisUsesStdinAndScrubbedOfflineEnvironment() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try makeQwenFixture(root: root)
+        let captured = LockedQwenInvocation()
+        let client = Qwen3TTSClient(helperExecutableURL: fixture.helper) { invocation in
+            captured.set(invocation)
+            try self.qwenPCM24kWAV(sampleFrames: 2_400).write(to: invocation.outputURL)
+        }
+        let line = try DialogueLine(text: "private sentence", textLanguage: "JA_jp")
+        let data = try await client.synthesize(
+            profile: fixture.profile,
+            line: line,
+            applicationSupportRoot: root
+        )
+        XCTAssertTrue(Qwen3TTSClient.isValidOutputWAV(data))
+        let invocation = try XCTUnwrap(captured.value)
+        XCTAssertEqual(invocation.executableURL, fixture.python)
+        XCTAssertEqual(invocation.environment["HF_HUB_OFFLINE"], "1")
+        XCTAssertEqual(invocation.environment["TRANSFORMERS_OFFLINE"], "1")
+        XCTAssertNil(invocation.environment["SSH_AUTH_SOCK"])
+        XCTAssertNotEqual(invocation.helperURL, root.appendingPathComponent(
+            fixture.profile.packageRootRelativePath + "/" + fixture.profile.handoverGeneratorRelativePath
+        ))
+        XCTAssertFalse(invocation.executableURL.path.contains("private sentence"))
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: invocation.standardInput) as? [String: Any])
+        XCTAssertEqual(body["text"] as? String, "private sentence")
+        XCTAssertEqual(body["text_language"] as? String, "japanese")
+        XCTAssertEqual(body["reference_language"] as? String, "japanese")
+    }
+
+    func testQwenJapaneseLanguageAliasesAreBoundedAndCanonical() {
+        for alias in ["japanese", "JAPANESE", "ja", "JA", "ja-JP", "JA_jp"] {
+            XCTAssertEqual(Qwen3TTSLanguage.canonicalJapanese(alias), "japanese")
+            XCTAssertTrue(Qwen3TTSLanguage.areJapaneseAliases(alias, "japanese"))
+        }
+        for unsupported in ["jp", "ja-JP-extra", "en", "chinese", ""] {
+            XCTAssertNil(Qwen3TTSLanguage.canonicalJapanese(unsupported))
+            XCTAssertFalse(Qwen3TTSLanguage.areJapaneseAliases(unsupported, "japanese"))
+        }
+    }
+
+    func testQwenSynthesisRejectsNonJapaneseLanguage() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try makeQwenFixture(root: root)
+        let captured = LockedQwenInvocation()
+        let client = Qwen3TTSClient(helperExecutableURL: fixture.helper) { invocation in
+            captured.set(invocation)
+        }
+        let line = try DialogueLine(text: "private sentence", textLanguage: "en")
+
+        do {
+            _ = try await client.synthesize(
+                profile: fixture.profile,
+                line: line,
+                applicationSupportRoot: root
+            )
+            XCTFail("A non-Japanese Qwen request was accepted")
+        } catch let error as DialogueVoiceRuntimeError {
+            XCTAssertEqual(error, .requestRejected)
+        }
+        XCTAssertNil(captured.value)
+    }
+
+    func testQwenPackageTreeDigestChangesWithNestedModelFile() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try makeQwenFixture(root: root)
+        let package = root.appendingPathComponent(fixture.profile.packageRootRelativePath)
+        let tokenizer = package.appendingPathComponent("model/speech_tokenizer/model.safetensors")
+        try FileManager.default.createDirectory(
+            at: tokenizer.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try Data("tokenizer-a".utf8).write(to: tokenizer)
+        let first = try Qwen3TTSProfileValidator.computePackageTreeSHA256(packageRoot: package)
+        try Data("tokenizer-b".utf8).write(to: tokenizer)
+        let second = try Qwen3TTSProfileValidator.computePackageTreeSHA256(packageRoot: package)
+        XCTAssertNotEqual(first, second)
+    }
+
+    func testQwenPackageInstallerBindsFullTreeAndRemovesPrivateCopy() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-package-installer-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("handover", isDirectory: true)
+        let support = root.appendingPathComponent("support", isDirectory: true)
+        try makeSyntheticQwenHandover(at: source)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+
+        let installer = Qwen3TTSPackageInstaller(applicationSupportRoot: support)
+        let imported = try installer.install(sourceURL: source)
+        let managedRoot = support.appendingPathComponent(
+            imported.packageRootRelativePath,
+            isDirectory: true
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: managedRoot.path))
+        XCTAssertEqual(
+            imported.treeSHA256,
+            try Qwen3TTSProfileValidator.computePackageTreeSHA256(packageRoot: managedRoot)
+        )
+        let directoryMode = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: managedRoot.path)[.posixPermissions]
+                as? NSNumber
+        ).intValue & 0o777
+        let modelMode = try XCTUnwrap(
+            FileManager.default.attributesOfItem(
+                atPath: managedRoot.appendingPathComponent("model/model.safetensors").path
+            )[.posixPermissions] as? NSNumber
+        ).intValue & 0o777
+        XCTAssertEqual(directoryMode, 0o700)
+        XCTAssertEqual(modelMode, 0o600)
+
+        let runtime = try Qwen3TTSProfileValidator.validatePythonExecutable(
+            at: URL(fileURLWithPath: "/bin/sh")
+        )
+        let provisional = try Qwen3TTSVoiceProfile(
+            name: "Synthetic Qwen",
+            packageRootRelativePath: imported.packageRootRelativePath,
+            pythonExecutablePath: runtime.invocationPath,
+            pythonExecutableSHA256: runtime.finalTargetSHA256,
+            packageTreeSHA256: imported.treeSHA256,
+            manifest: imported.manifest,
+            referenceText: imported.referenceText,
+            referenceLanguage: imported.referenceLanguage,
+            defaultTextLanguage: imported.referenceLanguage,
+            parameters: imported.parameters,
+            inputFingerprint: String(repeating: "0", count: 64)
+        )
+        let profile = try Qwen3TTSVoiceProfile(
+            id: provisional.id,
+            revision: provisional.revision,
+            name: provisional.name,
+            packageRootRelativePath: provisional.packageRootRelativePath,
+            pythonExecutablePath: provisional.pythonExecutablePath,
+            pythonExecutableSHA256: provisional.pythonExecutableSHA256,
+            packageTreeSHA256: provisional.packageTreeSHA256,
+            manifest: provisional.manifest,
+            referenceText: provisional.referenceText,
+            referenceLanguage: provisional.referenceLanguage,
+            defaultTextLanguage: provisional.defaultTextLanguage,
+            parameters: provisional.parameters,
+            inputFingerprint: Qwen3TTSProfileValidator.computeInputFingerprint(
+                components: provisional.inputFingerprintComponents
+            )
+        )
+        XCTAssertNoThrow(try Qwen3TTSProfileValidator.validate(
+            profile: profile,
+            applicationSupportRoot: support
+        ))
+
+        try Data("changed-tokenizer".utf8).write(
+            to: managedRoot.appendingPathComponent("model/tokenizer_config.json")
+        )
+        XCTAssertThrowsError(try Qwen3TTSProfileValidator.validate(
+            profile: profile,
+            applicationSupportRoot: support
+        )) { error in
+            XCTAssertEqual(error as? DialogueVoiceRuntimeError, .inputFingerprintMismatch)
+        }
+
+        XCTAssertNoThrow(try installer.removeManagedPackage(
+            relativePath: imported.packageRootRelativePath
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: managedRoot.path))
+    }
+
+    func testQwenPackageRemovalNeverFollowsSymbolicLinks() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-package-removal-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("handover", isDirectory: true)
+        let support = root.appendingPathComponent("support", isDirectory: true)
+        let outside = root.appendingPathComponent("outside.txt")
+        try Data("outside-sentinel".utf8).write(to: outside)
+        try makeSyntheticQwenHandover(at: source)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        let installer = Qwen3TTSPackageInstaller(applicationSupportRoot: support)
+        let imported = try installer.install(sourceURL: source)
+        let managedRoot = support.appendingPathComponent(imported.packageRootRelativePath)
+        let escape = managedRoot.appendingPathComponent("model/escape")
+        try FileManager.default.createSymbolicLink(at: escape, withDestinationURL: outside)
+
+        XCTAssertThrowsError(try installer.removeManagedPackage(
+            relativePath: imported.packageRootRelativePath
+        ))
+        XCTAssertEqual(try Data(contentsOf: outside), Data("outside-sentinel".utf8))
+    }
+
+    func testQwenRuntimeProbeRejectsNonPythonExecutable() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-runtime-probe-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try makeQwenFixture(root: root)
+        let client = Qwen3TTSClient(
+            helperExecutableURL: fixture.helper,
+            probeExecutableURL: fixture.helper
+        )
+        do {
+            try await client.validateProfile(
+                fixture.profile,
+                applicationSupportRoot: root
+            )
+            XCTFail("A non-Python executable passed the Qwen dependency probe")
+        } catch let error as DialogueVoiceRuntimeError {
+            XCTAssertEqual(error, .inferenceUnavailable)
+        }
+    }
+
+    func testQwenProcessRunnerCompletesContainedSilentProbeAfterStdinHandshake() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-fast-probe-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let probe = root.appendingPathComponent("probe.py")
+        try Data(
+            "import os, sys\n"
+                .appending("assert os.getpgrp() == os.getpid()\n")
+                .appending("sys.stdin.buffer.read()\n")
+                .utf8
+        ).write(to: probe)
+        let marker = root.appendingPathComponent("not-required")
+
+        try await Qwen3TTSProcessRunner().run(Qwen3TTSProcessInvocation(
+            executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+            helperURL: probe,
+            currentDirectoryURL: root,
+            environment: ["PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"],
+            standardInput: Data(),
+            outputURL: marker,
+            timeout: 5,
+            requiresOutputFile: false
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    func testQwenPythonRuntimeIdentityPreservesRegularAndAbsoluteSymlinkInvocation() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let executable = root.appendingPathComponent("python-real")
+        let launcher = root.appendingPathComponent("python-venv")
+        try Data("fixture python".utf8).write(to: executable)
+        XCTAssertEqual(chmod(executable.path, 0o700), 0)
+        XCTAssertEqual(symlink(executable.path, launcher.path), 0)
+
+        let regular = try Qwen3TTSProfileValidator.validatePythonExecutable(at: executable)
+        let linked = try Qwen3TTSProfileValidator.validatePythonExecutable(at: launcher)
+        XCTAssertEqual(regular.invocationPath, executable.path)
+        XCTAssertEqual(linked.invocationPath, launcher.path)
+        XCTAssertEqual(regular.finalTargetSHA256, linked.finalTargetSHA256)
+        XCTAssertNotEqual(regular.stableIdentityToken, linked.stableIdentityToken)
+        XCTAssertEqual(
+            Qwen3TTSProfileValidator.computeInputFingerprint(components: ["a", "bc"]),
+            Qwen3TTSProfileValidator.computeInputFingerprint(components: ["a", "bc"])
+        )
     }
 
     func testFingerprintIsStableAndChangesWithEverySynthesisInput() throws {
@@ -1298,6 +1603,122 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         appendUInt32(UInt32(sampleBytes), to: &data)
         data.append(Data(repeating: 0, count: sampleBytes))
         return data
+    }
+
+    private func qwenPCM24kWAV(sampleFrames: Int) -> Data {
+        let sampleBytes = sampleFrames * 2
+        var data = Data("RIFF".utf8)
+        appendUInt32(UInt32(36 + sampleBytes), to: &data)
+        data.append(Data("WAVEfmt ".utf8))
+        appendUInt32(16, to: &data)
+        appendUInt16(1, to: &data)
+        appendUInt16(1, to: &data)
+        appendUInt32(24_000, to: &data)
+        appendUInt32(48_000, to: &data)
+        appendUInt16(2, to: &data)
+        appendUInt16(16, to: &data)
+        data.append(Data("data".utf8))
+        appendUInt32(UInt32(sampleBytes), to: &data)
+        data.append(Data(repeating: 0, count: sampleBytes))
+        return data
+    }
+
+    private func makeQwenFixture(root: URL) throws -> QwenFixture {
+        let packageRelative = "voice/packages/qwen/fixture"
+        let package = root.appendingPathComponent(packageRelative, isDirectory: true)
+        let model = package.appendingPathComponent("model/model.safetensors")
+        let config = package.appendingPathComponent("config.json")
+        let generator = package.appendingPathComponent("generate.py")
+        let reference = package.appendingPathComponent("reference/clean.wav")
+        let python = root.appendingPathComponent("runtime/python")
+        let helper = root.appendingPathComponent("statelet-helper.py")
+        for directory in [model.deletingLastPathComponent(), reference.deletingLastPathComponent(),
+                          python.deletingLastPathComponent()] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        try Data("model".utf8).write(to: model)
+        try Data("config".utf8).write(to: config)
+        try Data("handover".utf8).write(to: generator)
+        try qwenPCM24kWAV(sampleFrames: 240).write(to: reference)
+        try Data("python".utf8).write(to: python)
+        try Data("helper".utf8).write(to: helper)
+        XCTAssertEqual(chmod(python.path, 0o700), 0)
+        let manifest = try Qwen3TTSPackageManifest(
+            modelRelativePath: "model/model.safetensors",
+            configRelativePath: "config.json",
+            handoverGeneratorRelativePath: "generate.py",
+            referenceAudioRelativePath: "reference/clean.wav",
+            modelSHA256: digest(model),
+            configSHA256: digest(config),
+            handoverGeneratorSHA256: digest(generator),
+            referenceAudioSHA256: digest(reference)
+        )
+        let placeholder = try Qwen3TTSVoiceProfile(
+            name: "Fixture", packageRootRelativePath: packageRelative,
+            pythonExecutablePath: python.path, pythonExecutableSHA256: digest(python),
+            packageTreeSHA256: try Qwen3TTSProfileValidator.computePackageTreeSHA256(packageRoot: package),
+            manifest: manifest, referenceText: "reference", referenceLanguage: "japanese",
+            defaultTextLanguage: "japanese", inputFingerprint: String(repeating: "0", count: 64)
+        )
+        var hasher = SHA256()
+        for field in placeholder.inputFingerprintComponents {
+            var length = UInt64(field.utf8.count).bigEndian
+            withUnsafeBytes(of: &length) { hasher.update(data: Data($0)) }
+            hasher.update(data: Data(field.utf8))
+        }
+        let fingerprint = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        let profile = try Qwen3TTSVoiceProfile(
+            name: "Fixture", packageRootRelativePath: packageRelative,
+            pythonExecutablePath: python.path, pythonExecutableSHA256: digest(python),
+            packageTreeSHA256: try Qwen3TTSProfileValidator.computePackageTreeSHA256(packageRoot: package),
+            manifest: manifest, referenceText: "reference", referenceLanguage: "japanese",
+            defaultTextLanguage: "japanese", inputFingerprint: fingerprint
+        )
+        return QwenFixture(profile: profile, python: python, helper: helper)
+    }
+
+    private func makeSyntheticQwenHandover(at root: URL) throws {
+        let files: [String: Data] = [
+            "model/model.safetensors": Data("model".utf8),
+            "model/tokenizer_config.json": Data("{}".utf8),
+            "model/speech_tokenizer/model.safetensors": Data("speech-tokenizer".utf8),
+            "generate.py": Data("# provenance only\n".utf8),
+            "reference/clean.wav": qwenPCM24kWAV(sampleFrames: 2_400),
+        ]
+        for (relativePath, data) in files {
+            let destination = root.appendingPathComponent(relativePath)
+            try FileManager.default.createDirectory(
+                at: destination.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try data.write(to: destination)
+        }
+        let config: [String: Any] = [
+            "model_path": "model",
+            "reference_audio": "reference/clean.wav",
+            "reference_text": "reference",
+            "language": "japanese",
+            "generation": [
+                "temperature": 0.7,
+                "top_k": 40,
+                "top_p": 0.95,
+                "repetition_penalty": 1.05,
+                "max_tokens": 2_048,
+                "seed": 1_112,
+            ],
+            "audio": [
+                "format": "wav",
+                "subtype": "PCM_16",
+                "expected_sample_rate": 24_000,
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys])
+            .write(to: root.appendingPathComponent("config.json"))
+    }
+
+    private func digest(_ url: URL) -> String {
+        let data = try! Data(contentsOf: url)
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     private func appendUInt16(_ value: UInt16, to data: inout Data) {

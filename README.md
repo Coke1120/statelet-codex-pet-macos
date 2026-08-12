@@ -188,37 +188,38 @@ The Animations pane also provides:
 Read [Using Statelet](docs/USAGE.md) for the full interaction, animation,
 appearance, resize, FPS, prompts, deletion, and recovery behavior.
 
-## Dialogue and local GPT-SoVITS voice
+## Dialogue and local voice
 
 The **Voice** Settings pane has separate **Dialogue** and **Voice Setup** pages.
 Dialogue assigns every message and generated voice to Idle, Running, Waiting,
 or Review, and provides preview, retry, and regeneration controls. When a new
 lifecycle state is presented, Statelet shows its selected message on the pet
 and plays ready audio without interrupting speech already in progress; the
-latest state-entry voice waits until the active clip finishes. Voice
-Setup manages one local character voice profile
-and accepts separate user-selected GPT `.ckpt` and SoVITS `.pth` weights plus
-reference audio, reference text, and the language identifiers required by
-GPT-SoVITS API v2. Imported assets are copied into private Application Support
-storage; they are never added to the repository or release bundle. A persisted
-content fingerprint covers the model bytes, reference inputs, endpoint, and
-language settings and is revalidated at launch. Reference audio must decode
-locally, and a profile becomes ready only after its user-managed API accepts
-both weight files.
+latest state-entry voice waits until the active clip finishes. Voice Setup
+supports local GPT-SoVITS and Qwen3-TTS profiles. Both profiles may remain
+configured, while one selected provider is active. Imported assets and Qwen
+packages are copied into private Application Support storage; they are never
+added to the repository or release bundle. Persisted fingerprints bind model,
+reference, language, and runtime inputs and are revalidated at launch.
 
-Statelet connects only to an explicit loopback HTTP endpoint such as
-`http://127.0.0.1:9880`. Adding or editing a line persists it immediately and
-queues background synthesis. Successful WAV output is validated and published
-atomically before it becomes available to **Preview**. Playback never starts
-synchronous inference, and failed or stale lines remain editable and retryable.
-Requests use conservative single-batch, non-parallel GPT-SoVITS settings so a
-short state message is not split into silent or widely separated fragments.
-After an inference-recipe upgrade, legacy generated clips are refreshed in the
-background and their old WAV files are retained until replacement succeeds.
+GPT-SoVITS accepts separate user-selected GPT `.ckpt` and SoVITS `.pth` weights,
+reference inputs, and a numeric-loopback API v2 endpoint such as
+`http://127.0.0.1:9880`. Qwen3-TTS accepts a trusted self-contained handover and
+the Python executable from a trusted local MLX Audio environment. Qwen runs
+locally with offline model-loading flags, accepts Japanese lines of 500
+characters or fewer, and publishes only validated 24 kHz mono PCM16 WAV output.
 
-Statelet does not install or train GPT-SoVITS. Start its API v2 locally before
-generating speech, import only model files you trust, and use voices and
-reference recordings you are authorized to use. See
+Adding or editing a line persists it immediately and queues background
+synthesis. Successful WAV output is validated and published atomically before
+it becomes available to **Preview**. Playback never starts synchronous
+inference, and failed or stale lines remain editable and retryable. Switching
+providers revalidates the selected profile and refreshes incompatible output;
+the old WAV is retained until its replacement succeeds.
+
+Statelet does not train either provider or install their external runtimes.
+Start GPT-SoVITS API v2 locally or provide an already working local Qwen Python
+and MLX Audio environment. Import only model files you trust, and use voices
+and reference recordings you are authorized to use. See
 [Using Statelet](docs/USAGE.md#dialogue-and-local-voice) for setup and recovery.
 
 ## Privacy and security
@@ -258,9 +259,10 @@ a public report.
 - The first public release is source-only. The generated app is ad-hoc signed,
   is not notarized, and is not offered as a public binary or DMG.
 - No animation media is bundled; users supply authorized media.
-- No GPT-SoVITS runtime, model weights, reference recordings, dialogue, or
-  generated speech is bundled. Voice generation requires a user-managed local
-  GPT-SoVITS API v2 service.
+- No TTS runtime, model weights, reference recordings, dialogue, or generated
+  speech is bundled. Voice generation requires either a user-managed local
+  GPT-SoVITS API v2 service or a trusted local Qwen3-TTS handover with a working
+  Python and MLX Audio environment.
 - MP4 conversion needs additional local tools and can take several minutes
   because every accepted delivery passes Apple round-trip and all-frame checks.
 - Statelet exposes four lifecycle states and one active decoder.

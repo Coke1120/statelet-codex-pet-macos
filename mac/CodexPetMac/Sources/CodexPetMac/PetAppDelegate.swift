@@ -1553,6 +1553,13 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
         controller.onSaveVoiceProfile = { [weak self] draft in self?.saveVoiceProfile(draft) }
         controller.onRemoveVoiceProfile = { [weak self] profile in self?.confirmVoiceProfileRemoval(profile) }
+        controller.onConfigureQwenProfile = { [weak self] in self?.chooseQwenVoiceProfile() }
+        controller.onSelectVoiceProvider = { [weak self] provider in
+            self?.selectVoiceProvider(provider)
+        }
+        controller.onRemoveQwenProfile = { [weak self] profile in
+            self?.confirmQwenVoiceProfileRemoval(profile)
+        }
         controller.onDialogueVoicePlaybackSettingsChange = { [weak self] settings in
             self?.updateDialogueVoicePlaybackSettings(settings)
         }
@@ -2074,6 +2081,69 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             guard response == .alertFirstButtonReturn else { return }
             do {
                 try self?.dialogueVoiceCoordinator.removeProfile()
+            } catch {
+                self?.presentSettingsError(error.localizedDescription)
+            }
+        }
+    }
+
+    private func chooseQwenVoiceProfile() {
+        guard let settingsWindow = settingsController?.window else { return }
+        let packagePanel = NSOpenPanel()
+        packagePanel.title = "Import Qwen3-TTS Handover"
+        packagePanel.message = "Choose a trusted self-contained Qwen3-TTS handover folder. Statelet copies it into private local storage; the model and reference audio are never added to the app or diagnostics."
+        packagePanel.prompt = "Choose Handover"
+        packagePanel.canChooseFiles = false
+        packagePanel.canChooseDirectories = true
+        packagePanel.allowsMultipleSelection = false
+        packagePanel.beginSheetModal(for: settingsWindow) { [weak self] response in
+            guard response == .OK, let packageURL = packagePanel.url else { return }
+            self?.chooseQwenPythonRuntime(for: packageURL)
+        }
+    }
+
+    private func chooseQwenPythonRuntime(for packageURL: URL) {
+        guard let settingsWindow = settingsController?.window else { return }
+        let pythonPanel = NSOpenPanel()
+        pythonPanel.title = "Choose Qwen Python Runtime"
+        pythonPanel.message = "Choose the Python executable from a trusted local environment that provides MLX Audio. Statelet pins the launcher and interpreter identity before generation."
+        pythonPanel.prompt = "Use Runtime"
+        pythonPanel.canChooseFiles = true
+        pythonPanel.canChooseDirectories = false
+        pythonPanel.allowsMultipleSelection = false
+        // Preserve a virtual environment launcher symlink so Python discovers
+        // that environment's site-packages. Runtime validation separately pins
+        // both the launcher and its final interpreter identity.
+        pythonPanel.resolvesAliases = false
+        pythonPanel.beginSheetModal(for: settingsWindow) { [weak self] response in
+            guard response == .OK, let pythonURL = pythonPanel.url else { return }
+            self?.dialogueVoiceCoordinator.configureQwenProfile(
+                sourceURL: packageURL,
+                pythonExecutableURL: pythonURL
+            )
+        }
+    }
+
+    private func selectVoiceProvider(_ provider: DialogueVoiceProviderKind) {
+        do {
+            try dialogueVoiceCoordinator.selectActiveProvider(provider)
+        } catch {
+            presentSettingsError(error.localizedDescription)
+        }
+    }
+
+    private func confirmQwenVoiceProfileRemoval(_ profile: Qwen3TTSVoiceProfile) {
+        guard let settingsWindow = settingsController?.window else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Remove \(profile.name)?"
+        alert.informativeText = "Statelet will remove its private managed Qwen package and generated speech. Dialogue text and any separately configured GPT-SoVITS profile will be kept."
+        alert.addButton(withTitle: "Remove Qwen Profile")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: settingsWindow) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            do {
+                try self?.dialogueVoiceCoordinator.removeProfile(provider: .qwen3TTS)
             } catch {
                 self?.presentSettingsError(error.localizedDescription)
             }

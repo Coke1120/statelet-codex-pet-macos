@@ -1,6 +1,6 @@
 ---
 name: operate-statelet-local-voice
-description: Configure, migrate, generate, and verify private GPT-SoVITS dialogue for Statelet. Use when importing GPT `.ckpt`, SoVITS `.pth`, or reference audio; configuring a loopback API v2 service; adding Idle, Running, Waiting, or Review state-owned messages; diagnosing silent or fragmented WAV output; validating synthesis-policy migration; or installing and testing local voice after a Statelet upgrade.
+description: Configure, migrate, generate, and verify private GPT-SoVITS or Qwen3-TTS dialogue for Statelet. Use when importing GPT `.ckpt`, SoVITS `.pth`, reference audio, or a self-contained Qwen handover; selecting a validated local Python and MLX Audio runtime; configuring a loopback API v2 service; adding Idle, Running, Waiting, or Review state-owned messages; diagnosing silent or fragmented WAV output; validating synthesis-policy migration; or installing and testing local voice after a Statelet upgrade.
 ---
 
 # Operate Statelet local voice
@@ -10,17 +10,23 @@ in private local storage. Never commit, bundle, diagnose-upload, or log them.
 
 ## Workflow
 
-1. Inspect the current checkout, installed app, voice library, and local service
-   before changing anything. Recheck paths and hashes; do not trust an earlier
-   run. Require GPT-SoVITS API v2 on numeric loopback HTTP only.
-2. Identify the weight roles. Select one validated GPT epoch, one matching
-   SoVITS weight, and one reference recording with its exact transcript and
-   language. Validate the reference, prompt, and seed together with bounded
-   duration and ASR checks; do not assume any reference or prompt is neutral.
-   Never load unknown PyTorch checkpoints.
-3. Import assets through **Settings → Voice → Voice Setup** so Statelet copies
-   and fingerprints them below private Application Support. Compare SHA-256
-   with the user-selected originals after import.
+1. Inspect the current checkout, installed app, voice library, configured
+   providers, and required local runtime or service before changing anything.
+   Recheck identities and hashes; do not trust an earlier run.
+2. Choose the provider contract:
+   - For GPT-SoVITS, identify one validated GPT epoch, one matching SoVITS
+     weight, and one reference recording with its exact transcript and
+     language. Require API v2 on numeric loopback HTTP only. Never load unknown
+     PyTorch checkpoints.
+   - For Qwen3-TTS, require a trusted self-contained handover and a trusted
+     local Python executable whose environment provides MLX Audio. The current
+     Statelet profile is Japanese-only and accepts at most 500 characters per
+     line. Read [references/qwen3-tts-mlx.md](references/qwen3-tts-mlx.md).
+3. Import through **Settings → Voice → Voice Setup** so Statelet copies and
+   fingerprints private inputs below Application Support. Select the provider
+   page first. GPT-SoVITS imports three assets separately; Qwen3-TTS imports the
+   handover directory and then asks for the Python executable. Compare the
+   managed identities with the selected originals after import.
 4. Add short messages through **Dialogue**. Assign one preferred message to
    each required lifecycle state: Idle, Running, Waiting, and Review. Keep the
    text to one concise sentence for one contiguous utterance. Preserve an
@@ -28,11 +34,16 @@ in private local storage. Never commit, bundle, diagnose-upload, or log them.
 5. Wait for every line to reach `ready`. Automatic state speech must not
    interrupt active speech; only the latest pending state entry should play.
    Same-state heartbeats and clip rotation must not replay delivered speech.
-6. Read [references/gpt-sovits-v2.md](references/gpt-sovits-v2.md) before
-   changing request fields, persistence, migration, or playback behavior.
-7. Run `python3 .agents/skills/operate-statelet-local-voice/scripts/verify_statelet_voice.py`
+6. Read the provider reference before changing request fields, persistence,
+   migration, or playback behavior: [GPT-SoVITS v2](references/gpt-sovits-v2.md)
+   or [Qwen3-TTS with MLX Audio](references/qwen3-tts-mlx.md).
+7. For GPT-SoVITS, run `python3 .agents/skills/operate-statelet-local-voice/scripts/verify_statelet_voice.py`
    to verify state coverage, managed paths, WAV geometry, synthesis-policy
    version, and non-silent sample energy without printing dialogue or paths.
+   This verifier does not yet accept Qwen profiles. For Qwen3-TTS, require a
+   `Ready` provider, a Japanese line of 500 characters or fewer that reaches
+   `Ready`, successful **Preview**, and the runtime-enforced 24 kHz mono PCM16
+   WAV contract.
 8. Verify the installed app separately: full-Xcode CI, signed release build,
    installed-binary hash equality, live animation, message display, and audible
    state transitions. Preserve existing media and voice data during upgrades.
@@ -47,6 +58,15 @@ in private local storage. Never commit, bundle, diagnose-upload, or log them.
   the exact bad WAV before proposing DSP. Do not add automatic fragmentation,
   retries with unvalidated seeds, silence trimming, or PCM concatenation without
   a separate fixture-backed change.
+- Qwen import is rejected before generation: confirm the selected directory is
+  the complete self-contained handover, contains no symbolic links or special
+  files, remains within the package-size bound, and declares Japanese. Then
+  choose the Python executable from the environment that provides MLX Audio;
+  selecting an arbitrary shell or system Python is not sufficient.
+- Qwen generation is rejected: keep the language set to `japanese`, shorten
+  the saved line to 500 characters or fewer, and retry only after the provider
+  returns to `Ready`. Do not enable downloads or replace the pinned package at
+  runtime; Statelet deliberately runs Qwen with offline model-loading flags.
 - Keep Statelet's per-job GPT and SoVITS activation as an integrity reassertion.
   Configure the local service to make repeated activation of the same absolute,
   canonical weight path a no-op; reloading identical weights has empirically
@@ -67,6 +87,11 @@ in private local storage. Never commit, bundle, diagnose-upload, or log them.
 - Legacy generated output: version the synthesis policy independently from the
   input fingerprint. Retain the old WAV until replacement succeeds, then clean
   it atomically.
+- Provider changes: GPT-SoVITS and Qwen3-TTS profiles may coexist, but only one
+  is active. Use the provider's **Use** button and wait for revalidation and
+  regeneration before judging playback. Removing Qwen deletes Statelet's
+  managed package and generated speech while preserving dialogue text and a
+  separately configured GPT-SoVITS profile.
 - `swift test` cannot import XCTest under Command Line Tools: use local builds
   and source checks for iteration, then require the repository full-Xcode CI
   before merge.
