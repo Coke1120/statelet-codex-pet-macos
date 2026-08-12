@@ -60,8 +60,17 @@ guard let singletonLock = SingletonLock() else {
     exit(EXIT_FAILURE)
 }
 withExtendedLifetime(singletonLock) {
+    // Complete the legacy preferences import before NSApplication, the app
+    // delegate, PositionStore, or any other UserDefaults.standard consumer is
+    // initialized. Publishing the plist after that point can leave the process
+    // reading a stale cfprefsd cache for the rest of this launch.
+    let preferencesMigrationStatus = PreferencesMigration().migrate()
+    guard preferencesMigrationStatus != .failed else {
+        FileHandle.standardError.write(Data("Statelet could not prepare its preferences.\n".utf8))
+        exit(EXIT_FAILURE)
+    }
     let application = NSApplication.shared
-    let delegate = PetAppDelegate()
+    let delegate = PetAppDelegate(preferencesMigrationStatus: preferencesMigrationStatus)
     application.delegate = delegate
     application.setActivationPolicy(.accessory)
     application.run()

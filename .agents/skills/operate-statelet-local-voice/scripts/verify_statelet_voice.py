@@ -537,7 +537,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--support-root",
         type=Path,
-        default=Path.home() / "Library" / "Application Support" / "CodexPet",
+        default=Path.home() / "Library" / "Application Support" / "Statelet",
     )
     parser.add_argument(
         "--required-policy-version",

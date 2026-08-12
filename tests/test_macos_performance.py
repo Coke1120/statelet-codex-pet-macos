@@ -13,6 +13,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -235,6 +236,17 @@ class MacPerformanceHarnessTests(unittest.TestCase):
         with self.assertRaises(measure_runtime.HarnessError):
             measure_runtime.validate_aggregator_process(os.getpid())
 
+    def test_aggregator_pid_accepts_canonical_and_legacy_compatibility_names(self) -> None:
+        for name in ("statelet_state_aggregator.py", "codex_pet_state_aggregator.py"):
+            completed = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=f"{os.getuid()} /usr/bin/python3 /private/runtime/{name}\n",
+                stderr="",
+            )
+            with mock.patch.object(measure_runtime.subprocess, "run", return_value=completed):
+                measure_runtime.validate_aggregator_process(42)
+
     def test_fixture_rejects_path_bearing_logs_and_non_monotonic_samples(self) -> None:
         unsafe = {
             "player_samples": samples(1.0, 20.0),
@@ -324,7 +336,7 @@ class MacPerformanceHarnessTests(unittest.TestCase):
                 "compact",
                 "--info",
                 "--predicate",
-                'processID == 123 AND subsystem == "com.coke1120.CodexPetMac"',
+                'processID == 123 AND subsystem == "com.coke1120.Statelet"',
             ],
         )
 

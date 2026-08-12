@@ -142,8 +142,8 @@ bash mac/CodexPetMac/scripts/build_app.sh
 codesign --verify --deep --strict mac/CodexPetMac/dist/Statelet.app
 bash mac/CodexPetMac/scripts/install.sh
 shasum -a 256 \
-  mac/CodexPetMac/dist/Statelet.app/Contents/MacOS/CodexPetMac \
-  "$HOME/Applications/Statelet.app/Contents/MacOS/CodexPetMac"
+  mac/CodexPetMac/dist/Statelet.app/Contents/MacOS/Statelet \
+  "$HOME/Applications/Statelet.app/Contents/MacOS/Statelet"
 ```
 
 The two executable digests must match. Full-Xcode CI remains authoritative when

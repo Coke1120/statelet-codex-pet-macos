@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
@@ -28,22 +29,85 @@ EVENTS = (
     "Stop",
 )
 EVENT_MATCHERS = {"SessionStart": "startup|resume|clear|compact"}
+MAX_MIGRATION_FILES = 100_000
+MAX_MIGRATION_BYTES = 32 * 1024 * 1024 * 1024
 
 
-def parse_codex_pet_command(command: object) -> Optional[Tuple[str, Path]]:
+def safe_tree_digest(root: Path) -> str:
+    """Hash one bounded regular-file tree without following links."""
+    if root.is_symlink():
+        raise ValueError(f"migration source contains a symbolic link: {root.name}")
+    digest = hashlib.sha256()
+    file_count = 0
+    byte_count = 0
+    paths = [root] if not root.is_dir() else sorted(root.rglob("*"))
+    for path in paths:
+        status = path.lstat()
+        relative = "." if path == root else path.relative_to(root).as_posix()
+        if stat.S_ISLNK(status.st_mode):
+            raise ValueError(f"migration source contains a symbolic link: {relative}")
+        if stat.S_ISDIR(status.st_mode):
+            digest.update(b"D\0" + relative.encode() + b"\0")
+            continue
+        if not stat.S_ISREG(status.st_mode):
+            raise ValueError(f"migration source contains a special file: {relative}")
+        file_count += 1
+        byte_count += status.st_size
+        if file_count > MAX_MIGRATION_FILES or byte_count > MAX_MIGRATION_BYTES:
+            raise ValueError("migration source exceeds the safe size limit")
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            final = os.fstat(descriptor)
+            if not stat.S_ISREG(final.st_mode) or (final.st_dev, final.st_ino) != (status.st_dev, status.st_ino):
+                raise ValueError(f"migration source changed during validation: {relative}")
+            digest.update(b"F\0" + relative.encode() + b"\0")
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            if os.fstat(descriptor).st_size != status.st_size:
+                raise ValueError(f"migration source changed during validation: {relative}")
+        finally:
+            os.close(descriptor)
+    return digest.hexdigest()
+
+
+def safe_copy_tree(source: Path, destination: Path) -> None:
+    expected = safe_tree_digest(source)
+    if destination.exists():
+        raise ValueError("migration staging destination already exists")
+    if source.is_dir():
+        shutil.copytree(source, destination, symlinks=False)
+    else:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination, follow_symlinks=False)
+    if safe_tree_digest(destination) != expected:
+        shutil.rmtree(destination, ignore_errors=True) if destination.is_dir() else destination.unlink(missing_ok=True)
+        raise ValueError("migration copy did not validate")
+
+
+def parse_statelet_command(command: object) -> Optional[Tuple[str, Path]]:
     if not isinstance(command, str):
         return None
     try:
         parts = shlex.split(command)
     except ValueError:
         return None
-    if len(parts) != 2 or Path(parts[1]).name != "codex_pet_hook.py":
+    if len(parts) != 2 or Path(parts[1]).name not in {"statelet_hook.py", "codex_pet_hook.py"}:
         return None
     return command, Path(parts[1]).expanduser()
 
 
 def is_application_support_hook(path: Path) -> bool:
-    return path.is_absolute() and "/Library/Application Support/CodexPet/" in str(path)
+    normalized = str(path).replace("\\", "/")
+    return path.is_absolute() and any(
+        marker in normalized
+        for marker in (
+            "/Library/Application Support/Statelet/",
+            "/Library/Application Support/CodexPet/",
+        )
+    )
 
 
 def command_interpreter_exists(command: str) -> bool:
@@ -80,7 +144,7 @@ def choose_command(hooks: dict[str, Any], python: str, installed_hook: Path) -> 
     candidates: Counter[str] = Counter()
     candidate_paths: dict[str, Path] = {}
     for item in iter_items(hooks):
-        parsed = parse_codex_pet_command(item.get("command"))
+        parsed = parse_statelet_command(item.get("command"))
         if parsed is None:
             continue
         command, hook_path = parsed
@@ -88,16 +152,18 @@ def choose_command(hooks: dict[str, Any], python: str, installed_hook: Path) -> 
             is_application_support_hook(hook_path)
             and hook_path.is_file()
             and command_interpreter_exists(command)
+            and "/Library/Application Support/Statelet/" in str(hook_path).replace("\\", "/")
+            and "/Statelet/python/" not in str(hook_path).replace("\\", "/")
         ):
             candidates[command] += 1
             candidate_paths[command] = hook_path
     if candidates:
-        # Prefer the shared board runtime when present, then the most complete
-        # existing hook coverage. This avoids adding a widget-only duplicate.
+        # Reuse only canonical Statelet shared runtimes. Legacy CodexPet paths
+        # point at the support tree retained for rollback; choosing one here
+        # would leave a fresh installation dependent on compatibility data.
         return min(
             candidates,
             key=lambda command: (
-                "/mac-widget/" in str(candidate_paths[command]),
                 -candidates[command],
                 command,
             ),
@@ -134,7 +200,7 @@ def merge(destination: Path, output: Path, python: str, installed_hook: Path) ->
                 continue
             retained = []
             for item in items:
-                parsed = parse_codex_pet_command(item.get("command") if isinstance(item, dict) else None)
+                parsed = parse_statelet_command(item.get("command") if isinstance(item, dict) else None)
                 if parsed is None:
                     retained.append(item)
                     continue
@@ -181,7 +247,7 @@ def remove_widget_hook(destination: Path, output: Path, widget_hook: Path) -> No
     shared: Counter[str] = Counter()
     shared_paths: dict[str, Path] = {}
     for item in iter_items(hooks):
-        parsed = parse_codex_pet_command(item.get("command"))
+        parsed = parse_statelet_command(item.get("command"))
         if parsed is None:
             continue
         command, hook_path = parsed
@@ -216,7 +282,7 @@ def remove_widget_hook(destination: Path, output: Path, widget_hook: Path) -> No
                 continue
             retained_items = []
             for item in group["hooks"]:
-                parsed = parse_codex_pet_command(item.get("command") if isinstance(item, dict) else None)
+                parsed = parse_statelet_command(item.get("command") if isinstance(item, dict) else None)
                 if parsed is not None and parsed[1] == widget_hook:
                     continue
                 if parsed is not None and replacement is not None and parsed[0] == replacement:
@@ -241,12 +307,25 @@ def remove_widget_hook(destination: Path, output: Path, widget_hook: Path) -> No
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--destination", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--python", required=True)
-    parser.add_argument("--hook-script", type=Path, required=True)
+    parser.add_argument("--destination", type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--python")
+    parser.add_argument("--hook-script", type=Path)
     parser.add_argument("--remove-widget-hook", action="store_true")
+    parser.add_argument("--safe-tree-digest", type=Path)
+    parser.add_argument("--safe-copy-source", type=Path)
+    parser.add_argument("--safe-copy-destination", type=Path)
     args = parser.parse_args()
+    if args.safe_tree_digest is not None:
+        print(safe_tree_digest(args.safe_tree_digest))
+        return 0
+    if args.safe_copy_source is not None or args.safe_copy_destination is not None:
+        if args.safe_copy_source is None or args.safe_copy_destination is None:
+            parser.error("safe copy requires both source and destination")
+        safe_copy_tree(args.safe_copy_source, args.safe_copy_destination)
+        return 0
+    if None in (args.destination, args.output, args.python, args.hook_script):
+        parser.error("hook merge requires destination, output, python, and hook-script")
     if args.remove_widget_hook:
         remove_widget_hook(args.destination, args.output, args.hook_script)
     else:

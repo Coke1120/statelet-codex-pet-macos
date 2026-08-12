@@ -259,7 +259,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var characterLibraryStorage: CharacterLibraryStorage!
     private var characterClipCounts: [String: Int] = [:]
     private let characterMetadataQueue = DispatchQueue(
-        label: "com.coke1120.CodexPetMac.character-metadata",
+        label: "com.coke1120.Statelet.character-metadata",
         qos: .utility
     )
     private let lifecycleStateReader = LifecycleStateFileReader()
@@ -298,6 +298,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var conversionProfile: AlphaConversionProfile = .fill
     private let launchAtLoginManager = LaunchAtLoginManager()
     private let diagnostics = PetDiagnostics()
+    private let preferencesMigrationStatus: PreferencesMigration.Status
     private var cachedLaunchAtLoginStatus: LaunchAtLoginManager.Status?
     private var cachedDiagnosticsReport = "Open Diagnostics and choose Refresh to inspect this Mac."
     private var activeMP4BatchID: UUID?
@@ -316,6 +317,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 processPendingCharacterBundleOpenIfPossible()
             }
         }
+    }
+
+    init(preferencesMigrationStatus: PreferencesMigration.Status = .notRun) {
+        self.preferencesMigrationStatus = preferencesMigrationStatus
+        super.init()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -3937,7 +3943,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             toolchainStatus: diagnosticsToolchainStatus,
             lastFailureCategory: publisherHealth.usesIdleFallback ? publisherHealth.rawValue : nil,
             conversionFailureCategory: lastConversionFailureDiagnostic?.code,
-            conversionFailureStage: lastConversionFailureDiagnostic?.stage
+            conversionFailureStage: lastConversionFailureDiagnostic?.stage,
+            preferencesMigrationStatus: preferencesMigrationStatus
         )
         cachedDiagnosticsReport = diagnostics.build(input: input)
         refreshSettings()

@@ -64,7 +64,7 @@ if [[ -z "$executable" ]]; then
   build_scratch="$(mktemp -d "$package_dir/.build/CodexPetMac-release.XXXXXX")"
   trap 'rm -rf "$build_scratch"' EXIT
   module_cache="$build_scratch/ModuleCache"
-  swift build --package-path "$package_dir" -c release --product codex-pet-mac \
+  swift build --package-path "$package_dir" -c release --product statelet \
     -Xswiftc -file-prefix-map \
     -Xswiftc "$package_dir=/BUILD/CodexPetMac" \
     -Xswiftc -file-prefix-map \
@@ -77,7 +77,7 @@ if [[ -z "$executable" ]]; then
     -Xcc "-ffile-prefix-map=$build_scratch=/BUILD/CodexPetMacTemp" \
     -Xcc "-ffile-prefix-map=$swift_temp_root=/BUILD/SwiftTemp"
   bin_dir="$(swift build --package-path "$package_dir" -c release --show-bin-path)"
-  executable="$bin_dir/codex-pet-mac"
+  executable="$bin_dir/statelet"
 fi
 
 [[ -f "$executable" && -x "$executable" ]] || {
@@ -125,7 +125,7 @@ mkdir -p \
   "$stage/Contents/MacOS" \
   "$stage/Contents/Resources/AlphaTools" \
   "$stage/Contents/Resources/QwenTTS"
-install -m 0755 "$executable" "$stage/Contents/MacOS/CodexPetMac"
+install -m 0755 "$executable" "$stage/Contents/MacOS/Statelet"
 install -m 0644 "$package_dir/Resources/Info.plist" "$stage/Contents/Info.plist"
 install -m 0644 "$icon" "$stage/Contents/Resources/Statelet.icns"
 install -m 0644 "$menu_icon" "$stage/Contents/Resources/StateletMenuBarTemplate.pdf"
@@ -150,8 +150,8 @@ if [[ "$release_build" -eq 1 ]]; then
   # dsymutil's relocation sidecar repeats local object-file paths. It is not
   # needed for crash symbolication once DWARF has been linked into the dSYM.
   rm -rf "$symbols_stage/Contents/Resources/Relocations"
-  strip -S "$stage/Contents/MacOS/CodexPetMac"
-  binary_uuid="$(xcrun dwarfdump --uuid "$stage/Contents/MacOS/CodexPetMac" | awk 'NR == 1 { print $2 }')"
+  strip -S "$stage/Contents/MacOS/Statelet"
+  binary_uuid="$(xcrun dwarfdump --uuid "$stage/Contents/MacOS/Statelet" | awk 'NR == 1 { print $2 }')"
   symbols_uuid="$(xcrun dwarfdump --uuid "$symbols_stage" | awk 'NR == 1 { print $2 }')"
   [[ -n "$binary_uuid" && "$binary_uuid" == "$symbols_uuid" ]] || {
     printf 'Crash symbol UUID does not match the release executable.\n' >&2
@@ -160,8 +160,8 @@ if [[ "$release_build" -eq 1 ]]; then
 fi
 
 plutil -lint "$stage/Contents/Info.plist" >/dev/null
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$stage/Contents/Info.plist")" == "CodexPetMac" ]]
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$stage/Contents/Info.plist")" == "com.coke1120.CodexPetMac" ]]
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$stage/Contents/Info.plist")" == "Statelet" ]]
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$stage/Contents/Info.plist")" == "com.coke1120.Statelet" ]]
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$stage/Contents/Info.plist")" == "Statelet" ]]
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$stage/Contents/Info.plist")" == "Statelet.icns" ]]
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' "$stage/Contents/Info.plist")" == "true" ]]

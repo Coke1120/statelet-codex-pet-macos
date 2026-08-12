@@ -2,7 +2,7 @@ import AppKit
 import CodexPetCore
 import Darwin
 import XCTest
-@testable import CodexPetMac
+@testable import Statelet
 
 final class StorageLifecycleHardeningTests: XCTestCase {
     private final class LockedState: @unchecked Sendable {

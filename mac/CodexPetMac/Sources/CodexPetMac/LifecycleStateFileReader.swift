@@ -11,7 +11,7 @@ enum LifecycleStateReadResult: Equatable {
 final class LifecycleStateFileReader: @unchecked Sendable {
     static let maximumBytes: UInt64 = 1_048_576
 
-    private let queue = DispatchQueue(label: "com.coke1120.CodexPetMac.lifecycle-state-reader", qos: .userInitiated)
+    private let queue = DispatchQueue(label: "com.coke1120.Statelet.lifecycle-state-reader", qos: .userInitiated)
     private let lock = NSLock()
     private var generation: UInt64 = 0
     private let loader: @Sendable (URL) -> LifecycleStateReadResult

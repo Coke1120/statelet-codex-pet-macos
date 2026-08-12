@@ -29,7 +29,8 @@ ANIMATION_LIBRARY = PACKAGE / "Sources" / "CodexPetMac" / "AnimationLibraryView.
 RUNTIME_EFFICIENCY = PACKAGE / "Sources" / "CodexPetCore" / "RuntimeEfficiency.swift"
 SETTINGS_CONTROLLER = PACKAGE / "Sources" / "CodexPetMac" / "SettingsWindowController.swift"
 MAC_MAIN = PACKAGE / "Sources" / "CodexPetMac" / "main.swift"
-MANAGED_MARKER = "mac-widget-v1"
+MANAGED_MARKER = "statelet-v2"
+LEGACY_MARKER = "mac-widget-v1"
 HOOK_EVENTS = (
     "SessionStart",
     "SessionEnd",
@@ -74,6 +75,28 @@ class MacPetPackagingTests(unittest.TestCase):
             check=True,
             capture_output=True,
             text=True,
+        )
+        return bundle
+
+    def make_legacy_bundle(self, name: str, payload: str = "legacy") -> Path:
+        canonical = self.make_bundle(name, payload)
+        bundle = self.base / f"{name}-legacy.app"
+        shutil.copytree(canonical, bundle)
+        info_path = bundle / "Contents" / "Info.plist"
+        with info_path.open("rb") as handle:
+            info = plistlib.load(handle)
+        info.update(
+            {
+                "CFBundleExecutable": "CodexPetMac",
+                "CFBundleName": "CodexPetMac",
+                "CFBundleIdentifier": "com.coke1120.CodexPetMac",
+                "CodexPetManaged": LEGACY_MARKER,
+            }
+        )
+        info.pop("StateletManaged", None)
+        info_path.write_bytes(plistlib.dumps(info))
+        (bundle / "Contents" / "MacOS" / "Statelet").rename(
+            bundle / "Contents" / "MacOS" / "CodexPetMac"
         )
         return bundle
 
@@ -171,9 +194,9 @@ esac
         with (bundle / "Contents" / "Info.plist").open("rb") as handle:
             info = plistlib.load(handle)
 
-        self.assertEqual(info["CFBundleExecutable"], "CodexPetMac")
-        self.assertEqual(info["CFBundleName"], "CodexPetMac")
-        self.assertEqual(info["CFBundleIdentifier"], "com.coke1120.CodexPetMac")
+        self.assertEqual(info["CFBundleExecutable"], "Statelet")
+        self.assertEqual(info["CFBundleName"], "Statelet")
+        self.assertEqual(info["CFBundleIdentifier"], "com.coke1120.Statelet")
         self.assertEqual(info["CFBundleDisplayName"], "Statelet")
         self.assertEqual(info["CFBundleIconFile"], "Statelet.icns")
         self.assertEqual(
@@ -184,13 +207,14 @@ esac
             info["NSHumanReadableCopyright"],
             "Copyright © 2026 Statelet contributors. MIT licensed.",
         )
-        self.assertEqual(info["CFBundleShortVersionString"], "1.6.0")
-        self.assertEqual(info["CFBundleVersion"], "11")
+        self.assertEqual(info["CFBundleShortVersionString"], "1.7.0")
+        self.assertEqual(info["CFBundleVersion"], "12")
         self.assertEqual(info["CFBundlePackageType"], "APPL")
         self.assertEqual(info["LSMinimumSystemVersion"], "13.0")
         self.assertTrue(info["LSUIElement"])
-        self.assertEqual(info["CodexPetManaged"], MANAGED_MARKER)
-        self.assertTrue((bundle / "Contents" / "MacOS" / "CodexPetMac").stat().st_mode & 0o111)
+        self.assertEqual(info["StateletManaged"], MANAGED_MARKER)
+        self.assertNotIn("CodexPetManaged", info)
+        self.assertTrue((bundle / "Contents" / "MacOS" / "Statelet").stat().st_mode & 0o111)
         icon = bundle / "Contents" / "Resources" / "Statelet.icns"
         self.assertTrue(icon.is_file())
         self.assertTrue(os.access(icon, os.R_OK))
@@ -1180,7 +1204,15 @@ struct WatchdogHarness {
         source = PET_APP_DELEGATE.read_text(encoding="utf-8")
         settings = SETTINGS_CONTROLLER.read_text(encoding="utf-8")
         self.assertIn("enum AlphaConversionProfile", coordinator)
-        self.assertIn('static let defaultsKey = "CodexPetAlphaConversionProfile"', coordinator)
+        self.assertIn('static let defaultsKey = "StateletAlphaConversionProfile"', coordinator)
+        for canonical in (
+            "STATELET_ALPHA_CONVERTER",
+            "STATELET_ALPHA_PYTHON",
+            "STATELET_FFMPEG",
+            "STATELET_FFPROBE",
+            "STATELET_AVCONVERT",
+        ):
+            self.assertIn(canonical, coordinator)
         self.assertIn("static func restored(from defaults: UserDefaults = .standard)", coordinator)
         self.assertIn("func persist(to defaults: UserDefaults = .standard)", coordinator)
         self.assertIn('"--profile", profile.commandProfile', coordinator)
@@ -1249,7 +1281,7 @@ struct WatchdogHarness {
         board_plist = self.home / "Library" / "LaunchAgents" / "com.coke1120.codex-pet.plist"
         board_plist.parent.mkdir(parents=True)
         board_plist.write_bytes(plistlib.dumps({"Label": "com.coke1120.codex-pet", "BoardSentinel": True}))
-        board_runtime = self.home / "Library" / "Application Support" / "CodexPet" / "runtime" / "board-sentinel.txt"
+        board_runtime = self.home / "Library" / "Application Support" / "Statelet" / "runtime" / "board-sentinel.txt"
         board_runtime.parent.mkdir(parents=True)
         board_runtime.write_text("preserve", encoding="utf-8")
 
@@ -1257,8 +1289,8 @@ struct WatchdogHarness {
         self.assertEqual(result.returncode, 0, result.stderr)
 
         launch_agents = self.home / "Library" / "LaunchAgents"
-        aggregator_path = launch_agents / "com.coke1120.codex-pet.state-aggregator.plist"
-        player_path = launch_agents / "com.coke1120.codex-pet.mac-player.plist"
+        aggregator_path = launch_agents / "com.coke1120.statelet.state-aggregator.plist"
+        player_path = launch_agents / "com.coke1120.statelet.mac-player.plist"
         with aggregator_path.open("rb") as handle:
             aggregator = plistlib.load(handle)
         with player_path.open("rb") as handle:
@@ -1266,17 +1298,17 @@ struct WatchdogHarness {
         with board_plist.open("rb") as handle:
             board = plistlib.load(handle)
 
-        self.assertEqual(aggregator["CodexPetMacManaged"], MANAGED_MARKER)
-        self.assertEqual(player["CodexPetMacManaged"], MANAGED_MARKER)
-        self.assertEqual(aggregator["Label"], "com.coke1120.codex-pet.state-aggregator")
-        self.assertEqual(player["Label"], "com.coke1120.codex-pet.mac-player")
+        self.assertEqual(aggregator["StateletManaged"], MANAGED_MARKER)
+        self.assertEqual(player["StateletManaged"], MANAGED_MARKER)
+        self.assertEqual(aggregator["Label"], "com.coke1120.statelet.state-aggregator")
+        self.assertEqual(player["Label"], "com.coke1120.statelet.mac-player")
         self.assertFalse(player["KeepAlive"])
         self.assertEqual(player["LimitLoadToSessionType"], "Aqua")
         self.assertEqual(player["ProcessType"], "Interactive")
-        self.assertTrue(player["ProgramArguments"][0].endswith("/Applications/Statelet.app/Contents/MacOS/CodexPetMac"))
+        self.assertTrue(player["ProgramArguments"][0].endswith("/Applications/Statelet.app/Contents/MacOS/Statelet"))
         self.assertEqual(aggregator["ProcessType"], "Background")
         aggregator_arguments = "\n".join(aggregator["ProgramArguments"])
-        self.assertIn("codex_pet_state_aggregator.py", aggregator_arguments)
+        self.assertIn("statelet_state_aggregator.py", aggregator_arguments)
         self.assertNotIn("codex_pet_daemon.py", aggregator_arguments)
         self.assertNotIn("serial", aggregator_arguments.lower())
         self.assertNotIn("/dev/", aggregator_arguments)
@@ -1285,20 +1317,20 @@ struct WatchdogHarness {
         self.assertEqual(board, {"Label": "com.coke1120.codex-pet", "BoardSentinel": True})
         self.assertEqual(board_runtime.read_text(encoding="utf-8"), "preserve")
 
-        component = self.home / "Library" / "Application Support" / "CodexPet" / "mac-widget"
+        component = self.home / "Library" / "Application Support" / "Statelet" / "Statelet"
         installed_names = {path.name for path in component.rglob("*") if path.is_file()}
         self.assertEqual(
             installed_names,
             {
-                "MANAGED_BY_CODEX_PET",
-                "codex_pet_hook.py",
-                "codex_pet_state.py",
-                "codex_pet_state_aggregator.py",
+                "MANAGED_BY_STATELET",
+                "statelet_hook.py",
+                "statelet_state.py",
+                "statelet_state_aggregator.py",
             },
         )
         self.assertNotIn("codex_pet_daemon.py", installed_names)
         self.assertEqual(
-            (self.home / "Library" / "Application Support" / "CodexPet" / "media" / "media-map.json").stat().st_mode & 0o777,
+            (self.home / "Library" / "Application Support" / "Statelet" / "media" / "media-map.json").stat().st_mode & 0o777,
             0o600,
         )
 
@@ -1311,7 +1343,7 @@ struct WatchdogHarness {
             self.home
             / "Library"
             / "LaunchAgents"
-            / "com.coke1120.codex-pet.mac-player.plist"
+            / "com.coke1120.statelet.mac-player.plist"
         )
         with player_path.open("rb") as handle:
             player = plistlib.load(handle)
@@ -1324,14 +1356,14 @@ struct WatchdogHarness {
         with player_path.open("rb") as handle:
             reinstalled = plistlib.load(handle)
         self.assertFalse(reinstalled["RunAtLoad"])
-        self.assertEqual(reinstalled["CodexPetMacManaged"], MANAGED_MARKER)
+        self.assertEqual(reinstalled["StateletManaged"], MANAGED_MARKER)
 
     def test_hook_merge_is_additive_and_migrates_exact_documents_entry(self) -> None:
         bundle = self.make_bundle("Hooks")
         hooks_file = self.home / ".codex" / "hooks.json"
         hooks_file.parent.mkdir(parents=True)
-        obsolete = f"python3 {self.home}/Documents/codex-pet-dev-board/mac/codex_pet_hook.py"
-        unrelated_documents = f"python3 {self.home}/Documents/another-project/codex_pet_hook.py"
+        obsolete = f"python3 {self.home}/Documents/codex-pet-dev-board/mac/statelet_hook.py"
+        unrelated_documents = f"python3 {self.home}/Documents/another-project/statelet_hook.py"
         original = {
             "unrelated": {"keep": True},
             "hooks": {
@@ -1360,10 +1392,10 @@ struct WatchdogHarness {
             widget_commands = [
                 command
                 for command in commands
-                if isinstance(command, str) and "/mac-widget/python/codex_pet_hook.py" in command
+                if isinstance(command, str) and "/Statelet/python/statelet_hook.py" in command
             ]
             self.assertEqual(len(widget_commands), 1, event)
-            self.assertIn("/mac-widget/python/codex_pet_hook.py", widget_commands[0])
+            self.assertIn("/Statelet/python/statelet_hook.py", widget_commands[0])
             self.assertNotIn("/Documents/", widget_commands[0])
         stop_commands = [
             item.get("command")
@@ -1377,7 +1409,7 @@ struct WatchdogHarness {
 
     def test_existing_application_support_board_hook_is_reused_without_duplicates(self) -> None:
         bundle = self.make_bundle("SharedHook")
-        board_hook = self.home / "Library" / "Application Support" / "CodexPet" / "runtime" / "codex_pet_hook.py"
+        board_hook = self.home / "Library" / "Application Support" / "Statelet" / "runtime" / "statelet_hook.py"
         board_hook.parent.mkdir(parents=True)
         board_hook.write_text("# existing board-compatible lifecycle hook\n", encoding="utf-8")
         board_command = shlex.join(["/usr/bin/python3", str(board_hook)])
@@ -1405,7 +1437,7 @@ struct WatchdogHarness {
                 for group in installed["hooks"][event]
                 if isinstance(group, dict)
                 for item in group.get("hooks", [])
-                if isinstance(item, dict) and "codex_pet_hook.py" in str(item.get("command"))
+                if isinstance(item, dict) and "statelet_hook.py" in str(item.get("command"))
             ]
             self.assertEqual(commands, [board_command], event)
         self.assertTrue(board_hook.exists())
@@ -1425,9 +1457,55 @@ struct WatchdogHarness {
                 for group in after_uninstall["hooks"][event]
                 if isinstance(group, dict)
                 for item in group.get("hooks", [])
-                if isinstance(item, dict) and "codex_pet_hook.py" in str(item.get("command"))
+                if isinstance(item, dict) and "statelet_hook.py" in str(item.get("command"))
             ]
             self.assertEqual(commands, [board_command], event)
+
+    def test_legacy_application_support_hook_is_replaced_by_canonical_hook(self) -> None:
+        bundle = self.make_bundle("LegacySharedHook")
+        legacy_hook = (
+            self.home
+            / "Library"
+            / "Application Support"
+            / "CodexPet"
+            / "runtime"
+            / "codex_pet_hook.py"
+        )
+        legacy_hook.parent.mkdir(parents=True)
+        legacy_hook.write_text("# retained legacy compatibility hook\n", encoding="utf-8")
+        legacy_command = shlex.join(["/usr/bin/python3", str(legacy_hook)])
+        hooks_file = self.home / ".codex" / "hooks.json"
+        hooks_file.parent.mkdir(parents=True)
+        hooks_file.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "Stop": [
+                            {"hooks": [{"type": "command", "command": legacy_command}]}
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.install(bundle)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        installed = json.loads(hooks_file.read_text(encoding="utf-8"))
+        commands = [
+            item.get("command")
+            for groups in installed["hooks"].values()
+            for group in groups
+            if isinstance(group, dict)
+            for item in group.get("hooks", [])
+            if isinstance(item, dict)
+        ]
+        self.assertNotIn(legacy_command, commands)
+        self.assertTrue(commands)
+        self.assertTrue(
+            all("/Application Support/Statelet/Statelet/python/statelet_hook.py" in command for command in commands)
+        )
+        self.assertTrue(legacy_hook.exists())
 
     def test_failed_upgrade_rolls_back_every_managed_target(self) -> None:
         first = self.make_bundle("First", "first")
@@ -1436,15 +1514,15 @@ struct WatchdogHarness {
 
         installed_app = self.home / "Applications" / "Statelet.app"
         legacy_app = self.home / "Applications" / "CodexPetMac.app"
-        subprocess.run(["ditto", str(installed_app), str(legacy_app)], check=True)
-        installed_executable = installed_app / "Contents" / "MacOS" / "CodexPetMac"
+        shutil.copytree(self.make_legacy_bundle("RollbackLegacy"), legacy_app)
+        installed_executable = installed_app / "Contents" / "MacOS" / "Statelet"
         legacy_executable = legacy_app / "Contents" / "MacOS" / "CodexPetMac"
         old_executable = installed_executable.read_bytes()
         old_legacy_executable = legacy_executable.read_bytes()
-        support = self.home / "Library" / "Application Support" / "CodexPet"
-        component_marker = support / "mac-widget" / "MANAGED_BY_CODEX_PET"
+        support = self.home / "Library" / "Application Support" / "Statelet"
+        component_marker = support / "Statelet" / "MANAGED_BY_STATELET"
         old_component = component_marker.read_bytes()
-        aggregator_plist = self.home / "Library" / "LaunchAgents" / "com.coke1120.codex-pet.state-aggregator.plist"
+        aggregator_plist = self.home / "Library" / "LaunchAgents" / "com.coke1120.statelet.state-aggregator.plist"
         old_plist = aggregator_plist.read_bytes()
         hooks_file = self.home / ".codex" / "hooks.json"
         old_hooks = hooks_file.read_bytes()
@@ -1464,17 +1542,102 @@ struct WatchdogHarness {
         self.assertFalse(list(support.glob(".mac-widget-stage.*")))
         self.assertFalse(list(support.glob(".mac-widget-backup.*")))
 
+    def test_abrupt_kill_after_app_replacement_recovers_then_completes(self) -> None:
+        first = self.make_bundle("CrashAppFirst", "first")
+        self.assertEqual(self.install(first).returncode, 0)
+        installed = self.home / "Applications" / "Statelet.app" / "Contents" / "MacOS" / "Statelet"
+        original = installed.read_bytes()
+        hooks = self.home / ".codex" / "hooks.json"
+        original_hooks = hooks.read_bytes()
+
+        second = self.make_bundle("CrashAppSecond", "second")
+        expected = (second / "Contents" / "MacOS" / "Statelet").read_bytes()
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-app"
+        crashed = self.install(second, env=environment)
+
+        self.assertEqual(crashed.returncode, -9, crashed.stderr)
+        transaction = self.home / ".statelet-install-transaction"
+        self.assertTrue((transaction / "journal.json").is_file())
+        self.assertNotEqual(installed.read_bytes(), original)
+
+        completed = self.install(second)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(installed.read_bytes(), expected)
+        self.assertNotEqual(installed.read_bytes(), original)
+        self.assertEqual(hooks.read_bytes(), original_hooks)
+        self.assertFalse(transaction.exists())
+
+    def test_abrupt_kill_after_support_publication_recovers_private_data_then_completes(self) -> None:
+        legacy = self.home / "Library" / "Application Support" / "CodexPet"
+        component = legacy / "mac-widget"
+        component.mkdir(parents=True)
+        (component / "MANAGED_BY_CODEX_PET").write_text(LEGACY_MARKER + "\n", encoding="utf-8")
+        private_voice = legacy / "voice" / "profile.json"
+        private_voice.parent.mkdir()
+        private_payload = b"private-voice-before-crash"
+        private_voice.write_bytes(private_payload)
+        alpha_tool = legacy / "alpha-runtime" / "bin" / "ffmpeg"
+        alpha_tool.parent.mkdir(parents=True)
+        alpha_tool.write_bytes(b"private-alpha-runtime")
+        board_file = legacy / "runtime" / "board-sentinel.txt"
+        board_file.parent.mkdir()
+        board_file.write_bytes(b"unrelated-board-state")
+        bundle = self.make_bundle("CrashSupport", "published")
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-support"
+
+        crashed = self.install(bundle, env=environment)
+
+        self.assertEqual(crashed.returncode, -9, crashed.stderr)
+        transaction = self.home / ".statelet-install-transaction"
+        canonical_voice = self.home / "Library" / "Application Support" / "Statelet" / "voice" / "profile.json"
+        canonical_alpha_tool = self.home / "Library" / "Application Support" / "Statelet" / "alpha-runtime" / "bin" / "ffmpeg"
+        self.assertEqual(canonical_voice.read_bytes(), private_payload)
+        self.assertEqual(canonical_alpha_tool.read_bytes(), b"private-alpha-runtime")
+        self.assertEqual(private_voice.read_bytes(), private_payload)
+        self.assertEqual(board_file.read_bytes(), b"unrelated-board-state")
+        self.assertTrue(transaction.exists())
+
+        completed = self.install(bundle)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(canonical_voice.read_bytes(), private_payload)
+        self.assertEqual(canonical_alpha_tool.read_bytes(), b"private-alpha-runtime")
+        self.assertEqual(alpha_tool.read_bytes(), b"private-alpha-runtime")
+        self.assertEqual(private_voice.read_bytes(), private_payload)
+        self.assertEqual(board_file.read_bytes(), b"unrelated-board-state")
+        self.assertFalse(component.exists())
+        self.assertFalse(transaction.exists())
+
+    def test_interrupted_transaction_fails_closed_if_installed_target_changed(self) -> None:
+        first = self.make_bundle("CrashAmbiguousFirst", "first")
+        self.assertEqual(self.install(first).returncode, 0)
+        second = self.make_bundle("CrashAmbiguousSecond", "second")
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-app"
+        self.assertEqual(self.install(second, env=environment).returncode, -9)
+        installed = self.home / "Applications" / "Statelet.app" / "Contents" / "MacOS" / "Statelet"
+        installed.write_bytes(b"#!/bin/sh\n# unmanaged-newer-change\n")
+
+        refused = self.install(second)
+
+        self.assertEqual(refused.returncode, 74)
+        self.assertIn("interrupted Statelet installation is ambiguous", refused.stderr)
+        self.assertEqual(installed.read_bytes(), b"#!/bin/sh\n# unmanaged-newer-change\n")
+        self.assertTrue((self.home / ".statelet-install-transaction" / "journal.json").exists())
+
     def test_rollback_reloads_only_previously_loaded_jobs(self) -> None:
         first = self.make_bundle("LoadedStateFirst", "first")
         initial = self.install(first)
         self.assertEqual(initial.returncode, 0, initial.stderr)
         statelet = self.home / "Applications" / "Statelet.app"
         legacy = self.home / "Applications" / "CodexPetMac.app"
-        statelet.rename(legacy)
+        statelet.rename(self.base / "discarded-canonical.app")
+        shutil.copytree(self.make_legacy_bundle("LoadedLegacy", "first"), legacy)
 
         second = self.make_bundle("LoadedStateSecond", "second")
         environment, log = self.fake_launchctl_environment(
-            "com.coke1120.codex-pet.state-aggregator"
+            "com.coke1120.statelet.state-aggregator"
         )
         environment["CODEX_PET_INSTALL_FAIL_AT"] = "after-app"
 
@@ -1517,12 +1680,14 @@ struct WatchdogHarness {
         installed_app = self.home / "Applications" / "Statelet.app"
         legacy_app = self.home / "Applications" / "CodexPetMac.app"
         subprocess.run(["ditto", str(installed_app), str(legacy_app)], check=True)
-        support = self.home / "Library" / "Application Support" / "CodexPet"
+        support = self.home / "Library" / "Application Support" / "Statelet"
         media_map = support / "media" / "media-map.json"
         media_map.write_text('{"user":"preserve"}\n', encoding="utf-8")
         private_movie = support / "media" / "idle.mov"
         private_movie.write_bytes(b"user-private-media")
-        board_runtime = support / "runtime" / "board.txt"
+        legacy_support = self.home / "Library" / "Application Support" / "CodexPet"
+        board_runtime = legacy_support / "runtime" / "board.txt"
+        board_runtime.parent.mkdir(parents=True, exist_ok=True)
         board_runtime.write_text("preserve", encoding="utf-8")
 
         removed = subprocess.run(
@@ -1534,10 +1699,10 @@ struct WatchdogHarness {
         )
         self.assertEqual(removed.returncode, 0, removed.stderr)
         self.assertFalse(installed_app.exists())
-        self.assertFalse(legacy_app.exists())
-        self.assertFalse((support / "mac-widget").exists())
-        self.assertFalse((self.home / "Library" / "LaunchAgents" / "com.coke1120.codex-pet.state-aggregator.plist").exists())
-        self.assertFalse((self.home / "Library" / "LaunchAgents" / "com.coke1120.codex-pet.mac-player.plist").exists())
+        self.assertTrue(legacy_app.exists())
+        self.assertFalse((support / "Statelet").exists())
+        self.assertFalse((self.home / "Library" / "LaunchAgents" / "com.coke1120.statelet.state-aggregator.plist").exists())
+        self.assertFalse((self.home / "Library" / "LaunchAgents" / "com.coke1120.statelet.mac-player.plist").exists())
         self.assertEqual(media_map.read_text(encoding="utf-8"), '{"user":"preserve"}\n')
         self.assertEqual(private_movie.read_bytes(), b"user-private-media")
         self.assertEqual(board_runtime.read_text(encoding="utf-8"), "preserve")
@@ -1552,19 +1717,19 @@ struct WatchdogHarness {
             if isinstance(item, dict)
         ]
         self.assertFalse(
-            [command for command in remaining_commands if "mac-widget/python/codex_pet_hook.py" in str(command)]
+            [command for command in remaining_commands if "mac-widget/python/statelet_hook.py" in str(command)]
         )
         self.assertIn("keep-me", remaining_commands)
 
     def test_unmanaged_launch_agent_fails_before_mutation(self) -> None:
         bundle = self.make_bundle("Unmanaged")
-        plist = self.home / "Library" / "LaunchAgents" / "com.coke1120.codex-pet.mac-player.plist"
+        plist = self.home / "Library" / "LaunchAgents" / "com.coke1120.statelet.mac-player.plist"
         plist.parent.mkdir(parents=True)
         plist.parent.chmod(0o711)
         launch_agents_mode = plist.parent.stat().st_mode & 0o777
         original = plistlib.dumps({"Label": "someone.else"})
         plist.write_bytes(original)
-        support = self.home / "Library" / "Application Support" / "CodexPet"
+        support = self.home / "Library" / "Application Support" / "Statelet"
 
         result = self.install(bundle)
 
@@ -1576,13 +1741,10 @@ struct WatchdogHarness {
         self.assertFalse((self.home / "Applications" / "Statelet.app").exists())
 
     def test_managed_legacy_app_is_migrated_to_statelet(self) -> None:
-        first = self.make_bundle("LegacyManaged", "legacy")
-        installed = self.install(first)
-        self.assertEqual(installed.returncode, 0, installed.stderr)
-
         statelet = self.home / "Applications" / "Statelet.app"
         legacy = self.home / "Applications" / "CodexPetMac.app"
-        statelet.rename(legacy)
+        legacy.parent.mkdir(parents=True)
+        shutil.copytree(self.make_legacy_bundle("LegacyManaged", "legacy"), legacy)
         old_payload = (legacy / "Contents" / "MacOS" / "CodexPetMac").read_bytes()
         player_path = (
             self.home
@@ -1590,10 +1752,16 @@ struct WatchdogHarness {
             / "LaunchAgents"
             / "com.coke1120.codex-pet.mac-player.plist"
         )
-        with player_path.open("rb") as handle:
-            player = plistlib.load(handle)
-        player["RunAtLoad"] = False
-        player_path.write_bytes(plistlib.dumps(player))
+        player_path.parent.mkdir(parents=True)
+        player_path.write_bytes(
+            plistlib.dumps(
+                {
+                    "Label": "com.coke1120.codex-pet.mac-player",
+                    "CodexPetMacManaged": LEGACY_MARKER,
+                    "RunAtLoad": False,
+                }
+            )
+        )
 
         second = self.make_bundle("MigratedStatelet", "new")
         migrated = self.install(second)
@@ -1601,12 +1769,264 @@ struct WatchdogHarness {
         self.assertTrue(statelet.exists())
         self.assertFalse(legacy.exists())
         self.assertNotEqual(
-            (statelet / "Contents" / "MacOS" / "CodexPetMac").read_bytes(),
+            (statelet / "Contents" / "MacOS" / "Statelet").read_bytes(),
             old_payload,
         )
+        player_path = self.home / "Library" / "LaunchAgents" / "com.coke1120.statelet.mac-player.plist"
         with player_path.open("rb") as handle:
             migrated_player = plistlib.load(handle)
         self.assertFalse(migrated_player["RunAtLoad"])
+
+    def test_legacy_support_migration_preserves_private_data_byte_for_byte(self) -> None:
+        legacy = self.home / "Library" / "Application Support" / "CodexPet"
+        fixtures = {
+            "media/idle.mov": b"representative-media\x00\xff",
+            "voice/generated/idle/one.wav": b"representative-voice\x10\x20",
+            "characters/chloe/library.json": b'{"character":"private"}\n',
+            "sessions/active/state.json": b'{"state":"running"}\n',
+            "alpha-runtime/bin/ffmpeg": b"private-alpha-toolchain",
+            "runtime/current_state.json": b'{"state":"waiting"}\n',
+        }
+        for relative, payload in fixtures.items():
+            path = legacy / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+        board_sentinel = legacy / "runtime" / "board-sentinel.txt"
+        board_sentinel.write_bytes(b"unrelated-board-runtime")
+        legacy_component = legacy / "mac-widget"
+        legacy_component.mkdir()
+        (legacy_component / "MANAGED_BY_CODEX_PET").write_text(LEGACY_MARKER + "\n", encoding="utf-8")
+
+        installed = self.install(self.make_bundle("DataMigration"))
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        canonical = self.home / "Library" / "Application Support" / "Statelet"
+        for relative, payload in fixtures.items():
+            self.assertEqual((canonical / relative).read_bytes(), payload, relative)
+            self.assertEqual((legacy / relative).read_bytes(), payload, relative)
+        self.assertEqual(board_sentinel.read_bytes(), b"unrelated-board-runtime")
+        self.assertFalse(legacy_component.exists())
+
+    def test_legacy_uninstalled_but_retained_user_data_is_migrated(self) -> None:
+        legacy = self.home / "Library" / "Application Support" / "CodexPet"
+        fixtures = {
+            "media/idle.mov": b"retained-private-media",
+            "voice/profile.json": b"retained-private-voice",
+            "characters/chloe/library.json": b"retained-private-character",
+            "sessions/old/state.json": b"retained-private-session",
+            "alpha-runtime/bin/ffmpeg": b"retained-private-alpha-runtime",
+            "runtime/current_state.json": b"retained-private-current-state",
+        }
+        for relative, payload in fixtures.items():
+            path = legacy / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+        board_sentinel = legacy / "runtime" / "board-sentinel.txt"
+        board_sentinel.write_bytes(b"unrelated-board-runtime")
+        unrelated = legacy / "user-notes.txt"
+        unrelated.write_bytes(b"unrelated-root-data")
+        self.assertFalse((legacy / "mac-widget").exists())
+        self.assertFalse((self.home / "Applications" / "CodexPetMac.app").exists())
+
+        installed = self.install(self.make_bundle("RetainedLegacyData"))
+
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        canonical = self.home / "Library" / "Application Support" / "Statelet"
+        for relative, payload in fixtures.items():
+            self.assertEqual((canonical / relative).read_bytes(), payload, relative)
+            self.assertEqual((legacy / relative).read_bytes(), payload, relative)
+        self.assertEqual(board_sentinel.read_bytes(), b"unrelated-board-runtime")
+        self.assertEqual(unrelated.read_bytes(), b"unrelated-root-data")
+
+    def test_completed_legacy_migration_allows_canonical_edits_on_reinstall(self) -> None:
+        legacy = self.home / "Library" / "Application Support" / "CodexPet"
+        legacy_voice = legacy / "voice" / "profile.json"
+        legacy_voice.parent.mkdir(parents=True)
+        legacy_voice.write_bytes(b"retained-legacy-voice")
+        first = self.install(self.make_bundle("MigrationAttestedFirst", "first"))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        canonical_voice = self.home / "Library" / "Application Support" / "Statelet" / "voice" / "profile.json"
+        canonical_voice.write_bytes(b"newer-canonical-voice")
+
+        second = self.install(self.make_bundle("MigrationAttestedSecond", "second"))
+
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(canonical_voice.read_bytes(), b"newer-canonical-voice")
+        self.assertEqual(legacy_voice.read_bytes(), b"retained-legacy-voice")
+        manifest = self.home / "Library" / "Application Support" / "Statelet" / ".legacy-migration-v1.json"
+        self.assertTrue(manifest.is_file())
+        self.assertEqual(manifest.stat().st_mode & 0o777, 0o600)
+
+    def test_tampered_migration_manifest_forces_safe_conflict_comparison(self) -> None:
+        legacy = self.home / "Library" / "Application Support" / "CodexPet"
+        legacy_voice = legacy / "voice" / "profile.json"
+        legacy_voice.parent.mkdir(parents=True)
+        legacy_voice.write_bytes(b"retained-legacy-voice")
+        bundle = self.make_bundle("MigrationAttestationTampered")
+        self.assertEqual(self.install(bundle).returncode, 0)
+        canonical_voice = self.home / "Library" / "Application Support" / "Statelet" / "voice" / "profile.json"
+        canonical_voice.write_bytes(b"newer-canonical-voice")
+        manifest = self.home / "Library" / "Application Support" / "Statelet" / ".legacy-migration-v1.json"
+        manifest.write_text('{"version":1,"source_identity":"tampered","subtrees":{}}\n', encoding="utf-8")
+        manifest.chmod(0o600)
+
+        failed = self.install(bundle)
+
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("Refusing to overwrite conflicting Statelet data", failed.stderr)
+        self.assertNotIn("profile.json", failed.stderr)
+        self.assertEqual(canonical_voice.read_bytes(), b"newer-canonical-voice")
+        self.assertEqual(legacy_voice.read_bytes(), b"retained-legacy-voice")
+
+    def test_legacy_support_symlink_is_rejected_before_mutation(self) -> None:
+        legacy_root = self.home / "Library" / "Application Support" / "CodexPet"
+        component = legacy_root / "mac-widget"
+        component.mkdir(parents=True)
+        (component / "MANAGED_BY_CODEX_PET").write_text(LEGACY_MARKER + "\n", encoding="utf-8")
+        external = self.base / "external-private.wav"
+        external.write_bytes(b"must-not-copy")
+        voice = legacy_root / "voice"
+        voice.mkdir()
+        (voice / "linked.wav").symlink_to(external)
+
+        failed = self.install(self.make_bundle("RejectSymlink"))
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("Refusing unsafe legacy Statelet data", failed.stderr)
+        self.assertFalse((self.home / "Applications" / "Statelet.app").exists())
+        self.assertEqual(external.read_bytes(), b"must-not-copy")
+
+    def test_legacy_support_root_symlink_is_rejected_before_classification(self) -> None:
+        external = self.base / "external-legacy-support"
+        component = external / "mac-widget"
+        component.mkdir(parents=True)
+        (component / "MANAGED_BY_CODEX_PET").write_text(LEGACY_MARKER + "\n", encoding="utf-8")
+        sentinel = component / "external-sentinel.txt"
+        sentinel.write_bytes(b"external-legacy-unchanged")
+        application_support = self.home / "Library" / "Application Support"
+        application_support.mkdir(parents=True)
+        (application_support / "CodexPet").symlink_to(external, target_is_directory=True)
+        bundle = self.make_bundle("RejectLegacySupportRootSymlink")
+        label = "com.coke1120.statelet.state-aggregator"
+        environment, log = self.fake_launchctl_environment(label)
+
+        failed = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("Refusing unsafe Statelet support directory layout", failed.stderr)
+        self.assertEqual(sentinel.read_bytes(), b"external-legacy-unchanged")
+        self.assertTrue(component.exists())
+        self.assertFalse((self.home / "Applications" / "Statelet.app").exists())
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+        self.assertTrue((log.parent / "state" / label).exists())
+        self.assertFalse(log.exists())
+
+    def test_canonical_support_root_symlink_is_rejected_before_mutation(self) -> None:
+        external = self.base / "external-canonical-support"
+        component = external / "Statelet"
+        component.mkdir(parents=True)
+        (component / "MANAGED_BY_STATELET").write_text(MANAGED_MARKER + "\n", encoding="utf-8")
+        sentinel = component / "external-sentinel.txt"
+        sentinel.write_bytes(b"external-canonical-unchanged")
+        application_support = self.home / "Library" / "Application Support"
+        application_support.mkdir(parents=True)
+        (application_support / "Statelet").symlink_to(external, target_is_directory=True)
+        bundle = self.make_bundle("RejectCanonicalSupportRootSymlink")
+        label = "com.coke1120.statelet.state-aggregator"
+        environment, log = self.fake_launchctl_environment(label)
+
+        failed = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("Refusing unsafe Statelet support directory layout", failed.stderr)
+        self.assertEqual(sentinel.read_bytes(), b"external-canonical-unchanged")
+        self.assertTrue(component.exists())
+        self.assertFalse((self.home / "Applications" / "Statelet.app").exists())
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+        self.assertTrue((log.parent / "state" / label).exists())
+        self.assertFalse(log.exists())
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO fixture requires POSIX")
+    def test_legacy_support_special_file_is_rejected_before_mutation(self) -> None:
+        legacy_root = self.home / "Library" / "Application Support" / "CodexPet"
+        component = legacy_root / "mac-widget"
+        component.mkdir(parents=True)
+        (component / "MANAGED_BY_CODEX_PET").write_text(LEGACY_MARKER + "\n", encoding="utf-8")
+        runtime = legacy_root / "runtime"
+        runtime.mkdir()
+        os.mkfifo(runtime / "current_state.json")
+
+        failed = self.install(self.make_bundle("RejectFIFO"))
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("Refusing unsafe legacy Statelet data", failed.stderr)
+        self.assertFalse((self.home / "Applications" / "Statelet.app").exists())
+
+    def test_support_migration_conflict_fails_closed_before_mutation(self) -> None:
+        legacy_root = self.home / "Library" / "Application Support" / "CodexPet"
+        component = legacy_root / "mac-widget"
+        component.mkdir(parents=True)
+        (component / "MANAGED_BY_CODEX_PET").write_text(LEGACY_MARKER + "\n", encoding="utf-8")
+        legacy = legacy_root / "voice"
+        canonical = self.home / "Library" / "Application Support" / "Statelet" / "voice"
+        legacy.mkdir(parents=True)
+        canonical.mkdir(parents=True)
+        (legacy / "library.json").write_bytes(b"legacy-private")
+        (canonical / "library.json").write_bytes(b"newer-private")
+
+        failed = self.install(self.make_bundle("Conflict"))
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("Refusing to overwrite conflicting Statelet data", failed.stderr)
+        self.assertEqual((legacy / "library.json").read_bytes(), b"legacy-private")
+        self.assertEqual((canonical / "library.json").read_bytes(), b"newer-private")
+        self.assertFalse((self.home / "Applications" / "Statelet.app").exists())
+
+    def test_identical_partial_support_migration_is_resumable(self) -> None:
+        legacy_root = self.home / "Library" / "Application Support" / "CodexPet"
+        component = legacy_root / "mac-widget"
+        component.mkdir(parents=True)
+        (component / "MANAGED_BY_CODEX_PET").write_text(LEGACY_MARKER + "\n", encoding="utf-8")
+        legacy = legacy_root / "voice"
+        canonical = self.home / "Library" / "Application Support" / "Statelet" / "voice"
+        legacy.mkdir(parents=True)
+        canonical.mkdir(parents=True)
+        payload = b"already-copied-private-data"
+        (legacy / "library.json").write_bytes(payload)
+        (canonical / "library.json").write_bytes(payload)
+
+        installed = self.install(self.make_bundle("Resumable"))
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.assertEqual((legacy / "library.json").read_bytes(), payload)
+        self.assertEqual((canonical / "library.json").read_bytes(), payload)
+
+    def test_support_migration_rolls_back_exactly_after_injected_failure(self) -> None:
+        legacy_root = self.home / "Library" / "Application Support" / "CodexPet"
+        component = legacy_root / "mac-widget"
+        component.mkdir(parents=True)
+        (component / "MANAGED_BY_CODEX_PET").write_text(LEGACY_MARKER + "\n", encoding="utf-8")
+        legacy = legacy_root / "voice"
+        legacy.mkdir(parents=True)
+        payload = b"rollback-private-data"
+        (legacy / "profile.json").write_bytes(payload)
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_FAIL_AT"] = "after-support"
+
+        failed = self.install(self.make_bundle("MigrationRollback"), env=environment)
+        self.assertEqual(failed.returncode, 70, failed.stderr)
+        self.assertEqual((legacy / "profile.json").read_bytes(), payload)
+        self.assertFalse((self.home / "Library" / "Application Support" / "Statelet" / "voice").exists())
+        self.assertFalse((self.home / "Applications" / "Statelet.app").exists())
 
     def test_unmanaged_legacy_app_is_preserved_while_statelet_installs(self) -> None:
         legacy = self.home / "Applications" / "CodexPetMac.app"
@@ -1660,10 +2080,10 @@ struct WatchdogHarness {
         installed = self.install(first)
         self.assertEqual(installed.returncode, 0, installed.stderr)
         statelet = self.home / "Applications" / "Statelet.app"
-        old_payload = (statelet / "Contents" / "MacOS" / "CodexPetMac").read_bytes()
+        old_payload = (statelet / "Contents" / "MacOS" / "Statelet").read_bytes()
         second = self.make_bundle("BootoutSecond", "second")
-        aggregator = "com.coke1120.codex-pet.state-aggregator"
-        player = "com.coke1120.codex-pet.mac-player"
+        aggregator = "com.coke1120.statelet.state-aggregator"
+        player = "com.coke1120.statelet.mac-player"
         environment, _ = self.fake_launchctl_environment(
             aggregator,
             player,
@@ -1682,7 +2102,7 @@ struct WatchdogHarness {
         self.assertEqual(failed.returncode, 72, failed.stderr)
         self.assertIn("installation was not applied", failed.stderr)
         self.assertEqual(
-            (statelet / "Contents" / "MacOS" / "CodexPetMac").read_bytes(),
+            (statelet / "Contents" / "MacOS" / "Statelet").read_bytes(),
             old_payload,
         )
 
@@ -1691,7 +2111,7 @@ struct WatchdogHarness {
         installed = self.install(first)
         self.assertEqual(installed.returncode, 0, installed.stderr)
         second = self.make_bundle("RollbackLaunchSecond", "second")
-        aggregator = "com.coke1120.codex-pet.state-aggregator"
+        aggregator = "com.coke1120.statelet.state-aggregator"
         environment, _ = self.fake_launchctl_environment(
             aggregator,
             fail_action="bootstrap",
@@ -1715,7 +2135,7 @@ struct WatchdogHarness {
         installed = self.install(first)
         self.assertEqual(installed.returncode, 0, installed.stderr)
         second = self.make_bundle("DelayedLaunchSecond", "second")
-        aggregator = "com.coke1120.codex-pet.state-aggregator"
+        aggregator = "com.coke1120.statelet.state-aggregator"
         environment, _ = self.fake_launchctl_environment(
             aggregator,
             delay_label=aggregator,
@@ -1736,7 +2156,7 @@ struct WatchdogHarness {
         installed = self.install(bundle)
         self.assertEqual(installed.returncode, 0, installed.stderr)
         statelet = self.home / "Applications" / "Statelet.app"
-        aggregator = "com.coke1120.codex-pet.state-aggregator"
+        aggregator = "com.coke1120.statelet.state-aggregator"
         environment, _ = self.fake_launchctl_environment(
             aggregator,
             fail_action="bootout",
@@ -1756,8 +2176,8 @@ struct WatchdogHarness {
         self.assertTrue(statelet.exists())
 
     def test_uninstall_refusal_does_not_stage_or_change_directory_modes(self) -> None:
-        support = self.home / "Library" / "Application Support" / "CodexPet"
-        component = support / "mac-widget"
+        support = self.home / "Library" / "Application Support" / "Statelet"
+        component = support / "Statelet"
         component.mkdir(parents=True)
         support.chmod(0o751)
         support_mode = support.stat().st_mode & 0o777
@@ -1781,7 +2201,7 @@ struct WatchdogHarness {
         bundle = self.make_bundle("UninstallRollback")
         installed = self.install(bundle)
         self.assertEqual(installed.returncode, 0, installed.stderr)
-        aggregator = "com.coke1120.codex-pet.state-aggregator"
+        aggregator = "com.coke1120.statelet.state-aggregator"
         environment, _ = self.fake_launchctl_environment(
             aggregator,
             fail_action="bootstrap",

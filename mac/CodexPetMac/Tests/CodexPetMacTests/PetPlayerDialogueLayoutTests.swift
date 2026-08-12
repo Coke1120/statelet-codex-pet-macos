@@ -1,7 +1,7 @@
 import AppKit
 import CodexPetCore
 import XCTest
-@testable import CodexPetMac
+@testable import Statelet
 
 final class PetPlayerDialogueLayoutTests: XCTestCase {
     @MainActor

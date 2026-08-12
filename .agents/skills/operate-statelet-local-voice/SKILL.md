@@ -37,7 +37,8 @@ in private local storage. Never commit, bundle, diagnose-upload, or log them.
 6. Read the provider reference before changing request fields, persistence,
    migration, or playback behavior: [GPT-SoVITS v2](references/gpt-sovits-v2.md)
    or [Qwen3-TTS with MLX Audio](references/qwen3-tts-mlx.md).
-7. For GPT-SoVITS, run `python3 .agents/skills/operate-statelet-local-voice/scripts/verify_statelet_voice.py`
+7. For GPT-SoVITS, run
+   `python3 .agents/skills/operate-statelet-local-voice/scripts/verify_statelet_voice.py --support-root "$HOME/Library/Application Support/Statelet"`
    to verify state coverage, managed paths, WAV geometry, synthesis-policy
    version, and non-silent sample energy without printing dialogue or paths.
    This verifier does not yet accept Qwen profiles. For Qwen3-TTS, require a

@@ -18,25 +18,39 @@ MAC_DIR = Path(__file__).resolve().parent
 if str(MAC_DIR) not in sys.path:
     sys.path.insert(0, str(MAC_DIR))
 
-from codex_pet_state import (  # noqa: E402
-    DEFAULT_ACTIVE_TTL,
-    STATE_PRIORITY,
-    VALID_STATES,
-    aggregate_state_with_source,
-    default_state_dir,
-    read_active_states,
-)
+try:
+    from statelet_state import (  # type: ignore[import-not-found]  # noqa: E402
+        DEFAULT_ACTIVE_TTL,
+        STATE_PRIORITY,
+        VALID_STATES,
+        aggregate_state_with_source,
+        default_state_dir,
+        read_active_states,
+    )
+except ModuleNotFoundError as error:
+    if error.name != "statelet_state":
+        raise
+    # Repository/source compatibility. Installed Statelet components use the
+    # canonical module name above.
+    from codex_pet_state import (  # noqa: E402
+        DEFAULT_ACTIVE_TTL,
+        STATE_PRIORITY,
+        VALID_STATES,
+        aggregate_state_with_source,
+        default_state_dir,
+        read_active_states,
+    )
 
 
-SCHEMA_VERSION = 1
 DEFAULT_OUTPUT_PATH = (
     Path.home()
     / "Library"
     / "Application Support"
-    / "CodexPet"
+    / "Statelet"
     / "runtime"
     / "current_state.json"
 )
+SCHEMA_VERSION = 1
 DEFAULT_POLL_INTERVAL = 0.25
 # State changes still publish immediately.  The heartbeat exists only to make
 # writer liveness observable, so keep it low-frequency to avoid needless SSD
