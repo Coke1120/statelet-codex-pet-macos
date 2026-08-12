@@ -299,7 +299,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         activeVoicePlayback = nil
         audioPlayer.stop()
         if !persistenceBlocked {
-            _ = retryPendingCleanup()
+            _ = retryPendingCleanup(preserving: inFlightQwenPackagePaths)
         }
     }
 

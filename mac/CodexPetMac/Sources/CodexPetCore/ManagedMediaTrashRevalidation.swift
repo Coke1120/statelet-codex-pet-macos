@@ -393,7 +393,7 @@ public enum ManagedMediaTrashRevalidator {
                 guard stagedName.withCString({
                     Darwin.fstatat(quarantineDescriptor, $0, &after, AT_SYMLINK_NOFOLLOW)
                 }) == 0,
-                    target(after, matches: expected) else {
+                    target(after, matchesIdentityAndContentsOf: expected) else {
                     throw ManagedMediaTrashRevalidationError.targetChanged
                 }
             }
@@ -475,14 +475,25 @@ public enum ManagedMediaTrashRevalidator {
     }
 
     private static func target(_ information: stat, matches expected: ManagedMediaTrashTarget) -> Bool {
+        target(information, matchesIdentityAndContentsOf: expected)
+            && Int64(information.st_ctimespec.tv_sec) == expected.changedSeconds
+            && Int64(information.st_ctimespec.tv_nsec) == expected.changedNanoseconds
+    }
+
+    /// A successful rename changes ctime on macOS even though it preserves the
+    /// file identity and contents. Use the full `target(_:matches:)` check at
+    /// the public source name before rename, then this rename-stable subset at
+    /// the descriptor-relative quarantine name.
+    private static func target(
+        _ information: stat,
+        matchesIdentityAndContentsOf expected: ManagedMediaTrashTarget
+    ) -> Bool {
         (information.st_mode & S_IFMT) == S_IFREG
             && UInt64(information.st_dev) == expected.device
             && UInt64(information.st_ino) == expected.inode
             && Int64(information.st_size) == expected.size
             && Int64(information.st_mtimespec.tv_sec) == expected.modifiedSeconds
             && Int64(information.st_mtimespec.tv_nsec) == expected.modifiedNanoseconds
-            && Int64(information.st_ctimespec.tv_sec) == expected.changedSeconds
-            && Int64(information.st_ctimespec.tv_nsec) == expected.changedNanoseconds
     }
 
     private static func validateLayout(

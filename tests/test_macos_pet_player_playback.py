@@ -43,6 +43,8 @@ class PetPlayerPlaybackSourceTests(unittest.TestCase):
         self.assertIn("button.showsBorderOnlyWhileMouseInside = false", text)
         self.assertIn("button.widthAnchor.constraint(equalToConstant: 40)", text)
         self.assertIn("button.heightAnchor.constraint(equalToConstant: 40)", text)
+        self.assertIn("button.convert(button.bounds, to: self)", text)
+        self.assertIn("if target.contains(point) { return button }", text)
 
 
 if __name__ == "__main__":

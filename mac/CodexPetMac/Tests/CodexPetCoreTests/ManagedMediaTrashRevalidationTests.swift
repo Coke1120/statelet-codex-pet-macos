@@ -316,6 +316,7 @@ final class ManagedMediaTrashRevalidationTests: XCTestCase {
         let published = try MediaMap(states: [PetState: StateMediaPlaylist]())
         try writeMap(published, to: fixture.mapURL)
         let replacement = Data("replacement report".utf8)
+        var replacementWasCreated = false
 
         XCTAssertThrowsError(
             try ManagedMediaTrashRevalidator.quarantineLibraryAfterPublish(
@@ -326,12 +327,14 @@ final class ManagedMediaTrashRevalidationTests: XCTestCase {
                     guard index == 1 else { return }
                     try FileManager.default.removeItem(at: fixture.reportURL)
                     try replacement.write(to: fixture.reportURL)
+                    replacementWasCreated = true
                 }
             )
         ) { error in
             XCTAssertEqual(error as? ManagedMediaTrashRevalidationError, .targetChanged)
         }
 
+        XCTAssertTrue(replacementWasCreated)
         XCTAssertEqual(try Data(contentsOf: fixture.movieURL), originalMovie)
         XCTAssertEqual(try Data(contentsOf: fixture.reportURL), replacement)
         let quarantineNames = try FileManager.default.contentsOfDirectory(atPath: fixture.root.path)
@@ -352,6 +355,7 @@ final class ManagedMediaTrashRevalidationTests: XCTestCase {
         let published = try MediaMap(states: [PetState: StateMediaPlaylist]())
         try writeMap(published, to: fixture.mapURL)
         let replacement = Data("concurrent replacement".utf8)
+        var replacementWasCreated = false
 
         XCTAssertThrowsError(
             try ManagedMediaTrashRevalidator.quarantineLibraryAfterPublish(
@@ -361,11 +365,13 @@ final class ManagedMediaTrashRevalidationTests: XCTestCase {
                 beforeStagingTarget: { index, _ in
                     guard index == 1 else { return }
                     try replacement.write(to: fixture.movieURL)
+                    replacementWasCreated = true
                     try FileManager.default.removeItem(at: fixture.reportURL)
                     try Data("changed report".utf8).write(to: fixture.reportURL)
                 }
             )
         )
+        XCTAssertTrue(replacementWasCreated)
         XCTAssertEqual(try Data(contentsOf: fixture.movieURL), originalMovie)
         let siblingNames = try FileManager.default.contentsOfDirectory(
             atPath: fixture.movieURL.deletingLastPathComponent().path

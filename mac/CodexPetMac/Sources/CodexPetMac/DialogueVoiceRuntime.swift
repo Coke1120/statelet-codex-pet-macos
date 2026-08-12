@@ -268,6 +268,7 @@ struct Qwen3TTSPackageInstaller: Sendable {
               packagesStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
             throw DialogueVoiceRuntimeError.copyFailed
         }
+        let packagesIdentity = DialogueVoiceDirectoryIdentity(packagesStatus)
         let token = destinationToken ?? UUID().uuidString.lowercased()
         let managedPaths = try Self.managedRelativePaths(destinationToken: token)
         let stageName = ".\(token).partial"
@@ -292,7 +293,7 @@ struct Qwen3TTSPackageInstaller: Sendable {
               stageStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
             throw DialogueVoiceRuntimeError.copyFailed
         }
-        let stageIdentity = DialogueVoiceFileIdentity(stageStatus)
+        let stageIdentity = DialogueVoiceDirectoryIdentity(stageStatus)
         var published = false
         defer {
             if !published {
@@ -337,14 +338,13 @@ struct Qwen3TTSPackageInstaller: Sendable {
         var finalStageStatus = stat()
         var namedStageStatus = stat()
         guard Darwin.fstat(packagesDescriptor, &finalPackagesStatus) == 0,
-              DialogueVoiceFileIdentity(finalPackagesStatus)
-                == DialogueVoiceFileIdentity(packagesStatus),
+              DialogueVoiceDirectoryIdentity(finalPackagesStatus) == packagesIdentity,
               Darwin.fstat(stageDescriptor, &finalStageStatus) == 0,
-              DialogueVoiceFileIdentity(finalStageStatus) == stageIdentity,
+              DialogueVoiceDirectoryIdentity(finalStageStatus) == stageIdentity,
               stageName.withCString({
                   Darwin.fstatat(packagesDescriptor, $0, &namedStageStatus, AT_SYMLINK_NOFOLLOW)
               }) == 0,
-              DialogueVoiceFileIdentity(namedStageStatus) == stageIdentity else {
+              DialogueVoiceDirectoryIdentity(namedStageStatus) == stageIdentity else {
             throw DialogueVoiceRuntimeError.copyFailed
         }
         guard stageName.withCString({ stagePointer in
@@ -365,7 +365,7 @@ struct Qwen3TTSPackageInstaller: Sendable {
         guard destinationName.withCString({
             Darwin.fstatat(packagesDescriptor, $0, &publishedStatus, AT_SYMLINK_NOFOLLOW)
         }) == 0,
-              DialogueVoiceFileIdentity(publishedStatus) == stageIdentity else {
+              DialogueVoiceDirectoryIdentity(publishedStatus) == stageIdentity else {
             throw DialogueVoiceRuntimeError.copyFailed
         }
         published = true
@@ -1102,6 +1102,18 @@ private struct DialogueVoiceFileIdentity: Equatable {
             UInt64(bitPattern: changedSeconds),
             UInt64(bitPattern: changedNanoseconds),
         ].map(String.init).joined(separator: ":")
+    }
+}
+
+private struct DialogueVoiceDirectoryIdentity: Equatable {
+    let fileType: mode_t
+    let device: UInt64
+    let inode: UInt64
+
+    init(_ status: stat) {
+        fileType = status.st_mode & mode_t(S_IFMT)
+        device = UInt64(status.st_dev)
+        inode = UInt64(status.st_ino)
     }
 }
 

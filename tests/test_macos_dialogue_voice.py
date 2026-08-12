@@ -697,7 +697,10 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         self.assertIn("stagedImportedPaths.union(inFlightQwenPackagePaths)", accept_import)
 
         shutdown = method_body(self.coordinator, "    func shutdown")
-        self.assertIn("retryPendingCleanup()", shutdown)
+        self.assertIn(
+            "retryPendingCleanup(preserving: inFlightQwenPackagePaths)",
+            shutdown,
+        )
         self.assertIn("inFlightQwenPackagePaths", self.coordinator)
 
         remove_profile = method_body(

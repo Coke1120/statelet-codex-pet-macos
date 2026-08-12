@@ -1078,6 +1078,9 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         XCTAssertEqual(try store.load().pendingCleanupPaths, [secondPath])
 
         coordinator.shutdown()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent(secondPath).path))
+        XCTAssertTrue(try store.load().pendingCleanupPaths.isEmpty)
     }
 
     @MainActor
@@ -1121,6 +1124,8 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(relativePath).path))
         XCTAssertEqual(try store.load().pendingCleanupPaths, [relativePath])
         coordinator.shutdown()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent(relativePath).path))
+        XCTAssertTrue(try store.load().pendingCleanupPaths.isEmpty)
     }
 
     @MainActor
