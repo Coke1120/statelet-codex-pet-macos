@@ -4,6 +4,45 @@ import XCTest
 @testable import Statelet
 
 final class PetPlayerPlaybackHeadlessTests: XCTestCase {
+    func testInStateTransitionPolicyOnlyAllowsAutomaticContinuousClipEnd() {
+        XCTAssertTrue(InStateTransitionPolicy.shouldTrigger(
+            trigger: .playlistRotation,
+            reduceMotion: false,
+            continuousRotation: true,
+            temporaryPreviewActive: false
+        ))
+        for trigger in [
+            LifecyclePresentationTrigger.authoritativeChange,
+            .initialPresentation, .sameStateHeartbeat, .forcedRefresh,
+            .nextClip, .playOnce, .temporaryState,
+        ] {
+            XCTAssertFalse(InStateTransitionPolicy.shouldTrigger(
+                trigger: trigger,
+                reduceMotion: false,
+                continuousRotation: true,
+                temporaryPreviewActive: false
+            ))
+        }
+        XCTAssertFalse(InStateTransitionPolicy.shouldTrigger(
+            trigger: .playlistRotation,
+            reduceMotion: true,
+            continuousRotation: true,
+            temporaryPreviewActive: false
+        ))
+        XCTAssertFalse(InStateTransitionPolicy.shouldTrigger(
+            trigger: .playlistRotation,
+            reduceMotion: false,
+            continuousRotation: false,
+            temporaryPreviewActive: false
+        ))
+        XCTAssertFalse(InStateTransitionPolicy.shouldTrigger(
+            trigger: .playlistRotation,
+            reduceMotion: false,
+            continuousRotation: true,
+            temporaryPreviewActive: true
+        ))
+    }
+
     func testResumeIntentSurvivesUntilLooperProvidesCurrentItem() {
         var deferred = DeferredPlaybackResume()
 

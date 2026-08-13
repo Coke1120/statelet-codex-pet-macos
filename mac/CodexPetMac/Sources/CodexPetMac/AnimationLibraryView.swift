@@ -1118,7 +1118,10 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
     ) {
         let pairs = PetState.allCases.flatMap { source in
             PetState.allCases.compactMap { destination in
-                source == destination ? nil : SettingsTransitionPair(source: source, destination: destination)
+                if source == destination {
+                    return scope == .character ? SettingsTransitionPair(source: source, destination: destination) : nil
+                }
+                return SettingsTransitionPair(source: source, destination: destination)
             }
         }
         let grouped = Dictionary(grouping: clips) {
@@ -1157,7 +1160,7 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
         let libraryName = scope == .character ? characterName : "Global"
         guidance.stringValue = reduceMotion
             ? "Reduce Motion is on for \(libraryName) transitions. Video preview and playback are skipped; the destination fallback is presented."
-            : "Optional directional clips for \(libraryName) play once before the destination animation. Maximum duration: 4 seconds."
+            : "Optional directional and same-state clip-end handoffs for \(libraryName). Maximum duration: 4 seconds."
         guidance.setAccessibilityHelp(guidance.stringValue)
         tableView.setAccessibilityLabel(scope == .character
             ? "\(characterName) directional lifecycle transitions"
@@ -1187,7 +1190,9 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
             let configurationStatus = clip.map { $0.exists ? "\($0.count) variants" : "Variant \($0.position + 1) missing" } ?? "No variants"
             return textCell(
                 identifier: TransitionColumn.route,
-                primary: "\(pair.source.displayName) → \(pair.destination.displayName)",
+                primary: pair.source == pair.destination
+                    ? "\(pair.source.displayName) clip end"
+                    : "\(pair.source.displayName) → \(pair.destination.displayName)",
                 secondary: configurationStatus,
                 secondaryColor: clip?.exists == false ? .systemRed : .secondaryLabelColor,
                 accessibilityLabel: "\(pair.source.displayName) to \(pair.destination.displayName), \(configurationStatus.lowercased())"
@@ -1213,7 +1218,7 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
             )
         case TransitionColumn.mode:
             let cell = actionCell(identifier: TransitionColumn.mode, title: model.mode.rawValue.capitalized, action: #selector(changeMode(_:)))
-            cell.button.isEnabled = model.clip != nil && !busy
+            cell.button.isEnabled = model.clip != nil && pair.source != pair.destination && !busy
             cell.button.setAccessibilityLabel("Selection mode for \(pair.source.displayName) to \(pair.destination.displayName): \(model.mode.rawValue)")
             cell.button.toolTip = model.clip == nil
                 ? "Add a transition variant before choosing a selection mode."
@@ -1221,7 +1226,7 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
             return cell
         case TransitionColumn.fixed:
             let cell = actionCell(identifier: TransitionColumn.fixed, title: clip?.isFixed == true ? "Default" : "Set", action: #selector(setFixed(_:)))
-            cell.button.isEnabled = clip != nil && clip?.isFixed == false && !busy
+            cell.button.isEnabled = clip != nil && pair.source != pair.destination && clip?.isFixed == false && !busy
             cell.button.setAccessibilityLabel("\(clip?.isFixed == true ? "Default variant" : "Set as default") for \(pair.source.displayName) to \(pair.destination.displayName)")
             return cell
         case TransitionColumn.preview:
@@ -1257,7 +1262,7 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
             return cell
         case TransitionColumn.reorder:
             let cell = actionCell(identifier: TransitionColumn.reorder, title: "Up / Down", action: #selector(showReorder(_:)))
-            cell.button.isEnabled = clip != nil && model.count > 1 && !busy
+            cell.button.isEnabled = clip != nil && pair.source != pair.destination && model.count > 1 && !busy
             cell.button.setAccessibilityLabel("Move variant \(model.position + 1) for \(pair.source.displayName) to \(pair.destination.displayName)")
             return cell
         case TransitionColumn.remove:

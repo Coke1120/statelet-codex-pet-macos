@@ -1314,7 +1314,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                 )
             }
         }
-        let transitionClips = transitionPlaylists.flatMap { key, playlist in
+        var transitionClips = transitionPlaylists.flatMap { key, playlist in
             playlist.entries.enumerated().map { index, entry in
                 SettingsTransitionClip(
                     source: key.from,
@@ -1327,6 +1327,20 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                     count: playlist.entries.count,
                     mode: playlist.mode,
                     isFixed: entry.path == playlist.fixedPath
+                )
+            }
+        }
+        if selectedTransitionScope == .character {
+            transitionClips += snapshot.mediaMap.inStateTransitions.map { state, entry in
+                SettingsTransitionClip(
+                    source: state,
+                    destination: state,
+                    path: entry.path,
+                    exists: FileManager.default.isReadableFile(atPath: snapshot.mediaMap.resolvedURL(for: entry, relativeTo: snapshot.mediaMapURL).path),
+                    position: 0,
+                    count: 1,
+                    mode: .fixed,
+                    isFixed: true
                 )
             }
         }

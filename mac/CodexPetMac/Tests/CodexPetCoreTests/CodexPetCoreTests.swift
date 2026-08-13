@@ -35,6 +35,19 @@ private func validAlphaReportJSON() -> String {
 }
 
 final class CodexPetCoreTests: XCTestCase {
+    func testInStateTransitionRoundTripIsIndependentAndOneShot() throws {
+        let transition = try MediaEntry(path: "media/idle-handoff.mov", loop: true)
+        let map = try MediaMap(
+            states: [.idle: try MediaEntry(path: "media/idle.mov")],
+            inStateTransitions: [.idle: transition]
+        )
+
+        XCTAssertFalse(try XCTUnwrap(map.inStateTransition(for: .idle)).loop)
+        XCTAssertNil(map.transitionPlaylist(from: .idle, to: .idle))
+        XCTAssertEqual(try JSONDecoder().decode(MediaMap.self, from: JSONEncoder().encode(map)), map)
+        XCTAssertNil(try map.removingInStateTransition(for: .idle).inStateTransition(for: .idle))
+    }
+
     func testLayeredLifecycleHandoffKeepsAVisibleThenPrerollsBUnderTransition() {
         var handoff = LayeredLifecycleHandoff(id: 7, source: .idle, destination: .running)
         XCTAssertEqual(handoff.lowerLayer, .outgoing(.idle))

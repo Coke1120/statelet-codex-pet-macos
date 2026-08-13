@@ -193,8 +193,15 @@ There is no weighted mode.
 The default advance policy is `state_entry`. It selects a clip when the real
 lifecycle enters the state. For Random and Sequential libraries with at least
 two entries, enable **Continue with another clip when this clip ends** to use
-`clip_end`. Statelet hard-cuts to the next clip with one AVFoundation decoder.
-Normal playlist rotation does not use a cross-fade or second warmed decoder.
+`clip_end`. Statelet normally switches directly to the next clip. A character
+can optionally configure one same-state transition for each lifecycle state.
+Only an automatic continuous Random or Sequential `clip_end` rotation uses it:
+the outgoing clip remains visible, the verified transparent transition plays
+once above the pre-rolled next clip, and the overlay leaves after its visible
+ending. Missing, changed, unreadable, timed-out, or failed transition media
+falls back to the ready next clip. Reduce Motion, manual preview, Next Clip,
+Play Once, temporary states, heartbeats, refreshes, and character changes bypass
+same-state transitions.
 
 The clip table shows order, filename, readiness, fixed state, poster state, and
 preview state. Each row provides **Preview** or **Stop**, **Actions…**, and

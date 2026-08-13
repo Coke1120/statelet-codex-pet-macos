@@ -97,9 +97,14 @@ Review as separate clip libraries:
   mode.
 - `advance_on` defaults to `state_entry`. For Random or Sequential libraries
   with at least two entries, **Continue with another clip when this clip ends**
-  selects `clip_end`: the player hard-cuts to the next eligible clip while the
+  selects `clip_end`: the player switches to the next eligible clip while the
   lifecycle state stays active. In Fixed mode or a one-entry library,
   `clip_end` is ineffective and the entry's normal `loop` behavior applies.
+  The active character can optionally configure one same-state transition for
+  each lifecycle state. It is used only for automatic effective `clip_end`
+  rotation, reuses the transparent layered handoff, and falls back to the next
+  ready clip on validation, readiness, playback, or timeout failure. Reduce
+  Motion and all manual or refresh paths bypass it.
 - The native clip table aligns filename, readiness, fixed/poster status, and
   row actions for quick comparison. **Preview** plays that exact clip once
   without changing the live Codex state,

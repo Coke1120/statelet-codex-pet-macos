@@ -71,6 +71,26 @@ public enum ManagedMediaRemovalPlanner {
     public static func plan(
         mediaMap: MediaMap,
         mapURL: URL,
+        inStateTransition state: PetState,
+        canonicalRoot: URL,
+        fileManager: FileManager = .default
+    ) throws -> ManagedMediaRemovalPlan {
+        let context = try validateContext(mapURL: mapURL, canonicalRoot: canonicalRoot)
+        guard let entry = mediaMap.inStateTransition(for: state) else {
+            throw ManagedMediaRemovalError.entryNotFound
+        }
+        return try plan(
+            mediaMap: mediaMap,
+            updatedMap: mediaMap.removingInStateTransition(for: state),
+            entry: entry,
+            context: context,
+            fileManager: fileManager
+        )
+    }
+
+    public static func plan(
+        mediaMap: MediaMap,
+        mapURL: URL,
         transitionFrom: PetState,
         transitionTo: PetState,
         path: String? = nil,
@@ -197,6 +217,12 @@ public enum ManagedMediaRemovalPlanner {
                     throw ManagedMediaRemovalError.stillReferenced
                 }
             }
+        }
+        for transition in updated.inStateTransitions.values {
+            let remainingURL = updated.resolvedURL(for: transition, relativeTo: mapURL)
+                .resolvingSymlinksInPath()
+                .standardizedFileURL
+            if remainingURL.path == movie.path { throw ManagedMediaRemovalError.stillReferenced }
         }
 
         var targets = [movie]

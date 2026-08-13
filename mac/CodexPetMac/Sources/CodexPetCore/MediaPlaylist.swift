@@ -410,13 +410,26 @@ public extension MediaMap {
         return try replacingTransitions(updated)
     }
 
+    func settingInStateTransition(for state: PetState, entry: MediaEntry) throws -> MediaMap {
+        var updated = inStateTransitions
+        updated[state] = entry
+        return try replacingInStateTransitions(updated)
+    }
+
+    func removingInStateTransition(for state: PetState) throws -> MediaMap {
+        var updated = inStateTransitions
+        updated[state] = nil
+        return try replacingInStateTransitions(updated)
+    }
+
     private func replacingStates(_ states: [PetState: StateMediaPlaylist]) throws -> MediaMap {
         try MediaMap(
             version: version,
             defaultFormat: defaultFormat,
             window: window,
             states: states,
-            transitions: transitions
+            transitions: transitions,
+            inStateTransitions: inStateTransitions
         )
     }
 
@@ -426,7 +439,19 @@ public extension MediaMap {
             defaultFormat: defaultFormat,
             window: window,
             states: states,
-            transitions: transitions
+            transitions: transitions,
+            inStateTransitions: inStateTransitions
+        )
+    }
+
+    private func replacingInStateTransitions(_ routes: [PetState: MediaEntry]) throws -> MediaMap {
+        try MediaMap(
+            version: version,
+            defaultFormat: defaultFormat,
+            window: window,
+            states: states,
+            transitions: transitions,
+            inStateTransitions: routes
         )
     }
 }

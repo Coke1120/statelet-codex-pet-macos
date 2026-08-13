@@ -203,6 +203,17 @@ private func runDialogueVoiceSelfTest() throws {
 
 private func runSelfTest() throws {
     try runDialogueVoiceSelfTest()
+    let sameStateTransition = try MediaEntry(path: "media/idle-handoff.mov", loop: true)
+    let map = try MediaMap(
+        states: [.idle: try MediaEntry(path: "media/idle.mov")],
+        inStateTransitions: [.idle: sameStateTransition]
+    )
+    try require(map.inStateTransition(for: .idle)?.loop == false, "same-state transition was not normalized to one-shot")
+    try require(map.transitionPlaylist(from: .idle, to: .idle) == nil, "same-state route leaked into lifecycle transitions")
+    let mapRoundTrip = try JSONDecoder().decode(MediaMap.self, from: JSONEncoder().encode(map))
+    try require(mapRoundTrip == map, "same-state transition did not round-trip")
+    let removed = try map.removingInStateTransition(for: .idle)
+    try require(removed.inStateTransition(for: .idle) == nil, "same-state transition removal failed")
     var handoff = LayeredLifecycleHandoff(id: 17, source: .idle, destination: .running)
     try require(handoff.lowerLayer == .outgoing(.idle), "layered handoff hid the outgoing state")
     try require(handoff.transitionBecameReady(id: 17) == .revealTransition, "transition did not become foreground")

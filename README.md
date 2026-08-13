@@ -38,6 +38,8 @@ use, not a Developer ID-signed or notarized public binary.
   later file fails or the remaining batch is cancelled.
 - Supports one-time preview, temporary state selection, Next Clip, Reduce Motion
   posters, appearance controls, diagnostics, and recoverable media cleanup.
+- Supports an optional character-owned same-state transition for each lifecycle
+  state, triggered only by automatic continuous `clip_end` rotation.
 - Runs the lifecycle publisher with the Python standard library; Python media
   packages are needed only for optional MP4 conversion.
 

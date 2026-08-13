@@ -621,13 +621,15 @@ public struct MediaMap: Codable, Equatable, Sendable {
     public let window: WindowConfiguration
     public let states: [PetState: StateMediaPlaylist]
     public let transitions: [StateTransitionKey: StateMediaPlaylist]
+    public let inStateTransitions: [PetState: MediaEntry]
 
     public init(
         version: Int = StateContract.version,
         defaultFormat: String = "mov",
         window: WindowConfiguration = try! WindowConfiguration(),
         states: [PetState: StateMediaPlaylist] = [:],
-        transitions: [StateTransitionKey: StateMediaPlaylist] = [:]
+        transitions: [StateTransitionKey: StateMediaPlaylist] = [:],
+        inStateTransitions: [PetState: MediaEntry] = [:]
     ) throws {
         guard version == StateContract.version else {
             throw PetContractError.unsupportedVersion(version)
@@ -666,6 +668,15 @@ public struct MediaMap: Codable, Equatable, Sendable {
         self.window = window
         self.states = states
         self.transitions = normalizedTransitions
+        self.inStateTransitions = try Dictionary(uniqueKeysWithValues: inStateTransitions.map { state, entry in
+            _ = try PlaybackRate(entry.playbackRate.value)
+            return (state, try MediaEntry(
+                path: entry.path,
+                posterPath: entry.posterPath,
+                loop: false,
+                playbackRate: entry.playbackRate.value
+            ))
+        })
     }
 
     /// Source-compatible initializer for callers that still supply one entry
@@ -675,7 +686,8 @@ public struct MediaMap: Codable, Equatable, Sendable {
         defaultFormat: String = "mov",
         window: WindowConfiguration = try! WindowConfiguration(),
         states: [PetState: MediaEntry],
-        transitions: [StateTransitionKey: MediaEntry] = [:]
+        transitions: [StateTransitionKey: MediaEntry] = [:],
+        inStateTransitions: [PetState: MediaEntry] = [:]
     ) throws {
         let playlists = try Dictionary(uniqueKeysWithValues: states.map { state, entry in
             (state, try StateMediaPlaylist(entries: [entry]))
@@ -688,7 +700,8 @@ public struct MediaMap: Codable, Equatable, Sendable {
             defaultFormat: defaultFormat,
             window: window,
             states: playlists,
-            transitions: transitionPlaylists
+            transitions: transitionPlaylists,
+            inStateTransitions: inStateTransitions
         )
     }
 
@@ -698,6 +711,7 @@ public struct MediaMap: Codable, Equatable, Sendable {
         case window
         case states
         case transitions
+        case inStateTransitions = "in_state_transitions"
     }
 
     public init(from decoder: Decoder) throws {
@@ -718,12 +732,19 @@ public struct MediaMap: Codable, Equatable, Sendable {
                 throw PetContractError.invalidValue("duplicate transition key")
             }
         }
+        let rawInStateTransitions = try container.decodeIfPresent([String: MediaEntry].self, forKey: .inStateTransitions) ?? [:]
+        var decodedInStateTransitions: [PetState: MediaEntry] = [:]
+        for (rawState, entry) in rawInStateTransitions {
+            guard let state = PetState(rawValue: rawState) else { throw PetContractError.invalidState(rawState) }
+            decodedInStateTransitions[state] = entry
+        }
         try self.init(
             version: container.decode(Int.self, forKey: .version),
             defaultFormat: container.decodeIfPresent(String.self, forKey: .defaultFormat) ?? "mov",
             window: container.decodeIfPresent(WindowConfiguration.self, forKey: .window) ?? (try WindowConfiguration()),
             states: decodedStates,
-            transitions: decodedTransitions
+            transitions: decodedTransitions,
+            inStateTransitions: decodedInStateTransitions
         )
     }
 
@@ -737,6 +758,12 @@ public struct MediaMap: Codable, Equatable, Sendable {
             try container.encode(
                 Dictionary(uniqueKeysWithValues: transitions.map { ($0.key.storageKey, $0.value) }),
                 forKey: .transitions
+            )
+        }
+        if !inStateTransitions.isEmpty {
+            try container.encode(
+                Dictionary(uniqueKeysWithValues: inStateTransitions.map { ($0.key.rawValue, $0.value) }),
+                forKey: .inStateTransitions
             )
         }
     }
@@ -770,8 +797,12 @@ public struct MediaMap: Codable, Equatable, Sendable {
         transitions.values.flatMap(\.entries)
     }
 
+    public func inStateTransition(for state: PetState) -> MediaEntry? { inStateTransitions[state] }
+
+    public var allInStateTransitionEntries: [MediaEntry] { Array(inStateTransitions.values) }
+
     public var allMediaEntries: [MediaEntry] {
-        states.values.flatMap(\.entries) + allTransitionEntries
+        states.values.flatMap(\.entries) + allTransitionEntries + allInStateTransitionEntries
     }
 
     public func resolvedURL(for state: PetState, relativeTo mapURL: URL) -> URL? {
