@@ -105,6 +105,76 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
     }
 
     @MainActor
+    func testSameStateLifecycleHandoffRetainsOutgoingThenPromotesNextClip() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("statelet-same-state-transition-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let movieURL = directory.appendingPathComponent("same-state.mov")
+        try Self.writeTestMovie(to: movieURL)
+
+        let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
+        let controller = PetPlayerController(view: view)
+        let entry = try MediaEntry(path: movieURL.lastPathComponent)
+        XCTAssertEqual(
+            controller.show(
+                state: .running,
+                entry: entry,
+                url: movieURL,
+                posterURL: nil,
+                transitionID: 143,
+                startedAt: DispatchTime.now().uptimeNanoseconds,
+                advancePlaylistWhenEnded: true
+            ),
+            .preparing
+        )
+        try Self.waitUntil("same-state outgoing presentation did not become ready") {
+            controller.currentURL == movieURL
+        }
+        let outgoingPlayer = try XCTUnwrap(view.playerLayer.player)
+        var endedIDs: [UInt64] = []
+        controller.onLifecycleTransitionEnded = { endedIDs.append($0) }
+
+        XCTAssertEqual(
+            controller.showLifecycleTransition(
+                sourceState: .running,
+                destinationState: .running,
+                transitionEntry: entry,
+                transitionURL: movieURL,
+                transitionAttestation: try Self.testTransitionAttestation(for: movieURL),
+                destinationEntry: entry,
+                destinationURL: movieURL,
+                transitionID: 144,
+                startedAt: DispatchTime.now().uptimeNanoseconds,
+                advancePlaylistWhenEnded: true
+            ),
+            .preparing
+        )
+        XCTAssertTrue(view.playerLayer.player === outgoingPlayer)
+        XCTAssertFalse(view.playerLayer.isHidden)
+        XCTAssertTrue(view.destinationPlayerLayer.isHidden)
+        XCTAssertTrue(view.lifecycleTransitionPlayerLayer.isHidden)
+
+        try Self.waitUntil("same-state transition foreground never became visible") {
+            !view.lifecycleTransitionPlayerLayer.isHidden
+        }
+        try Self.waitUntil("same-state destination did not preroll underneath transition") {
+            !view.destinationPlayerLayer.isHidden
+                && (view.destinationPlayerLayer.player?.currentTime().seconds ?? 0) > 0
+        }
+        try Self.waitUntil("same-state transition did not promote its destination") {
+            endedIDs == [144]
+                && view.playerLayer.player !== outgoingPlayer
+                && view.destinationPlayerLayer.isHidden
+        }
+        XCTAssertEqual(controller.currentState, .running)
+        XCTAssertEqual(controller.currentURL, movieURL)
+        XCTAssertFalse(view.playerLayer.isHidden)
+        XCTAssertNil(view.lifecycleTransitionPlayerLayer.player)
+        controller.clearTransientPresentation()
+    }
+
+    @MainActor
     func testNewPresentationSuppressesStaleTransitionCompletion() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("statelet-transition-cancel-test-\(UUID().uuidString)", isDirectory: true)

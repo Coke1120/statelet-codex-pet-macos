@@ -90,6 +90,40 @@ final class CodexPetCoreTests: XCTestCase {
         XCTAssertTrue(handoff.preservesVisibleContent)
     }
 
+    func testLayeredSameStateHandoffPrerollsAndFallsBackWithoutClearingVisibleLayer() {
+        var handoff = LayeredLifecycleHandoff(id: 41, source: .running, destination: .running)
+        XCTAssertEqual(handoff.lowerLayer, .outgoing(.running))
+        XCTAssertEqual(handoff.transitionBecameReady(id: 41), .revealTransition)
+        XCTAssertEqual(handoff.destinationPrerollCueReached(id: 41), .startDestinationPreroll(.running))
+        XCTAssertEqual(handoff.destinationBecameReady(id: 41), .revealDestination(.running))
+        XCTAssertEqual(handoff.lowerLayer, .destination(.running))
+        XCTAssertEqual(handoff.transitionFinished(id: 41), .finish(.running))
+
+        var failed = LayeredLifecycleHandoff(id: 42, source: .running, destination: .running)
+        XCTAssertEqual(failed.transitionBecameReady(id: 42), .revealTransition)
+        XCTAssertEqual(failed.destinationPrerollCueReached(id: 42), .startDestinationPreroll(.running))
+        XCTAssertEqual(failed.transitionFailed(id: 42), .fallBack(.running))
+        XCTAssertEqual(failed.lowerLayer, .outgoing(.running))
+        XCTAssertTrue(failed.preservesVisibleContent)
+        XCTAssertEqual(failed.destinationBecameReady(id: 41), .none)
+    }
+
+    func testSameStateFallbackReusesSelectedPlaylistEntryWithoutDoubleAdvancingCursor() throws {
+        let first = try MediaEntry(path: "running-first.mov")
+        let second = try MediaEntry(path: "running-second.mov")
+        let playlist = try StateMediaPlaylist(mode: .sequential, entries: [first, second])
+        var cursor = MediaSelectionCursor()
+
+        XCTAssertEqual(cursor.select(for: .running, from: playlist)?.path, first.path)
+        let selectedDestination = cursor.select(for: .running, from: playlist)?.path
+        XCTAssertEqual(selectedDestination, second.path)
+        XCTAssertEqual(
+            cursor.select(for: .running, from: playlist, advance: false)?.path,
+            selectedDestination
+        )
+        XCTAssertEqual(cursor.select(for: .running, from: playlist)?.path, first.path)
+    }
+
     func testLayeredLifecycleHandoffUsesDeterministicBoundedOverlap() {
         XCTAssertEqual(LayeredLifecycleHandoffPolicy.destinationPrerollTime(duration: 4), 3.65, accuracy: 0.0001)
         XCTAssertEqual(LayeredLifecycleHandoffPolicy.destinationPrerollTime(duration: 0.2), 0.1, accuracy: 0.0001)

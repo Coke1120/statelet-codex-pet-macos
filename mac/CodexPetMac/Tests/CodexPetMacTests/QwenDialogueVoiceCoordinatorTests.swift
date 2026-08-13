@@ -470,6 +470,30 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
     }
 
     @MainActor
+    func testRemovingInactiveVoxCPM2ProfileKeepsActiveGPTProvider() throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gptProfile = try makeGPTProfile(root: root)
+        let voxProfile = try makeVoxProfile(root: root)
+        let library = try DialogueVoiceLibrary(
+            profile: gptProfile,
+            voxcpm2Profile: voxProfile,
+            activeProviderKind: .gptSovits
+        )
+        try save(library, root: root)
+
+        let coordinator = DialogueVoiceCoordinator(applicationSupportRoot: root)
+        defer { coordinator.shutdown() }
+        coordinator.start()
+        try coordinator.removeProfile(provider: .voxcpm2)
+
+        XCTAssertEqual(coordinator.library.activeProviderKind, .gptSovits)
+        XCTAssertNotNil(coordinator.library.profile)
+        XCTAssertNil(coordinator.library.voxcpm2Profile)
+        XCTAssertTrue(coordinator.library.pendingCleanupPaths.isEmpty)
+    }
+
+    @MainActor
     func testQwenProviderRoundTripDiscardsCancellationInsensitiveStaleAttempt() async throws {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -639,6 +663,54 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
             inputFingerprint: DialogueVoiceProfileFingerprint.compute(
                 apiBaseURL: endpoint, referenceText: "Reference", promptLanguage: "en", defaultTextLanguage: "en", assetDigests: digests
             )
+        )
+    }
+
+    private func makeVoxProfile(root: URL) throws -> VoxCPM2VoiceProfile {
+        let snapshot = root.appendingPathComponent("VoxCPM2-fixture", isDirectory: true)
+        let model = snapshot.appendingPathComponent("model", isDirectory: true)
+        let referenceRelativePath = "voice/assets/voxcpm2-reference/reference.wav"
+        let reference = root.appendingPathComponent(referenceRelativePath)
+        try FileManager.default.createDirectory(at: model, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: reference.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        for (name, data) in [
+            ("model.safetensors", Data("weights".utf8)),
+            ("audiovae.pth", Data("vae".utf8)),
+            ("config.json", Data("{}".utf8)),
+            ("tokenizer.json", Data("{}".utf8)),
+        ] {
+            try data.write(to: model.appendingPathComponent(name))
+        }
+        let referenceData = Self.pcmWAV(sampleRate: 32_000, frames: 3_200)
+        try referenceData.write(to: reference)
+        let python = URL(fileURLWithPath: "/bin/sh")
+        let treeDigest = try VoxCPM2ProfileValidator.computeSnapshotTreeSHA256(snapshotRoot: snapshot)
+        let pythonDigest = sha(try Data(contentsOf: python))
+        let referenceDigest = sha(referenceData)
+        let provisional = try VoxCPM2VoiceProfile(
+            name: "VoxCPM2", snapshotPath: snapshot.path,
+            snapshotTreeSHA256: treeDigest,
+            pythonExecutablePath: python.path,
+            pythonExecutableSHA256: pythonDigest,
+            referenceAudioRelativePath: referenceRelativePath,
+            referenceAudioSHA256: referenceDigest,
+            referenceText: "参照音声です。", defaultTextLanguage: "japanese",
+            inputFingerprint: String(repeating: "0", count: 64)
+        )
+        return try VoxCPM2VoiceProfile(
+            id: provisional.id, revision: provisional.revision, name: provisional.name,
+            snapshotPath: provisional.snapshotPath,
+            snapshotTreeSHA256: provisional.snapshotTreeSHA256,
+            pythonExecutablePath: provisional.pythonExecutablePath,
+            pythonExecutableSHA256: provisional.pythonExecutableSHA256,
+            referenceAudioRelativePath: provisional.referenceAudioRelativePath,
+            referenceAudioSHA256: provisional.referenceAudioSHA256,
+            referenceText: provisional.referenceText,
+            defaultTextLanguage: provisional.defaultTextLanguage,
+            parameters: provisional.parameters,
+            inputFingerprint: fingerprint(provisional.inputFingerprintComponents)
         )
     }
 

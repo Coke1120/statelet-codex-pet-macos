@@ -51,6 +51,23 @@ final class DialogueVoiceTests: XCTestCase {
         )
     }
 
+    private func voxProfile(revision: Int = 1) throws -> VoxCPM2VoiceProfile {
+        try VoxCPM2VoiceProfile(
+            id: UUID(uuidString: "CCCCCCCC-DDDD-EEEE-FFFF-000000000000")!,
+            revision: revision,
+            name: "VoxCPM2 Test Voice",
+            snapshotPath: "/opt/statelet/VoxCPM2",
+            snapshotTreeSHA256: String(repeating: "7", count: 64),
+            pythonExecutablePath: "/opt/statelet/venv/bin/python",
+            pythonExecutableSHA256: String(repeating: "8", count: 64),
+            referenceAudioRelativePath: "voice/assets/voxcpm2-reference/reference.wav",
+            referenceAudioSHA256: String(repeating: "9", count: 64),
+            referenceText: "Reference text",
+            defaultTextLanguage: "japanese",
+            inputFingerprint: String(repeating: "a", count: 64)
+        )
+    }
+
     private func libraryWithQueuedLine(state: PetState = .idle) throws -> DialogueVoiceLibrary {
         var library = try DialogueVoiceLibrary(profile: profile())
         try library.addLine(text: "你好", state: state, id: lineID)
@@ -232,10 +249,13 @@ final class DialogueVoiceTests: XCTestCase {
     }
 
     func testProviderProfilesCoexistAndOnlySelectedProviderDrivesTickets() throws {
-        var library = try DialogueVoiceLibrary(profile: profile(), qwenProfile: qwenProfile())
+        var library = try DialogueVoiceLibrary(
+            profile: profile(), qwenProfile: qwenProfile(), voxcpm2Profile: voxProfile()
+        )
         XCTAssertEqual(library.activeProviderKind, .gptSovits)
         XCTAssertNotNil(library.profile)
         XCTAssertNotNil(library.qwenProfile)
+        XCTAssertNotNil(library.voxcpm2Profile)
         _ = try library.addLine(text: "Hello", id: lineID)
 
         try library.selectActiveProvider(.qwen3TTS)
@@ -251,6 +271,13 @@ final class DialogueVoiceTests: XCTestCase {
         XCTAssertEqual(ticket.profileRevision, library.qwenProfile?.revision)
 
         try library.failGeneration(ticket: ticket, failureCode: "TEST_FAILURE")
+        try library.retryLine(id: lineID)
+        try library.selectActiveProvider(.voxcpm2)
+        XCTAssertEqual(library.activeProviderKind, .voxcpm2)
+        let voxTicket = try library.beginGeneration(for: lineID)
+        XCTAssertEqual(voxTicket.profileID, library.voxcpm2Profile?.id)
+        XCTAssertEqual(voxTicket.profileRevision, library.voxcpm2Profile?.revision)
+        try library.failGeneration(ticket: voxTicket, failureCode: "TEST_FAILURE")
         try library.retryLine(id: lineID)
         try library.selectActiveProvider(.gptSovits)
         let gptTicket = try library.beginGeneration(for: lineID)
