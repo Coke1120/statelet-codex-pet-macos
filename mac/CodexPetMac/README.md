@@ -47,6 +47,19 @@ verification. A Command Line Tools-only Mac can still build the app and run
 `swift run -c release codex-pet-core-self-test`, but Apple does not include the
 XCTest module in that smaller toolchain.
 
+## Local voice providers
+
+Voice Setup supports GPT-SoVITS, Qwen3-TTS, and VoxCPM2 while keeping only one
+provider active. VoxCPM2 imports the complete external handover directory,
+one WAV reference with its exact transcript, and a trusted Python runtime. The
+snapshot remains external and is fingerprinted as a complete tree; Statelet
+copies only the reference into private Application Support. Its bounded probe
+loads the snapshot offline, confirms a sanitized `mps`, `cuda`, or `cpu`
+device category and a 48 kHz model rate, and its helper runs under an OS
+network-denied child-process policy. MPS uses the upstream float32 stability
+path and may be slow on Apple Silicon. See [Using Statelet](../../docs/USAGE.md#voxcpm2-setup-and-recovery)
+and the project-local [VoxCPM2 voice reference](../../.agents/skills/operate-statelet-local-voice/references/voxcpm2.md).
+
 An ad-hoc signature is appropriate for personal local execution. It is not a
 Developer ID signature and is not notarized. Distribution to other people
 requires an authorized Apple Developer identity, hardened-runtime review,

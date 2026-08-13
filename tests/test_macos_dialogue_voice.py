@@ -645,6 +645,31 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
             probe.index("import mlx"),
         )
 
+    def test_voxcpm2_provider_is_pinned_offline_and_network_denied(self) -> None:
+        helper_root = ROOT / "mac" / "CodexPetMac" / "Resources" / "VoxCPM2"
+        generator = read(helper_root / "voxcpm2_generate.py")
+        probe = read(helper_root / "voxcpm2_probe.py")
+        for source in (generator, probe):
+            self.assertIn('HF_HUB_OFFLINE', source)
+            self.assertIn('TRANSFORMERS_OFFLINE', source)
+            self.assertIn('HF_DATASETS_OFFLINE', source)
+            self.assertIn('local_files_only=True', source)
+            self.assertIn('load_denoiser=False', source)
+            self.assertIn('optimize=False', source)
+        self.assertIn('VoxCPM.from_pretrained', probe)
+        self.assertIn('model.tts_model.sample_rate', probe)
+        self.assertIn('48000', probe)
+        self.assertIn('deny network-outbound', self.runtime)
+        self.assertIn('invocation.deniesNetwork', self.runtime)
+        self.assertIn('probe_output', self.runtime)
+
+    def test_voxcpm2_setup_exposes_complete_snapshot_and_runtime_contract(self) -> None:
+        self.assertIn('VoxCPM2', self.voice_view)
+        self.assertIn('Choose VoxCPM2 Snapshot', self.app_delegate)
+        self.assertIn('voxcpm2Profile', self.core)
+        self.assertIn('voxcpm2_generate.py', self.build_script)
+        self.assertIn('voxcpm2_probe.py', self.build_script)
+
     def test_profile_state_fingerprint_and_secure_cleanup_are_persisted(self) -> None:
         for status in ("notConfigured", "validating", "ready", "invalid", "unavailable"):
             self.assertRegex(self.core, rf"\bcase\s+{status}\b")

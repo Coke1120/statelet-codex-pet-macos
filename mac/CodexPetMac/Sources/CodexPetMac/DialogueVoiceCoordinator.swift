@@ -132,6 +132,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     private var inFlightQwenPackagePaths: Set<String> = []
     private var profileValidationTask: Task<Void, Never>?
     private var validatedProviderIdentity: ValidatedProviderIdentity?
+    private var voxcpm2ProbeSummary: String?
     private var profileValidationSequence: UInt64 = 0
     private var importSequence: UInt64 = 0
     private var persistenceBlocked = false
@@ -1372,25 +1373,30 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         let client = voxcpm2Client
         profileValidationTask = Task.detached(priority: .utility) {
             let result: ProfileValidationResult
+            var probeSummary: String?
             do {
                 let validated = try VoxCPM2ProfileValidator.validate(
                     profile: profile, applicationSupportRoot: root
                 )
                 do {
-                    try await client.validateProfile(profile, applicationSupportRoot: root)
+                    let probe = try await client.validateProfile(profile, applicationSupportRoot: root)
+                    probeSummary = probe.sanitizedSummary
                     result = .valid(.voxcpm2(validated.identityTokens), [])
                 } catch let error as DialogueVoiceRuntimeError
                     where error == .inferenceUnavailable || error == .cancelled {
                     result = .unavailable(.voxcpm2(validated.identityTokens), [])
                 } catch { result = .invalid }
             } catch { result = .invalid }
+            let validationResult = result
+            let validationSummary = probeSummary
             await MainActor.run {
                 guard sequence == self.profileValidationSequence,
                       self.library.activeProviderKind == .voxcpm2,
                       self.library.voxcpm2Profile?.id == profile.id,
                       self.library.voxcpm2Profile?.inputFingerprint == profile.inputFingerprint else { return }
                 self.profileValidationTask = nil
-                self.finishProfileValidation(provider: .voxcpm2, result: result)
+                self.voxcpm2ProbeSummary = validationSummary
+                self.finishProfileValidation(provider: .voxcpm2, result: validationResult)
             }
         }
     }
@@ -1421,8 +1427,14 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                 }
                 validatedProviderIdentity = identity
                 let cleanup = retryPendingCleanup()
+                let validationMessage: String
+                if provider == .voxcpm2, let probeSummary = voxcpm2ProbeSummary {
+                    validationMessage = "VoxCPM2 profile validated (\(probeSummary))."
+                } else {
+                    validationMessage = "Voice profile validation completed."
+                }
                 activityMessage = cleanupAwareMessage(
-                    "Voice profile validation completed.",
+                    validationMessage,
                     outcome: cleanup
                 )
                 logger.info("event=profile_validated provider=\(provider.rawValue, privacy: .public)")
@@ -1454,6 +1466,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                 library = updated
                 if let gptProfile { clearDigestsForActiveProfile(gptProfile) }
                 validatedProviderIdentity = nil
+                if provider == .voxcpm2 { voxcpm2ProbeSummary = nil }
                 activityMessage = "The saved voice assets changed, are missing, or are no longer valid. Re-import them before generating speech."
                 logger.error("event=profile_validation_failed code=INPUT_FINGERPRINT_MISMATCH")
             }

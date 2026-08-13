@@ -408,6 +408,17 @@ esac
             path = qwen_tools / resource
             self.assertTrue(os.access(path, os.R_OK))
             self.assertFalse(path.stat().st_mode & 0o111)
+
+        voxcpm2_tools = bundle / "Contents" / "Resources" / "VoxCPM2"
+        expected_voxcpm2_resources = {"voxcpm2_generate.py", "voxcpm2_probe.py"}
+        self.assertEqual(
+            {path.name for path in voxcpm2_tools.iterdir() if path.is_file()},
+            expected_voxcpm2_resources,
+        )
+        for resource in expected_voxcpm2_resources:
+            path = voxcpm2_tools / resource
+            self.assertTrue(os.access(path, os.R_OK))
+            self.assertFalse(path.stat().st_mode & 0o111)
         self.assertFalse([path for path in bundle.rglob("__pycache__")])
         self.assertFalse([path for path in bundle.rglob("*.pyc")])
 

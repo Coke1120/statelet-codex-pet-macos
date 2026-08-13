@@ -956,9 +956,19 @@ enum Qwen3TTSProfileValidator {
 
 struct VoxCPM2ValidatedProfile: Equatable, Sendable {
     let snapshotRoot: URL
+    let modelRoot: URL
     let pythonExecutable: URL
     let referenceAudio: URL
     let identityTokens: [String]
+}
+
+struct VoxCPM2ProbeResult: Equatable, Sendable {
+    let device: String
+    let sampleRate: Int
+
+    var sanitizedSummary: String {
+        "device=\(device) sample_rate=\(sampleRate)"
+    }
 }
 
 enum VoxCPM2ProfileValidator {
@@ -997,6 +1007,7 @@ enum VoxCPM2ProfileValidator {
         guard treeBefore == treeAfter else { throw DialogueVoiceRuntimeError.sourceChanged }
         return VoxCPM2ValidatedProfile(
             snapshotRoot: snapshot,
+            modelRoot: modelRoot(snapshot),
             pythonExecutable: URL(fileURLWithPath: runtime.invocationPath),
             referenceAudio: applicationSupportRoot.appendingPathComponent(profile.referenceAudioRelativePath),
             identityTokens: treeAfter.identityTokens + [runtime.stableIdentityToken, referenceIdentity]
@@ -1047,6 +1058,23 @@ enum VoxCPM2ProfileValidator {
         let tokens = entries.sorted { $0.0 < $1.0 }.map { "\($0.0):\($0.2):\($0.3)" }
         return (digest, tokens)
     }
+
+    private static func modelRoot(_ snapshot: URL) -> URL {
+        let nested = snapshot.appendingPathComponent("model", isDirectory: true)
+        var status = stat()
+        guard Darwin.lstat(nested.path, &status) == 0,
+              status.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else { return snapshot }
+        func isRegular(_ name: String) -> Bool {
+            var nestedStatus = stat()
+            let url = nested.appendingPathComponent(name)
+            return Darwin.lstat(url.path, &nestedStatus) == 0
+                && nestedStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG)
+        }
+        let hasRequired = requiredFiles.allSatisfy(isRegular)
+        let hasTokenizer = tokenizerCandidates.contains(where: isRegular)
+        return hasRequired && hasTokenizer ? nested : snapshot
+    }
+
 }
 
 private func qwenPackageURL(relativePath: String, root: URL) throws -> URL {
@@ -2236,6 +2264,7 @@ struct Qwen3TTSProcessInvocation: Sendable {
     let outputURL: URL
     let timeout: TimeInterval
     let requiresOutputFile: Bool
+    let deniesNetwork: Bool
 
     init(
         executableURL: URL,
@@ -2245,7 +2274,8 @@ struct Qwen3TTSProcessInvocation: Sendable {
         standardInput: Data,
         outputURL: URL,
         timeout: TimeInterval,
-        requiresOutputFile: Bool = true
+        requiresOutputFile: Bool = true,
+        deniesNetwork: Bool = true
     ) {
         self.executableURL = executableURL
         self.helperURL = helperURL
@@ -2255,6 +2285,7 @@ struct Qwen3TTSProcessInvocation: Sendable {
         self.outputURL = outputURL
         self.timeout = timeout
         self.requiresOutputFile = requiresOutputFile
+        self.deniesNetwork = deniesNetwork
     }
 }
 
@@ -2396,6 +2427,7 @@ private final class QwenProcessFinalizer {
 struct Qwen3TTSProcessRunner: Sendable {
     typealias ProcessGroupValidator = @Sendable (Int32) -> Bool
     private static let maximumCapturedBytes = 65_536
+    private static let networkDeniedSandboxProfile = "(version 1) (allow default) (deny network-outbound) (deny network-inbound)"
     private let processGroupValidator: ProcessGroupValidator
 
     init(
@@ -2432,8 +2464,16 @@ struct Qwen3TTSProcessRunner: Sendable {
         let stdout = QwenLockedDataBuffer(limit: Self.maximumCapturedBytes)
         let stderr = QwenLockedDataBuffer(limit: Self.maximumCapturedBytes)
         let reads = DispatchGroup()
-        process.executableURL = invocation.executableURL
-        process.arguments = ["-B", invocation.helperURL.path]
+        if invocation.deniesNetwork {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
+            process.arguments = [
+                "-p", Self.networkDeniedSandboxProfile,
+                invocation.executableURL.path, "-B", invocation.helperURL.path,
+            ]
+        } else {
+            process.executableURL = invocation.executableURL
+            process.arguments = ["-B", invocation.helperURL.path]
+        }
         process.currentDirectoryURL = invocation.currentDirectoryURL
         process.environment = invocation.environment
         process.standardInput = stdinPipe
@@ -2698,6 +2738,7 @@ actor Qwen3TTSClient {
             "PYTHONDONTWRITEBYTECODE": "1",
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
+            "HF_DATASETS_OFFLINE": "1",
             "TOKENIZERS_PARALLELISM": "false",
         ]
     }
@@ -2756,18 +2797,34 @@ actor VoxCPM2Client {
         self.runner = runner
     }
 
-    func validateProfile(_ profile: VoxCPM2VoiceProfile, applicationSupportRoot: URL) async throws {
+    func validateProfile(_ profile: VoxCPM2VoiceProfile, applicationSupportRoot: URL) async throws -> VoxCPM2ProbeResult {
         let validated = try VoxCPM2ProfileValidator.validate(profile: profile, applicationSupportRoot: applicationSupportRoot)
         let probe = try resolveResource(probeExecutableURL, named: "voxcpm2_probe.py")
         let job = applicationSupportRoot.appendingPathComponent("voice/tmp/\(UUID().uuidString.lowercased())", isDirectory: true)
         try DialogueVoiceAssetInstaller.ensurePrivateDirectory(job)
         defer { try? FileManager.default.removeItem(at: job) }
-        let request = try JSONSerialization.data(withJSONObject: ["snapshot_root": validated.snapshotRoot.path])
+        let marker = job.appendingPathComponent("probe.json")
+        let request = try JSONSerialization.data(withJSONObject: [
+            "snapshot_root": validated.snapshotRoot.path,
+            "model_root": validated.modelRoot.path,
+            "probe_output": marker.path,
+        ], options: [.sortedKeys])
         try await runner(Qwen3TTSProcessInvocation(
             executableURL: validated.pythonExecutable, helperURL: probe, currentDirectoryURL: job,
             environment: Self.environment(home: job), standardInput: request,
-            outputURL: job.appendingPathComponent("probe.ok"), timeout: 30, requiresOutputFile: false
+            outputURL: marker, timeout: 30
         ))
+        let data = try Data(contentsOf: marker, options: [.mappedIfSafe])
+        guard data.count <= 4_096,
+              let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["schema"] as? Int == 1,
+              let sampleRate = object["sample_rate"] as? Int,
+              sampleRate == 48_000,
+              let device = object["device"] as? String,
+              ["mps", "cuda", "cpu"].contains(device) else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        return VoxCPM2ProbeResult(device: device, sampleRate: sampleRate)
     }
 
     func synthesize(profile: VoxCPM2VoiceProfile, line: DialogueLine,
@@ -2784,7 +2841,10 @@ actor VoxCPM2Client {
         defer { try? FileManager.default.removeItem(at: job) }
         let output = job.appendingPathComponent("result.wav")
         let request = try JSONSerialization.data(withJSONObject: [
-            "snapshot_root": validated.snapshotRoot.path, "reference_file": validated.referenceAudio.path,
+            "snapshot_root": validated.snapshotRoot.path,
+            "model_root": validated.modelRoot.path,
+            "prompt_wav_path": validated.referenceAudio.path,
+            "reference_wav_path": validated.referenceAudio.path,
             "reference_text": profile.referenceText, "text": line.text, "output_file": output.path,
             "cfg_value": profile.parameters.cfgValue,
             "inference_timesteps": profile.parameters.inferenceTimesteps,

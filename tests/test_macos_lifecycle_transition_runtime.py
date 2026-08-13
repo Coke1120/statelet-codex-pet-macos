@@ -59,6 +59,28 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         self.assertIn("advanceSelection: false", retry_source)
         self.assertIn("selectionRequest: selectionRequest", retry_source)
 
+    def test_same_state_clip_end_uses_layered_handoff_and_direct_fallback(self):
+        advance = self.app.index("private func advancePlaylistAfterClipEnd")
+        begin = self.app.index("private func beginInStateTransition", advance)
+        advance_source = self.app[advance:begin]
+        self.assertIn("InStateTransitionPolicy.shouldTrigger", advance_source)
+        self.assertIn("beginInStateTransition(state: state)", advance_source)
+        self.assertIn('refreshReason: "clip_end"', advance_source)
+
+        begin_end = self.app.index("private func handlePresentationEvent", begin)
+        begin_source = self.app[begin:begin_end]
+        self.assertIn("destination: state", begin_source)
+        self.assertIn("selectionRequest: nil", begin_source)
+        self.assertIn("attestRuntimeTransition", begin_source)
+
+        finish = self.app.index("private func finishLifecycleTransition")
+        finish_end = self.app.index("private static func attestRuntimeTransition", finish)
+        finish_source = self.app[finish:finish_end]
+        self.assertIn("if active.isInState", finish_source)
+        self.assertIn('refreshReason: "in_state_handoff_failed"', finish_source)
+        self.assertIn("preselectedEntry: active.destinationEntry", finish_source)
+        self.assertIn("advanceSelection: false", finish_source)
+
         active = self.app.index("private struct ActiveLifecycleTransition")
         active_end = self.app.index("enum LifecycleTransitionCompletionDecision", active)
         active_source = self.app[active:active_end]

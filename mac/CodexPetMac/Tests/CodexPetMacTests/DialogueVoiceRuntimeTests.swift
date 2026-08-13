@@ -438,6 +438,51 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         XCTAssertEqual(body["text"] as? String, "private sentence")
         XCTAssertEqual(body["text_language"] as? String, "japanese")
         XCTAssertEqual(body["reference_language"] as? String, "japanese")
+        XCTAssertTrue(invocation.deniesNetwork)
+        XCTAssertEqual(body["prompt_wav_path"] as? String, body["reference_wav_path"] as? String)
+    }
+
+    func testNetworkDeniedProcessInvocationUsesOSNetworkSandbox() {
+        let invocation = Qwen3TTSProcessInvocation(
+            executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+            helperURL: URL(fileURLWithPath: "/tmp/helper.py"),
+            currentDirectoryURL: FileManager.default.temporaryDirectory,
+            environment: [:], standardInput: Data(), outputURL: URL(fileURLWithPath: "/tmp/out"),
+            timeout: 1
+        )
+        XCTAssertTrue(invocation.deniesNetwork)
+    }
+
+    func testProcessRunnerDeniesOutboundSocketForLocalVoiceHelper() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("voice-network-denial-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let helper = root.appendingPathComponent("network.py")
+        let marker = root.appendingPathComponent("network.result")
+        try Data(
+            "import socket\n"
+                .appending("try:\n")
+                .appending(" s = socket.socket()\n")
+                .appending(" s.settimeout(1)\n")
+                .appending(" s.connect(('1.1.1.1', 80))\n")
+                .appending(" result = 'connected'\n")
+                .appending("except PermissionError:\n")
+                .appending(" result = 'denied'\n")
+                .appending("except OSError:\n")
+                .appending(" result = 'blocked'\n")
+                .appending("open('network.result', 'w').write(result)\n")
+                .appending("import sys; sys.stdin.buffer.read()\n")
+                .utf8
+        ).write(to: helper)
+        try await Qwen3TTSProcessRunner().run(Qwen3TTSProcessInvocation(
+            executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+            helperURL: helper,
+            currentDirectoryURL: root,
+            environment: ["PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"],
+            standardInput: Data(), outputURL: marker, timeout: 5
+        ))
+        XCTAssertNotEqual(try String(contentsOf: marker, encoding: .utf8), "connected")
     }
 
     func testQwenJapaneseLanguageAliasesAreBoundedAndCanonical() {
@@ -1845,6 +1890,24 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         return data
     }
 
+    private func voxPCM48kWAV(sampleFrames: Int) -> Data {
+        let sampleBytes = sampleFrames * 2
+        var data = Data("RIFF".utf8)
+        appendUInt32(UInt32(36 + sampleBytes), to: &data)
+        data.append(Data("WAVEfmt ".utf8))
+        appendUInt32(16, to: &data)
+        appendUInt16(1, to: &data)
+        appendUInt16(1, to: &data)
+        appendUInt32(48_000, to: &data)
+        appendUInt32(96_000, to: &data)
+        appendUInt16(2, to: &data)
+        appendUInt16(16, to: &data)
+        data.append(Data("data".utf8))
+        appendUInt32(UInt32(sampleBytes), to: &data)
+        data.append(Data(repeating: 0, count: sampleBytes))
+        return data
+    }
+
     private func makeQwenFixture(root: URL) throws -> QwenFixture {
         let packageRelative = "voice/packages/qwen/fixture"
         let package = root.appendingPathComponent(packageRelative, isDirectory: true)
@@ -1959,6 +2022,17 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             at: root.appendingPathComponent("unsafe"), withDestinationURL: root.appendingPathComponent("config.json")
         )
         XCTAssertThrowsError(try VoxCPM2ProfileValidator.computeSnapshotTreeSHA256(snapshotRoot: root))
+    }
+
+    func testVoxCPM2OutputValidationRequires48kMonoPCM16() {
+        let valid = voxPCM48kWAV(sampleFrames: 240)
+        XCTAssertTrue(VoxCPM2Client.isValidOutputWAV(valid))
+        var wrongRate = valid
+        wrongRate[24] = 0x80
+        wrongRate[25] = 0x3e
+        wrongRate[28] = 0x00
+        wrongRate[29] = 0x7d
+        XCTAssertFalse(VoxCPM2Client.isValidOutputWAV(wrongRate))
     }
 
     private func appendUInt16(_ value: UInt16, to data: inout Data) {

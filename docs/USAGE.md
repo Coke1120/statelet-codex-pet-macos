@@ -422,8 +422,9 @@ them.
 
 ## Dialogue and local voice
 
-Open **Settings → Voice**. Use **Voice Setup** to configure one local GPT-SoVITS
-voice profile, then use **Dialogue** to enter text and manage generated lines.
+Open **Settings → Voice**. Use **Voice Setup** to configure one local
+GPT-SoVITS, Qwen3-TTS, or VoxCPM2 voice profile, then use **Dialogue** to enter
+text and manage generated lines.
 If no profile has been saved yet, Voice opens on Voice Setup; otherwise it opens
 on Dialogue and remembers subsequent page changes while Settings remains open.
 
@@ -477,6 +478,40 @@ zero fragment interval, and the bounded sampling values documented in the
 source so short messages remain contiguous. Statelet versions generated output
 independently from the model fingerprint; after this recipe changes, legacy WAV
 files remain protected until their replacements generate successfully.
+
+### VoxCPM2 setup and recovery
+
+Select **VoxCPM2** in **Settings → Voice → Voice Setup** and complete the three
+pickers: the complete trusted handover directory, one reference WAV, and the
+Python executable from the prepared VoxCPM2 environment. Import the entire
+folder; selecting only `model.safetensors` is not sufficient because the
+snapshot also needs `audiovae.pth`, configuration, tokenizer files, and the
+tokenization module. Enter the exact reference transcript from the handover.
+Statelet copies only the reference WAV into private Application Support. The
+external snapshot is never copied, bundled, uploaded, or logged; its complete
+regular-file tree, selected runtime, reference identity, transcript, and
+synthesis settings are fingerprinted and rechecked before each use.
+
+Profile validation runs a bounded offline probe with `load_denoiser=False`,
+`optimize=False`, and `local_files_only=True`. The probe must load the model,
+report only `mps`, `cuda`, or `cpu`, and confirm a 48 kHz model output rate.
+The probe and generator execute below an OS network-denied child-process
+policy in addition to the helper's Hugging Face offline flags. A profile stays
+`Invalid` or `Local service unavailable` when the snapshot, runtime, probe, or
+reference changes; reselect the original complete folder and matching Python
+environment rather than editing the pinned snapshot.
+
+VoxCPM2 uses the same WAV/reference audio for `prompt_wav_path` and
+`reference_wav_path`, with the saved transcript as `prompt_text`. Generation is
+asynchronous, cancellable, and bounded; an old ready WAV remains until a new
+48 kHz mono PCM16 result passes structural validation and atomic publication.
+On Apple Silicon, MPS is deliberately promoted to float32 for stability and
+can be slow or memory-intensive. A `Ready` status proves software validation,
+not audible quality: use **Preview** and assess the private audio locally.
+
+Removing VoxCPM2 removes only its managed reference and generated speech while
+preserving dialogue text and other configured providers. Deferred cleanup is
+retained and retried if a managed file cannot be removed safely.
 
 Managed voice data lives below:
 

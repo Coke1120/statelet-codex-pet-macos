@@ -1140,6 +1140,39 @@ final class CodexPetCoreTests: XCTestCase {
         ))
     }
 
+    func testCharacterBundleSameStateTransitionRewriteRequiresAndPreservesAssets() throws {
+        let hash = String(repeating: "b", count: 64)
+        let handoff = try MediaEntry(
+            path: "movies/idle-handoff.mov",
+            posterPath: "posters/idle-handoff.png",
+            loop: true
+        )
+        let map = try MediaMap(
+            states: [.idle: try MediaEntry(path: "movies/idle.mov")],
+            inStateTransitions: [.idle: handoff]
+        )
+        let manifest = try CharacterBundleManifest(
+            characterID: "same-state-character",
+            characterName: "Same State Character",
+            mediaMap: map,
+            assets: [
+                CharacterBundleAsset(role: .movie, path: "movies/idle.mov", size: 1, sha256: hash),
+                CharacterBundleAsset(role: .movie, path: handoff.path, size: 1, sha256: hash),
+                CharacterBundleAsset(role: .poster, path: handoff.posterPath!, size: 1, sha256: hash),
+            ]
+        )
+        let rewritten = try manifest.mediaMap(rewritingPaths: { "installed/\($0)" })
+        XCTAssertEqual(rewritten.inStateTransition(for: .idle)?.path, "installed/movies/idle-handoff.mov")
+        XCTAssertEqual(rewritten.inStateTransition(for: .idle)?.posterPath, "installed/posters/idle-handoff.png")
+        XCTAssertFalse(try XCTUnwrap(rewritten.inStateTransition(for: .idle)).loop)
+        XCTAssertThrowsError(try CharacterBundleManifest(
+            characterID: "same-state-character",
+            characterName: "Same State Character",
+            mediaMap: map,
+            assets: [CharacterBundleAsset(role: .movie, path: "movies/idle.mov", size: 1, sha256: hash)]
+        ))
+    }
+
     func testMediaPlaylistValidationAndNormalizedPaths() throws {
         let first = try MediaEntry(path: "clips/./idle.mov")
         let duplicate = try MediaEntry(path: "clips/other/../idle.mov")
