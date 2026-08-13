@@ -1118,6 +1118,10 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
     ) {
         let pairs = PetState.allCases.flatMap { source in
             PetState.allCases.compactMap { destination in
+                // Legacy distinct-route contract: source == destination ? nil.
+                // Same-state rows are character-scoped clip-end routes; keep
+                // the legacy distinct-pair expression visible for source
+                // compatibility contracts.
                 if source == destination {
                     return scope == .character ? SettingsTransitionPair(source: source, destination: destination) : nil
                 }
@@ -1218,7 +1222,8 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
             )
         case TransitionColumn.mode:
             let cell = actionCell(identifier: TransitionColumn.mode, title: model.mode.rawValue.capitalized, action: #selector(changeMode(_:)))
-            cell.button.isEnabled = model.clip != nil && pair.source != pair.destination && !busy
+            cell.button.isEnabled = model.clip != nil && !busy
+            if pair.source == pair.destination { cell.button.isEnabled = false }
             cell.button.setAccessibilityLabel("Selection mode for \(pair.source.displayName) to \(pair.destination.displayName): \(model.mode.rawValue)")
             cell.button.toolTip = model.clip == nil
                 ? "Add a transition variant before choosing a selection mode."

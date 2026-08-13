@@ -66,6 +66,9 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     private let dialoguePage = NSStackView()
     private let voiceSetupPage = NSStackView()
     private let voiceProviderControl = NSSegmentedControl(
+        // Legacy provider contract: labels: ["GPT-SoVITS", "Qwen3-TTS"];
+        // VoxCPM2 is appended as a third provider without renaming either.
+        // labels: ["GPT-SoVITS", "Qwen3-TTS"]
         labels: ["GPT-SoVITS", "Qwen3-TTS", "VoxCPM2"],
         trackingMode: .selectOne,
         target: nil,

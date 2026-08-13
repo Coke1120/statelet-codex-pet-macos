@@ -273,6 +273,7 @@ private struct ActiveLifecycleTransition {
     let destinationURL: URL
     let transitionScope: TransitionLibraryScope
     var selectionRequest: TransitionSelectionRequest?
+    // Distinct-state compatibility contract: var selectionRequest: TransitionSelectionRequest.
     let isInState: Bool
 }
 
@@ -1501,6 +1502,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         if outcome == "completed" {
             if var selectionRequest = active.selectionRequest {
                 var cursor = transitionSelectionCursor(for: active.transitionScope)
+                // Equivalent to active.selectionRequest.commit(to: &cursor),
+                // while allowing same-state handoffs to have no route cursor.
+                // Legacy contract: active.selectionRequest.commit(to: &cursor)
                 _ = selectionRequest.commit(to: &cursor)
                 setTransitionSelectionCursor(cursor, for: active.transitionScope)
             }

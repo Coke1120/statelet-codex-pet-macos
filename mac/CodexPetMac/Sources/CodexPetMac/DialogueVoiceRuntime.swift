@@ -1035,7 +1035,11 @@ enum VoxCPM2ProfileValidator {
             entries.append((relative, url, size, digest))
         }
         let names = Set(entries.map(\.0))
-        guard requiredFiles.allSatisfy(names.contains), tokenizerCandidates.contains(where: names.contains) else {
+        func containsSnapshotFile(_ name: String) -> Bool {
+            names.contains(name) || names.contains("model/\(name)")
+        }
+        guard requiredFiles.allSatisfy(containsSnapshotFile),
+              tokenizerCandidates.contains(where: containsSnapshotFile) else {
             throw DialogueVoiceRuntimeError.profileRejected
         }
         let components = entries.sorted { $0.0 < $1.0 }.flatMap { [$0.0, $0.3] }
@@ -2489,7 +2493,9 @@ struct Qwen3TTSProcessRunner: Sendable {
         let standardError = stderr.snapshot
         guard !standardOutput.overflowed, !standardError.overflowed,
               standardOutput.data.isEmpty,
-              standardError.data.isEmpty || standardError.data == Data("QWEN_TTS_FAILED\n".utf8) else {
+              standardError.data.isEmpty
+                || standardError.data == Data("QWEN_TTS_FAILED\n".utf8)
+                || standardError.data == Data("VOXCPM2_FAILED\n".utf8) else {
             throw DialogueVoiceRuntimeError.inferenceUnavailable
         }
         guard process.terminationStatus == 0 else {
