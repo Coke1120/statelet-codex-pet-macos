@@ -1190,12 +1190,12 @@ final class PetPlayerController {
                 ?? "preparing media"
         )
         scheduleDirectReadinessTimeout(transitionID: transitionID)
+        // Preroll warms the hidden standby without advancing it. Starting the
+        // same player here would overlap decoder startup; playback begins only
+        // after both readiness gates atomically promote this player to base.
         replacementPlayer.preroll(atRate: Float(playbackRate)) { [weak self] ready in
             guard ready else { return }
             DispatchQueue.main.async { self?.tryPromoteDirectReplacement(transitionID: transitionID) }
-        }
-        if suspensionPolicy.reasons.isEmpty {
-            replacementPlayer.playImmediately(atRate: Float(playbackRate))
         }
         return .preparing
     }
@@ -1826,7 +1826,6 @@ final class PetPlayerController {
         if let replacementID = activeDirectReplacement?.id {
             tryPromoteDirectReplacement(transitionID: replacementID)
             if let replacement = activeDirectReplacement, replacement.id == replacementID {
-                replacement.player.playImmediately(atRate: Float(replacement.entry.playbackRate.value))
                 scheduleDirectReadinessTimeout(transitionID: replacement.id)
             }
         }

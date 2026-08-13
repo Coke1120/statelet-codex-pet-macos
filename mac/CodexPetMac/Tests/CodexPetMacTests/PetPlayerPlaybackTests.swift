@@ -472,10 +472,14 @@ final class PetPlayerPlaybackTests: XCTestCase {
         XCTAssertTrue(view.playerLayer.player === outgoingPlayer)
         XCTAssertFalse(view.playerLayer.isHidden)
         XCTAssertTrue(view.destinationPlayerLayer.isHidden)
+        let standbyPlayer = try XCTUnwrap(view.destinationPlayerLayer.player)
+        XCTAssertEqual(standbyPlayer.rate, 0, "hidden standby playback must not start before promotion")
         try await Self.waitUntil("direct replacement was not atomically promoted") {
             controller.currentState == .running
-                && view.playerLayer.player !== outgoingPlayer
+                && view.playerLayer.player === standbyPlayer
+                && standbyPlayer.rate > 0
         }
+        XCTAssertGreaterThan(standbyPlayer.rate, 0)
         XCTAssertNil(view.destinationPlayerLayer.player)
     }
 
