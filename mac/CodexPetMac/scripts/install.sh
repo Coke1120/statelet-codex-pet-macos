@@ -513,6 +513,411 @@ def validate_install_ancestor_mutations(data, indices):
     for index in indices:
         validate_live_install(data["operations"][index])
 
+def validate_handed_off_install(operation):
+    parent, name = open_parent(Path(operation["target"]), home)
+    try:
+        if entry_identity(os.fstat(parent)) != operation.get("target_parent"):
+            raise ValueError("transaction parent changed")
+        status = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if not stat.S_ISREG(status.st_mode) or status.st_uid != os.getuid():
+            raise ValueError("handed-off entry is unsafe")
+    finally:
+        os.close(parent)
+
+def validate_operation_contract(data, allowed_targets):
+    for operation in data.get("operations", []):
+        if not isinstance(operation, dict):
+            raise ValueError("transaction operation is invalid")
+        kind = operation.get("kind")
+        source = Path(operation.get("source", ""))
+        target = Path(operation.get("target", ""))
+        if kind not in {"backup", "install", "mkdir", "retain"} or not target.is_absolute() or str(target) not in allowed_targets:
+            raise ValueError("transaction operation is invalid")
+        if kind in {"mkdir", "retain"}:
+            if operation.get("source") != "":
+                raise ValueError("transaction operation is invalid")
+            continue
+        try:
+            source.relative_to(root)
+        except ValueError as error:
+            raise ValueError("transaction operation is invalid") from error
+        expected_source_root = root / "backup" if kind == "backup" else root / "stage"
+        try:
+            source.relative_to(expected_source_root)
+        except ValueError as error:
+            raise ValueError("transaction operation is invalid") from error
+
+def validate_retain(operation):
+    parent, name = open_parent(Path(operation["target"]), home)
+    try:
+        if entry_identity(os.fstat(parent)) != operation.get("target_parent"):
+            raise ValueError("transaction parent changed")
+        digest_value, current_identity = entry_digest_and_identity(parent, name)
+        if current_identity != operation.get("target_entry") or digest_value != operation.get("digest"):
+            raise ValueError("retained entry changed")
+    finally:
+        os.close(parent)
+
+def validate_backup_coverage(data):
+    declared = []
+    for operation in data.get("operations", []):
+        if operation.get("kind") != "backup":
+            continue
+        try:
+            declared.append(tuple(Path(operation["source"]).relative_to(root / "backup").parts))
+        except ValueError as error:
+            raise ValueError("transaction backup source is invalid") from error
+    root_fd = os.open(root / "backup", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        def visit(directory_fd, prefix):
+            names = sorted(os.listdir(directory_fd))
+            for name in names:
+                current_parts = prefix + (name,)
+                status = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                within_declared = any(current_parts[:len(parts)] == parts for parts in declared)
+                ancestor_of_declared = any(parts[:len(current_parts)] == current_parts for parts in declared)
+                if not within_declared and not ancestor_of_declared:
+                    raise ValueError("unreferenced transaction backup entry")
+                if stat.S_ISDIR(status.st_mode):
+                    child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
+                    try:
+                        visit(child, current_parts)
+                    finally:
+                        os.close(child)
+                elif not stat.S_ISREG(status.st_mode):
+                    raise ValueError("unsafe transaction backup entry")
+        visit(root_fd, ())
+    finally:
+        os.close(root_fd)
+
+def open_bound_directory(path):
+    descriptor, name = open_parent(path, home)
+    try:
+        child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+    finally:
+        os.close(descriptor)
+    status = os.fstat(child)
+    if status.st_uid != os.getuid():
+        os.close(child)
+        raise ValueError("unsafe handed-off directory owner")
+    return child, entry_identity(status)
+
+def record_handoff(support):
+    runtime = support / "runtime"
+    logs = support / "logs"
+    runtime_fd, runtime_identity = open_bound_directory(runtime)
+    logs_fd, logs_identity = open_bound_directory(logs)
+    try:
+        try:
+            current = os.stat("current_state.json", dir_fd=runtime_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            current_state = {"state": "absent"}
+        else:
+            if not stat.S_ISREG(current.st_mode) or current.st_uid != os.getuid():
+                raise ValueError("handed-off entry is unsafe")
+            current_state = {"state": "regular", "identity": entry_identity(current)}
+    finally:
+        os.close(runtime_fd)
+        os.close(logs_fd)
+    return {
+        "runtime": {"path": str(runtime), "identity": runtime_identity},
+        "logs": {"path": str(logs), "identity": logs_identity, "mutable_descendants": True},
+        "current_state": {"path": str(runtime / "current_state.json"), "initial": current_state, "mutable": True},
+    }
+
+def validate_handoff_contract(data, support):
+    handoff = data.get("handoff")
+    if not isinstance(handoff, dict) or set(handoff) != {"runtime", "logs", "current_state"}:
+        raise ValueError("transaction handoff state is invalid")
+    runtime = support / "runtime"
+    logs = support / "logs"
+    expected_paths = (str(runtime), str(logs), str(runtime / "current_state.json"))
+    runtime_data, logs_data, current_data = handoff["runtime"], handoff["logs"], handoff["current_state"]
+    if (not isinstance(runtime_data, dict) or set(runtime_data) != {"path", "identity"}
+            or not isinstance(logs_data, dict) or set(logs_data) != {"path", "identity", "mutable_descendants"}
+            or not isinstance(current_data, dict) or set(current_data) != {"path", "initial", "mutable"}
+            or (runtime_data["path"], logs_data["path"], current_data["path"]) != expected_paths
+            or logs_data["mutable_descendants"] is not True or current_data["mutable"] is not True
+            or not all(type(value) is int for item in (runtime_data["identity"], logs_data["identity"])
+                       if isinstance(item, list) and len(item) == 2 for value in item)
+            or not all(isinstance(item, list) and len(item) == 2 for item in (runtime_data["identity"], logs_data["identity"]))):
+        raise ValueError("transaction handoff state is invalid")
+    initial = current_data["initial"]
+    if (not isinstance(initial, dict) or initial.get("state") not in {"absent", "regular"}
+            or (initial["state"] == "absent" and set(initial) != {"state"})
+            or (initial["state"] == "regular" and
+                (set(initial) != {"state", "identity"} or not isinstance(initial["identity"], list)
+                 or len(initial["identity"]) != 2 or not all(type(value) is int for value in initial["identity"])))):
+        raise ValueError("transaction handoff state is invalid")
+    runtime_fd, runtime_identity = open_bound_directory(runtime)
+    logs_fd, logs_identity = open_bound_directory(logs)
+    try:
+        if runtime_identity != runtime_data["identity"] or logs_identity != logs_data["identity"]:
+            raise ValueError("handed-off directory changed")
+        try:
+            current = os.stat("current_state.json", dir_fd=runtime_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        if current is not None and (not stat.S_ISREG(current.st_mode) or current.st_uid != os.getuid()):
+            raise ValueError("handed-off entry is unsafe")
+    finally:
+        os.close(runtime_fd)
+        os.close(logs_fd)
+    return {support / "runtime/current_state.json"}
+
+def seal_payload(data):
+    operations = data.get("operations")
+    launch = data.get("launch")
+    handoff = data.get("handoff")
+    if not isinstance(operations, list) or not isinstance(launch, dict) or not isinstance(handoff, dict):
+        raise ValueError("transaction seal inputs are invalid")
+    active_targets = [
+        data["operations"][index]["target"]
+        for index in active_install_indices(operations)
+    ]
+    if launch == {"skipped": True}:
+        sealed_launch = {"skipped": True}
+    else:
+        sealed_launch = {
+            "labels": launch.get("labels"),
+            "plists": launch.get("plists"),
+            "desired": launch.get("desired"),
+        }
+    return {
+        "operations": operations,
+        "operation_count": len(operations),
+        "active_targets": active_targets,
+        "handoff": handoff,
+        "launch": sealed_launch,
+    }
+
+def seal_digest(payload):
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+def record_seal(data):
+    payload = seal_payload(data)
+    data["seal"] = {
+        "version": 1,
+        "operation_count": payload["operation_count"],
+        "active_targets": payload["active_targets"],
+        "digest": seal_digest(payload),
+    }
+
+def validate_seal(data):
+    seal = data.get("seal")
+    if (not isinstance(seal, dict) or set(seal) != {"version", "operation_count", "active_targets", "digest"}
+            or seal.get("version") != 1 or type(seal.get("operation_count")) is not int
+            or not isinstance(seal.get("active_targets"), list)
+            or not all(isinstance(value, str) for value in seal["active_targets"])
+            or not isinstance(seal.get("digest"), str) or len(seal["digest"]) != 64):
+        raise ValueError("transaction seal is invalid")
+    payload = seal_payload(data)
+    if (seal["operation_count"] != payload["operation_count"]
+            or seal["active_targets"] != payload["active_targets"]
+            or seal["digest"] != seal_digest(payload)):
+        raise ValueError("transaction seal is invalid")
+
+def validate_required_publication(data, installer_args, support):
+    if len(installer_args) < 9:
+        raise ValueError("transaction publication contract is invalid")
+    active_targets = {
+        Path(data["operations"][index]["target"])
+        for index in active_install_indices(data.get("operations", []))
+    }
+    app, legacy_app, component, legacy_component = map(Path, installer_args[:4])
+    aggregator_plist, player_plist, legacy_aggregator_plist, legacy_player_plist = map(Path, installer_args[4:8])
+    hooks = Path(installer_args[8])
+    required = {app, component, aggregator_plist, hooks, support / ".legacy-migration-v1.json"}
+    forbidden = {legacy_app, legacy_component, legacy_aggregator_plist, legacy_player_plist}
+    if not required.issubset(active_targets) or active_targets.intersection(forbidden):
+        raise ValueError("transaction publication contract is invalid")
+    media_map = support / "media/media-map.json"
+    media_operations = [
+        operation for operation in data.get("operations", [])
+        if Path(operation.get("target", "")) == media_map and operation.get("kind") in {"install", "retain"}
+    ]
+    if len(media_operations) != 1:
+        raise ValueError("transaction publication contract is invalid")
+    player_active = player_plist in active_targets
+    launch = data.get("launch")
+    if launch == {"skipped": True}:
+        return
+    if not isinstance(launch, dict) or launch.get("desired") != [True, player_active, False, False]:
+        raise ValueError("transaction publication contract is invalid")
+
+def validate_file_transaction(data, handed_off_targets=()):
+    operations = data.get("operations", [])
+    active_installs = active_install_indices(operations)
+    replayed_installs = []
+    displaced_installs = set()
+    for index, operation in enumerate(operations):
+        kind = operation.get("kind")
+        target = Path(operation.get("target", ""))
+        if kind == "backup":
+            displaced = [
+                owner_index
+                for owner_index in replayed_installs
+                if is_within(Path(operations[owner_index]["target"]), target)
+            ]
+            for owner_index in displaced:
+                owner = operations[owner_index]
+                relative = Path(owner["target"]).relative_to(target)
+                saved_path = Path(operation["source"]) / relative
+                saved_parent, saved_name = open_parent(saved_path, root)
+                try:
+                    validate_install_at(owner, saved_parent, saved_name)
+                finally:
+                    os.close(saved_parent)
+                displaced_installs.add(owner_index)
+            replayed_installs = [owner for owner in replayed_installs if owner not in displaced]
+        elif kind == "install":
+            displaced = [
+                owner_index
+                for owner_index in replayed_installs
+                if is_within(Path(operations[owner_index]["target"]), target)
+            ]
+            if displaced:
+                raise ValueError("install ownership graph is ambiguous")
+            replayed_installs.append(index)
+
+    if replayed_installs != active_installs:
+        raise ValueError("install ownership graph is invalid")
+
+    for operation_index, operation in enumerate(operations):
+        kind = operation.get("kind")
+        if kind in {"install", "backup"}:
+            source_parent, source_name = open_parent(Path(operation["source"]), root)
+            recorded_target_parent = open_recorded_target_parent(operations, operation_index)
+            live_target_parent = None
+            try:
+                source_status = os.fstat(source_parent)
+                if entry_identity(source_status) != operation.get("source_parent"):
+                    raise ValueError("transaction parent changed")
+                try: source_digest, source_entry_identity = entry_digest_and_identity(source_parent, source_name)
+                except FileNotFoundError: source_exists = False
+                else: source_exists = True
+                try:
+                    live_target_parent, target_name = open_parent(Path(operation["target"]), home)
+                    os.stat(target_name, dir_fd=live_target_parent, follow_symlinks=False)
+                except (FileNotFoundError, NotADirectoryError):
+                    target_exists = False
+                else:
+                    target_exists = True
+                if kind == "install":
+                    if (source_exists or
+                        (operation_index in active_installs and not target_exists) or
+                        (operation_index not in active_installs and operation_index not in displaced_installs)):
+                        raise ValueError("installed entry changed")
+                else:
+                    later_owner = active_install_owner(
+                        operations, active_installs, Path(operation["target"])
+                    )
+                    if ((later_owner is None and target_exists) or
+                        (later_owner is not None and later_owner <= operation_index) or
+                        not source_exists or source_entry_identity != operation.get("source_entry") or
+                        source_digest != operation["digest"]):
+                        raise ValueError("backup entry changed")
+            finally:
+                os.close(source_parent)
+                os.close(recorded_target_parent)
+                if live_target_parent is not None:
+                    os.close(live_target_parent)
+        elif kind == "mkdir":
+            parent, _ = open_parent(Path(operation["target"]), home)
+            try:
+                status = os.fstat(parent)
+                if [status.st_dev, status.st_ino] != operation.get("target_parent"):
+                    raise ValueError("transaction parent changed")
+                child = os.stat(Path(operation["target"]).name, dir_fd=parent, follow_symlinks=False)
+                if not stat.S_ISDIR(child.st_mode) or [child.st_dev, child.st_ino] != operation.get("created"):
+                    raise ValueError("transaction directory changed")
+            finally:
+                os.close(parent)
+        elif kind == "retain":
+            validate_retain(operation)
+    for index in active_installs:
+        if Path(operations[index]["target"]) in handed_off_targets:
+            validate_handed_off_install(operations[index])
+        else:
+            validate_live_install(operations[index])
+
+def validate_launch_plist(data, label, plist):
+    launch = data.get("launch")
+    if not isinstance(launch, dict) or label not in launch.get("labels", []):
+        raise ValueError("transaction launch state is invalid")
+    index = launch["labels"].index(label)
+    if index >= len(launch.get("plists", [])) or launch["plists"][index] != plist:
+        raise ValueError("transaction launch state is invalid")
+    owners = [
+        operation_index
+        for operation_index in active_install_indices(data.get("operations", []))
+        if data["operations"][operation_index].get("target") == plist
+    ]
+    if len(owners) != 1:
+        raise ValueError("launch plist ownership is invalid")
+    validate_live_install(data["operations"][owners[0]])
+
+def original_launch_plist_attestation(data, label, plist, require_backup=False):
+    launch = data.get("launch")
+    if not isinstance(launch, dict) or label not in launch.get("labels", []):
+        raise ValueError("transaction launch state is invalid")
+    index = launch["labels"].index(label)
+    if index >= len(launch.get("plists", [])) or launch["plists"][index] != plist:
+        raise ValueError("transaction launch state is invalid")
+    originals = launch.get("original_plists")
+    if (not isinstance(originals, list) or len(originals) != 4
+            or any(item is not None and
+                   (not isinstance(item, dict) or set(item) != {"parent", "entry", "digest"}
+                    or not all(isinstance(value, list) and len(value) == 2
+                               and all(type(part) is int for part in value)
+                               for value in (item.get("parent"), item.get("entry")))
+                    or not isinstance(item.get("digest"), str) or len(item["digest"]) != 64)
+                   for item in originals)):
+        raise ValueError("restored launch plist ownership is invalid")
+    backups = [
+        operation for operation in data.get("operations", [])
+        if operation.get("kind") == "backup" and operation.get("target") == plist
+    ]
+    if len(backups) > 1 or (require_backup and len(backups) != 1):
+        raise ValueError("restored launch plist ownership is invalid")
+    original = originals[index]
+    if not isinstance(original, dict):
+        raise ValueError("restored launch plist ownership is invalid")
+    if backups:
+        operation = backups[0]
+        if (operation.get("digest") != original.get("digest")
+                or operation.get("target_parent") != original.get("parent")
+                or operation.get("source_entry") != original.get("entry")):
+            raise ValueError("restored launch plist attestation changed")
+    return original
+
+def validate_launch_backup_attestations(data):
+    launch = data.get("launch")
+    if launch == {"skipped": True}:
+        return
+    if not isinstance(launch, dict):
+        raise ValueError("transaction launch state is invalid")
+    labels, plists, loaded = (launch.get(key) for key in ("labels", "plists", "loaded"))
+    if (not all(isinstance(values, list) and len(values) == 4 for values in (labels, plists, loaded))
+            or not all(isinstance(value, bool) for value in loaded)):
+        raise ValueError("transaction launch state is invalid")
+    for label, plist, was_loaded in zip(labels, plists, loaded):
+        if was_loaded:
+            original_launch_plist_attestation(data, label, plist, require_backup=True)
+
+def validate_restored_launch_plist(data, label, plist):
+    original = original_launch_plist_attestation(data, label, plist)
+    parent, name = open_parent(Path(plist), home)
+    try:
+        digest_value, current_identity = entry_digest_and_identity(parent, name)
+        if entry_identity(os.fstat(parent)) != original.get("parent"):
+            raise ValueError("transaction parent changed")
+        if digest_value != original.get("digest") or current_identity != original.get("entry"):
+            raise ValueError("restored launch plist changed")
+    finally:
+        os.close(parent)
+
 def sync_directory(path):
     descriptor = os.open(path, os.O_RDONLY)
     try:
@@ -539,7 +944,7 @@ def load():
     if not stat.S_ISREG(journal_status.st_mode) or journal_status.st_uid != os.getuid():
         raise ValueError("transaction journal ownership is unsafe")
     data = json.loads(journal.read_text(encoding="utf-8"))
-    if data.get("version") != 1 or data.get("home") != str(home) or data.get("state") not in {"active", "committed"}:
+    if data.get("version") != 1 or data.get("home") != str(home) or data.get("state") not in {"active", "files-committed", "committed"}:
         raise ValueError("transaction journal identity is invalid")
     return data
 
@@ -660,12 +1065,56 @@ elif command == "mkdir-make":
         write(data)
     finally:
         os.close(parent)
+elif command == "retain":
+    target = Path(args[0])
+    data = load()
+    if data["state"] != "active":
+        raise ValueError("inactive transaction")
+    parent, name = open_parent(target, home)
+    try:
+        digest_value, current_identity = entry_digest_and_identity(parent, name)
+        parent_identity = entry_identity(os.fstat(parent))
+        data["operations"].append({"kind": "retain", "source": "", "target": str(target),
+                                   "digest": digest_value, "target_parent": parent_identity,
+                                   "target_entry": current_identity})
+        write(data)
+    finally:
+        os.close(parent)
 elif command == "launch-init":
     data = load()
     labels = args[:4]
     plists = args[4:8]
-    loaded = [value == "1" for value in args[8:12]]
-    data["launch"] = {"labels": labels, "plists": plists, "loaded": loaded, "pending": [False] * 4, "changed": [False] * 4}
+    loaded_values = args[8:12]
+    desired_values = args[12:16]
+    if (len(args) != 16 or any(value not in {"0", "1"} for value in loaded_values + desired_values)
+            or any(not value for value in labels + plists)):
+        raise ValueError("invalid launch state")
+    loaded = [value == "1" for value in loaded_values]
+    desired = [value == "1" for value in desired_values]
+    original_plists = []
+    for plist, was_loaded in zip(plists, loaded):
+        if not was_loaded:
+            original_plists.append(None)
+            continue
+        parent, name = open_parent(Path(plist), home)
+        try:
+            digest_value, current_identity = entry_digest_and_identity(parent, name)
+            current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if not stat.S_ISREG(current.st_mode) or current.st_uid != os.getuid():
+                raise ValueError("unsafe original launch plist")
+            original_plists.append({"parent": entry_identity(os.fstat(parent)),
+                                    "entry": current_identity, "digest": digest_value})
+        finally:
+            os.close(parent)
+    data["launch"] = {"labels": labels, "plists": plists, "loaded": loaded, "desired": desired,
+                      "original_plists": original_plists,
+                      "pending": [False] * 4, "changed": [False] * 4}
+    write(data)
+elif command == "launch-skip":
+    data = load()
+    if data["state"] != "active" or "launch" in data:
+        raise ValueError("invalid skipped launch state")
+    data["launch"] = {"skipped": True}
     write(data)
 elif command == "launch-phase":
     data = load()
@@ -683,8 +1132,15 @@ elif command == "launch-phase":
     else:
         data["launch"]["pending"][index] = False
     write(data)
-elif command == "commit":
+elif command == "launch-validate":
     data = load()
+    if data["state"] != "files-committed":
+        raise ValueError("file transaction is not committed")
+    validate_launch_plist(data, args[0], args[1])
+elif command == "files-commit":
+    data = load()
+    if data["state"] != "active":
+        raise ValueError("file transaction is not active")
     gate = os.environ.get("STATELET_INSTALL_TEST_COMMIT_GATE")
     if gate:
         gate_path = Path(gate)
@@ -696,95 +1152,28 @@ elif command == "commit":
             time.sleep(0.01)
         else:
             raise ValueError("test gate timeout")
-    operations = data.get("operations", [])
-    active_installs = active_install_indices(operations)
-    replayed_installs = []
-    displaced_installs = set()
-    for index, operation in enumerate(operations):
-        kind = operation.get("kind")
-        target = Path(operation.get("target", ""))
-        if kind == "backup":
-            displaced = [
-                owner_index
-                for owner_index in replayed_installs
-                if is_within(Path(operations[owner_index]["target"]), target)
-            ]
-            for owner_index in displaced:
-                owner = operations[owner_index]
-                relative = Path(owner["target"]).relative_to(target)
-                saved_path = Path(operation["source"]) / relative
-                saved_parent, saved_name = open_parent(saved_path, root)
-                try:
-                    validate_install_at(owner, saved_parent, saved_name)
-                finally:
-                    os.close(saved_parent)
-                displaced_installs.add(owner_index)
-            replayed_installs = [owner for owner in replayed_installs if owner not in displaced]
-        elif kind == "install":
-            displaced = [
-                owner_index
-                for owner_index in replayed_installs
-                if is_within(Path(operations[owner_index]["target"]), target)
-            ]
-            if displaced:
-                raise ValueError("install ownership graph is ambiguous")
-            replayed_installs.append(index)
-
-    if replayed_installs != active_installs:
-        raise ValueError("install ownership graph is invalid")
-
-    for operation_index, operation in enumerate(operations):
-        kind = operation.get("kind")
-        if kind in {"install", "backup"}:
-            source_parent, source_name = open_parent(Path(operation["source"]), root)
-            recorded_target_parent = open_recorded_target_parent(operations, operation_index)
-            live_target_parent = None
-            try:
-                source_status = os.fstat(source_parent)
-                if entry_identity(source_status) != operation.get("source_parent"):
-                    raise ValueError("transaction parent changed")
-                try: source_digest, source_entry_identity = entry_digest_and_identity(source_parent, source_name)
-                except FileNotFoundError: source_exists = False
-                else: source_exists = True
-                try:
-                    live_target_parent, target_name = open_parent(Path(operation["target"]), home)
-                    os.stat(target_name, dir_fd=live_target_parent, follow_symlinks=False)
-                except (FileNotFoundError, NotADirectoryError):
-                    target_exists = False
-                else:
-                    target_exists = True
-                if kind == "install":
-                    if (source_exists or
-                        (operation_index in active_installs and not target_exists) or
-                        (operation_index not in active_installs and operation_index not in displaced_installs)):
-                        raise ValueError("installed entry changed")
-                else:
-                    later_owner = active_install_owner(
-                        operations, active_installs, Path(operation["target"])
-                    )
-                    if ((later_owner is None and target_exists) or
-                        (later_owner is not None and later_owner <= operation_index) or
-                        not source_exists or source_entry_identity != operation.get("source_entry") or
-                        source_digest != operation["digest"]):
-                        raise ValueError("backup entry changed")
-            finally:
-                os.close(source_parent)
-                os.close(recorded_target_parent)
-                if live_target_parent is not None:
-                    os.close(live_target_parent)
-        elif kind == "mkdir":
-            parent, _ = open_parent(Path(operation["target"]), home)
-            try:
-                status = os.fstat(parent)
-                if [status.st_dev, status.st_ino] != operation.get("target_parent"):
-                    raise ValueError("transaction parent changed")
-                child = os.stat(Path(operation["target"]).name, dir_fd=parent, follow_symlinks=False)
-                if not stat.S_ISDIR(child.st_mode) or [child.st_dev, child.st_ino] != operation.get("created"):
-                    raise ValueError("transaction directory changed")
-            finally:
-                os.close(parent)
-    for index in active_installs:
-        validate_live_install(operations[index])
+    allowed_targets = set(args[:-1])
+    support = Path(args[-1])
+    validate_operation_contract(data, allowed_targets)
+    validate_required_publication(data, args, support)
+    validate_backup_coverage(data)
+    validate_launch_backup_attestations(data)
+    validate_file_transaction(data)
+    data["handoff"] = record_handoff(support)
+    record_seal(data)
+    data["state"] = "files-committed"
+    write(data)
+elif command == "commit":
+    data = load()
+    if data["state"] != "files-committed":
+        raise ValueError("file transaction is not committed")
+    validate_seal(data)
+    allowed_targets = set(args[:-1])
+    support = Path(args[-1])
+    validate_operation_contract(data, allowed_targets)
+    validate_required_publication(data, args, support)
+    validate_backup_coverage(data)
+    validate_file_transaction(data, validate_handoff_contract(data, support))
     data["state"] = "committed"
     write(data)
 elif command == "recover":
@@ -797,6 +1186,14 @@ elif command == "recover":
         for relative in ("media", "voice", "characters", "sessions", "alpha-runtime", "runtime/current_state.json", "media/media-map.json", ".legacy-migration-v1.json")
     }
     allowed_exact.update(allowed_support)
+    if data["state"] in {"files-committed", "committed"}:
+        validate_seal(data)
+    validate_operation_contract(data, allowed_exact)
+    if data["state"] in {"files-committed", "committed"}:
+        validate_required_publication(data, args, Path(support))
+        validate_backup_coverage(data)
+    if data["state"] == "files-committed":
+        validate_file_transaction(data, validate_handoff_contract(data, Path(support)))
     if data["state"] == "active" and not data.get("files_restored", False):
         recovered_operations = 0
         for operation in reversed(data["operations"]):
@@ -825,6 +1222,9 @@ elif command == "recover":
                 elif target_status is not None:
                     raise ValueError(f"created directory became ambiguous: {target}")
                 os.close(target_parent)
+                continue
+            if kind == "retain":
+                validate_retain(operation)
                 continue
             if kind not in {"backup", "install"} or not str(source).startswith(root_prefix):
                 raise ValueError("transaction operation is invalid")
@@ -881,13 +1281,40 @@ elif command == "recover":
         write(data)
     launch_failed = False
     launch = data.get("launch")
-    if data["state"] == "active" and isinstance(launch, dict):
+    if data["state"] == "files-committed" and not isinstance(launch, dict):
+        raise ValueError("transaction launch state is invalid")
+    launch_skipped = launch == {"skipped": True}
+    if data["state"] == "files-committed" and launch_skipped:
+        pass
+    elif data["state"] in {"active", "files-committed"} and isinstance(launch, dict) and not launch_skipped:
         domain = f"gui/{os.getuid()}"
-        for label, plist, should_load, pending, changed in zip(launch["labels"], launch["plists"], launch["loaded"], launch["pending"], launch["changed"]):
+        should_load_values = launch["loaded"] if data["state"] == "active" else launch.get("desired")
+        sequences = [launch.get(key) for key in ("labels", "plists", "loaded", "pending", "changed")]
+        expected_plists = args[4:8]
+        expected_labels = [Path(value).stem for value in expected_plists]
+        active_targets = {
+            Path(data["operations"][index]["target"])
+            for index in active_install_indices(data["operations"])
+        }
+        expected_desired = [True, Path(expected_plists[1]) in active_targets, False, False]
+        if (not all(isinstance(values, list) and len(values) == 4 for values in sequences)
+                or not all(isinstance(value, str) and value for value in launch["labels"] + launch["plists"])
+                or not all(isinstance(value, bool) for key in ("loaded", "pending", "changed") for value in launch[key])
+                or not isinstance(should_load_values, list) or len(should_load_values) != 4
+                or not all(isinstance(value, bool) for value in should_load_values)
+                or launch["plists"] != expected_plists or launch["labels"] != expected_labels
+                or (data["state"] == "files-committed" and launch.get("desired") != expected_desired)):
+            raise ValueError("transaction launch state is invalid")
+        for label, plist, should_load, pending, changed in zip(launch["labels"], launch["plists"], should_load_values, launch["pending"], launch["changed"]):
             loaded = subprocess.run(["launchctl", "print", f"{domain}/{label}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-            if not changed and not pending:
+            if data["state"] == "active" and not changed and not pending:
                 continue
-            if loaded:
+            if data["state"] == "active" and should_load:
+                try:
+                    validate_restored_launch_plist(data, label, plist)
+                except (OSError, ValueError):
+                    raise ValueError("restored launch plist is ambiguous")
+            if loaded and (data["state"] == "active" or not should_load):
                 result = subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 if result.returncode != 0:
                     launch_failed = True
@@ -897,8 +1324,16 @@ elif command == "recover":
                     time.sleep(0.05)
                 else:
                     launch_failed = True
-            if should_load:
-                if not Path(plist).is_file():
+                loaded = False
+            if should_load and not loaded:
+                try:
+                    if data["state"] == "active":
+                        validate_restored_launch_plist(data, label, plist)
+                    else:
+                        validate_launch_plist(data, label, plist)
+                except (OSError, ValueError):
+                    if data["state"] == "active":
+                        raise ValueError("restored launch plist is ambiguous")
                     launch_failed = True
                     continue
                 result = subprocess.run(["launchctl", "bootstrap", domain, plist], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -911,12 +1346,23 @@ elif command == "recover":
                     time.sleep(0.05)
                 else:
                     launch_failed = True
-            elif subprocess.run(["launchctl", "print", f"{domain}/{label}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                try:
+                    if data["state"] == "files-committed":
+                        validate_launch_plist(data, label, plist)
+                    else:
+                        validate_restored_launch_plist(data, label, plist)
+                except (OSError, ValueError):
+                    if data["state"] == "active":
+                        raise ValueError("restored launch plist is ambiguous")
+                    launch_failed = True
+            elif not should_load and subprocess.run(["launchctl", "print", f"{domain}/{label}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
                 launch_failed = True
     if launch_failed:
         raise SystemExit(71)
     shutil.rmtree(root)
     sync_directory(root.parent)
+    if data["state"] in {"files-committed", "committed"}:
+        raise SystemExit(77)
 else:
     raise ValueError("unknown journal command")
 PY
@@ -935,6 +1381,10 @@ if recover_transaction; then
   :
 else
   recovery_status=$?
+  if [[ "$recovery_status" -eq 77 ]]; then
+    printf 'Completed interrupted Statelet installation and launchd reconciliation.\n'
+    exit 0
+  fi
   if [[ "$recovery_status" -eq 71 ]]; then printf 'Interrupted installation files were recovered but launchd reconciliation was incomplete.\n' >&2; exit 71; fi
   printf 'Refusing to continue because the interrupted Statelet installation is ambiguous.\n' >&2
   exit 74
@@ -971,6 +1421,7 @@ committed=0
 labels=("$aggregator_label" "$player_label" "$legacy_aggregator_label" "$legacy_player_label")
 plists=("$aggregator_plist" "$player_plist" "$legacy_aggregator_plist" "$legacy_player_plist")
 was_loaded=(0 0 0 0)
+desired_loaded=(1 "$install_player" 0 0)
 
 job_is_loaded() { launchctl print "gui/$(id -u)/$1" >/dev/null 2>&1; }
 wait_for_job_state() {
@@ -990,6 +1441,10 @@ rollback() {
       :
     else
       recovery_status=$?
+      if [[ "$recovery_status" -eq 77 ]]; then
+        printf 'Installed Statelet, the Codex lifecycle companion.\n'
+        exit 0
+      fi
       if [[ "$recovery_status" -eq 71 ]]; then printf 'Installation failed and launchd rollback was incomplete.\n' >&2; exit 71; fi
       printf 'Installation failed and file rollback was ambiguous.\n' >&2
       exit 74
@@ -1092,7 +1547,7 @@ from pathlib import Path
 support = Path(support_dir)
 common = {"StateletManaged": marker, "ProcessType": "Background", "RunAtLoad": True, "ThrottleInterval": 10}
 aggregator = {**common, "Label": aggregator_label, "KeepAlive": True,
- "ProgramArguments": [python_bin, str(Path(python_dir) / "statelet_state_aggregator.py"), "--state-dir", str(support / "sessions"), "--output", str(support / "runtime/current_state.json")],
+ "ProgramArguments": [python_bin, "-B", str(Path(python_dir) / "statelet_state_aggregator.py"), "--state-dir", str(support / "sessions"), "--output", str(support / "runtime/current_state.json")],
  "WorkingDirectory": python_dir, "StandardOutPath": str(support / "logs/state-aggregator.out.log"), "StandardErrorPath": str(support / "logs/state-aggregator.err.log")}
 player = {**common, "RunAtLoad": player_run_at_load == "1", "Label": player_label, "KeepAlive": False,
  "LimitLoadToSessionType": "Aqua", "ProcessType": "Interactive",
@@ -1105,7 +1560,7 @@ plutil -lint "$stage_aggregator_plist" "$stage_player_plist" >/dev/null
 
 if [[ "$skip_launchctl" -eq 0 ]]; then
   for ((index=0; index<4; index++)); do if job_is_loaded "${labels[$index]}"; then was_loaded[$index]=1; fi; done
-  journal_command launch-init "${labels[@]}" "${plists[@]}" "${was_loaded[@]}"
+  journal_command launch-init "${labels[@]}" "${plists[@]}" "${was_loaded[@]}" "${desired_loaded[@]}"
   for ((index=0; index<4; index++)); do
     label="${labels[$index]}"
     if [[ "${was_loaded[$index]}" -eq 1 ]]; then
@@ -1125,6 +1580,8 @@ if [[ "$skip_launchctl" -eq 0 ]]; then
       if [[ "${STATELET_INSTALL_CRASH_AT:-}" == "after-first-bootout" ]]; then kill -KILL $$; fi
     fi
   done
+else
+  journal_command launch-skip
 fi
 
 if [[ -e "$hooks_file" ]]; then
@@ -1273,7 +1730,13 @@ done
 backup_target "$migration_manifest" migration-manifest
 install_target "$stage_migration_manifest" "$migration_manifest"
 for directory in "$media_dir" "$runtime_dir" "$logs_dir"; do ensure_private_dir "$directory"; done
-if [[ ! -e "$media_map" ]]; then cp "$package_dir/Examples/media-map.json" "$stage_root/media-map.json"; chmod 0600 "$stage_root/media-map.json"; install_target "$stage_root/media-map.json" "$media_map"; fi
+if [[ ! -e "$media_map" ]]; then
+  cp "$package_dir/Examples/media-map.json" "$stage_root/media-map.json"
+  chmod 0600 "$stage_root/media-map.json"
+  install_target "$stage_root/media-map.json" "$media_map"
+else
+  journal_command retain "$media_map"
+fi
 if [[ -n "${STATELET_INSTALL_TEST_POSTVALIDATION_GATE:-}" ]]; then
   gate="${STATELET_INSTALL_TEST_POSTVALIDATION_GATE}"
   [[ "$gate" = "$home_dir"/* ]] || { printf 'Invalid migration test gate.\n' >&2; exit 2; }
@@ -1301,22 +1764,43 @@ done
 if [[ "${STATELET_INSTALL_CRASH_AT:-}" == "after-support" ]]; then kill -KILL $$; fi
 if [[ "${STATELET_INSTALL_FAIL_AT:-${CODEX_PET_INSTALL_FAIL_AT:-}}" == "after-support" ]]; then printf 'Injected installation failure after support migration.\n' >&2; exit 70; fi
 
+journal_command files-commit \
+  "$app_dest" "$legacy_app" "$component_dir" "$legacy_component" \
+  "$aggregator_plist" "$player_plist" "$legacy_aggregator_plist" "$legacy_player_plist" \
+  "$hooks_file" "$applications_dir" "$home_dir/Library" "$home_dir/Library/Application Support" \
+  "$support_dir" "$launch_agents_dir" "$home_dir/.codex" "$media_dir" "$runtime_dir" "$logs_dir" \
+  "$support_dir/media" "$support_dir/voice" "$support_dir/characters" "$support_dir/sessions" \
+  "$support_dir/alpha-runtime" "$support_dir/runtime/current_state.json" "$support_dir/media/media-map.json" \
+  "$support_dir/.legacy-migration-v1.json" "$support_dir"
+if [[ "${STATELET_INSTALL_CRASH_AT:-}" == "after-files-commit" ]]; then kill -KILL $$; fi
+
 if [[ "$skip_launchctl" -eq 0 ]]; then
   journal_command launch-phase 0 pending
+  journal_command launch-validate "$aggregator_label" "$aggregator_plist"
   launchctl bootstrap "gui/$(id -u)" "$aggregator_plist"
   wait_for_job_state "$aggregator_label" 1 || { printf 'The aggregator LaunchAgent did not load after bootstrap.\n' >&2; exit 73; }
+  journal_command launch-validate "$aggregator_label" "$aggregator_plist"
   if [[ "${STATELET_INSTALL_CRASH_AT:-}" == "after-aggregator-rebootstrap" ]]; then kill -KILL $$; fi
   journal_command launch-phase 0 changed
   if [[ "$install_player" -eq 1 ]]; then
     journal_command launch-phase 1 pending
+    journal_command launch-validate "$player_label" "$player_plist"
     launchctl bootstrap "gui/$(id -u)" "$player_plist"
     wait_for_job_state "$player_label" 1 || { printf 'The player LaunchAgent did not register after bootstrap.\n' >&2; exit 73; }
+    journal_command launch-validate "$player_label" "$player_plist"
     journal_command launch-phase 1 changed
     [[ "$player_run_at_load" -eq 1 ]] || /usr/bin/open "$app_dest"
   fi
 fi
 
-journal_command commit
+journal_command commit \
+  "$app_dest" "$legacy_app" "$component_dir" "$legacy_component" \
+  "$aggregator_plist" "$player_plist" "$legacy_aggregator_plist" "$legacy_player_plist" \
+  "$hooks_file" "$applications_dir" "$home_dir/Library" "$home_dir/Library/Application Support" \
+  "$support_dir" "$launch_agents_dir" "$home_dir/.codex" "$media_dir" "$runtime_dir" "$logs_dir" \
+  "$support_dir/media" "$support_dir/voice" "$support_dir/characters" "$support_dir/sessions" \
+  "$support_dir/alpha-runtime" "$support_dir/runtime/current_state.json" "$support_dir/media/media-map.json" \
+  "$support_dir/.legacy-migration-v1.json" "$support_dir"
 committed=1
 rm -rf "$transaction_root"
 trap - EXIT

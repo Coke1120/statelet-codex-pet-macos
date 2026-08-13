@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import plistlib
 import shlex
@@ -186,8 +187,37 @@ case "$action" in
     fi
     if [[ "$action" == "bootout" ]]; then
       rm -f "$CODEX_PET_FAKE_LAUNCH_STATE/$label"
+      if [[ "$label" == "${STATELET_FAKE_BOOTOUT_TAMPER_LABEL:-}" && -n "${STATELET_FAKE_BOOTOUT_TAMPER_PATH:-}" ]]; then
+        printf '\n# tampered after bootout\n' >> "$STATELET_FAKE_BOOTOUT_TAMPER_PATH"
+      elif [[ "$label" == "${STATELET_FAKE_BOOTOUT_REPLACE_LABEL:-}" && -n "${STATELET_FAKE_BOOTOUT_REPLACE_PATH:-}" ]]; then
+        cp -p "$STATELET_FAKE_BOOTOUT_REPLACE_PATH" "$STATELET_FAKE_BOOTOUT_REPLACE_PATH.replacement"
+        mv -f "$STATELET_FAKE_BOOTOUT_REPLACE_PATH.replacement" "$STATELET_FAKE_BOOTOUT_REPLACE_PATH"
+      elif [[ "$label" == "${STATELET_FAKE_BOOTOUT_REPARENT_LABEL:-}" && -n "${STATELET_FAKE_BOOTOUT_REPARENT_PATH:-}" ]]; then
+        parent="$(dirname "$STATELET_FAKE_BOOTOUT_REPARENT_PATH")"
+        displaced="$parent.displaced"
+        mv "$parent" "$displaced"
+        mkdir "$parent"
+        mv "$displaced/$(basename "$STATELET_FAKE_BOOTOUT_REPARENT_PATH")" "$STATELET_FAKE_BOOTOUT_REPARENT_PATH"
+      fi
     else
       touch "$CODEX_PET_FAKE_LAUNCH_STATE/$label"
+      if [[ "$label" == "${STATELET_FAKE_WRITER_LABEL:-}" && -n "${STATELET_FAKE_WRITER_SCRIPT:-}" ]]; then
+        mkdir -p "$(dirname "$STATELET_FAKE_WRITER_OUTPUT")" "$(dirname "$STATELET_FAKE_WRITER_STDOUT")"
+        if [[ -n "${STATELET_FAKE_WRITER_TRANSACTION:-}" ]]; then
+          "$STATELET_FAKE_WRITER_PYTHON" - "$STATELET_FAKE_WRITER_TRANSACTION/journal.json" "$STATELET_FAKE_WRITER_PHASE" <<'PY'
+import json, sys
+from pathlib import Path
+journal, output = map(Path, sys.argv[1:])
+output.write_text(json.loads(journal.read_text(encoding="utf-8"))["state"] + "\\n", encoding="utf-8")
+PY
+        fi
+        "$STATELET_FAKE_WRITER_PYTHON" -B "$STATELET_FAKE_WRITER_SCRIPT" \
+          --once --state-dir "$STATELET_FAKE_WRITER_SESSIONS" --output "$STATELET_FAKE_WRITER_OUTPUT" \
+          >>"$STATELET_FAKE_WRITER_STDOUT" 2>>"$STATELET_FAKE_WRITER_STDERR"
+      fi
+      if [[ "$label" == "${STATELET_FAKE_TAMPER_LABEL:-}" && -n "${STATELET_FAKE_TAMPER_PATH:-}" ]]; then
+        printf '\n# tampered after file commit\n' >> "$STATELET_FAKE_TAMPER_PATH"
+      fi
     fi
     ;;
   *) exit 2 ;;
@@ -209,6 +239,114 @@ esac
             }
         )
         return environment, log
+
+    def enable_fake_runtime_writer(self, environment: dict[str, str]) -> Path:
+        support = self.home / "Library" / "Application Support" / "Statelet"
+        phase = self.base / "writer-transaction-phase.txt"
+        environment.update(
+            {
+                "STATELET_FAKE_WRITER_LABEL": "com.coke1120.statelet.state-aggregator",
+                "STATELET_FAKE_WRITER_PYTHON": sys.executable,
+                "STATELET_FAKE_WRITER_SCRIPT": str(support / "Statelet" / "python" / "statelet_state_aggregator.py"),
+                "STATELET_FAKE_WRITER_SESSIONS": str(support / "sessions"),
+                "STATELET_FAKE_WRITER_OUTPUT": str(support / "runtime" / "current_state.json"),
+                "STATELET_FAKE_WRITER_STDOUT": str(support / "logs" / "state-aggregator.out.log"),
+                "STATELET_FAKE_WRITER_STDERR": str(support / "logs" / "state-aggregator.err.log"),
+                "STATELET_FAKE_WRITER_TRANSACTION": str(self.home / ".statelet-install-transaction"),
+                "STATELET_FAKE_WRITER_PHASE": str(phase),
+            }
+        )
+        return phase
+
+    def recompute_transaction_seal(self, journal: dict[str, object]) -> None:
+        operations = journal["operations"]
+        self.assertIsInstance(operations, list)
+        active: list[int] = []
+        for index, operation in enumerate(operations):
+            if operation.get("kind") not in {"backup", "install"}:
+                continue
+            target = Path(operation["target"])
+            active = [owner for owner in active if not Path(operations[owner]["target"]).is_relative_to(target)]
+            if operation["kind"] == "install":
+                active.append(index)
+        launch = journal["launch"]
+        sealed_launch = (
+            {"skipped": True}
+            if launch == {"skipped": True}
+            else {"labels": launch["labels"], "plists": launch["plists"], "desired": launch["desired"]}
+        )
+        payload = {
+            "operations": operations,
+            "operation_count": len(operations),
+            "active_targets": [operations[index]["target"] for index in active],
+            "handoff": journal["handoff"],
+            "launch": sealed_launch,
+        }
+        journal["seal"] = {
+            "version": 1,
+            "operation_count": payload["operation_count"],
+            "active_targets": payload["active_targets"],
+            "digest": hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+        }
+
+    def assert_sealed_operation_tamper_is_rejected(self, *, skip_launchctl: bool, empty: bool) -> None:
+        first = self.make_bundle(f"SealFirst-{skip_launchctl}-{empty}", "first")
+        second = self.make_bundle(f"SealSecond-{skip_launchctl}-{empty}", "second")
+        if skip_launchctl:
+            self.assertEqual(self.install(first).returncode, 0)
+            environment = os.environ.copy()
+            environment["STATELET_INSTALL_CRASH_AT"] = "after-files-commit"
+            crashed = self.install(second, env=environment)
+        else:
+            environment, _ = self.fake_launchctl_environment()
+            self.assertEqual(
+                subprocess.run(
+                    ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(first)],
+                    cwd=ROOT,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                ).returncode,
+                0,
+            )
+            environment["STATELET_INSTALL_CRASH_AT"] = "after-files-commit"
+            crashed = subprocess.run(
+                ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(second)],
+                cwd=ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+        self.assertEqual(crashed.returncode, -9, crashed.stderr)
+        transaction = self.home / ".statelet-install-transaction"
+        journal_path = transaction / "journal.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        self.assertEqual(journal["state"], "files-committed")
+        self.assertTrue(any((transaction / "backup").rglob("*")))
+        journal["operations"] = [] if empty else journal["operations"][:-1]
+        self.recompute_transaction_seal(journal)
+        journal_path.write_text(json.dumps(journal, separators=(",", ":")) + "\n", encoding="utf-8")
+        journal_path.chmod(0o600)
+        environment.pop("STATELET_INSTALL_CRASH_AT")
+
+        if skip_launchctl:
+            refused = self.install(second, env=environment)
+        else:
+            refused = subprocess.run(
+                ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(second)],
+                cwd=ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+
+        self.assertEqual(refused.returncode, 74, refused.stderr)
+        self.assertIn("interrupted Statelet installation is ambiguous", refused.stderr)
+        self.assertTrue(transaction.exists())
+        self.assertTrue(any((transaction / "backup").rglob("*")))
 
     def test_bundle_info_contract_and_public_payload(self) -> None:
         bundle = self.make_bundle("InfoContract")
@@ -1319,6 +1457,7 @@ struct WatchdogHarness {
         self.assertEqual(aggregator["ProcessType"], "Background")
         aggregator_arguments = "\n".join(aggregator["ProgramArguments"])
         self.assertIn("statelet_state_aggregator.py", aggregator_arguments)
+        self.assertEqual(aggregator["ProgramArguments"][1], "-B")
         self.assertNotIn("codex_pet_daemon.py", aggregator_arguments)
         self.assertNotIn("serial", aggregator_arguments.lower())
         self.assertNotIn("/dev/", aggregator_arguments)
@@ -2312,7 +2451,7 @@ struct WatchdogHarness {
         self.assertEqual(failed.returncode, 71, failed.stderr)
         self.assertIn("launchd rollback was incomplete", failed.stderr)
 
-    def test_fresh_install_player_bootstrap_failure_removes_new_aggregator(self) -> None:
+    def test_fresh_install_player_bootstrap_failure_retains_sealed_files_for_forward_recovery(self) -> None:
         bundle = self.make_bundle("FreshPlayerBootstrapFailure")
         aggregator = "com.coke1120.statelet.state-aggregator"
         player = "com.coke1120.statelet.mac-player"
@@ -2330,16 +2469,593 @@ struct WatchdogHarness {
             env=environment,
         )
 
-        self.assertEqual(failed.returncode, 64, failed.stderr)
+        self.assertEqual(failed.returncode, 71, failed.stderr)
+        self.assertIn("launchd rollback was incomplete", failed.stderr)
         state = log.parent / "state"
-        self.assertFalse((state / aggregator).exists())
+        self.assertTrue((state / aggregator).exists())
         self.assertFalse((state / player).exists())
-        self.assertFalse((self.home / "Applications" / "Statelet.app").exists())
-        self.assertFalse((self.home / "Library" / "Application Support" / "Statelet").exists())
-        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+        self.assertTrue((self.home / "Applications" / "Statelet.app").exists())
+        self.assertTrue((self.home / "Library" / "Application Support" / "Statelet").exists())
+        transaction = self.home / ".statelet-install-transaction"
+        self.assertEqual(json.loads((transaction / "journal.json").read_text())["state"], "files-committed")
         commands = log.read_text(encoding="utf-8").splitlines()
         self.assertTrue(any(command.startswith("bootstrap ") and "state-aggregator.plist" in command for command in commands))
-        self.assertTrue(any(command.startswith("bootout ") and aggregator in command for command in commands))
+        environment["CODEX_PET_FAKE_FAIL_ACTION"] = ""
+        environment["CODEX_PET_FAKE_FAIL_LABEL"] = ""
+
+        recovered = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertTrue((state / aggregator).exists())
+        self.assertTrue((state / player).exists())
+        self.assertFalse(transaction.exists())
+
+    def test_immediate_runtime_writes_start_only_after_files_are_committed(self) -> None:
+        bundle = self.make_bundle("ImmediateRuntimeWriter")
+        aggregator = "com.coke1120.statelet.state-aggregator"
+        player = "com.coke1120.statelet.mac-player"
+        environment, _ = self.fake_launchctl_environment()
+        phase = self.enable_fake_runtime_writer(environment)
+
+        installed = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.assertEqual(phase.read_text(encoding="utf-8"), "files-committed\n")
+        support = self.home / "Library" / "Application Support" / "Statelet"
+        current_state = json.loads((support / "runtime" / "current_state.json").read_text(encoding="utf-8"))
+        self.assertEqual(current_state["source"], "aggregate")
+        self.assertTrue((support / "logs" / "state-aggregator.out.log").is_file())
+        self.assertTrue((support / "logs" / "state-aggregator.err.log").is_file())
+        state = Path(environment["CODEX_PET_FAKE_LAUNCH_STATE"])
+        self.assertTrue((state / aggregator).exists())
+        self.assertTrue((state / player).exists())
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+
+    def test_post_files_commit_immutable_tamper_fails_final_commit_closed(self) -> None:
+        bundle = self.make_bundle("PostFilesCommitImmutableTamper")
+        environment, _ = self.fake_launchctl_environment()
+        installed = self.home / "Applications" / "Statelet.app" / "Contents" / "MacOS" / "Statelet"
+        environment.update(
+            {
+                "STATELET_FAKE_TAMPER_LABEL": "com.coke1120.statelet.state-aggregator",
+                "STATELET_FAKE_TAMPER_PATH": str(installed),
+            }
+        )
+
+        failed = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(failed.returncode, 74, failed.stderr)
+        self.assertIn("file rollback was ambiguous", failed.stderr)
+        transaction = self.home / ".statelet-install-transaction"
+        self.assertEqual(json.loads((transaction / "journal.json").read_text())["state"], "files-committed")
+        self.assertIn(b"tampered after file commit", installed.read_bytes())
+
+    def test_crash_after_files_commit_recovers_forward_without_republishing_files(self) -> None:
+        first = self.make_bundle("FilesCommittedFirst", "first")
+        self.assertEqual(self.install(first).returncode, 0)
+        second = self.make_bundle("FilesCommittedSecond", "second")
+        expected = (second / "Contents" / "MacOS" / "Statelet").read_bytes()
+        aggregator = "com.coke1120.statelet.state-aggregator"
+        player = "com.coke1120.statelet.mac-player"
+        environment, _ = self.fake_launchctl_environment(aggregator, player)
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-files-commit"
+
+        crashed = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(second)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(crashed.returncode, -9, crashed.stderr)
+        installed = self.home / "Applications" / "Statelet.app" / "Contents" / "MacOS" / "Statelet"
+        self.assertEqual(installed.read_bytes(), expected)
+        transaction = self.home / ".statelet-install-transaction"
+        journal = json.loads((transaction / "journal.json").read_text(encoding="utf-8"))
+        self.assertEqual(journal["state"], "files-committed")
+        self.assertEqual(journal["launch"]["desired"], [True, True, False, False])
+        environment.pop("STATELET_INSTALL_CRASH_AT")
+
+        recovered = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(first)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(installed.read_bytes(), expected)
+        state = Path(environment["CODEX_PET_FAKE_LAUNCH_STATE"])
+        self.assertTrue((state / aggregator).exists())
+        self.assertTrue((state / player).exists())
+        self.assertFalse(transaction.exists())
+
+    def test_files_committed_recovery_rejects_missing_desired_launch_state(self) -> None:
+        bundle = self.make_bundle("FilesCommittedMissingDesired")
+        environment, _ = self.fake_launchctl_environment()
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-files-commit"
+        crashed = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        self.assertEqual(crashed.returncode, -9, crashed.stderr)
+        transaction = self.home / ".statelet-install-transaction"
+        journal_path = transaction / "journal.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        journal["launch"].pop("desired")
+        journal_path.write_text(json.dumps(journal, separators=(",", ":")) + "\n", encoding="utf-8")
+        journal_path.chmod(0o600)
+        environment.pop("STATELET_INSTALL_CRASH_AT")
+
+        refused = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(refused.returncode, 74, refused.stderr)
+        self.assertIn("interrupted Statelet installation is ambiguous", refused.stderr)
+        self.assertEqual(json.loads(journal_path.read_text(encoding="utf-8"))["state"], "files-committed")
+        self.assertTrue((self.home / "Applications" / "Statelet.app").exists())
+
+    def test_files_committed_recovery_rejects_tampered_handoff_identity(self) -> None:
+        bundle = self.make_bundle("FilesCommittedHandoffIdentity")
+        environment, _ = self.fake_launchctl_environment()
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-files-commit"
+        crashed = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        self.assertEqual(crashed.returncode, -9, crashed.stderr)
+        transaction = self.home / ".statelet-install-transaction"
+        journal_path = transaction / "journal.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        journal["handoff"]["runtime"]["identity"][1] += 1
+        journal_path.write_text(json.dumps(journal, separators=(",", ":")) + "\n", encoding="utf-8")
+        journal_path.chmod(0o600)
+        environment.pop("STATELET_INSTALL_CRASH_AT")
+
+        refused = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(refused.returncode, 74, refused.stderr)
+        self.assertIn("interrupted Statelet installation is ambiguous", refused.stderr)
+        self.assertTrue(transaction.exists())
+
+    def test_launch_plist_swap_after_bootstrap_fails_closed(self) -> None:
+        bundle = self.make_bundle("LaunchPlistPostBootstrapSwap")
+        environment, _ = self.fake_launchctl_environment()
+        plist = self.home / "Library" / "LaunchAgents" / "com.coke1120.statelet.state-aggregator.plist"
+        environment.update(
+            {
+                "STATELET_FAKE_TAMPER_LABEL": "com.coke1120.statelet.state-aggregator",
+                "STATELET_FAKE_TAMPER_PATH": str(plist),
+            }
+        )
+
+        failed = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(failed.returncode, 74, failed.stderr)
+        transaction = self.home / ".statelet-install-transaction"
+        self.assertEqual(json.loads((transaction / "journal.json").read_text())["state"], "files-committed")
+        self.assertIn(b"tampered after file commit", plist.read_bytes())
+
+    def test_files_committed_recovery_rejects_immutable_target_tamper(self) -> None:
+        bundle = self.make_bundle("FilesCommittedImmutableTamper")
+        environment, _ = self.fake_launchctl_environment()
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-files-commit"
+        crashed = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        self.assertEqual(crashed.returncode, -9, crashed.stderr)
+        installed = self.home / "Applications" / "Statelet.app" / "Contents" / "MacOS" / "Statelet"
+        installed.write_bytes(installed.read_bytes() + b"\n# immutable tamper\n")
+        transaction = self.home / ".statelet-install-transaction"
+        environment.pop("STATELET_INSTALL_CRASH_AT")
+
+        refused = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(refused.returncode, 74, refused.stderr)
+        self.assertIn("interrupted Statelet installation is ambiguous", refused.stderr)
+        self.assertEqual(json.loads((transaction / "journal.json").read_text())["state"], "files-committed")
+
+    def test_files_committed_recovery_rejects_handed_off_current_state_symlink(self) -> None:
+        legacy = self.home / "Library" / "Application Support" / "CodexPet"
+        current_state = legacy / "runtime" / "current_state.json"
+        current_state.parent.mkdir(parents=True)
+        current_state.write_text('{"state":"idle"}\n', encoding="utf-8")
+        bundle = self.make_bundle("FilesCommittedCurrentStateSymlink")
+        environment, _ = self.fake_launchctl_environment()
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-files-commit"
+        crashed = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        self.assertEqual(crashed.returncode, -9, crashed.stderr)
+        canonical = self.home / "Library" / "Application Support" / "Statelet" / "runtime" / "current_state.json"
+        replacement = self.base / "untrusted-current-state.json"
+        replacement.write_text('{"state":"waiting"}\n', encoding="utf-8")
+        canonical.unlink()
+        canonical.symlink_to(replacement)
+        transaction = self.home / ".statelet-install-transaction"
+        environment.pop("STATELET_INSTALL_CRASH_AT")
+
+        refused = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(refused.returncode, 74, refused.stderr)
+        self.assertIn("interrupted Statelet installation is ambiguous", refused.stderr)
+        self.assertTrue(canonical.is_symlink())
+        self.assertEqual(json.loads((transaction / "journal.json").read_text())["state"], "files-committed")
+
+    def test_fresh_files_committed_recovery_rejects_new_current_state_symlink(self) -> None:
+        bundle = self.make_bundle("FreshCurrentStateSymlink")
+        environment, _ = self.fake_launchctl_environment()
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-files-commit"
+        crashed = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        self.assertEqual(crashed.returncode, -9, crashed.stderr)
+        support = self.home / "Library" / "Application Support" / "Statelet"
+        canonical = support / "runtime" / "current_state.json"
+        replacement = self.base / "fresh-untrusted-current-state.json"
+        replacement.write_text('{"state":"waiting"}\n', encoding="utf-8")
+        canonical.symlink_to(replacement)
+        transaction = self.home / ".statelet-install-transaction"
+        environment.pop("STATELET_INSTALL_CRASH_AT")
+
+        refused = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(refused.returncode, 74, refused.stderr)
+        self.assertIn("interrupted Statelet installation is ambiguous", refused.stderr)
+        self.assertTrue(canonical.is_symlink())
+        self.assertEqual(json.loads((transaction / "journal.json").read_text())["state"], "files-committed")
+
+    def test_files_committed_recovery_rejects_preexisting_logs_root_replacement(self) -> None:
+        support = self.home / "Library" / "Application Support" / "Statelet"
+        logs = support / "logs"
+        logs.mkdir(parents=True)
+        (logs / "preserved.log").write_text("before install\n", encoding="utf-8")
+        bundle = self.make_bundle("LogsRootReplacement")
+        environment, _ = self.fake_launchctl_environment()
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-files-commit"
+        crashed = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        self.assertEqual(crashed.returncode, -9, crashed.stderr)
+        displaced = support / "displaced-logs"
+        logs.rename(displaced)
+        logs.mkdir()
+        (logs / "replacement.log").write_text("replacement\n", encoding="utf-8")
+        transaction = self.home / ".statelet-install-transaction"
+        environment.pop("STATELET_INSTALL_CRASH_AT")
+
+        refused = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(refused.returncode, 74, refused.stderr)
+        self.assertIn("interrupted Statelet installation is ambiguous", refused.stderr)
+        self.assertEqual(json.loads((transaction / "journal.json").read_text())["state"], "files-committed")
+        self.assertTrue((displaced / "preserved.log").is_file())
+
+    def test_files_committed_recovery_rejects_non_allowlisted_launch_metadata(self) -> None:
+        bundle = self.make_bundle("FilesCommittedLaunchAllowlist")
+        environment, _ = self.fake_launchctl_environment()
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-files-commit"
+        crashed = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        self.assertEqual(crashed.returncode, -9, crashed.stderr)
+        transaction = self.home / ".statelet-install-transaction"
+        journal_path = transaction / "journal.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        journal["launch"]["labels"][0] = "com.example.untrusted"
+        journal_path.write_text(json.dumps(journal, separators=(",", ":")) + "\n", encoding="utf-8")
+        journal_path.chmod(0o600)
+        environment.pop("STATELET_INSTALL_CRASH_AT")
+
+        refused = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(refused.returncode, 74, refused.stderr)
+        self.assertIn("interrupted Statelet installation is ambiguous", refused.stderr)
+        self.assertTrue(transaction.exists())
+
+    def test_files_committed_recovery_rejects_unsealed_desired_launch_state(self) -> None:
+        bundle = self.make_bundle("FilesCommittedDesiredLaunch")
+        environment, _ = self.fake_launchctl_environment()
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-files-commit"
+        crashed = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        self.assertEqual(crashed.returncode, -9, crashed.stderr)
+        transaction = self.home / ".statelet-install-transaction"
+        journal_path = transaction / "journal.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        journal["launch"]["desired"] = [False, True, True, True]
+        journal_path.write_text(json.dumps(journal, separators=(",", ":")) + "\n", encoding="utf-8")
+        journal_path.chmod(0o600)
+        environment.pop("STATELET_INSTALL_CRASH_AT")
+
+        refused = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(refused.returncode, 74, refused.stderr)
+        self.assertIn("interrupted Statelet installation is ambiguous", refused.stderr)
+        self.assertTrue(transaction.exists())
+        state = Path(environment["CODEX_PET_FAKE_LAUNCH_STATE"])
+        self.assertFalse(any(state.iterdir()))
+
+    def test_files_committed_recovery_rejects_operation_outside_allowlist_before_open(self) -> None:
+        bundle = self.make_bundle("FilesCommittedOperationAllowlist")
+        environment, _ = self.fake_launchctl_environment()
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-files-commit"
+        crashed = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        self.assertEqual(crashed.returncode, -9, crashed.stderr)
+        transaction = self.home / ".statelet-install-transaction"
+        journal_path = transaction / "journal.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        sentinel = self.base / "outside-allowlist"
+        sentinel.mkdir()
+        journal["operations"][0]["target"] = str(sentinel / "missing")
+        journal_path.write_text(json.dumps(journal, separators=(",", ":")) + "\n", encoding="utf-8")
+        journal_path.chmod(0o600)
+        environment.pop("STATELET_INSTALL_CRASH_AT")
+
+        refused = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(refused.returncode, 74, refused.stderr)
+        self.assertIn("interrupted Statelet installation is ambiguous", refused.stderr)
+        self.assertTrue(transaction.exists())
+        self.assertEqual(list(sentinel.iterdir()), [])
+
+    def test_skip_launchctl_crash_after_files_commit_recovers_without_launch_mutation(self) -> None:
+        first = self.make_bundle("SkipLaunchFilesFirst", "first")
+        self.assertEqual(self.install(first).returncode, 0)
+        second = self.make_bundle("SkipLaunchFilesSecond", "second")
+        expected = (second / "Contents" / "MacOS" / "Statelet").read_bytes()
+        fake_bin = self.base / "skip-launch-fake-bin"
+        fake_bin.mkdir()
+        launch_log = fake_bin / "launchctl.log"
+        launchctl = fake_bin / "launchctl"
+        launchctl.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {shlex.quote(str(launch_log))}\nexit 99\n", encoding="utf-8")
+        launchctl.chmod(0o755)
+        environment = os.environ.copy()
+        environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-files-commit"
+
+        crashed = self.install(second, env=environment)
+
+        self.assertEqual(crashed.returncode, -9, crashed.stderr)
+        transaction = self.home / ".statelet-install-transaction"
+        journal = json.loads((transaction / "journal.json").read_text(encoding="utf-8"))
+        self.assertEqual(journal["state"], "files-committed")
+        self.assertEqual(journal["launch"], {"skipped": True})
+        environment.pop("STATELET_INSTALL_CRASH_AT")
+        recovered = self.install(first, env=environment)
+
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        installed = self.home / "Applications" / "Statelet.app" / "Contents" / "MacOS" / "Statelet"
+        self.assertEqual(installed.read_bytes(), expected)
+        self.assertFalse(transaction.exists())
+        self.assertFalse(launch_log.exists())
+
+    def test_active_partial_transaction_has_no_forward_promotion_surface(self) -> None:
+        bundle = self.make_bundle("NoForwardPromotion")
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-app"
+        crashed = self.install(bundle, env=environment)
+        self.assertEqual(crashed.returncode, -9, crashed.stderr)
+        transaction = self.home / ".statelet-install-transaction"
+        self.assertEqual(json.loads((transaction / "journal.json").read_text())["state"], "active")
+        environment.pop("STATELET_INSTALL_CRASH_AT")
+
+        refused = self.install(bundle, "--forward-seal-transaction", env=environment)
+
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertIn("Unknown option", refused.stderr)
+        self.assertEqual(json.loads((transaction / "journal.json").read_text())["state"], "active")
+
+    def test_skip_launch_files_committed_rejects_empty_operations_and_retains_backups(self) -> None:
+        self.assert_sealed_operation_tamper_is_rejected(skip_launchctl=True, empty=True)
+
+    def test_skip_launch_files_committed_rejects_truncated_operations_and_retains_backups(self) -> None:
+        self.assert_sealed_operation_tamper_is_rejected(skip_launchctl=True, empty=False)
+
+    def test_launch_files_committed_rejects_empty_operations_and_retains_backups(self) -> None:
+        self.assert_sealed_operation_tamper_is_rejected(skip_launchctl=False, empty=True)
+
+    def test_launch_files_committed_rejects_truncated_operations_and_retains_backups(self) -> None:
+        self.assert_sealed_operation_tamper_is_rejected(skip_launchctl=False, empty=False)
+
+    def test_recomputed_seal_omitting_app_backup_operation_retains_transaction_and_backup(self) -> None:
+        first = self.make_bundle("OmittedAppBackupFirst", "first")
+        second = self.make_bundle("OmittedAppBackupSecond", "second")
+        self.assertEqual(self.install(first).returncode, 0)
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-files-commit"
+        crashed = self.install(second, env=environment)
+        self.assertEqual(crashed.returncode, -9, crashed.stderr)
+        transaction = self.home / ".statelet-install-transaction"
+        journal_path = transaction / "journal.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        app_target = self.home / "Applications" / "Statelet.app"
+        removed = [
+            operation for operation in journal["operations"]
+            if operation.get("kind") == "backup" and Path(operation.get("target", "")) == app_target
+        ]
+        self.assertEqual(len(removed), 1)
+        app_backup = Path(removed[0]["source"])
+        self.assertTrue(app_backup.exists())
+        journal["operations"].remove(removed[0])
+        self.recompute_transaction_seal(journal)
+        journal_path.write_text(json.dumps(journal, separators=(",", ":")) + "\n", encoding="utf-8")
+        journal_path.chmod(0o600)
+        environment.pop("STATELET_INSTALL_CRASH_AT")
+
+        refused = self.install(second, env=environment)
+
+        self.assertEqual(refused.returncode, 74, refused.stderr)
+        self.assertTrue(transaction.exists())
+        self.assertTrue(app_backup.exists())
+
+    def test_recomputed_seal_omitting_fresh_media_map_install_rejects_live_tamper(self) -> None:
+        bundle = self.make_bundle("OmittedFreshMediaMap")
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-files-commit"
+        crashed = self.install(bundle, env=environment)
+        self.assertEqual(crashed.returncode, -9, crashed.stderr)
+        transaction = self.home / ".statelet-install-transaction"
+        journal_path = transaction / "journal.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        media_map = self.home / "Library" / "Application Support" / "Statelet" / "media" / "media-map.json"
+        removed = [
+            operation for operation in journal["operations"]
+            if operation.get("kind") == "install" and Path(operation.get("target", "")) == media_map
+        ]
+        self.assertEqual(len(removed), 1)
+        journal["operations"].remove(removed[0])
+        media_map.write_text('{"unvalidated":true}\n', encoding="utf-8")
+        self.recompute_transaction_seal(journal)
+        journal_path.write_text(json.dumps(journal, separators=(",", ":")) + "\n", encoding="utf-8")
+        journal_path.chmod(0o600)
+        environment.pop("STATELET_INSTALL_CRASH_AT")
+
+        refused = self.install(bundle, env=environment)
+
+        self.assertEqual(refused.returncode, 74, refused.stderr)
+        self.assertTrue(transaction.exists())
+        self.assertEqual(media_map.read_text(encoding="utf-8"), '{"unvalidated":true}\n')
 
     def test_sigkill_after_first_bootout_recovers_original_launch_jobs(self) -> None:
         bundle = self.make_bundle("CrashAfterFirstBootout")
@@ -2389,6 +3105,101 @@ struct WatchdogHarness {
             if command.startswith("bootout ")
         )
         self.assertLess(first_recovery_bootstrap, later_requiesce)
+
+    def test_active_recovery_rejects_prequiesce_plist_tamper_before_bootstrap(self) -> None:
+        bundle = self.make_bundle("PrequiescePlistTamper")
+        aggregator = "com.coke1120.statelet.state-aggregator"
+        environment, log = self.fake_launchctl_environment(aggregator)
+        launch_agents = self.home / "Library" / "LaunchAgents"
+        launch_agents.mkdir(parents=True)
+        plist = launch_agents / f"{aggregator}.plist"
+        plist.write_bytes(plistlib.dumps({"Label": aggregator, "StateletManaged": MANAGED_MARKER}))
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-first-bootout"
+        crashed = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        self.assertEqual(crashed.returncode, -9, crashed.stderr)
+        plist.write_bytes(plist.read_bytes() + b"\n# tampered after bootout\n")
+        before = len(log.read_text(encoding="utf-8").splitlines())
+        environment.pop("STATELET_INSTALL_CRASH_AT")
+
+        refused = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(refused.returncode, 74, refused.stderr)
+        self.assertTrue((self.home / ".statelet-install-transaction" / "journal.json").is_file())
+        recovery_commands = log.read_text(encoding="utf-8").splitlines()[before:]
+        self.assertFalse(any(command.startswith("bootstrap ") for command in recovery_commands))
+
+    def test_install_rejects_launch_plist_changed_between_bootout_and_backup(self) -> None:
+        self.assert_launch_plist_change_between_bootout_and_backup_is_rejected("digest")
+
+    def test_install_rejects_launch_plist_replaced_between_bootout_and_backup(self) -> None:
+        self.assert_launch_plist_change_between_bootout_and_backup_is_rejected("entry")
+
+    def test_install_rejects_launch_plist_reparented_between_bootout_and_backup(self) -> None:
+        self.assert_launch_plist_change_between_bootout_and_backup_is_rejected("parent")
+
+    def assert_launch_plist_change_between_bootout_and_backup_is_rejected(self, mismatch: str) -> None:
+        bundle = self.make_bundle("BootoutBackupPlistTamper")
+        aggregator = "com.coke1120.statelet.state-aggregator"
+        environment, log = self.fake_launchctl_environment(aggregator)
+        launch_agents = self.home / "Library" / "LaunchAgents"
+        launch_agents.mkdir(parents=True)
+        plist = launch_agents / f"{aggregator}.plist"
+        original = plistlib.dumps({"Label": aggregator, "StateletManaged": MANAGED_MARKER})
+        plist.write_bytes(original)
+        original_digest = self.safe_tree_digest(plist)
+        mutation_variables = {
+            "digest": ("STATELET_FAKE_BOOTOUT_TAMPER_LABEL", "STATELET_FAKE_BOOTOUT_TAMPER_PATH"),
+            "entry": ("STATELET_FAKE_BOOTOUT_REPLACE_LABEL", "STATELET_FAKE_BOOTOUT_REPLACE_PATH"),
+            "parent": ("STATELET_FAKE_BOOTOUT_REPARENT_LABEL", "STATELET_FAKE_BOOTOUT_REPARENT_PATH"),
+        }
+        label_variable, path_variable = mutation_variables[mismatch]
+        environment.update({label_variable: aggregator, path_variable: str(plist), "STATELET_INSTALL_FAIL_AT": "after-app"})
+
+        refused = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "--app-bundle", str(bundle)],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(refused.returncode, 74, refused.stderr)
+        self.assertIn("file rollback was ambiguous", refused.stderr)
+        transaction = self.home / ".statelet-install-transaction"
+        journal = json.loads((transaction / "journal.json").read_text(encoding="utf-8"))
+        original_record = journal["launch"]["original_plists"][0]
+        self.assertEqual(original_record["digest"], original_digest)
+        backups = [
+            operation for operation in journal["operations"]
+            if operation.get("kind") == "backup" and operation.get("target") == str(plist)
+        ]
+        self.assertEqual(len(backups), 1)
+        comparisons = {
+            "digest": backups[0]["digest"] == original_record["digest"],
+            "entry": backups[0]["source_entry"] == original_record["entry"],
+            "parent": backups[0]["target_parent"] == original_record["parent"],
+        }
+        self.assertFalse(comparisons[mismatch])
+        self.assertTrue(all(matches for field, matches in comparisons.items() if field != mismatch))
+        commands = log.read_text(encoding="utf-8").splitlines()
+        bootout = next(index for index, command in enumerate(commands) if command.startswith("bootout "))
+        self.assertFalse(any(command.startswith("bootstrap ") for command in commands[bootout + 1 :]))
+        self.assertFalse((log.parent / "state" / aggregator).exists())
 
     def test_sigkill_after_delayed_bootout_submission_reconciles_pending_state(self) -> None:
         bundle = self.make_bundle("CrashAfterDelayedBootoutSubmit")
@@ -2473,7 +3284,7 @@ struct WatchdogHarness {
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
         self.assertFalse(transaction.exists())
 
-    def test_crash_after_rebootstrap_reloads_restored_old_plist(self) -> None:
+    def test_crash_after_rebootstrap_keeps_sealed_files_and_completes_forward(self) -> None:
         first = self.make_bundle("RebootstrapCrashFirst", "first")
         self.assertEqual(self.install(first).returncode, 0)
         aggregator = "com.coke1120.statelet.state-aggregator"
@@ -2488,6 +3299,11 @@ struct WatchdogHarness {
             env=environment,
         )
         self.assertEqual(crashed.returncode, -9, crashed.stderr)
+        installed = self.home / "Applications" / "Statelet.app" / "Contents" / "MacOS" / "Statelet"
+        expected = (self.base / "RebootstrapCrashSecond.app" / "Contents" / "MacOS" / "Statelet").read_bytes()
+        self.assertEqual(installed.read_bytes(), expected)
+        transaction = self.home / ".statelet-install-transaction"
+        self.assertEqual(json.loads((transaction / "journal.json").read_text())["state"], "files-committed")
         environment.pop("STATELET_INSTALL_CRASH_AT")
         before = len(log.read_text(encoding="utf-8").splitlines())
         recovered = subprocess.run(
@@ -2500,8 +3316,9 @@ struct WatchdogHarness {
         )
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
         recovery_commands = log.read_text(encoding="utf-8").splitlines()[before:]
-        self.assertTrue(any(command.startswith("bootout ") and aggregator in command for command in recovery_commands))
-        self.assertTrue(any(command.startswith("bootstrap ") and "state-aggregator.plist" in command for command in recovery_commands))
+        self.assertFalse(any(command.startswith("bootout ") and aggregator in command for command in recovery_commands))
+        self.assertEqual(installed.read_bytes(), expected)
+        self.assertFalse(transaction.exists())
 
     def test_file_recovery_crash_is_idempotent_on_retry(self) -> None:
         first = self.make_bundle("RecoveryCrashFirst", "first")
@@ -2522,7 +3339,7 @@ struct WatchdogHarness {
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
         self.assertFalse(transaction.exists())
 
-    def test_commit_accepts_later_ancestor_install_owning_nested_backup_target(self) -> None:
+    def test_files_commit_rejects_noncanonical_synthetic_ownership_graph(self) -> None:
         target = self.home / "owned"
         nested = target / "nested"
         nested.parent.mkdir(parents=True)
@@ -2563,12 +3380,22 @@ struct WatchdogHarness {
         )
         self.assertEqual(installed.returncode, 0, installed.stderr)
 
-        committed = self.journal_command(transaction, "commit")
-
-        self.assertEqual(committed.returncode, 0, committed.stderr)
+        (self.home / "runtime").mkdir()
+        (self.home / "logs").mkdir()
+        files_committed = self.journal_command(
+            transaction,
+            "files-commit",
+            str(target),
+            str(nested),
+            str(self.home / "runtime"),
+            str(self.home / "logs"),
+            str(self.home),
+        )
+        self.assertNotEqual(files_committed.returncode, 0, files_committed.stderr)
+        self.assertIn("transaction publication contract is invalid", files_committed.stderr)
         self.assertEqual((target / "nested").read_bytes(), b"replacement-nested")
         self.assertEqual((backup_nested).read_bytes(), b"original-nested")
-        self.assertEqual(json.loads((transaction / "journal.json").read_text())["state"], "committed")
+        self.assertEqual(json.loads((transaction / "journal.json").read_text())["state"], "active")
 
     def test_commit_rejects_changed_final_install_and_retains_journal(self) -> None:
         self.assertEqual(self.install(self.make_bundle("CommitTargetFirst", "first")).returncode, 0)
