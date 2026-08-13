@@ -23,13 +23,13 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
     }
 
     @MainActor
-    func testLifecycleTransitionRetainsOutgoingThenPrerollsAndPromotesDestination() async throws {
+    func testLifecycleTransitionRetainsOutgoingThenPrerollsAndPromotesDestination() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("statelet-transition-test-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let movieURL = directory.appendingPathComponent("transition.mov")
-        try await Self.writeTestMovie(to: movieURL)
+        try Self.writeTestMovie(to: movieURL)
 
         let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         let controller = PetPlayerController(view: view)
@@ -45,7 +45,7 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
             ),
             .preparing
         )
-        try await Self.waitUntil("outgoing presentation did not become ready") {
+        try Self.waitUntil("outgoing presentation did not become ready") {
             controller.currentURL == movieURL
         }
         let outgoingPlayer = try XCTUnwrap(view.playerLayer.player)
@@ -77,19 +77,19 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
             view.lifecycleTransitionPlayerLayer.zPosition
         )
 
-        try await Self.waitUntil("transition foreground never became visible") {
+        try Self.waitUntil("transition foreground never became visible") {
             !view.lifecycleTransitionPlayerLayer.isHidden
         }
         XCTAssertTrue(view.playerLayer.player === outgoingPlayer)
-        try await Self.waitUntil("destination did not begin underneath transition") {
+        try Self.waitUntil("destination did not begin underneath transition") {
             !view.destinationPlayerLayer.isHidden
                 && (view.destinationPlayerLayer.player?.currentTime().seconds ?? 0) > 0
         }
         XCTAssertFalse(view.lifecycleTransitionPlayerLayer.isHidden)
-        try await Self.waitUntil("transition did not end exactly once") {
+        try Self.waitUntil("transition did not end exactly once") {
             endedIDs == [44]
         }
-        try await Task.sleep(nanoseconds: 150_000_000)
+        Self.pumpMainRunLoop(for: 0.15)
         XCTAssertEqual(endedIDs, [44])
         XCTAssertFalse(view.playerLayer.isHidden)
         XCTAssertNil(view.lifecycleTransitionPlayerLayer.player)
@@ -105,13 +105,13 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
     }
 
     @MainActor
-    func testNewPresentationSuppressesStaleTransitionCompletion() async throws {
+    func testNewPresentationSuppressesStaleTransitionCompletion() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("statelet-transition-cancel-test-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let movieURL = directory.appendingPathComponent("transition.mov")
-        try await Self.writeTestMovie(to: movieURL)
+        try Self.writeTestMovie(to: movieURL)
 
         let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         let controller = PetPlayerController(view: view)
@@ -124,7 +124,7 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
             transitionID: 50,
             startedAt: DispatchTime.now().uptimeNanoseconds
         )
-        try await Self.waitUntil("outgoing presentation did not become ready") {
+        try Self.waitUntil("outgoing presentation did not become ready") {
             controller.currentURL == movieURL
         }
         let outgoingPlayer = view.playerLayer.player
@@ -153,7 +153,7 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
             transitionID: 52,
             startedAt: DispatchTime.now().uptimeNanoseconds
         )
-        try await Task.sleep(nanoseconds: 1_300_000_000)
+        Self.pumpMainRunLoop(for: 1.3)
         XCTAssertTrue(endedIDs.isEmpty)
         XCTAssertTrue(view.lifecycleTransitionPlayerLayer.isHidden)
         XCTAssertNil(view.lifecycleTransitionPlayerLayer.player)
@@ -162,13 +162,13 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
     }
 
     @MainActor
-    func testLifecycleTransitionCancellationRetainsOutgoingWithoutBlanking() async throws {
+    func testLifecycleTransitionCancellationRetainsOutgoingWithoutBlanking() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("statelet-transition-retain-test-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let movieURL = directory.appendingPathComponent("transition.mov")
-        try await Self.writeTestMovie(to: movieURL)
+        try Self.writeTestMovie(to: movieURL)
         let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         let controller = PetPlayerController(view: view)
         let entry = try MediaEntry(path: movieURL.lastPathComponent)
@@ -180,7 +180,7 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
             transitionID: 60,
             startedAt: DispatchTime.now().uptimeNanoseconds
         )
-        try await Self.waitUntil("outgoing presentation did not become ready") {
+        try Self.waitUntil("outgoing presentation did not become ready") {
             controller.currentURL == movieURL
         }
         let outgoingPlayer = view.playerLayer.player
@@ -212,6 +212,9 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let movieURL = directory.appendingPathComponent("unreadable.mov")
+        try Data("not a playable movie".utf8).write(to: movieURL)
+        let reportURL = directory.appendingPathComponent("transition.report.json")
+        try Data("{}".utf8).write(to: reportURL)
         let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         let controller = PetPlayerController(view: view)
         controller.setReduceMotion(true)
@@ -224,8 +227,8 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
                 transitionEntry: entry,
                 transitionURL: movieURL,
                 transitionAttestation: CharacterTransitionRuntimeAttestation(
-                    movieRevision: LocalFileRevision(url: movieURL)!,
-                    reportRevision: LocalFileRevision(url: movieURL)!,
+                    movieRevision: try XCTUnwrap(LocalFileRevision(url: movieURL)),
+                    reportRevision: try XCTUnwrap(LocalFileRevision(url: reportURL)),
                     movieSHA256: "",
                     reportSHA256: ""
                 ),
@@ -241,13 +244,13 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
     }
 
     @MainActor
-    func testDirectReplacementRetainsVisibleBaseUntilStandbyIsReady() async throws {
+    func testDirectReplacementRetainsVisibleBaseUntilStandbyIsReady() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("statelet-direct-retention-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let movieURL = directory.appendingPathComponent("movie.mov")
-        try await Self.writeTestMovie(to: movieURL)
+        try Self.writeTestMovie(to: movieURL)
         let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         let controller = PetPlayerController(view: view)
         let entry = try MediaEntry(path: movieURL.lastPathComponent)
@@ -259,7 +262,7 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
             transitionID: 71,
             startedAt: DispatchTime.now().uptimeNanoseconds
         )
-        try await Self.waitUntil("initial direct presentation did not become ready") {
+        try Self.waitUntil("initial direct presentation did not become ready") {
             controller.currentURL == movieURL
         }
         let outgoingPlayer = view.playerLayer.player
@@ -276,7 +279,7 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
         XCTAssertTrue(view.destinationPlayerLayer.isHidden)
         let standbyPlayer = try XCTUnwrap(view.destinationPlayerLayer.player)
         XCTAssertEqual(standbyPlayer.rate, 0, "hidden standby playback must not start before promotion")
-        try await Self.waitUntil("direct replacement was not atomically promoted") {
+        try Self.waitUntil("direct replacement was not atomically promoted") {
             controller.currentState == .running
                 && view.playerLayer.player === standbyPlayer
                 && standbyPlayer.rate > 0
@@ -286,13 +289,13 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
     }
 
     @MainActor
-    func testReduceMotionWithoutPosterRetainsExistingPresentation() async throws {
+    func testReduceMotionWithoutPosterRetainsExistingPresentation() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("statelet-reduce-retention-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let movieURL = directory.appendingPathComponent("movie.mov")
-        try await Self.writeTestMovie(to: movieURL)
+        try Self.writeTestMovie(to: movieURL)
         let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         let controller = PetPlayerController(view: view)
         let entry = try MediaEntry(path: movieURL.lastPathComponent)
@@ -304,7 +307,7 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
             transitionID: 73,
             startedAt: DispatchTime.now().uptimeNanoseconds
         )
-        try await Self.waitUntil("initial presentation did not become ready") {
+        try Self.waitUntil("initial presentation did not become ready") {
             controller.currentURL == movieURL
         }
         let player = view.playerLayer.player
@@ -326,13 +329,13 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
     }
 
     @MainActor
-    func testRapidLifecycleHandoffCancelsObsoleteLayersBeforePreparingNewestDestination() async throws {
+    func testRapidLifecycleHandoffCancelsObsoleteLayersBeforePreparingNewestDestination() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("statelet-transition-rapid-test-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let movieURL = directory.appendingPathComponent("transition.mov")
-        try await Self.writeTestMovie(to: movieURL)
+        try Self.writeTestMovie(to: movieURL)
         let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         let controller = PetPlayerController(view: view)
         let entry = try MediaEntry(path: movieURL.lastPathComponent)
@@ -344,7 +347,7 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
             transitionID: 80,
             startedAt: DispatchTime.now().uptimeNanoseconds
         )
-        try await Self.waitUntil("outgoing presentation did not become ready") {
+        try Self.waitUntil("outgoing presentation did not become ready") {
             controller.currentURL == movieURL
         }
         var endedIDs: [UInt64] = []
@@ -379,7 +382,7 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
         XCTAssertFalse(view.lifecycleTransitionPlayerLayer.player === obsoleteTransitionPlayer)
         XCTAssertTrue(endedIDs.isEmpty)
         controller.cancelLifecycleTransition()
-        try await Task.sleep(nanoseconds: 1_300_000_000)
+        Self.pumpMainRunLoop(for: 1.3)
         XCTAssertTrue(endedIDs.isEmpty)
         XCTAssertNil(view.destinationPlayerLayer.player)
         XCTAssertNil(view.lifecycleTransitionPlayerLayer.player)
@@ -388,13 +391,13 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
     }
 
     @MainActor
-    func testLifecycleHandoffCancelsPendingDirectReplacementBeforeReusingStandbyLayer() async throws {
+    func testLifecycleHandoffCancelsPendingDirectReplacementBeforeReusingStandbyLayer() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("statelet-transition-pending-direct-test-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let movieURL = directory.appendingPathComponent("transition.mov")
-        try await Self.writeTestMovie(to: movieURL)
+        try Self.writeTestMovie(to: movieURL)
         let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         let controller = PetPlayerController(view: view)
         let entry = try MediaEntry(path: movieURL.lastPathComponent)
@@ -406,7 +409,7 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
             transitionID: 83,
             startedAt: DispatchTime.now().uptimeNanoseconds
         )
-        try await Self.waitUntil("outgoing presentation did not become ready") {
+        try Self.waitUntil("outgoing presentation did not become ready") {
             controller.currentURL == movieURL
         }
         let outgoing = view.playerLayer.player
@@ -434,10 +437,10 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
 
         XCTAssertTrue(view.playerLayer.player === outgoing)
         XCTAssertFalse(view.destinationPlayerLayer.player === obsoleteDirectPlayer)
-        try await Self.waitUntil("new lifecycle handoff did not commit") {
+        try Self.waitUntil("new lifecycle handoff did not commit") {
             controller.currentState == .review
         }
-        try await Task.sleep(nanoseconds: 150_000_000)
+        Self.pumpMainRunLoop(for: 0.15)
         XCTAssertEqual(controller.currentState, .review)
         XCTAssertNil(view.destinationPlayerLayer.player)
         XCTAssertNil(view.lifecycleTransitionPlayerLayer.player)
@@ -446,13 +449,13 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
     }
 
     @MainActor
-    func testSuspensionCancelsLifecycleReadinessDeadlineUntilResume() async throws {
+    func testSuspensionCancelsLifecycleReadinessDeadlineUntilResume() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("statelet-transition-suspend-test-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let movieURL = directory.appendingPathComponent("transition.mov")
-        try await Self.writeTestMovie(to: movieURL)
+        try Self.writeTestMovie(to: movieURL)
         let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         let controller = PetPlayerController(view: view)
         let entry = try MediaEntry(path: movieURL.lastPathComponent)
@@ -468,7 +471,7 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
             transitionID: 90,
             startedAt: DispatchTime.now().uptimeNanoseconds
         )
-        try await Self.waitUntil("outgoing presentation did not become ready") {
+        try Self.waitUntil("outgoing presentation did not become ready") {
             controller.currentURL == movieURL
         }
         controller.setSuspended(true, for: .windowOccluded)
@@ -484,7 +487,7 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
             startedAt: DispatchTime.now().uptimeNanoseconds
         )
         XCTAssertFalse(controller.hasPendingLifecycleReadinessTimeoutForTesting)
-        try await Task.sleep(nanoseconds: 4_100_000_000)
+        Self.pumpMainRunLoop(for: 4.1)
         XCTAssertNotNil(view.playerLayer.player)
         XCTAssertFalse(view.playerLayer.isHidden)
         XCTAssertTrue(view.destinationPlayerLayer.isHidden)
@@ -494,7 +497,7 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
         XCTAssertFalse(controller.hasPendingLifecyclePlaybackStallTimeoutForTesting)
 
         controller.setSuspended(false, for: .windowOccluded)
-        try await Self.waitUntil("resumed handoff did not commit its destination") {
+        try Self.waitUntil("resumed handoff did not commit its destination") {
             endedIDs == [91] && controller.currentState == .running
         }
         XCTAssertTrue(failedIDs.isEmpty)
@@ -505,13 +508,13 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
     }
 
     @MainActor
-    func testInitialDirectPresentationPreparedWhileSuspendedCommitsAfterResume() async throws {
+    func testInitialDirectPresentationPreparedWhileSuspendedCommitsAfterResume() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("statelet-initial-suspended-direct-test-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let movieURL = directory.appendingPathComponent("movie.mov")
-        try await Self.writeTestMovie(to: movieURL)
+        try Self.writeTestMovie(to: movieURL)
         let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         let controller = PetPlayerController(view: view)
         let entry = try MediaEntry(path: movieURL.lastPathComponent)
@@ -524,12 +527,12 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
             transitionID: 96,
             startedAt: DispatchTime.now().uptimeNanoseconds
         )
-        try await Task.sleep(nanoseconds: 150_000_000)
+        Self.pumpMainRunLoop(for: 0.15)
         XCTAssertNil(controller.currentURL)
         XCTAssertTrue(view.destinationPlayerLayer.isHidden)
 
         controller.setSuspended(false, for: .windowOccluded)
-        try await Self.waitUntil("initial suspended presentation did not commit after resume") {
+        try Self.waitUntil("initial suspended presentation did not commit after resume") {
             controller.currentURL == movieURL && controller.currentState == .idle
         }
         XCTAssertFalse(view.playerLayer.isHidden)
@@ -538,13 +541,13 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
     }
 
     @MainActor
-    func testLifecycleReadinessTimeoutRetainsOutgoingWhenNeitherOverlayIsVisible() async throws {
+    func testLifecycleReadinessTimeoutRetainsOutgoingWhenNeitherOverlayIsVisible() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("statelet-transition-timeout-test-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let movieURL = directory.appendingPathComponent("transition.mov")
-        try await Self.writeTestMovie(to: movieURL)
+        try Self.writeTestMovie(to: movieURL)
         let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         let controller = PetPlayerController(view: view)
         let entry = try MediaEntry(path: movieURL.lastPathComponent)
@@ -556,7 +559,7 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
             transitionID: 92,
             startedAt: DispatchTime.now().uptimeNanoseconds
         )
-        try await Self.waitUntil("outgoing presentation did not become ready") {
+        try Self.waitUntil("outgoing presentation did not become ready") {
             controller.currentURL == movieURL
         }
         let outgoing = view.playerLayer.player
@@ -584,13 +587,13 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
     }
 
     @MainActor
-    func testLifecyclePlaybackStallPromotesReadyDestinationWithoutBlanking() async throws {
+    func testLifecyclePlaybackStallPromotesReadyDestinationWithoutBlanking() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("statelet-transition-stall-test-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let movieURL = directory.appendingPathComponent("transition.mov")
-        try await Self.writeTestMovie(to: movieURL)
+        try Self.writeTestMovie(to: movieURL)
         let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         let controller = PetPlayerController(view: view)
         let entry = try MediaEntry(path: movieURL.lastPathComponent)
@@ -602,7 +605,7 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
             transitionID: 94,
             startedAt: DispatchTime.now().uptimeNanoseconds
         )
-        try await Self.waitUntil("outgoing presentation did not become ready") {
+        try Self.waitUntil("outgoing presentation did not become ready") {
             controller.currentURL == movieURL
         }
         var endedIDs: [UInt64] = []
@@ -618,15 +621,15 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
             transitionID: 95,
             startedAt: DispatchTime.now().uptimeNanoseconds
         )
-        try await Self.waitUntil("transition foreground did not become visible") {
+        try Self.waitUntil("transition foreground did not become visible") {
             !view.lifecycleTransitionPlayerLayer.isHidden
                 && controller.hasPendingLifecyclePlaybackStallTimeoutForTesting
         }
         view.lifecycleTransitionPlayerLayer.player?.pause()
-        try await Task.sleep(nanoseconds: 50_000_000)
+        Self.pumpMainRunLoop(for: 0.05)
         controller.fireLifecyclePlaybackStallTimeoutForTesting(transitionID: 95)
 
-        try await Self.waitUntil("stall fallback did not promote destination") {
+        try Self.waitUntil("stall fallback did not promote destination") {
             endedIDs == [95] && controller.currentState == .running
         }
         XCTAssertFalse(view.playerLayer.isHidden)
@@ -636,13 +639,13 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
     }
 
     @MainActor
-    func testLoopingMovieStartsAfterAVPlayerLooperPopulatesQueue() async throws {
+    func testLoopingMovieStartsAfterAVPlayerLooperPopulatesQueue() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("statelet-looper-test-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let movieURL = directory.appendingPathComponent("multi-frame.mov", isDirectory: false)
-        try await Self.writeTestMovie(to: movieURL)
+        try Self.writeTestMovie(to: movieURL)
 
         let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         let controller = PetPlayerController(view: view)
@@ -657,12 +660,15 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
         )
         XCTAssertEqual(disposition, .preparing)
 
-        let player = try XCTUnwrap(view.playerLayer.player as? AVQueuePlayer)
-        try await Self.waitUntil("AVPlayerLooper did not populate the queue") {
-            player.currentItem != nil
+        try Self.waitUntil("AVPlayerLooper did not populate the queue") {
+            guard let player = view.playerLayer.player as? AVQueuePlayer else {
+                return false
+            }
+            return controller.currentURL == movieURL && player.currentItem != nil
         }
+        let player = try XCTUnwrap(view.playerLayer.player as? AVQueuePlayer)
         let initialTime = player.currentTime().seconds
-        try await Self.waitUntil("looping playback did not start advancing") {
+        try Self.waitUntil("looping playback did not start advancing") {
             player.rate > 0
                 && player.currentTime().seconds.isFinite
                 && player.currentTime().seconds > initialTime + 0.03
@@ -673,7 +679,8 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
         controller.clearTransientPresentation()
     }
 
-    private static func writeTestMovie(to url: URL) async throws {
+    @MainActor
+    private static func writeTestMovie(to url: URL) throws {
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         let width = 32
         let height = 32
@@ -704,7 +711,7 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
         writer.startSession(atSourceTime: .zero)
 
         for frameIndex in 0..<30 {
-            try await waitUntil("asset writer input did not become ready") {
+            try waitUntil("asset writer input did not become ready") {
                 input.isReadyForMoreMediaData
             }
             var optionalBuffer: CVPixelBuffer?
@@ -736,8 +743,12 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
         }
 
         input.markAsFinished()
-        await withCheckedContinuation { continuation in
-            writer.finishWriting { continuation.resume() }
+        var didFinishWriting = false
+        writer.finishWriting {
+            didFinishWriting = true
+        }
+        try waitUntil("asset writer did not finish writing") {
+            didFinishWriting
         }
         guard writer.status == .completed else {
             throw TestFailure.assetWriter(writer.error?.localizedDescription ?? "finishWriting failed")
@@ -763,18 +774,26 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
         )
     }
 
+    @MainActor
     private static func waitUntil(
         _ timeoutMessage: String,
-        timeout: Duration = .seconds(5),
+        timeout: TimeInterval = 5,
         condition: @escaping () -> Bool
-    ) async throws {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
+    ) throws {
+        let deadline = Date().addingTimeInterval(timeout)
         while !condition() {
-            guard clock.now < deadline else {
+            guard Date() < deadline else {
                 throw TestFailure.timedOut(timeoutMessage)
             }
-            try await Task.sleep(for: .milliseconds(10))
+            RunLoop.main.run(until: min(deadline, Date().addingTimeInterval(0.01)))
+        }
+    }
+
+    @MainActor
+    private static func pumpMainRunLoop(for duration: TimeInterval) {
+        let deadline = Date().addingTimeInterval(duration)
+        while Date() < deadline {
+            RunLoop.main.run(until: min(deadline, Date().addingTimeInterval(0.01)))
         }
     }
 }

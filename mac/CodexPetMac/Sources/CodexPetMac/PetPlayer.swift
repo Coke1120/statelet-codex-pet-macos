@@ -965,12 +965,16 @@ final class PetPlayerController {
         let startedAt: UInt64
         let advancePlaylistWhenEnded: Bool
         var destinationItemReady = false
+        var destinationPrerollStarted = false
+        var destinationPrerollCompleted = false
         var destinationDisplayReady = false
         var destinationDisplayReset = false
         var destinationStarted = false
         var destinationVisible = false
         var destinationRetryCount = 0
         var transitionItemReady = false
+        var transitionPrerollStarted = false
+        var transitionPrerollCompleted = false
         var transitionDisplayReady = false
         var transitionDisplayReset = false
         var transitionVisible = false
@@ -991,6 +995,8 @@ final class PetPlayerController {
         let notifyWhenEnded: Bool
         let advancePlaylistWhenEnded: Bool
         var itemReady = false
+        var prerollStarted = false
+        var prerollCompleted = false
         var displayReady = false
         var displayReset = false
     }
@@ -1146,7 +1152,6 @@ final class PetPlayerController {
             replacementLooper = nil
             replacementPlayer.insert(item, after: nil)
         }
-        let playbackRate = entry.playbackRate.value
         activeDirectReplacement = ActiveDirectReplacement(
             id: transitionID,
             state: state,
@@ -1190,13 +1195,6 @@ final class PetPlayerController {
                 ?? "preparing media"
         )
         scheduleDirectReadinessTimeout(transitionID: transitionID)
-        // Preroll warms the hidden standby without advancing it. Starting the
-        // same player here would overlap decoder startup; playback begins only
-        // after both readiness gates atomically promote this player to base.
-        replacementPlayer.preroll(atRate: Float(playbackRate)) { [weak self] ready in
-            guard ready else { return }
-            DispatchQueue.main.async { self?.tryPromoteDirectReplacement(transitionID: transitionID) }
-        }
         return .preparing
     }
 
@@ -1318,22 +1316,6 @@ final class PetPlayerController {
             queue: .main
         ) { [weak self] _ in
             self?.failLifecycleHandoff(transitionID: transitionID, reason: "transition_playback_failed")
-        }
-        transitionPlayer.preroll(atRate: Float(transitionEntry.playbackRate.value)) { [weak self] ready in
-            DispatchQueue.main.async {
-                guard let self, self.activeLifecycleHandoff?.id == transitionID else { return }
-                if ready {
-                    self.tryRevealLifecycleTransition(transitionID: transitionID)
-                }
-            }
-        }
-        destinationPlayer.preroll(atRate: Float(destinationEntry.playbackRate.value)) { [weak self] ready in
-            DispatchQueue.main.async {
-                guard let self, self.activeLifecycleHandoff?.id == transitionID else { return }
-                if ready {
-                    self.tryRevealLifecycleDestination(transitionID: transitionID)
-                }
-            }
         }
         scheduleLifecycleReadinessTimeout(transitionID: transitionID)
         presentationStatus = .preparing(destinationState)
@@ -1459,6 +1441,7 @@ final class PetPlayerController {
         case .readyToPlay:
             replacement.itemReady = true
             activeDirectReplacement = replacement
+            startDirectPrerollIfNeeded(item: item, transitionID: transitionID)
             tryPromoteDirectReplacement(transitionID: transitionID)
         case .failed:
             failDirectReplacement(transitionID: transitionID)
@@ -1466,6 +1449,33 @@ final class PetPlayerController {
             break
         @unknown default:
             failDirectReplacement(transitionID: transitionID)
+        }
+    }
+
+    private func startDirectPrerollIfNeeded(item: AVPlayerItem, transitionID: UInt64) {
+        guard var replacement = activeDirectReplacement,
+              replacement.id == transitionID,
+              replacement.player.currentItem === item,
+              !replacement.prerollStarted else { return }
+        replacement.prerollStarted = true
+        activeDirectReplacement = replacement
+        let player = replacement.player
+        player.preroll(atRate: Float(replacement.entry.playbackRate.value)) { [weak self, weak item] ready in
+            guard let item else { return }
+            DispatchQueue.main.async {
+                guard let self,
+                      var active = self.activeDirectReplacement,
+                      active.id == transitionID,
+                      active.player === player,
+                      active.player.currentItem === item else { return }
+                guard ready else {
+                    self.failDirectReplacement(transitionID: transitionID)
+                    return
+                }
+                active.prerollCompleted = true
+                self.activeDirectReplacement = active
+                self.tryPromoteDirectReplacement(transitionID: transitionID)
+            }
         }
     }
 
@@ -1487,6 +1497,7 @@ final class PetPlayerController {
         guard let replacement = activeDirectReplacement,
               replacement.id == transitionID,
               replacement.itemReady,
+              replacement.prerollCompleted,
               replacement.displayReady,
               suspensionPolicy.reasons.isEmpty else { return }
         directTimeoutWorkItem?.cancel()
@@ -1611,6 +1622,7 @@ final class PetPlayerController {
         case .readyToPlay:
             handoff.destinationItemReady = true
             activeLifecycleHandoff = handoff
+            startLifecycleDestinationPrerollIfNeeded(item: item, transitionID: transitionID)
             tryRevealLifecycleDestination(transitionID: transitionID)
         case .failed:
             retryLifecycleDestination(transitionID: transitionID)
@@ -1653,6 +1665,7 @@ final class PetPlayerController {
         case .readyToPlay:
             handoff.transitionItemReady = true
             activeLifecycleHandoff = handoff
+            startLifecycleTransitionPrerollIfNeeded(item: item, transitionID: transitionID)
             tryRevealLifecycleTransition(transitionID: transitionID)
         case .failed:
             failLifecycleHandoff(transitionID: transitionID, reason: "transition_item_failed")
@@ -1660,6 +1673,70 @@ final class PetPlayerController {
             break
         @unknown default:
             failLifecycleHandoff(transitionID: transitionID, reason: "transition_item_failed")
+        }
+    }
+
+    private func startLifecycleTransitionPrerollIfNeeded(
+        item: AVPlayerItem,
+        transitionID: UInt64
+    ) {
+        guard var handoff = activeLifecycleHandoff,
+              handoff.id == transitionID,
+              handoff.transitionItem === item,
+              !handoff.transitionPrerollStarted else { return }
+        handoff.transitionPrerollStarted = true
+        activeLifecycleHandoff = handoff
+        let player = handoff.transitionPlayer
+        player.preroll(atRate: Float(handoff.transitionPlaybackRate)) { [weak self, weak item] ready in
+            guard let item else { return }
+            DispatchQueue.main.async {
+                guard let self,
+                      var active = self.activeLifecycleHandoff,
+                      active.id == transitionID,
+                      active.transitionPlayer === player,
+                      active.transitionItem === item else { return }
+                guard ready else {
+                    self.failLifecycleHandoff(
+                        transitionID: transitionID,
+                        reason: "transition_preroll_failed"
+                    )
+                    return
+                }
+                active.transitionPrerollCompleted = true
+                self.activeLifecycleHandoff = active
+                self.tryRevealLifecycleTransition(transitionID: transitionID)
+            }
+        }
+    }
+
+    private func startLifecycleDestinationPrerollIfNeeded(
+        item: AVPlayerItem,
+        transitionID: UInt64
+    ) {
+        guard var handoff = activeLifecycleHandoff,
+              handoff.id == transitionID,
+              handoff.destinationPlayer.currentItem === item,
+              !handoff.destinationPrerollStarted else { return }
+        handoff.destinationPrerollStarted = true
+        activeLifecycleHandoff = handoff
+        let player = handoff.destinationPlayer
+        player.preroll(atRate: Float(handoff.destinationEntry.playbackRate.value)) { [weak self, weak item] ready in
+            guard let item else { return }
+            DispatchQueue.main.async {
+                guard let self,
+                      var active = self.activeLifecycleHandoff,
+                      active.id == transitionID,
+                      active.destinationPlayer === player,
+                      active.destinationPlayer.currentItem === item else { return }
+                guard ready else {
+                    self.retryLifecycleDestination(transitionID: transitionID)
+                    return
+                }
+                active.destinationPrerollCompleted = true
+                self.activeLifecycleHandoff = active
+                self.startLifecycleDestinationPlaybackIfReady(transitionID: transitionID)
+                self.tryRevealLifecycleDestination(transitionID: transitionID)
+            }
         }
     }
 
@@ -1688,6 +1765,7 @@ final class PetPlayerController {
         guard var handoff = activeLifecycleHandoff,
               handoff.id == transitionID,
               handoff.transitionItemReady,
+              handoff.transitionPrerollCompleted,
               handoff.transitionDisplayReady,
               !handoff.transitionVisible,
               suspensionPolicy.reasons.isEmpty else { return }
@@ -1731,13 +1809,20 @@ final class PetPlayerController {
               !handoff.destinationStarted else { return }
         handoff.destinationStarted = true
         activeLifecycleHandoff = handoff
-        if suspensionPolicy.reasons.isEmpty {
-            handoff.destinationPlayer.playImmediately(
-                atRate: Float(handoff.destinationEntry.playbackRate.value)
-            )
-        }
+        startLifecycleDestinationPlaybackIfReady(transitionID: transitionID)
         tryRevealLifecycleDestination(transitionID: transitionID)
         logger.info("event=lifecycle_destination_preroll_started transition_id=\(transitionID, privacy: .public)")
+    }
+
+    private func startLifecycleDestinationPlaybackIfReady(transitionID: UInt64) {
+        guard let handoff = activeLifecycleHandoff,
+              handoff.id == transitionID,
+              handoff.destinationStarted,
+              handoff.destinationPrerollCompleted,
+              suspensionPolicy.reasons.isEmpty else { return }
+        handoff.destinationPlayer.playImmediately(
+            atRate: Float(handoff.destinationEntry.playbackRate.value)
+        )
     }
 
     private func tryRevealLifecycleDestination(transitionID: UInt64) {
@@ -1745,6 +1830,7 @@ final class PetPlayerController {
               handoff.id == transitionID,
               handoff.destinationStarted,
               handoff.destinationItemReady,
+              handoff.destinationPrerollCompleted,
               handoff.destinationDisplayReady,
               !handoff.destinationVisible,
               suspensionPolicy.reasons.isEmpty else { return }
@@ -1842,9 +1928,7 @@ final class PetPlayerController {
             )
         }
         if handoff.destinationStarted {
-            handoff.destinationPlayer.playImmediately(
-                atRate: Float(handoff.destinationEntry.playbackRate.value)
-            )
+            startLifecycleDestinationPlaybackIfReady(transitionID: handoff.id)
             tryRevealLifecycleDestination(transitionID: handoff.id)
         }
     }
@@ -1888,6 +1972,8 @@ final class PetPlayerController {
         }
         handoff.destinationRetryCount = 1
         handoff.destinationItemReady = false
+        handoff.destinationPrerollStarted = false
+        handoff.destinationPrerollCompleted = false
         handoff.destinationDisplayReady = false
         handoff.destinationDisplayReset = false
         handoff.destinationStarted = false
@@ -1921,14 +2007,6 @@ final class PetPlayerController {
             let currentItem = player.currentItem
             DispatchQueue.main.async {
                 self?.observeLifecycleDestinationCurrentItem(currentItem, transitionID: transitionID)
-            }
-        }
-        handoff.destinationPlayer.preroll(
-            atRate: Float(handoff.destinationEntry.playbackRate.value)
-        ) { [weak self] ready in
-            guard ready else { return }
-            DispatchQueue.main.async {
-                self?.tryRevealLifecycleDestination(transitionID: transitionID)
             }
         }
         if handoff.transitionEnded {
