@@ -20,6 +20,14 @@ struct CharacterLibraryCatalogSnapshot {
 struct CharacterTransitionRuntimeAttestation: Equatable {
     let movieRevision: LocalFileRevision
     let reportRevision: LocalFileRevision
+
+    func requireUnchanged(movieURL: URL) throws {
+        let reportURL = movieURL.deletingPathExtension().appendingPathExtension("report.json")
+        guard LocalFileRevision(url: movieURL) == movieRevision,
+              LocalFileRevision(url: reportURL) == reportRevision else {
+            throw CharacterLibraryStorageError.sourceChanged
+        }
+    }
 }
 
 enum CharacterLibraryStorageError: LocalizedError {

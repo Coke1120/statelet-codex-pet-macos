@@ -1209,6 +1209,7 @@ final class PetPlayerController {
         destinationState: PetState,
         transitionEntry: MediaEntry,
         transitionURL: URL,
+        transitionAttestation: CharacterTransitionRuntimeAttestation,
         destinationEntry: MediaEntry,
         destinationURL: URL,
         transitionID: UInt64,
@@ -1218,6 +1219,14 @@ final class PetPlayerController {
         guard !reduceMotion,
               FileManager.default.isReadableFile(atPath: transitionURL.path),
               FileManager.default.isReadableFile(atPath: destinationURL.path) else {
+            return .failed
+        }
+        do {
+            try transitionAttestation.requireUnchanged(movieURL: transitionURL)
+        } catch {
+            logger.error(
+                "event=lifecycle_transition_binding_rejected transition_id=\(transitionID, privacy: .public) reason=source_changed"
+            )
             return .failed
         }
         cancelDirectReplacement()
@@ -1397,13 +1406,6 @@ final class PetPlayerController {
 
     func updatePublisherHealth(_ summary: String) {
         view.updatePublisherHealth(summary)
-    }
-
-    /// Removes a one-shot item before the lifecycle presentation is restored.
-    /// This prevents the normal soft-failure retention policy from treating a
-    /// preview as the last known-good lifecycle animation.
-    func clearOneShotPresentation() {
-        clearTransientPresentation()
     }
 
     /// Removes any temporary presentation before authoritative lifecycle media

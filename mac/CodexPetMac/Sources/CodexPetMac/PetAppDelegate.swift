@@ -252,6 +252,16 @@ private struct ActiveLifecycleTransition {
     let destinationEntry: MediaEntry
 }
 
+private struct PendingLifecycleTransitionAttestation {
+    let id: UInt64
+    let source: PetState
+    let destination: PetState
+    let transitionEntry: MediaEntry
+    let transitionURL: URL
+    let destinationEntry: MediaEntry
+    let destinationURL: URL
+}
+
 enum LifecycleTransitionCompletionDecision: Equatable {
     case commit(PetState)
     case ignore
@@ -412,6 +422,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var lastPresentedState: PetState?
     private var lastCommittedLifecycleState: PetState?
     private var pendingPresentationState: PetState?
+    private var pendingLifecycleTransitionAttestation: PendingLifecycleTransitionAttestation?
     private var activeLifecycleTransition: ActiveLifecycleTransition?
     private var stateDialoguePresentation: StateDialoguePresentation?
     private var publisherHealth: PublisherHealth = .unknown
@@ -601,6 +612,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        pendingLifecycleTransitionAttestation = nil
         stateWatcher?.stop()
         mapWatcher?.stop()
         characterLibraryWatcher?.stop()
@@ -822,7 +834,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         cancelActiveLifecycleTransition(reason: "character_changed")
         cancelActiveOneShotWithoutRestore(reason: "character_changed")
         _ = temporaryStatePreviewPolicy.cancel()
-        player?.clearTransientPresentation()
         mediaSelectionCursor = MediaSelectionCursor()
         manualPreviewSelectionCursor = MediaSelectionCursor()
         lastLifecycleStateForSelection = nil
@@ -971,14 +982,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             switch oneShotArbiter.heartbeat(state: state) {
             case .inactive:
                 activeOneShotPreview = nil
-                player.clearTransientPresentation()
                 lastPresentedState = nil
                 pendingPresentationState = nil
             case .continuing:
                 break
             case let .preempted(preview):
                 activeOneShotPreview = nil
-                player.clearTransientPresentation()
                 lastPresentedState = nil
                 pendingPresentationState = nil
                 logger.info("event=one_shot_preempted token=\(preview.token.rawValue, privacy: .public) lifecycle_state=\(state.rawValue, privacy: .public)")
@@ -1001,7 +1010,13 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             presentationWillRefresh: decision.shouldRefresh
         )
         var cancelledLifecycleTransition = false
-        if let activeLifecycleTransition,
+        if let pendingLifecycleTransitionAttestation,
+           forceRefresh || pendingLifecycleTransitionAttestation.destination != state {
+            cancelActiveLifecycleTransition(
+                reason: forceRefresh ? "forced_refresh" : "authoritative_state_changed"
+            )
+            cancelledLifecycleTransition = true
+        } else if let activeLifecycleTransition,
            forceRefresh || activeLifecycleTransition.destination != state {
             cancelActiveLifecycleTransition(
                 reason: forceRefresh ? "forced_refresh" : "authoritative_state_changed"
@@ -1031,7 +1046,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                reduceMotion: reduceMotion,
                hasConfiguredMedia: configuredTransition != nil
            ),
-           startLifecycleTransition(
+           beginLifecycleTransition(
                from: source,
                to: state,
                advanceSelection: shouldAdvanceSelection
@@ -1049,7 +1064,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         )
     }
 
-    private func startLifecycleTransition(
+    private func beginLifecycleTransition(
         from source: PetState,
         to destination: PetState,
         advanceSelection: Bool
@@ -1070,13 +1085,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             logger.error("event=lifecycle_transition_unavailable from=\(source.rawValue, privacy: .public) to=\(destination.rawValue, privacy: .public) reason=unreadable")
             return false
         }
-        do {
-            _ = try CharacterLibraryStorage.attestRuntimeTransition(movieURL: transitionURL)
-        } catch {
-            logger.error("event=lifecycle_transition_unavailable from=\(source.rawValue, privacy: .public) to=\(destination.rawValue, privacy: .public) reason=attestation_failed")
-            return false
-        }
-
         cancelActiveLifecycleTransition(reason: "superseded")
         if stateDialoguePresentation != nil {
             dialogueVoiceCoordinator.cancelAutomaticPlayback()
@@ -1085,34 +1093,86 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
         transitionSequence &+= 1
         let transitionID = transitionSequence
-        activeLifecycleTransition = ActiveLifecycleTransition(
+        let request = PendingLifecycleTransitionAttestation(
             id: transitionID,
             source: source,
             destination: destination,
-            destinationEntry: destinationEntry
-        )
-        pendingPresentationState = destination
-        let continuousRotation = mediaMap.playlist(for: destination)?.isContinuousRotationEffective == true
-        let result = player.showLifecycleTransition(
-            sourceState: source,
-            destinationState: destination,
             transitionEntry: transitionEntry,
             transitionURL: transitionURL,
             destinationEntry: destinationEntry,
-            destinationURL: destinationURL,
-            transitionID: transitionID,
-            startedAt: DispatchTime.now().uptimeNanoseconds,
-            advancePlaylistWhenEnded: continuousRotation
+            destinationURL: destinationURL
         )
-        guard result == .preparing else {
-            activeLifecycleTransition = nil
-            pendingPresentationState = nil
-            return false
+        pendingLifecycleTransitionAttestation = request
+        pendingPresentationState = destination
+        logger.info("event=lifecycle_transition_attestation_started transition_id=\(transitionID, privacy: .public) from=\(source.rawValue, privacy: .public) to=\(destination.rawValue, privacy: .public)")
+        Task { @MainActor [weak self] in
+            let result = await Task.detached(priority: .userInitiated) {
+                Result {
+                    try CharacterLibraryStorage.attestRuntimeTransition(movieURL: transitionURL)
+                }
+            }.value
+            self?.finishLifecycleTransitionAttestation(request: request, result: result)
         }
-        logger.info("event=lifecycle_transition_started transition_id=\(transitionID, privacy: .public) from=\(source.rawValue, privacy: .public) to=\(destination.rawValue, privacy: .public)")
         updateStatusMenu()
         refreshSettings()
         return true
+    }
+
+    private func finishLifecycleTransitionAttestation(
+        request: PendingLifecycleTransitionAttestation,
+        result: Result<CharacterTransitionRuntimeAttestation, Error>
+    ) {
+        guard pendingLifecycleTransitionAttestation?.id == request.id,
+              transitionSequence == request.id,
+              currentState == request.destination,
+              temporaryStatePreviewPolicy.previewState == nil,
+              activeOneShotPreview == nil else { return }
+        pendingLifecycleTransitionAttestation = nil
+        switch result {
+        case .failure:
+            pendingPresentationState = nil
+            logger.error("event=lifecycle_transition_unavailable from=\(request.source.rawValue, privacy: .public) to=\(request.destination.rawValue, privacy: .public) reason=attestation_failed")
+            startLifecyclePresentation(
+                state: request.destination,
+                advanceSelection: false,
+                refreshReason: "layered_handoff_attestation_failed",
+                preselectedEntry: request.destinationEntry
+            )
+        case let .success(attestation):
+            activeLifecycleTransition = ActiveLifecycleTransition(
+                id: request.id,
+                source: request.source,
+                destination: request.destination,
+                destinationEntry: request.destinationEntry
+            )
+            let continuousRotation = mediaMap.playlist(for: request.destination)?.isContinuousRotationEffective == true
+            let playback = player.showLifecycleTransition(
+                sourceState: request.source,
+                destinationState: request.destination,
+                transitionEntry: request.transitionEntry,
+                transitionURL: request.transitionURL,
+                transitionAttestation: attestation,
+                destinationEntry: request.destinationEntry,
+                destinationURL: request.destinationURL,
+                transitionID: request.id,
+                startedAt: DispatchTime.now().uptimeNanoseconds,
+                advancePlaylistWhenEnded: continuousRotation
+            )
+            guard playback == .preparing else {
+                activeLifecycleTransition = nil
+                pendingPresentationState = nil
+                startLifecyclePresentation(
+                    state: request.destination,
+                    advanceSelection: false,
+                    refreshReason: "layered_handoff_binding_failed",
+                    preselectedEntry: request.destinationEntry
+                )
+                return
+            }
+            logger.info("event=lifecycle_transition_started transition_id=\(request.id, privacy: .public) from=\(request.source.rawValue, privacy: .public) to=\(request.destination.rawValue, privacy: .public)")
+            updateStatusMenu()
+            refreshSettings()
+        }
     }
 
     private func finishLifecycleTransition(transitionID: UInt64, outcome: String) {
@@ -1146,7 +1206,22 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func cancelActiveLifecycleTransition(reason: String) {
-        guard let active = activeLifecycleTransition else { return }
+        var cancelledPending = false
+        if let pending = pendingLifecycleTransitionAttestation {
+            cancelledPending = true
+            pendingLifecycleTransitionAttestation = nil
+            if pendingPresentationState == pending.destination {
+                pendingPresentationState = nil
+            }
+            logger.info("event=lifecycle_transition_attestation_cancelled transition_id=\(pending.id, privacy: .public) from=\(pending.source.rawValue, privacy: .public) to=\(pending.destination.rawValue, privacy: .public) reason=\(reason, privacy: .public)")
+        }
+        guard let active = activeLifecycleTransition else {
+            if cancelledPending {
+                updateStatusMenu()
+                refreshSettings()
+            }
+            return
+        }
         activeLifecycleTransition = nil
         pendingPresentationState = nil
         player.cancelLifecycleTransition()
@@ -1498,7 +1573,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         if temporaryStatePreviewPolicy.previewState == nil {
             manualPreviewSelectionCursor = mediaSelectionCursor
         }
-        player.clearTransientPresentation()
         lastPresentedState = nil
         pendingPresentationState = nil
         _ = temporaryStatePreviewPolicy.begin(
@@ -1535,7 +1609,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     ) {
         cancelActiveLifecycleTransition(reason: "temporary_state_relinquished")
         cancelActiveOneShotWithoutRestore(reason: "temporary_state_relinquished")
-        player.clearTransientPresentation()
         lastPresentedState = nil
         pendingPresentationState = nil
         if let previousPreview {
@@ -4142,7 +4215,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
               oneShotArbiter.complete(token: active.playback.token) != nil else { return }
         activeOneShotPreview = nil
         pendingPresentationState = nil
-        player.clearOneShotPresentation()
         logger.info("event=one_shot_finished token=\(active.playback.token.rawValue, privacy: .public) reason=\(reason, privacy: .public)")
         updateStatusMenu()
         refreshSettings()
@@ -4154,7 +4226,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
               oneShotArbiter.cancel(token: active.playback.token) != nil else { return }
         activeOneShotPreview = nil
         pendingPresentationState = nil
-        player.clearOneShotPresentation()
         logger.info("event=one_shot_stopped token=\(active.playback.token.rawValue, privacy: .public) reason=\(reason, privacy: .public)")
         updateStatusMenu()
         refreshSettings()
@@ -4166,7 +4237,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         _ = oneShotArbiter.cancel(token: active.playback.token)
         activeOneShotPreview = nil
         pendingPresentationState = nil
-        player.clearOneShotPresentation()
         logger.info("event=one_shot_cancelled token=\(active.playback.token.rawValue, privacy: .public) reason=\(reason, privacy: .public)")
     }
 

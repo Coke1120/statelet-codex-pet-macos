@@ -54,10 +54,18 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         active_source = self.app[active:active_end]
         self.assertIn("let destinationEntry: MediaEntry", active_source)
 
-        transition = self.app.index("private func startLifecycleTransition(")
-        transition_end = self.app.index("private func finishLifecycleTransition", transition)
+        transition = self.app.index("private func beginLifecycleTransition(")
+        transition_end = self.app.index("private func finishLifecycleTransitionAttestation", transition)
         transition_source = self.app[transition:transition_end]
         self.assertIn("destinationEntry: destinationEntry", transition_source)
+        self.assertIn("Task.detached(priority: .userInitiated)", transition_source)
+        self.assertIn("finishLifecycleTransitionAttestation", transition_source)
+        attestation_finish = self.app.index("private func finishLifecycleTransitionAttestation")
+        attestation_finish_end = self.app.index("private func finishLifecycleTransition(", attestation_finish)
+        self.assertIn(
+            "transitionAttestation: attestation",
+            self.app[attestation_finish:attestation_finish_end],
+        )
 
         presentation = self.app.index("private func startLifecyclePresentation(")
         presentation_end = self.app.index("private func advancePlaylistAfterClipEnd", presentation)
@@ -104,6 +112,7 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         self.assertIn("view.revealLifecycleDestination()", self.player)
         self.assertIn("LayeredLifecycleHandoffPolicy.destinationPrerollTime", self.player)
         self.assertIn("CharacterLibraryStorage.attestRuntimeTransition", self.app)
+        self.assertIn("transitionAttestation.requireUnchanged", self.player)
 
     def test_publisher_rejection_cancels_transition_and_forces_idle_without_transition(self):
         start = self.app.index("private func rejectPublisher")

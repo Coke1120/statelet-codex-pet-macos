@@ -255,6 +255,7 @@ final class PetPlayerPlaybackTests: XCTestCase {
                 destinationState: .running,
                 transitionEntry: entry,
                 transitionURL: movieURL,
+                transitionAttestation: try Self.testTransitionAttestation(for: movieURL),
                 destinationEntry: entry,
                 destinationURL: movieURL,
                 transitionID: 44,
@@ -326,11 +327,16 @@ final class PetPlayerPlaybackTests: XCTestCase {
         let outgoingPlayer = view.playerLayer.player
         var endedIDs: [UInt64] = []
         controller.onLifecycleTransitionEnded = { endedIDs.append($0) }
+        let attestation = try Self.testTransitionAttestation(for: movieURL)
+        var mutatedMovie = try Data(contentsOf: movieURL)
+        mutatedMovie.append(0x00)
+        try mutatedMovie.write(to: movieURL, options: [.atomic])
         _ = controller.showLifecycleTransition(
             sourceState: .idle,
             destinationState: .running,
             transitionEntry: entry,
             transitionURL: movieURL,
+            transitionAttestation: attestation,
             destinationEntry: entry,
             destinationURL: movieURL,
             transitionID: 51,
@@ -380,6 +386,7 @@ final class PetPlayerPlaybackTests: XCTestCase {
             destinationState: .running,
             transitionEntry: entry,
             transitionURL: movieURL,
+            transitionAttestation: try Self.testTransitionAttestation(for: movieURL),
             destinationEntry: entry,
             destinationURL: movieURL,
             transitionID: 61,
@@ -413,6 +420,10 @@ final class PetPlayerPlaybackTests: XCTestCase {
                 destinationState: .running,
                 transitionEntry: entry,
                 transitionURL: movieURL,
+                transitionAttestation: CharacterTransitionRuntimeAttestation(
+                    movieRevision: LocalFileRevision(url: movieURL)!,
+                    reportRevision: LocalFileRevision(url: movieURL)!
+                ),
                 destinationEntry: entry,
                 destinationURL: movieURL,
                 transitionID: 70,
@@ -534,6 +545,7 @@ final class PetPlayerPlaybackTests: XCTestCase {
             destinationState: .running,
             transitionEntry: entry,
             transitionURL: movieURL,
+            transitionAttestation: try Self.testTransitionAttestation(for: movieURL),
             destinationEntry: entry,
             destinationURL: movieURL,
             transitionID: 81,
@@ -547,6 +559,7 @@ final class PetPlayerPlaybackTests: XCTestCase {
             destinationState: .review,
             transitionEntry: entry,
             transitionURL: movieURL,
+            transitionAttestation: try Self.testTransitionAttestation(for: movieURL),
             destinationEntry: entry,
             destinationURL: movieURL,
             transitionID: 82,
@@ -603,6 +616,7 @@ final class PetPlayerPlaybackTests: XCTestCase {
             destinationState: .review,
             transitionEntry: entry,
             transitionURL: movieURL,
+            transitionAttestation: try Self.testTransitionAttestation(for: movieURL),
             destinationEntry: entry,
             destinationURL: movieURL,
             transitionID: 85,
@@ -654,6 +668,7 @@ final class PetPlayerPlaybackTests: XCTestCase {
             destinationState: .running,
             transitionEntry: entry,
             transitionURL: movieURL,
+            transitionAttestation: try Self.testTransitionAttestation(for: movieURL),
             destinationEntry: entry,
             destinationURL: movieURL,
             transitionID: 91,
@@ -743,6 +758,7 @@ final class PetPlayerPlaybackTests: XCTestCase {
             destinationState: .running,
             transitionEntry: entry,
             transitionURL: movieURL,
+            transitionAttestation: try Self.testTransitionAttestation(for: movieURL),
             destinationEntry: entry,
             destinationURL: movieURL,
             transitionID: 93,
@@ -787,6 +803,7 @@ final class PetPlayerPlaybackTests: XCTestCase {
             destinationState: .running,
             transitionEntry: entry,
             transitionURL: movieURL,
+            transitionAttestation: try Self.testTransitionAttestation(for: movieURL),
             destinationEntry: entry,
             destinationURL: movieURL,
             transitionID: 95,
@@ -1003,6 +1020,19 @@ final class PetPlayerPlaybackTests: XCTestCase {
         guard writer.status == .completed else {
             throw TestFailure.assetWriter(writer.error?.localizedDescription ?? "finishWriting failed")
         }
+    }
+
+    private static func testTransitionAttestation(
+        for movieURL: URL
+    ) throws -> CharacterTransitionRuntimeAttestation {
+        let reportURL = movieURL.deletingPathExtension().appendingPathExtension("report.json")
+        if !FileManager.default.fileExists(atPath: reportURL.path) {
+            try Data("test transition attestation".utf8).write(to: reportURL)
+        }
+        return CharacterTransitionRuntimeAttestation(
+            movieRevision: try XCTUnwrap(LocalFileRevision(url: movieURL)),
+            reportRevision: try XCTUnwrap(LocalFileRevision(url: reportURL))
+        )
     }
 
     private static func waitUntil(
