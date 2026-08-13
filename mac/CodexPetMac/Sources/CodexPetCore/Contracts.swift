@@ -81,6 +81,67 @@ public struct PlaybackRate: Codable, Equatable, Sendable {
     }
 }
 
+public enum CurrentStateHookEvent: String, Codable, CaseIterable, Sendable {
+    /// Privacy-safe fallback for an event name a newer producer understands
+    /// but this contract version does not yet recognize.
+    case unknown
+    case permissionRequest = "PermissionRequest"
+    case postCompact = "PostCompact"
+    case postToolUse = "PostToolUse"
+    case preCompact = "PreCompact"
+    case preToolUse = "PreToolUse"
+    case sessionEnd = "SessionEnd"
+    case sessionStart = "SessionStart"
+    case stop = "Stop"
+    case subagentStart = "SubagentStart"
+    case subagentStop = "SubagentStop"
+    case userPromptSubmit = "UserPromptSubmit"
+}
+
+public struct CurrentStateRejectionDiagnostics: Codable, Equatable, Sendable {
+    public static let maximumCount = 1_000_000
+    public static let maximumReasons = 8
+    public static let allowedReasons: Set<String> = [
+        "expired",
+        "future_event",
+        "invalid_record",
+        "invalid_timestamp",
+        "stale_event",
+    ]
+
+    public let count: Int
+    public let reasons: [String: Int]
+
+    private enum CodingKeys: String, CodingKey {
+        case count
+        case reasons
+    }
+
+    public init(count: Int = 0, reasons: [String: Int] = [:]) throws {
+        guard (0...Self.maximumCount).contains(count) else {
+            throw PetContractError.invalidValue("rejection_diagnostics.count is out of range")
+        }
+        guard reasons.count <= Self.maximumReasons else {
+            throw PetContractError.invalidValue("rejection_diagnostics contains too many reasons")
+        }
+        for (reason, value) in reasons {
+            guard Self.allowedReasons.contains(reason), (1...Self.maximumCount).contains(value) else {
+                throw PetContractError.invalidValue("rejection_diagnostics contains an invalid reason")
+            }
+        }
+        self.count = count
+        self.reasons = reasons
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            count: try container.decodeIfPresent(Int.self, forKey: .count) ?? 0,
+            reasons: try container.decodeIfPresent([String: Int].self, forKey: .reasons) ?? [:]
+        )
+    }
+}
+
 public struct CurrentState: Codable, Equatable, Sendable {
     public let version: Int
     public let schemaVersion: Int
@@ -96,6 +157,11 @@ public struct CurrentState: Codable, Equatable, Sendable {
     public let emittedAt: Double
     public let reason: String?
     public let forced: Bool
+    public let publicationRevision: Int?
+    public let recovery: Bool
+    public let latestEvent: String?
+    public let latestEventAt: Double?
+    public let rejectionDiagnostics: CurrentStateRejectionDiagnostics
 
     public init(
         version: Int = StateContract.version,
@@ -108,7 +174,12 @@ public struct CurrentState: Codable, Equatable, Sendable {
         sourceUpdatedAt: Double? = nil,
         emittedAt: Double? = nil,
         reason: String? = nil,
-        forced: Bool = false
+        forced: Bool = false,
+        publicationRevision: Int? = nil,
+        recovery: Bool = false,
+        latestEvent: String? = nil,
+        latestEventAt: Double? = nil,
+        rejectionDiagnostics: CurrentStateRejectionDiagnostics = try! CurrentStateRejectionDiagnostics()
     ) throws {
         guard version == StateContract.version else {
             throw PetContractError.unsupportedVersion(version)
@@ -137,6 +208,16 @@ public struct CurrentState: Codable, Equatable, Sendable {
         guard emittedTimestamp.isFinite else {
             throw PetContractError.invalidNumber("emitted_at")
         }
+        if let publicationRevision, publicationRevision < 1 {
+            throw PetContractError.invalidValue("publication_revision must be positive")
+        }
+        if let latestEventAt, !latestEventAt.isFinite {
+            throw PetContractError.invalidNumber("latest_event_at")
+        }
+        if let latestEvent,
+           !CurrentStateHookEvent.allCases.map(\.rawValue).contains(latestEvent) {
+            throw PetContractError.invalidValue("latest_event is not a supported hook event")
+        }
         self.version = version
         self.schemaVersion = schemaVersion
         self.state = state
@@ -148,6 +229,11 @@ public struct CurrentState: Codable, Equatable, Sendable {
         self.emittedAt = emittedTimestamp
         self.reason = reason
         self.forced = forced
+        self.publicationRevision = publicationRevision
+        self.recovery = recovery
+        self.latestEvent = latestEvent
+        self.latestEventAt = latestEventAt
+        self.rejectionDiagnostics = rejectionDiagnostics
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -162,6 +248,11 @@ public struct CurrentState: Codable, Equatable, Sendable {
         case emittedAt = "emitted_at"
         case reason
         case forced
+        case publicationRevision = "publication_revision"
+        case recovery
+        case latestEvent = "latest_event"
+        case latestEventAt = "latest_event_at"
+        case rejectionDiagnostics = "rejection_diagnostics"
     }
 
     public init(from decoder: Decoder) throws {
@@ -184,7 +275,15 @@ public struct CurrentState: Codable, Equatable, Sendable {
             sourceUpdatedAt: try container.decodeIfPresent(Double.self, forKey: .sourceUpdatedAt),
             emittedAt: try container.decodeIfPresent(Double.self, forKey: .emittedAt),
             reason: try container.decodeIfPresent(String.self, forKey: .reason),
-            forced: try container.decodeIfPresent(Bool.self, forKey: .forced) ?? false
+            forced: try container.decodeIfPresent(Bool.self, forKey: .forced) ?? false,
+            publicationRevision: try container.decodeIfPresent(Int.self, forKey: .publicationRevision),
+            recovery: try container.decodeIfPresent(Bool.self, forKey: .recovery) ?? false,
+            latestEvent: try container.decodeIfPresent(String.self, forKey: .latestEvent),
+            latestEventAt: try container.decodeIfPresent(Double.self, forKey: .latestEventAt),
+            rejectionDiagnostics: try container.decodeIfPresent(
+                CurrentStateRejectionDiagnostics.self,
+                forKey: .rejectionDiagnostics
+            ) ?? CurrentStateRejectionDiagnostics()
         )
     }
 
@@ -201,6 +300,57 @@ public struct CurrentState: Codable, Equatable, Sendable {
         try container.encode(emittedAt, forKey: .emittedAt)
         try container.encodeIfPresent(reason, forKey: .reason)
         try container.encode(forced, forKey: .forced)
+        try container.encodeIfPresent(publicationRevision, forKey: .publicationRevision)
+        try container.encode(recovery, forKey: .recovery)
+        try container.encodeIfPresent(latestEvent, forKey: .latestEvent)
+        try container.encodeIfPresent(latestEventAt, forKey: .latestEventAt)
+        try container.encode(rejectionDiagnostics, forKey: .rejectionDiagnostics)
+    }
+}
+
+public enum StatePublicationOrderDecision: String, Equatable, Sendable {
+    case acceptInitial = "accept_initial"
+    case acceptNewerRevision = "accept_newer_revision"
+    case acceptNewerLegacyTimestamp = "accept_newer_legacy_timestamp"
+    case rejectLowerRevision = "lower_revision"
+    case rejectEqualRevisionDuplicate = "equal_revision_duplicate"
+    case rejectEqualRevisionConflict = "equal_revision_conflict"
+    case rejectRevisionlessRollback = "revisionless_rollback"
+    case rejectLegacyTimestampDuplicate = "legacy_timestamp_duplicate"
+    case rejectLegacyTimestampRollback = "legacy_timestamp_rollback"
+
+    public var shouldAccept: Bool {
+        switch self {
+        case .acceptInitial, .acceptNewerRevision, .acceptNewerLegacyTimestamp:
+            return true
+        default:
+            return false
+        }
+    }
+
+    public var rejectionReason: String? { shouldAccept ? nil : rawValue }
+}
+
+public enum StatePublicationOrderPolicy {
+    public static func decide(
+        lastAccepted: CurrentState?,
+        incoming: CurrentState
+    ) -> StatePublicationOrderDecision {
+        guard let lastAccepted else { return .acceptInitial }
+        switch (lastAccepted.publicationRevision, incoming.publicationRevision) {
+        case let (.some(previous), .some(next)):
+            if next > previous { return .acceptNewerRevision }
+            if next < previous { return .rejectLowerRevision }
+            return incoming == lastAccepted ? .rejectEqualRevisionDuplicate : .rejectEqualRevisionConflict
+        case (.some, .none):
+            return .rejectRevisionlessRollback
+        case (.none, .some):
+            return .acceptNewerRevision
+        case (.none, .none):
+            if incoming.emittedAt > lastAccepted.emittedAt { return .acceptNewerLegacyTimestamp }
+            if incoming.emittedAt < lastAccepted.emittedAt { return .rejectLegacyTimestampRollback }
+            return incoming == lastAccepted ? .rejectLegacyTimestampDuplicate : .rejectLegacyTimestampRollback
+        }
     }
 }
 
@@ -470,14 +620,14 @@ public struct MediaMap: Codable, Equatable, Sendable {
     public let defaultFormat: String
     public let window: WindowConfiguration
     public let states: [PetState: StateMediaPlaylist]
-    public let transitions: [StateTransitionKey: MediaEntry]
+    public let transitions: [StateTransitionKey: StateMediaPlaylist]
 
     public init(
         version: Int = StateContract.version,
         defaultFormat: String = "mov",
         window: WindowConfiguration = try! WindowConfiguration(),
         states: [PetState: StateMediaPlaylist] = [:],
-        transitions: [StateTransitionKey: MediaEntry] = [:]
+        transitions: [StateTransitionKey: StateMediaPlaylist] = [:]
     ) throws {
         guard version == StateContract.version else {
             throw PetContractError.unsupportedVersion(version)
@@ -490,17 +640,25 @@ public struct MediaMap: Codable, Equatable, Sendable {
                 _ = try PlaybackRate(entry.playbackRate.value)
             }
         }
-        var normalizedTransitions: [StateTransitionKey: MediaEntry] = [:]
-        for (key, entry) in transitions {
+        var normalizedTransitions: [StateTransitionKey: StateMediaPlaylist] = [:]
+        for (key, playlist) in transitions {
             guard key.from != key.to else {
                 throw PetContractError.invalidValue("transition states must be distinct")
             }
-            _ = try PlaybackRate(entry.playbackRate.value)
-            normalizedTransitions[key] = try MediaEntry(
-                path: entry.path,
-                posterPath: entry.posterPath,
-                loop: false,
-                playbackRate: entry.playbackRate.value
+            let entries = try playlist.entries.map { entry in
+                _ = try PlaybackRate(entry.playbackRate.value)
+                return try MediaEntry(
+                    path: entry.path,
+                    posterPath: entry.posterPath,
+                    loop: false,
+                    playbackRate: entry.playbackRate.value
+                )
+            }
+            normalizedTransitions[key] = try StateMediaPlaylist(
+                mode: playlist.mode,
+                advanceOn: .stateEntry,
+                fixedPath: playlist.fixedPath,
+                entries: entries
             )
         }
         self.version = version
@@ -522,12 +680,15 @@ public struct MediaMap: Codable, Equatable, Sendable {
         let playlists = try Dictionary(uniqueKeysWithValues: states.map { state, entry in
             (state, try StateMediaPlaylist(entries: [entry]))
         })
+        let transitionPlaylists = try Dictionary(uniqueKeysWithValues: transitions.map { key, entry in
+            (key, try StateMediaPlaylist(entries: [entry]))
+        })
         try self.init(
             version: version,
             defaultFormat: defaultFormat,
             window: window,
             states: playlists,
-            transitions: transitions
+            transitions: transitionPlaylists
         )
     }
 
@@ -549,11 +710,11 @@ public struct MediaMap: Codable, Equatable, Sendable {
             }
             decodedStates[state] = playlist
         }
-        let rawTransitions = try container.decodeIfPresent([String: MediaEntry].self, forKey: .transitions) ?? [:]
-        var decodedTransitions: [StateTransitionKey: MediaEntry] = [:]
-        for (rawKey, entry) in rawTransitions {
+        let rawTransitions = try container.decodeIfPresent([String: StateMediaPlaylist].self, forKey: .transitions) ?? [:]
+        var decodedTransitions: [StateTransitionKey: StateMediaPlaylist] = [:]
+        for (rawKey, playlist) in rawTransitions {
             let key = try StateTransitionKey(storageKey: rawKey)
-            guard decodedTransitions.updateValue(entry, forKey: key) == nil else {
+            guard decodedTransitions.updateValue(playlist, forKey: key) == nil else {
                 throw PetContractError.invalidValue("duplicate transition key")
             }
         }
@@ -593,8 +754,24 @@ public struct MediaMap: Codable, Equatable, Sendable {
     }
 
     public func transition(from: PetState, to: PetState) -> MediaEntry? {
+        transitionPlaylist(from: from, to: to)?.fixedEntry
+    }
+
+    public func transitionPlaylist(from: PetState, to: PetState) -> StateMediaPlaylist? {
         guard from != to, let key = try? StateTransitionKey(from: from, to: to) else { return nil }
         return transitions[key]
+    }
+
+    public func transitionEntries(from: PetState, to: PetState) -> [MediaEntry] {
+        transitionPlaylist(from: from, to: to)?.entries ?? []
+    }
+
+    public var allTransitionEntries: [MediaEntry] {
+        transitions.values.flatMap(\.entries)
+    }
+
+    public var allMediaEntries: [MediaEntry] {
+        states.values.flatMap(\.entries) + allTransitionEntries
     }
 
     public func resolvedURL(for state: PetState, relativeTo mapURL: URL) -> URL? {

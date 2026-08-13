@@ -409,6 +409,38 @@ private func runSelfTest() throws {
         _ = try CurrentState(state: .running, sourceUpdatedAt: .nan, emittedAt: 1)
     }
 
+    let revisionedJSON = Data(#"{"version":1,"state":"running","emitted_at":10,"publication_revision":7,"recovery":true,"latest_event":"PostToolUse","latest_event_at":9.5,"rejection_diagnostics":{"count":2,"reasons":{"stale_event":2}}}"#.utf8)
+    let revisioned = try JSONDecoder.codexPet.decode(CurrentState.self, from: revisionedJSON)
+    try require(revisioned.publicationRevision == 7, "publication revision was not decoded")
+    try require(revisioned.latestEvent == "PostToolUse", "latest hook event was not decoded")
+    try require(revisioned.rejectionDiagnostics.reasons == ["stale_event": 2], "rejection diagnostics were not decoded")
+    let unknownEventJSON = Data(#"{"version":1,"state":"idle","emitted_at":11,"publication_revision":8,"latest_event":"unknown"}"#.utf8)
+    let unknownEvent = try JSONDecoder.codexPet.decode(CurrentState.self, from: unknownEventJSON)
+    try require(unknownEvent.latestEvent == "unknown", "privacy-safe unknown hook category was rejected")
+    try requiresError("zero publication revision was accepted") {
+        _ = try CurrentState(state: .idle, emittedAt: 1, publicationRevision: 0)
+    }
+    try requiresError("unknown rejection category was accepted") {
+        _ = try CurrentStateRejectionDiagnostics(count: 1, reasons: ["private-error": 1])
+    }
+
+    let legacyNewer = try CurrentState(state: .running, emittedAt: 1_710_000_003)
+    let revisionTwo = try CurrentState(state: .running, emittedAt: 1_710_000_004, publicationRevision: 2)
+    let revisionThree = try CurrentState(
+        state: .running,
+        activeSessions: 2,
+        emittedAt: 1_710_000_005,
+        publicationRevision: 3,
+        latestEvent: "PostToolUse",
+        latestEventAt: 1_710_000_005
+    )
+    let lowerRevision = try CurrentState(state: .review, emittedAt: 1_710_000_006, publicationRevision: 2)
+    try require(StatePublicationOrderPolicy.decide(lastAccepted: legacy, incoming: legacyNewer) == .acceptNewerLegacyTimestamp, "newer legacy publication was rejected")
+    try require(StatePublicationOrderPolicy.decide(lastAccepted: legacyNewer, incoming: revisionTwo) == .acceptNewerRevision, "first revisioned publication was rejected")
+    try require(StatePublicationOrderPolicy.decide(lastAccepted: revisionTwo, incoming: revisionThree) == .acceptNewerRevision, "same-state metadata repair was rejected")
+    try require(StatePublicationOrderPolicy.decide(lastAccepted: revisionThree, incoming: lowerRevision) == .rejectLowerRevision, "lower revision was accepted")
+    try require(StatePublicationOrderPolicy.decide(lastAccepted: revisionThree, incoming: legacyNewer) == .rejectRevisionlessRollback, "revisionless rollback was accepted")
+
     let freshness = try StateFreshnessPolicy()
     try require(freshness.maximumAge == 150, "production freshness window changed unexpectedly")
     try require(

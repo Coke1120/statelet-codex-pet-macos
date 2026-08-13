@@ -12,6 +12,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +36,31 @@ def write_record(path: Path, lifecycle: str, updated_at: float) -> None:
                 "state": lifecycle,
                 "event": "UserPromptSubmit",
                 "updated_at": updated_at,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def write_v2_record(
+    path: Path,
+    lifecycle: str,
+    event: str,
+    event_at: float,
+    *,
+    terminal: bool = False,
+    rejections=None,
+) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "state": lifecycle,
+                "event": event,
+                "event_at": event_at,
+                "updated_at": event_at,
+                "terminal": terminal,
+                "rejections": rejections or {},
             }
         ),
         encoding="utf-8",
@@ -155,6 +181,97 @@ class LifecycleStateTests(unittest.TestCase):
                 ("waiting", 160.0, 2),
             )
 
+    def test_terminal_session_is_excluded_and_diagnostics_are_privacy_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            write_v2_record(
+                record_path(directory, "a"),
+                "idle",
+                "SessionEnd",
+                99.0,
+                terminal=True,
+            )
+            write_v2_record(
+                record_path(directory, "b"),
+                "waiting",
+                "PermissionRequest",
+                98.0,
+                rejections={"stale_event": 2},
+            )
+
+            snapshot = state.read_session_snapshot(directory, now=100.0, active_ttl=10.0)
+
+        self.assertEqual(snapshot["active"], [("waiting", 98.0)])
+        self.assertEqual(snapshot["latest_event"], "SessionEnd")
+        self.assertEqual(snapshot["latest_event_at"], 99.0)
+        self.assertEqual(snapshot["rejections"], {"stale_event": 2})
+        self.assertNotIn("a" * 24, json.dumps(snapshot))
+        self.assertNotIn("b" * 24, json.dumps(snapshot))
+
+    def test_private_event_string_is_rejected_before_aggregation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            private = record_path(directory, "a")
+            write_v2_record(
+                private,
+                "running",
+                "/Users/private/repository prompt contents",
+                99.0,
+            )
+
+            snapshot = state.read_session_snapshot(directory, now=100.0, active_ttl=10.0)
+
+        self.assertEqual(snapshot["active"], [])
+        self.assertIsNone(snapshot["latest_event"])
+        self.assertEqual(snapshot["rejections"], {"invalid_record": 1})
+
+    def test_bounded_causal_metadata_is_accepted_but_never_aggregated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            record = record_path(directory, "c")
+            turn_hash = "a" * 24
+            record.write_text(
+                json.dumps({
+                    "version": 2,
+                    "state": "running",
+                    "event": "PreToolUse",
+                    "event_at": 99.0,
+                    "updated_at": 99.0,
+                    "terminal": False,
+                    "rejections": {},
+                    "causal": {
+                        "version": 1,
+                        "current_turn": turn_hash,
+                        "prior_turns": [],
+                        "tool_phases": {},
+                        "active_tool": None,
+                        "pending_permissions": [],
+                        "latest_event": "PreToolUse",
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            snapshot = state.read_session_snapshot(directory, now=100.0, active_ttl=10.0)
+
+        self.assertEqual(snapshot["active"], [("running", 99.0)])
+        self.assertNotIn("causal", snapshot)
+        self.assertNotIn(turn_hash, json.dumps(snapshot))
+
+    def test_malformed_causal_metadata_invalidates_record_without_crashing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            record = record_path(directory, "d")
+            write_v2_record(record, "running", "PreToolUse", 99.0)
+            value = json.loads(record.read_text(encoding="utf-8"))
+            value["causal"] = []
+            record.write_text(json.dumps(value), encoding="utf-8")
+
+            snapshot = state.read_session_snapshot(directory, now=100.0, active_ttl=10.0)
+
+        self.assertEqual(snapshot["active"], [])
+        self.assertEqual(snapshot["rejections"], {"invalid_record": 1})
+
 
 class PublisherTests(unittest.TestCase):
     def test_default_heartbeat_is_low_frequency(self) -> None:
@@ -229,6 +346,143 @@ class PublisherTests(unittest.TestCase):
             self.assertEqual(changed["state"], "running")
             self.assertEqual(heartbeat["source_updated_at"], 102.0)
             self.assertEqual(heartbeat["emitted_at"], 106.5)
+
+    def test_restart_seeds_revision_and_publishes_recovery_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "current_state.json"
+            first = aggregator.StatePublisher(output, heartbeat=60.0)
+            initial = first.publish_if_due(
+                "running",
+                99.0,
+                100.0,
+                10.0,
+                active_sessions=1,
+                latest_event="UserPromptSubmit",
+                latest_event_at=99.0,
+            )
+            restarted = aggregator.StatePublisher(output, heartbeat=60.0)
+            recovered = restarted.publish_if_due(
+                "running",
+                99.0,
+                101.0,
+                11.0,
+                active_sessions=1,
+                latest_event="UserPromptSubmit",
+                latest_event_at=99.0,
+            )
+
+        self.assertGreater(initial["publication_revision"], 1)
+        self.assertTrue(initial["recovery"])
+        self.assertGreater(
+            recovered["publication_revision"], initial["publication_revision"]
+        )
+        self.assertTrue(recovered["recovery"])
+
+    def test_same_state_metadata_change_repairs_before_heartbeat(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "current_state.json"
+            publisher = aggregator.StatePublisher(output, heartbeat=60.0)
+            publisher.publish_if_due(
+                "running",
+                99.0,
+                100.0,
+                10.0,
+                active_sessions=1,
+                latest_event="UserPromptSubmit",
+                latest_event_at=99.0,
+            )
+            repaired = publisher.publish_if_due(
+                "running",
+                100.0,
+                100.1,
+                10.1,
+                active_sessions=2,
+                latest_event="SubagentStart",
+                latest_event_at=100.0,
+                rejection_diagnostics={"count": 1, "reasons": {"stale_event": 1}},
+            )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(repaired["active_sessions"], 2)
+        self.assertEqual(repaired["latest_event"], "SubagentStart")
+        self.assertEqual(repaired["rejection_diagnostics"]["count"], 1)
+        self.assertFalse(repaired["recovery"])
+
+    def test_publication_canonicalizes_private_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "current_state.json"
+            publisher = aggregator.StatePublisher(output, heartbeat=60.0)
+            published = publisher.publish_if_due(
+                "running",
+                99.0,
+                100.0,
+                10.0,
+                latest_event="prompt:/Users/private/repository",
+                latest_event_at=99.0,
+                rejection_diagnostics={
+                    "count": 999,
+                    "reasons": {
+                        "stale_event": 2,
+                        "/Users/private/repository": 500,
+                        "prompt contents": 700,
+                    },
+                },
+            )
+
+        encoded = json.dumps(published)
+        self.assertEqual(published["latest_event"], "unknown")
+        self.assertEqual(
+            published["rejection_diagnostics"],
+            {"count": 2, "reasons": {"stale_event": 2}},
+        )
+        self.assertNotIn("/Users/private", encoded)
+        self.assertNotIn("prompt contents", encoded)
+
+    def test_missing_or_corrupt_output_uses_wall_clock_revision_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "current_state.json"
+            with mock.patch.object(aggregator.time, "time", return_value=1234.5):
+                missing = aggregator.StatePublisher(output, heartbeat=60.0)
+            output.write_text("{corrupt", encoding="utf-8")
+            with mock.patch.object(aggregator.time, "time", return_value=1234.6):
+                corrupt = aggregator.StatePublisher(output, heartbeat=60.0)
+
+        self.assertGreaterEqual(missing.publication_revision, 1_234_500_000)
+        self.assertGreater(corrupt.publication_revision, missing.publication_revision)
+
+    def test_revision_sidecar_survives_output_corruption_and_clock_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "current_state.json"
+            with mock.patch.object(aggregator.time, "time", return_value=2000.0):
+                publisher = aggregator.StatePublisher(output, heartbeat=60.0)
+            published = publisher.publish_if_due("running", 1.0, 2.0, 3.0)
+            output.write_text("{corrupt", encoding="utf-8")
+
+            with mock.patch.object(aggregator.time, "time", return_value=1000.0):
+                restarted = aggregator.StatePublisher(output, heartbeat=60.0)
+
+        self.assertGreaterEqual(
+            restarted.publication_revision,
+            published["publication_revision"],
+        )
+
+    def test_oversized_revision_sources_are_ignored_for_automatic_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "current_state.json"
+            output.write_text(json.dumps({
+                "version": 1,
+                "schema_version": 1,
+                "state": "running",
+                "source": "aggregate",
+                "publication_revision": 1 << 100,
+            }), encoding="utf-8")
+            output.with_name(output.name + aggregator.REVISION_SIDECAR_SUFFIX).write_text(
+                str(1 << 100), encoding="ascii"
+            )
+            with mock.patch.object(aggregator.time, "time", return_value=1234.5):
+                publisher = aggregator.StatePublisher(output, heartbeat=60.0)
+
+        self.assertEqual(publisher.publication_revision, 1_234_500_000)
 
     def test_force_state_expires_back_to_aggregate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

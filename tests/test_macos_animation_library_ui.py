@@ -87,18 +87,46 @@ class MacAnimationLibraryUISourceTests(unittest.TestCase):
         self.assertIn('labelWithString: "LIFECYCLE TRANSITIONS"', self.source)
         self.assertIn('labels: ["State Animations", "Transitions"]', self.controller)
 
-    def test_transition_editor_exposes_import_preview_replace_and_remove(self) -> None:
+    def test_transition_editor_exposes_per_variant_editing_callbacks(self) -> None:
         for callback in (
             "onImportTransitionMP4",
             "onUseTransitionMovie",
+            "onReplaceTransitionMP4",
+            "onReplaceTransitionMovie",
             "onPreviewTransition",
             "onRemoveTransition",
+            "onMoveTransition",
+            "onTransitionModeChange",
+            "onSetFixedTransition",
         ):
             self.assertIn(callback, self.controller)
-        self.assertIn('NSMenuItem(title: "Import MP4…"', self.source)
-        self.assertIn('NSMenuItem(title: "Verified MOV…"', self.source)
-        self.assertIn('title: clip == nil ? "Import…" : "Replace…"', self.source)
+        self.assertIn('"Import MP4s…"', self.source)
+        self.assertIn('"Add Verified MOVs…"', self.source)
+        self.assertIn('title: "Add…"', self.source)
+        self.assertIn('title: "Replace…"', self.source)
         self.assertIn('title: "Remove…"', self.source)
+
+    def test_transition_editor_flattens_every_variant_and_keeps_empty_routes(self) -> None:
+        self.assertIn("private struct SettingsTransitionRowModel", self.source)
+        self.assertIn("let grouped = Dictionary(grouping: clips)", self.source)
+        self.assertIn("let routeClips = (grouped[pair] ?? []).sorted", self.source)
+        self.assertIn("guard !routeClips.isEmpty else", self.source)
+        self.assertIn("clip: nil, position: 0, count: 0, mode: .fixed", self.source)
+        self.assertIn("playlist.entries.enumerated().map", self.controller)
+        self.assertIn("position: index", self.controller)
+        self.assertIn("count: playlist.entries.count", self.controller)
+
+    def test_transition_editor_exposes_accessible_mode_default_and_order_controls(self) -> None:
+        self.assertIn('title: "Selection"', self.source)
+        self.assertIn('title: "Default"', self.source)
+        self.assertIn('title: "Order"', self.source)
+        self.assertIn("cell.button.isEnabled = model.clip != nil && !busy", self.source)
+        self.assertIn('"Choose Fixed, Random, or Sequential selection for this route."', self.source)
+        self.assertIn('"Set as default"', self.source)
+        self.assertIn('("Move Up", model.position - 1)', self.source)
+        self.assertIn('("Move Down", model.position + 1)', self.source)
+        self.assertIn("setAccessibilityLabel(\"Selection mode for", self.source)
+        self.assertIn("setAccessibilityLabel(\"Move variant", self.source)
 
     def test_transition_preview_is_disabled_under_reduce_motion(self) -> None:
         self.assertIn("clip?.exists == true && !reduceMotion && !busy", self.source)
@@ -111,7 +139,7 @@ class MacAnimationLibraryUISourceTests(unittest.TestCase):
 
     def test_missing_transition_file_is_visible_and_cannot_be_previewed(self) -> None:
         self.assertIn("let exists: Bool", self.source)
-        self.assertIn('configurationStatus = clip.map { $0.exists ? "Configured" : "Missing" }', self.source)
+        self.assertIn('"Variant \\($0.position + 1) missing"', self.source)
         self.assertIn('clipStatus = "Movie file is missing"', self.source)
         self.assertIn("clip?.exists == false ? .systemRed", self.source)
         self.assertIn('"The transition movie file is missing. Replace or remove it."', self.source)

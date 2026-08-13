@@ -564,6 +564,8 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
         }
         let outgoing = view.playerLayer.player
         var failedIDs: [UInt64] = []
+        var endedIDs: [UInt64] = []
+        controller.onLifecycleTransitionEnded = { endedIDs.append($0) }
         controller.onLifecycleTransitionFailed = { failedIDs.append($0) }
         _ = controller.showLifecycleTransition(
             sourceState: .idle,
@@ -579,6 +581,7 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
         controller.fireLifecycleReadinessTimeoutForTesting(transitionID: 93)
 
         XCTAssertEqual(failedIDs, [93])
+        XCTAssertTrue(endedIDs.isEmpty)
         XCTAssertTrue(view.playerLayer.player === outgoing)
         XCTAssertFalse(view.playerLayer.isHidden)
         XCTAssertNil(view.destinationPlayerLayer.player)
@@ -587,7 +590,7 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
     }
 
     @MainActor
-    func testLifecyclePlaybackStallPromotesReadyDestinationWithoutBlanking() throws {
+    func testLifecyclePlaybackStallReportsFailureAndRetainsOutgoingWithoutBlanking() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("statelet-transition-stall-test-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -608,8 +611,11 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
         try Self.waitUntil("outgoing presentation did not become ready") {
             controller.currentURL == movieURL
         }
+        let outgoing = view.playerLayer.player
         var endedIDs: [UInt64] = []
+        var failedIDs: [UInt64] = []
         controller.onLifecycleTransitionEnded = { endedIDs.append($0) }
+        controller.onLifecycleTransitionFailed = { failedIDs.append($0) }
         _ = controller.showLifecycleTransition(
             sourceState: .idle,
             destinationState: .running,
@@ -629,9 +635,11 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
         Self.pumpMainRunLoop(for: 0.05)
         controller.fireLifecyclePlaybackStallTimeoutForTesting(transitionID: 95)
 
-        try Self.waitUntil("stall fallback did not promote destination") {
-            endedIDs == [95] && controller.currentState == .running
-        }
+        XCTAssertEqual(failedIDs, [95])
+        XCTAssertTrue(endedIDs.isEmpty)
+        XCTAssertEqual(controller.currentState, .idle)
+        XCTAssertEqual(controller.currentURL, movieURL)
+        XCTAssertTrue(view.playerLayer.player === outgoing)
         XCTAssertFalse(view.playerLayer.isHidden)
         XCTAssertNil(view.destinationPlayerLayer.player)
         XCTAssertNil(view.lifecycleTransitionPlayerLayer.player)

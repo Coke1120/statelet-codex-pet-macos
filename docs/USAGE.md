@@ -39,9 +39,10 @@ priority state:
 waiting > review > running > idle
 ```
 
-At equal priority, the newest session event wins. A Stop event changes only its
-own session to Idle; another active session may still keep Statelet in Waiting,
-Review, or Running.
+At equal priority, the newest session event wins. Stop or SessionEnd closes only
+its own session; another active session may still keep Statelet in Waiting,
+Review, or Running. Delayed callbacks cannot replace a newer event for the same
+session.
 
 Session records remain eligible for 900 seconds. On macOS, `kqueue` directory
 events normally wake the aggregator immediately; explicit TTL, temporary-force,
@@ -49,8 +50,11 @@ and once-per-minute heartbeat deadlines handle changes that do not produce a
 file event. If event watching is unsupported or fails, bounded 250 ms polling
 preserves correctness. The aggregator log reports a path-free
 `mode=event_driven` or `mode=poll_fallback` diagnostic with a sanitized reason
-category. A heartbeat refreshes publisher health but does not restart a movie
-or advance a playlist.
+category. Each publication has a monotonically increasing revision, including
+the first recovery publication after an aggregator restart. Statelet rejects an
+older or conflicting revision, retries transient atomic-replacement reads, and
+falls back to polling if its directory watch is invalidated. A heartbeat
+refreshes publisher metadata but does not restart a movie or advance a playlist.
 
 The badge reports:
 
@@ -103,9 +107,11 @@ Choose Idle, Running, Waiting, or Review without changing Codex or
 `current_state.json`. Choose **Return to Live State** beside the pet or
 **Follow Codex** in the menu-bar menu to end the override.
 
-Temporary State is not saved. A fresh publisher heartbeat for the same real
-state leaves it active. The first fresh different real state returns the player
-to lifecycle control. Publisher health continues to show the actual producer
+Temporary State is not saved. **Return to Live State** immediately presents the
+newest accepted publisher snapshot; it does not wait for another hook event. A
+fresh publisher heartbeat for the same real state leaves the override active.
+The first fresh different real state also returns the player to lifecycle
+control. Publisher health and diagnostics continue to show the actual producer
 condition during the preview.
 
 ### Play Once
@@ -205,40 +211,63 @@ The Actions menu can:
 ### Directional lifecycle transitions
 
 Choose **Transitions** in Settings → Animations to configure the active
-character's optional source → destination clips. All 12 distinct ordered pairs
-are available: `Idle → Running` and `Running → Idle`, for example, are separate
-settings. Each row offers **Import…** or **Replace…**, **Preview**, and
-**Remove…**. Import accepts an MP4 for conversion or a verified transparent
-MOV/report pair using the same validation and managed-media safety boundary as
-state animation clips.
+character's optional source → destination playlists. All 12 distinct ordered
+pairs are available: `Idle → Running` and `Running → Idle`, for example, are
+separate libraries with independent modes, defaults, and runtime cursors.
+
+Each variant row provides **Preview**, **Replace…**, **Up / Down**, and
+**Remove…**. Use **Add… → Import MP4s…** to convert one or more MP4s, or
+**Add… → Add Verified MOVs…** to install one or more transparent MOV/report
+pairs. Adding appends variants without replacing the route. Replacing affects
+only the selected row. Set the route selection mode directly in its row:
+
+| Mode | Transition selection |
+| --- | --- |
+| Fixed | Uses the variant marked **Default** |
+| Random | Avoids an immediate repeat when another readable variant exists |
+| Sequential | Follows the displayed order and wraps |
+
+Use **Set** in the Default column to change the fixed/default path. Moving rows
+changes Sequential order. Preview plays that exact variant without changing
+the route cursor.
 
 A transition clip is decorative, must be no longer than 4 seconds, and must
 retain a working alpha channel backed by its current converter report. Reportless
 or visually opaque transition assets are rejected, including during character
 bundle import and export.
 
-For a real A → B lifecycle change, Statelet keeps A attached while it prepares
-the transition and B. The transition becomes a foreground layer only after its
-first frame is display-ready. B then starts below that foreground before the
-transition ends; the default lead-in is the final 350 ms, or half of a shorter
-clip. When the foreground completes, only that layer is removed and the already
-running B animation continues. A newer lifecycle event cancels every obsolete
-player, readiness observer, deadline, and layer before it can reveal a stale
-destination. If either new asset fails, the last valid lower presentation stays
-visible while Statelet retries or safely retains it for the newest authoritative
-state; it never substitutes an empty lower layer.
+For a real A → B lifecycle change, Statelet selects one readable variant after
+accepting the authoritative change. Initial launch, same-state heartbeat,
+refresh, state-playlist rotation, Next Clip, Play Once, transition preview, and
+Temporary State do not consume a transition selection. Statelet keeps A
+attached while it prepares the chosen transition and B. The transition becomes
+a foreground layer only after its first frame is display-ready. B then starts
+below that foreground before the transition ends; the default lead-in is the
+final 350 ms, or half of a shorter clip. When the foreground completes, only
+that layer is removed and the already running B animation continues.
+
+If the selected variant is unreadable or fails runtime attestation/readiness,
+Statelet tries each other eligible variant for that request at most once, then
+falls back directly to the newest destination. A newer lifecycle event cancels
+obsolete selection, players, readiness observers, deadlines, and layers before
+they can advance a cursor or reveal a stale destination. The last valid lower
+presentation remains visible throughout; Statelet never substitutes an empty
+lower layer.
 
 This handoff is transparent layer compositing, not an opacity cross-fade. With
 Reduce Motion enabled, preview is unavailable and runtime transition video is
 skipped; Statelet switches to the destination static presentation without an
-intermediate blank frame.
+intermediate blank frame or advancing the route cursor.
 
-Transitions are stored per character and round-trip, with their movie/report
-hash binding and validation status, in secure `.statelet-character` bundles.
-Removing a transition first removes only the
-active character's reference; managed-file Trash eligibility is revalidated
-before any file move. Maps and imported character bundles without transitions
-remain compatible and continue switching directly to destination animations.
+Transition playlists are stored per character. Secure `.statelet-character`
+round trips preserve every variant, order, mode, default path, movie/poster/
+report reference, hash binding, and validation status while rewriting paths to
+the package layout. Removing a variant first removes only the active
+character's route reference; managed-file Trash eligibility is revalidated
+across every state, transition route, and character map before any file move.
+Existing maps and bundles with one transition decode as Fixed singleton
+playlists. Maps without transitions continue switching directly to destination
+animations.
 
 ## Import MP4 animations
 
@@ -507,8 +536,13 @@ change; verify them independently before uploading private or licensed artwork.
 Open **Settings → Diagnostics** and choose **Refresh**. The report includes:
 
 - app version/build and managed installation status;
-- requested state, publisher health, publication ages, and active-session count;
+- requested and last accepted live state, publisher health, publication ages
+  and revision, recovery status, latest accepted hook event/time, active-session
+  count, and aggregated state;
+- bounded categories and counts for rejected hook events or app snapshots;
 - playback mode, selected media kind, and presentation state;
+- whether Temporary State, Play Once, transition playback, or Offline fallback
+  currently overrides the live presentation;
 - conversion-tool readiness;
 - player and aggregator LaunchAgent status; and
 - readability of the media map, current state, media directory, and logs.

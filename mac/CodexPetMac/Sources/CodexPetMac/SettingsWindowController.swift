@@ -180,8 +180,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     var onExportCharacterBundle: ((String) -> Void)?
     var onImportTransitionMP4: ((PetState, PetState) -> Void)?
     var onUseTransitionMovie: ((PetState, PetState) -> Void)?
+    var onReplaceTransitionMP4: ((PetState, PetState, String) -> Void)?
+    var onReplaceTransitionMovie: ((PetState, PetState, String) -> Void)?
     var onPreviewTransition: ((PetState, PetState, String) -> Void)?
     var onRemoveTransition: ((PetState, PetState, String) -> Void)?
+    var onMoveTransition: ((PetState, PetState, String, Int) -> Void)?
+    var onTransitionModeChange: ((PetState, PetState, MediaPlaybackMode) -> Void)?
+    var onSetFixedTransition: ((PetState, PetState, String) -> Void)?
 
     private let tabs = NSSegmentedControl(labels: ["Animations", "Voice", "Appearance", "General", "Diagnostics", "Prompts", "Recommendation"], trackingMode: .selectOne, target: nil, action: nil)
     private let paneHost = NSView()
@@ -552,6 +557,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         transitionLibrary.onUseMovie = { [weak self] source, destination in
             self?.onUseTransitionMovie?(source, destination)
         }
+        transitionLibrary.onReplaceMP4 = { [weak self] source, destination, path in
+            self?.onReplaceTransitionMP4?(source, destination, path)
+        }
+        transitionLibrary.onReplaceMovie = { [weak self] source, destination, path in
+            self?.onReplaceTransitionMovie?(source, destination, path)
+        }
         transitionLibrary.onPreviewOrStop = { [weak self] clip, shouldStop in
             if shouldStop {
                 self?.onStopPreview?()
@@ -561,6 +572,15 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         }
         transitionLibrary.onRemove = { [weak self] clip in
             self?.onRemoveTransition?(clip.source, clip.destination, clip.path)
+        }
+        transitionLibrary.onMove = { [weak self] source, destination, path, index in
+            self?.onMoveTransition?(source, destination, path, index)
+        }
+        transitionLibrary.onModeChange = { [weak self] source, destination, mode in
+            self?.onTransitionModeChange?(source, destination, mode)
+        }
+        transitionLibrary.onSetFixed = { [weak self] source, destination, path in
+            self?.onSetFixedTransition?(source, destination, path)
         }
         animationsMode.selectedSegment = 0
         animationsMode.translatesAutoresizingMaskIntoConstraints = true
@@ -1249,15 +1269,21 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             importEnabled: toolchainState.isReady,
             characterName: activeCharacterName
         )
-        let transitionClips = snapshot.mediaMap.transitions.map { key, entry in
-            SettingsTransitionClip(
-                source: key.from,
-                destination: key.to,
-                path: entry.path,
-                exists: FileManager.default.isReadableFile(
-                    atPath: snapshot.mediaMap.resolvedURL(for: entry, relativeTo: snapshot.mediaMapURL).path
+        let transitionClips = snapshot.mediaMap.transitions.flatMap { key, playlist in
+            playlist.entries.enumerated().map { index, entry in
+                SettingsTransitionClip(
+                    source: key.from,
+                    destination: key.to,
+                    path: entry.path,
+                    exists: FileManager.default.isReadableFile(
+                        atPath: snapshot.mediaMap.resolvedURL(for: entry, relativeTo: snapshot.mediaMapURL).path
+                    ),
+                    position: index,
+                    count: playlist.entries.count,
+                    mode: playlist.mode,
+                    isFixed: entry.path == playlist.fixedPath
                 )
-            )
+            }
         }
         transitionLibrary.update(
             clips: transitionClips,

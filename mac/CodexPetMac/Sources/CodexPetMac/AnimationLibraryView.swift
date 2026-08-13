@@ -12,6 +12,10 @@ struct SettingsTransitionClip: Equatable {
     let destination: PetState
     let path: String
     let exists: Bool
+    let position: Int
+    let count: Int
+    let mode: MediaPlaybackMode
+    let isFixed: Bool
 }
 
 private struct SettingsTransitionPair: Hashable {
@@ -22,9 +26,23 @@ private struct SettingsTransitionPair: Hashable {
 private enum TransitionColumn {
     static let route = NSUserInterfaceItemIdentifier("animation-library.transition.route")
     static let clip = NSUserInterfaceItemIdentifier("animation-library.transition.clip")
+    static let mode = NSUserInterfaceItemIdentifier("animation-library.transition.mode")
+    static let fixed = NSUserInterfaceItemIdentifier("animation-library.transition.fixed")
     static let preview = NSUserInterfaceItemIdentifier("animation-library.transition.preview")
+    static let add = NSUserInterfaceItemIdentifier("animation-library.transition.add")
     static let replace = NSUserInterfaceItemIdentifier("animation-library.transition.replace")
+    static let reorder = NSUserInterfaceItemIdentifier("animation-library.transition.reorder")
     static let remove = NSUserInterfaceItemIdentifier("animation-library.transition.remove")
+}
+
+private struct SettingsTransitionRowModel {
+    let pair: SettingsTransitionPair
+    let clip: SettingsTransitionClip?
+    let position: Int
+    let count: Int
+    let mode: MediaPlaybackMode
+
+    var isPlaceholder: Bool { clip == nil }
 }
 
 enum MP4ImportURLValidation {
@@ -975,16 +993,20 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
 final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDelegate {
     var onImportMP4: ((PetState, PetState) -> Void)?
     var onUseMovie: ((PetState, PetState) -> Void)?
+    var onReplaceMP4: ((PetState, PetState, String) -> Void)?
+    var onReplaceMovie: ((PetState, PetState, String) -> Void)?
     var onPreviewOrStop: ((SettingsTransitionClip, Bool) -> Void)?
     var onRemove: ((SettingsTransitionClip) -> Void)?
+    var onMove: ((PetState, PetState, String, Int) -> Void)?
+    var onModeChange: ((PetState, PetState, MediaPlaybackMode) -> Void)?
+    var onSetFixed: ((PetState, PetState, String) -> Void)?
 
     private let tableView = NSTableView()
     private let scrollView = NSScrollView()
     private let guidance = NSTextField(
         wrappingLabelWithString: "Optional directional clips play once before the destination animation. Maximum duration: 4 seconds."
     )
-    private var pairs: [SettingsTransitionPair] = []
-    private var clipsByPair: [SettingsTransitionPair: SettingsTransitionClip] = [:]
+    private var rows: [SettingsTransitionRowModel] = []
     private var previewPath: String?
     private var reduceMotion = false
     private var busy = false
@@ -1009,7 +1031,7 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
 
         tableView.delegate = self
         tableView.dataSource = self
-        tableView.rowHeight = 36
+        tableView.rowHeight = 42
         tableView.intercellSpacing = NSSize(width: 4, height: 1)
         tableView.selectionHighlightStyle = .regular
         tableView.allowsMultipleSelection = false
@@ -1017,9 +1039,13 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
         tableView.headerView = NSTableHeaderView()
         tableView.setAccessibilityLabel("Directional lifecycle transitions")
         addColumn(identifier: TransitionColumn.route, title: "Direction", width: 138, minimumWidth: 120)
-        addColumn(identifier: TransitionColumn.clip, title: "Clip", width: 170, minimumWidth: 120, flexible: true)
+        addColumn(identifier: TransitionColumn.clip, title: "Variant", width: 170, minimumWidth: 120, flexible: true)
+        addColumn(identifier: TransitionColumn.mode, title: "Selection", width: 104, minimumWidth: 96)
+        addColumn(identifier: TransitionColumn.fixed, title: "Default", width: 68, minimumWidth: 64)
         addColumn(identifier: TransitionColumn.preview, title: "Preview", width: 70, minimumWidth: 66)
-        addColumn(identifier: TransitionColumn.replace, title: "Import / Replace", width: 118, minimumWidth: 110)
+        addColumn(identifier: TransitionColumn.add, title: "Add", width: 72, minimumWidth: 68)
+        addColumn(identifier: TransitionColumn.replace, title: "Replace", width: 82, minimumWidth: 76)
+        addColumn(identifier: TransitionColumn.reorder, title: "Order", width: 92, minimumWidth: 86)
         addColumn(identifier: TransitionColumn.remove, title: "Remove", width: 70, minimumWidth: 66)
 
         scrollView.borderType = .bezelBorder
@@ -1069,14 +1095,23 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
         busy: Bool,
         characterName: String
     ) {
-        pairs = PetState.allCases.flatMap { source in
+        let pairs = PetState.allCases.flatMap { source in
             PetState.allCases.compactMap { destination in
                 source == destination ? nil : SettingsTransitionPair(source: source, destination: destination)
             }
         }
-        clipsByPair = Dictionary(uniqueKeysWithValues: clips.map {
-            (SettingsTransitionPair(source: $0.source, destination: $0.destination), $0)
-        })
+        let grouped = Dictionary(grouping: clips) {
+            SettingsTransitionPair(source: $0.source, destination: $0.destination)
+        }
+        rows = pairs.flatMap { pair -> [SettingsTransitionRowModel] in
+            let routeClips = (grouped[pair] ?? []).sorted { $0.position < $1.position }
+            guard !routeClips.isEmpty else {
+                return [SettingsTransitionRowModel(pair: pair, clip: nil, position: 0, count: 0, mode: .fixed)]
+            }
+            return routeClips.map {
+                SettingsTransitionRowModel(pair: pair, clip: $0, position: $0.position, count: $0.count, mode: $0.mode)
+            }
+        }
         self.previewPath = previewPath
         self.reduceMotion = reduceMotion
         self.busy = busy
@@ -1088,16 +1123,17 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
         tableView.reloadData()
     }
 
-    func numberOfRows(in tableView: NSTableView) -> Int { pairs.count }
+    func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        guard row >= 0, row < pairs.count, let tableColumn else { return nil }
-        let pair = pairs[row]
-        let clip = clipsByPair[pair]
+        guard row >= 0, row < rows.count, let tableColumn else { return nil }
+        let model = rows[row]
+        let pair = model.pair
+        let clip = model.clip
         let filename = clip.map { URL(fileURLWithPath: $0.path).lastPathComponent } ?? "Not configured"
         switch tableColumn.identifier {
         case TransitionColumn.route:
-            let configurationStatus = clip.map { $0.exists ? "Configured" : "Missing" } ?? "Optional"
+            let configurationStatus = clip.map { $0.exists ? "\($0.count) variants" : "Variant \($0.position + 1) missing" } ?? "No variants"
             return textCell(
                 identifier: TransitionColumn.route,
                 primary: "\(pair.source.displayName) → \(pair.destination.displayName)",
@@ -1116,12 +1152,25 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
             }
             return textCell(
                 identifier: TransitionColumn.clip,
-                primary: filename,
+                primary: clip.map { "\($0.position + 1). \(filename)" } ?? filename,
                 secondary: clipStatus,
                 primaryColor: clip?.exists == false ? .systemRed : .labelColor,
                 secondaryColor: clip?.exists == false ? .systemRed : .secondaryLabelColor,
                 accessibilityLabel: "\(filename), \(clipStatus.lowercased())"
             )
+        case TransitionColumn.mode:
+            let cell = actionCell(identifier: TransitionColumn.mode, title: model.mode.rawValue.capitalized, action: #selector(changeMode(_:)))
+            cell.button.isEnabled = model.clip != nil && !busy
+            cell.button.setAccessibilityLabel("Selection mode for \(pair.source.displayName) to \(pair.destination.displayName): \(model.mode.rawValue)")
+            cell.button.toolTip = model.clip == nil
+                ? "Add a transition variant before choosing a selection mode."
+                : "Choose Fixed, Random, or Sequential selection for this route."
+            return cell
+        case TransitionColumn.fixed:
+            let cell = actionCell(identifier: TransitionColumn.fixed, title: clip?.isFixed == true ? "Default" : "Set", action: #selector(setFixed(_:)))
+            cell.button.isEnabled = clip != nil && clip?.isFixed == false && !busy
+            cell.button.setAccessibilityLabel("\(clip?.isFixed == true ? "Default variant" : "Set as default") for \(pair.source.displayName) to \(pair.destination.displayName)")
+            return cell
         case TransitionColumn.preview:
             let cell = actionCell(identifier: TransitionColumn.preview, title: "Preview", action: #selector(previewTransition(_:)))
             let isPreviewing = clip?.path == previewPath
@@ -1141,11 +1190,22 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
             cell.button.setAccessibilityHelp(disabledReason)
             cell.button.setAccessibilityLabel("\(isPreviewing ? "Stop preview" : "Preview") \(pair.source.displayName) to \(pair.destination.displayName) transition")
             return cell
-        case TransitionColumn.replace:
-            let cell = actionCell(identifier: TransitionColumn.replace, title: clip == nil ? "Import…" : "Replace…", action: #selector(importOrReplace(_:)))
+        case TransitionColumn.add:
+            let cell = actionCell(identifier: TransitionColumn.add, title: "Add…", action: #selector(addVariants(_:)))
             cell.button.isEnabled = !busy
-            cell.button.setAccessibilityLabel("\(clip == nil ? "Import" : "Replace") \(pair.source.displayName) to \(pair.destination.displayName) transition")
-            cell.button.toolTip = "Import an MP4 to convert, or choose a verified transparent MOV."
+            cell.button.setAccessibilityLabel("Add variants for \(pair.source.displayName) to \(pair.destination.displayName)")
+            cell.button.toolTip = "Import one or multiple MP4s, or add verified transparent MOVs."
+            return cell
+        case TransitionColumn.replace:
+            let cell = actionCell(identifier: TransitionColumn.replace, title: "Replace…", action: #selector(replaceVariant(_:)))
+            cell.button.isEnabled = clip != nil && !busy
+            cell.button.setAccessibilityLabel("Replace variant \((clip?.position ?? 0) + 1) for \(pair.source.displayName) to \(pair.destination.displayName)")
+            cell.button.toolTip = "Replace only this transition variant."
+            return cell
+        case TransitionColumn.reorder:
+            let cell = actionCell(identifier: TransitionColumn.reorder, title: "Up / Down", action: #selector(showReorder(_:)))
+            cell.button.isEnabled = clip != nil && model.count > 1 && !busy
+            cell.button.setAccessibilityLabel("Move variant \(model.position + 1) for \(pair.source.displayName) to \(pair.destination.displayName)")
             return cell
         case TransitionColumn.remove:
             let cell = actionCell(identifier: TransitionColumn.remove, title: "Remove…", action: #selector(removeTransition(_:)))
@@ -1187,50 +1247,116 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
         return cell
     }
 
-    private func pair(for sender: NSView) -> SettingsTransitionPair? {
+    private func rowModel(for sender: NSView) -> SettingsTransitionRowModel? {
         let row = tableView.row(for: sender)
-        guard row >= 0, row < pairs.count else { return nil }
-        return pairs[row]
+        guard row >= 0, row < rows.count else { return nil }
+        return rows[row]
     }
 
     @objc private func previewTransition(_ sender: NSButton) {
-        guard let pair = pair(for: sender), let clip = clipsByPair[pair] else { return }
+        guard let clip = rowModel(for: sender)?.clip else { return }
         onPreviewOrStop?(clip, clip.path == previewPath)
     }
 
-    @objc private func importOrReplace(_ sender: NSButton) {
-        guard let pair = pair(for: sender) else { return }
+    @objc private func addVariants(_ sender: NSButton) {
+        guard rowModel(for: sender) != nil else { return }
         let menu = NSMenu()
-        let mp4 = NSMenuItem(title: "Import MP4…", action: #selector(importTransitionMP4(_:)), keyEquivalent: "")
+        let mp4 = NSMenuItem(title: "Import MP4s…", action: #selector(importTransitionMP4(_:)), keyEquivalent: "")
         mp4.target = self
-        mp4.representedObject = rowIndex(for: pair)
+        mp4.representedObject = tableView.row(for: sender)
         menu.addItem(mp4)
-        let movie = NSMenuItem(title: "Verified MOV…", action: #selector(useTransitionMovie(_:)), keyEquivalent: "")
+        let movie = NSMenuItem(title: "Add Verified MOVs…", action: #selector(useTransitionMovie(_:)), keyEquivalent: "")
         movie.target = self
-        movie.representedObject = rowIndex(for: pair)
+        movie.representedObject = tableView.row(for: sender)
         menu.addItem(movie)
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.maxY + 4), in: sender)
     }
 
-    private func rowIndex(for pair: SettingsTransitionPair) -> Int { pairs.firstIndex(of: pair) ?? -1 }
+    @objc private func replaceVariant(_ sender: NSButton) {
+        guard rowModel(for: sender)?.clip != nil else { return }
+        let menu = NSMenu()
+        let mp4 = NSMenuItem(title: "Replace with MP4…", action: #selector(importTransitionMP4(_:)), keyEquivalent: "")
+        mp4.target = self
+        mp4.representedObject = tableView.row(for: sender)
+        menu.addItem(mp4)
+        let movie = NSMenuItem(title: "Replace with Verified MOV…", action: #selector(useTransitionMovie(_:)), keyEquivalent: "")
+        movie.target = self
+        movie.representedObject = tableView.row(for: sender)
+        menu.addItem(movie)
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.maxY + 4), in: sender)
+    }
 
-    private func representedPair(_ sender: NSMenuItem) -> SettingsTransitionPair? {
-        guard let row = sender.representedObject as? Int, row >= 0, row < pairs.count else { return nil }
-        return pairs[row]
+    private func representedRow(_ sender: NSMenuItem) -> SettingsTransitionRowModel? {
+        guard let row = sender.representedObject as? Int, row >= 0, row < rows.count else { return nil }
+        return rows[row]
     }
 
     @objc private func importTransitionMP4(_ sender: NSMenuItem) {
-        guard let pair = representedPair(sender) else { return }
-        onImportMP4?(pair.source, pair.destination)
+        guard let model = representedRow(sender) else { return }
+        if sender.title.hasPrefix("Replace"), let clip = model.clip {
+            onReplaceMP4?(model.pair.source, model.pair.destination, clip.path)
+        } else {
+            onImportMP4?(model.pair.source, model.pair.destination)
+        }
     }
 
     @objc private func useTransitionMovie(_ sender: NSMenuItem) {
-        guard let pair = representedPair(sender) else { return }
-        onUseMovie?(pair.source, pair.destination)
+        guard let model = representedRow(sender) else { return }
+        if sender.title.hasPrefix("Replace"), let clip = model.clip {
+            onReplaceMovie?(model.pair.source, model.pair.destination, clip.path)
+        } else {
+            onUseMovie?(model.pair.source, model.pair.destination)
+        }
     }
 
     @objc private func removeTransition(_ sender: NSButton) {
-        guard let pair = pair(for: sender), let clip = clipsByPair[pair] else { return }
+        guard let clip = rowModel(for: sender)?.clip else { return }
         onRemove?(clip)
+    }
+
+    @objc private func changeMode(_ sender: NSButton) {
+        guard let model = rowModel(for: sender) else { return }
+        let menu = NSMenu()
+        for mode in MediaPlaybackMode.allCases {
+            let item = NSMenuItem(title: mode.rawValue.capitalized, action: #selector(selectMode(_:)), keyEquivalent: "")
+            item.target = self
+            item.state = mode == model.mode ? .on : .off
+            item.representedObject = [tableView.row(for: sender), MediaPlaybackMode.allCases.firstIndex(of: mode) ?? 0]
+            menu.addItem(item)
+        }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.maxY + 4), in: sender)
+    }
+
+    @objc private func selectMode(_ sender: NSMenuItem) {
+        guard let values = sender.representedObject as? [Int], values.count == 2,
+              values[0] >= 0, values[0] < rows.count,
+              values[1] >= 0, values[1] < MediaPlaybackMode.allCases.count else { return }
+        let pair = rows[values[0]].pair
+        onModeChange?(pair.source, pair.destination, MediaPlaybackMode.allCases[values[1]])
+    }
+
+    @objc private func setFixed(_ sender: NSButton) {
+        guard let clip = rowModel(for: sender)?.clip else { return }
+        onSetFixed?(clip.source, clip.destination, clip.path)
+    }
+
+    @objc private func showReorder(_ sender: NSButton) {
+        guard let model = rowModel(for: sender), model.clip != nil else { return }
+        let menu = NSMenu()
+        for (title, index) in [("Move Up", model.position - 1), ("Move Down", model.position + 1)] {
+            let item = NSMenuItem(title: title, action: #selector(moveTransition(_:)), keyEquivalent: "")
+            item.target = self
+            item.isEnabled = index >= 0 && index < model.count
+            item.representedObject = [tableView.row(for: sender), index]
+            menu.addItem(item)
+        }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.maxY + 4), in: sender)
+    }
+
+    @objc private func moveTransition(_ sender: NSMenuItem) {
+        guard let values = sender.representedObject as? [Int], values.count == 2,
+              values[0] >= 0, values[0] < rows.count,
+              let clip = rows[values[0]].clip else { return }
+        onMove?(clip.source, clip.destination, clip.path, values[1])
     }
 }

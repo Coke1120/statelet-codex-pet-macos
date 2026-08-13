@@ -1934,29 +1934,13 @@ final class PetPlayerController {
     }
 
     private func failLifecycleHandoff(transitionID: UInt64, reason: String) {
-        guard var handoff = activeLifecycleHandoff,
+        guard let handoff = activeLifecycleHandoff,
               handoff.id == transitionID else { return }
-        if handoff.destinationVisible {
-            handoff.transitionEnded = true
-            activeLifecycleHandoff = handoff
-            promoteLifecycleDestination(transitionID: transitionID)
-            return
-        }
-        if reason.hasPrefix("transition_") {
-            handoff.transitionEnded = true
-            activeLifecycleHandoff = handoff
-            lifecyclePlaybackStallTimeoutWorkItem?.cancel()
-            lifecyclePlaybackStallTimeoutWorkItem = nil
-            view.lifecycleTransitionPlayerLayer.isHidden = true
-            startLifecycleDestination(transitionID: transitionID)
-            if activeLifecycleHandoff?.destinationVisible == true {
-                promoteLifecycleDestination(transitionID: transitionID)
-            } else {
-                scheduleLifecycleReadinessTimeout(transitionID: transitionID)
-            }
-            return
-        }
         logger.error("event=lifecycle_handoff_failed transition_id=\(transitionID, privacy: .public) reason=\(reason, privacy: .public)")
+        // A failed or stalled transition clip is not a completed selection,
+        // even when its destination has already decoded on the lower layer.
+        // Keep the committed outgoing base visible and let the app retry the
+        // next request-local playlist candidate before using direct fallback.
         cancelLifecycleHandoff(notifyFailure: true)
     }
 
@@ -2272,12 +2256,7 @@ final class PetPlayerController {
         logger.error(
             "event=lifecycle_transition_readiness_timeout transition_id=\(transitionID, privacy: .public)"
         )
-        startLifecycleDestination(transitionID: transitionID)
-        if activeLifecycleHandoff?.destinationVisible == true {
-            promoteLifecycleDestination(transitionID: transitionID)
-        } else {
-            cancelLifecycleHandoff(notifyFailure: true)
-        }
+        cancelLifecycleHandoff(notifyFailure: true)
     }
 
     private func scheduleLifecyclePlaybackStallTimeout(transitionID: UInt64) {
@@ -2316,15 +2295,10 @@ final class PetPlayerController {
         logger.error(
             "event=lifecycle_transition_playback_stalled transition_id=\(transitionID, privacy: .public)"
         )
-        handoff.transitionEnded = true
-        activeLifecycleHandoff = handoff
-        view.lifecycleTransitionPlayerLayer.isHidden = true
-        startLifecycleDestination(transitionID: transitionID)
-        if activeLifecycleHandoff?.destinationVisible == true {
-            promoteLifecycleDestination(transitionID: transitionID)
-        } else {
-            scheduleLifecycleReadinessTimeout(transitionID: transitionID)
-        }
+        failLifecycleHandoff(
+            transitionID: transitionID,
+            reason: "transition_playback_stalled"
+        )
     }
 
     /// Deterministic test seam for the same fail-closed action used by the

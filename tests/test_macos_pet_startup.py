@@ -16,6 +16,67 @@ SOURCES = ROOT / "mac" / "CodexPetMac" / "Sources" / "CodexPetMac"
 
 
 class MacPetStartupTests(unittest.TestCase):
+    def test_state_directory_watcher_recovers_after_directory_recreation(self) -> None:
+        swiftc = shutil.which("swiftc")
+        if swiftc is None:
+            self.skipTest("swiftc is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            harness = root / "watcher_harness.swift"
+            executable = root / "watcher-harness"
+            harness.write_text(
+                textwrap.dedent(
+                    r'''
+                    import Foundation
+
+                    @main
+                    struct Harness {
+                        static func main() throws {
+                            let root = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
+                            let directory = root.appendingPathComponent("runtime", isDirectory: true)
+                            let target = directory.appendingPathComponent("current_state.json")
+                            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                            let watcher = StateDirectoryWatcher(fileURL: target)
+                            var observedRecreatedFile = false
+                            watcher.start(emitInitial: false) { url in
+                                if (try? Data(contentsOf: url)) == Data("recreated".utf8) {
+                                    observedRecreatedFile = true
+                                }
+                            }
+                            try FileManager.default.removeItem(at: directory)
+                            DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) {
+                                try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                                try? Data("recreated".utf8).write(to: target)
+                            }
+                            let deadline = Date().addingTimeInterval(3)
+                            while !observedRecreatedFile && RunLoop.current.run(mode: .default, before: deadline) && Date() < deadline {}
+                            watcher.stop()
+                            guard observedRecreatedFile else { throw NSError(domain: "watcher", code: 1) }
+                            print("watcher recovery self-test passed")
+                        }
+                    }
+                    '''
+                ),
+                encoding="utf-8",
+            )
+            compiled = subprocess.run(
+                [swiftc, str(SOURCES / "StateDirectoryWatcher.swift"), str(harness), "-o", str(executable)],
+                cwd=ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            result = subprocess.run(
+                [str(executable), str(root)],
+                cwd=ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("watcher recovery self-test passed", result.stdout)
+
     def test_preferences_migrate_before_app_and_defaults_consumers_are_created(self) -> None:
         main = (SOURCES / "main.swift").read_text(encoding="utf-8")
         delegate = (SOURCES / "PetAppDelegate.swift").read_text(encoding="utf-8")
@@ -362,6 +423,16 @@ class MacPetStartupTests(unittest.TestCase):
                                     lifecycleState: "running",
                                     publisherHealth: "live",
                                     publisherSource: "/Users/private/source",
+                                    latestHookEvent: "PostToolUse",
+                                    latestHookAgeSeconds: 1.25,
+                                    observedPublicationRevision: 1_786_000_000_000_008,
+                                    acceptedLifecycleState: "running",
+                                    acceptedPublicationRevision: 1_786_000_000_000_007,
+                                    publisherRecovery: true,
+                                    overrideStatus: "inactive",
+                                    fallbackReason: "lower_revision",
+                                    publicationRejectionCount: 2,
+                                    publicationRejectionReasons: ["lower_revision": 2, "/private/path": 99],
                                     playbackMode: "random",
                                     selectedClipName: "/Users/private/media/clip.mov",
                                     previewStatus: "presented",
@@ -373,7 +444,12 @@ class MacPetStartupTests(unittest.TestCase):
                                   !report.contains("/Users/private"),
                                   report.contains("playback.media: mov"),
                                   !report.contains("clip.mov"),
-                                  report.contains("publisher.source: unavailable") else {
+                                  report.contains("publisher.source: unavailable"),
+                                  report.contains("publisher.latest_event: PostToolUse"),
+                                  report.contains("publisher.observed_revision: 1786000000000008"),
+                                  report.contains("publisher.accepted_revision: 1786000000000007"),
+                                  report.contains("publisher.rejection_categories: lower_revision=2"),
+                                  !report.contains("/private/path") else {
                                 throw HarnessFailure.failed("diagnostics privacy")
                             }
                             print("startup and diagnostics self-test passed")

@@ -8,6 +8,7 @@ import math
 import os
 import select
 import signal
+import stat
 import sys
 import tempfile
 import time
@@ -22,10 +23,13 @@ try:
     from statelet_state import (  # type: ignore[import-not-found]  # noqa: E402
         DEFAULT_ACTIVE_TTL,
         STATE_PRIORITY,
+        VALID_EVENTS,
+        VALID_REJECTION_REASONS,
         VALID_STATES,
         aggregate_state_with_source,
         default_state_dir,
         read_active_states,
+        read_session_snapshot,
     )
 except ModuleNotFoundError as error:
     if error.name != "statelet_state":
@@ -35,10 +39,13 @@ except ModuleNotFoundError as error:
     from codex_pet_state import (  # noqa: E402
         DEFAULT_ACTIVE_TTL,
         STATE_PRIORITY,
+        VALID_EVENTS,
+        VALID_REJECTION_REASONS,
         VALID_STATES,
         aggregate_state_with_source,
         default_state_dir,
         read_active_states,
+        read_session_snapshot,
     )
 
 
@@ -51,6 +58,9 @@ DEFAULT_OUTPUT_PATH = (
     / "current_state.json"
 )
 SCHEMA_VERSION = 1
+REVISION_TICKS_PER_SECOND = 1_000_000
+REVISION_SIDECAR_SUFFIX = ".revision"
+MAX_PUBLICATION_REVISION = (1 << 63) - 2
 DEFAULT_POLL_INTERVAL = 0.25
 # State changes still publish immediately.  The heartbeat exists only to make
 # writer liveness observable, so keep it low-frequency to avoid needless SSD
@@ -89,6 +99,11 @@ def atomic_write_state(
     emitted_at: float,
     active_sessions: int = 0,
     forced: bool = False,
+    publication_revision: Optional[int] = None,
+    latest_event: Optional[str] = None,
+    latest_event_at: Optional[float] = None,
+    rejection_diagnostics: Optional[Dict[str, object]] = None,
+    recovery: Optional[bool] = None,
 ) -> Dict[str, object]:
     """Atomically publish a small state record with private permissions."""
     if state not in VALID_STATES:
@@ -99,6 +114,15 @@ def atomic_write_state(
         raise ValueError("emitted_at must be finite")
     if source_updated_at is not None and not math.isfinite(source_updated_at):
         raise ValueError("source_updated_at must be finite when present")
+    if publication_revision is not None and (
+        isinstance(publication_revision, bool) or publication_revision < 1
+    ):
+        raise ValueError("publication_revision must be a positive integer")
+    if latest_event is not None and latest_event not in VALID_EVENTS:
+        latest_event = "unknown"
+    if latest_event_at is not None and not math.isfinite(latest_event_at):
+        raise ValueError("latest_event_at must be finite when present")
+    rejection_diagnostics = sanitize_rejection_diagnostics(rejection_diagnostics)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.parent.chmod(0o700)
     record: Dict[str, object] = {
@@ -115,6 +139,16 @@ def atomic_write_state(
         "source_updated_at": source_updated_at,
         "emitted_at": emitted_at,
     }
+    if publication_revision is not None:
+        record.update(
+            {
+                "publication_revision": publication_revision,
+                "latest_event": latest_event,
+                "latest_event_at": latest_event_at,
+                "rejection_diagnostics": rejection_diagnostics,
+                "recovery": bool(recovery),
+            }
+        )
     fd, temporary = tempfile.mkstemp(
         prefix=".current-state-", suffix=".json", dir=str(output_path.parent)
     )
@@ -146,15 +180,132 @@ def atomic_write_state(
     return record
 
 
+def sanitize_rejection_diagnostics(
+    diagnostic: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    reasons: Dict[str, int] = {}
+    raw_reasons = diagnostic.get("reasons") if isinstance(diagnostic, dict) else None
+    if isinstance(raw_reasons, dict):
+        for reason in sorted(VALID_REJECTION_REASONS):
+            count = raw_reasons.get(reason)
+            if (
+                isinstance(count, int)
+                and not isinstance(count, bool)
+                and count > 0
+            ):
+                reasons[reason] = min(1_000_000, count)
+    return {"count": min(1_000_000, sum(reasons.values())), "reasons": reasons}
+
+
 class StatePublisher:
     """Suppress unchanged writes until the heartbeat becomes due."""
 
     def __init__(self, output_path: Path, heartbeat: float) -> None:
         self.output_path = output_path
+        self.revision_path = output_path.with_name(
+            output_path.name + REVISION_SIDECAR_SUFFIX
+        )
         self.heartbeat = heartbeat
         self.last_state: Optional[str] = None
         self.last_forced: Optional[bool] = None
+        self.last_fingerprint: Optional[Tuple[object, ...]] = None
         self.next_heartbeat_at = 0.0
+        self.publication_revision = self._seed_revision()
+        self.recovery_pending = True
+
+    def _seed_revision(self) -> int:
+        wall_clock_floor = min(
+            MAX_PUBLICATION_REVISION,
+            max(0, int(time.time() * REVISION_TICKS_PER_SECOND)),
+        )
+        sidecar_floor = self._read_revision_sidecar()
+        descriptor: Optional[int] = None
+        try:
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            descriptor = os.open(self.output_path, flags)
+            status = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(status.st_mode)
+                or status.st_size > 16 * 1024
+                or status.st_uid != os.getuid()
+            ):
+                return max(wall_clock_floor, sidecar_floor)
+            raw = os.read(descriptor, status.st_size + 1)
+            if len(raw) != status.st_size:
+                return max(wall_clock_floor, sidecar_floor)
+            record = json.loads(raw.decode("utf-8"))
+            if not isinstance(record, dict):
+                return max(wall_clock_floor, sidecar_floor)
+            revision = record.get("publication_revision", 0)
+            if (
+                record.get("version") != SCHEMA_VERSION
+                or record.get("schema_version") != SCHEMA_VERSION
+                or record.get("state") not in VALID_STATES
+                or record.get("source") != "aggregate"
+                or isinstance(revision, bool)
+                or not isinstance(revision, int)
+                or revision < 0
+                or revision > MAX_PUBLICATION_REVISION
+            ):
+                return max(wall_clock_floor, sidecar_floor)
+            return max(wall_clock_floor, sidecar_floor, revision)
+        except (OSError, ValueError, UnicodeError, AttributeError):
+            return max(wall_clock_floor, sidecar_floor)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def _read_revision_sidecar(self) -> int:
+        descriptor: Optional[int] = None
+        try:
+            descriptor = os.open(
+                self.revision_path,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            status = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(status.st_mode)
+                or status.st_size > 32
+                or status.st_uid != os.getuid()
+            ):
+                return 0
+            raw = os.read(descriptor, status.st_size + 1).decode("ascii").strip()
+            value = int(raw)
+            return value if 0 < value <= MAX_PUBLICATION_REVISION else 0
+        except (OSError, ValueError, UnicodeError):
+            return 0
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def _persist_revision(self) -> None:
+        self.revision_path.parent.mkdir(parents=True, exist_ok=True)
+        self.revision_path.parent.chmod(0o700)
+        fd, temporary = tempfile.mkstemp(
+            prefix=".revision-", dir=str(self.revision_path.parent)
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="ascii") as handle:
+                fd = -1
+                handle.write(str(self.publication_revision) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.revision_path)
+            self.revision_path.chmod(0o600)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
 
     def publish_if_due(
         self,
@@ -164,13 +315,32 @@ class StatePublisher:
         monotonic_time: float,
         active_sessions: int = 0,
         forced: bool = False,
+        latest_event: Optional[str] = None,
+        latest_event_at: Optional[float] = None,
+        rejection_diagnostics: Optional[Dict[str, object]] = None,
     ) -> Optional[Dict[str, object]]:
+        diagnostic = sanitize_rejection_diagnostics(rejection_diagnostics)
+        if latest_event is not None and latest_event not in VALID_EVENTS:
+            latest_event = "unknown"
+        fingerprint = (
+            state,
+            source_updated_at,
+            active_sessions,
+            forced,
+            latest_event,
+            latest_event_at,
+            json.dumps(diagnostic, sort_keys=True, separators=(",", ":")),
+        )
         if (
-            state == self.last_state
-            and forced == self.last_forced
+            fingerprint == self.last_fingerprint
             and monotonic_time < self.next_heartbeat_at
         ):
             return None
+        if self.publication_revision >= MAX_PUBLICATION_REVISION:
+            # The operational wall-clock range is centuries below this guard;
+            # fail closed instead of emitting a value Swift cannot decode.
+            raise OverflowError("publication revision exhausted")
+        self.publication_revision += 1
         record = atomic_write_state(
             self.output_path,
             state,
@@ -178,9 +348,17 @@ class StatePublisher:
             wall_time,
             active_sessions,
             forced,
+            self.publication_revision,
+            latest_event,
+            latest_event_at,
+            diagnostic,
+            self.recovery_pending,
         )
+        self._persist_revision()
         self.last_state = state
         self.last_forced = forced
+        self.last_fingerprint = fingerprint
+        self.recovery_pending = False
         self.next_heartbeat_at = monotonic_time + self.heartbeat
         return record
 
@@ -458,6 +636,41 @@ def resolve_state_snapshot_with_expiry(
     return (lifecycle, source_updated_at, len(active), next_expiry)
 
 
+def resolve_diagnostic_snapshot(
+    state_dir: Path, active_ttl: float, wall_time: float
+) -> Tuple[
+    str,
+    Optional[float],
+    int,
+    Optional[float],
+    Optional[str],
+    Optional[float],
+    Dict[str, object],
+]:
+    snapshot = read_session_snapshot(state_dir, now=wall_time, active_ttl=active_ttl)
+    active = snapshot["active"]
+    lifecycle, source_updated_at = aggregate_state_with_source(active)
+    next_expiry = (
+        min(updated_at + active_ttl for _, updated_at in active) + TTL_DEADLINE_EPSILON
+        if active
+        else None
+    )
+    reasons = snapshot["rejections"]
+    diagnostics: Dict[str, object] = {
+        "count": min(1_000_000, sum(reasons.values())),
+        "reasons": reasons,
+    }
+    return (
+        lifecycle,
+        source_updated_at,
+        len(active),
+        next_expiry,
+        snapshot["latest_event"],
+        snapshot["latest_event_at"],
+        diagnostics,
+    )
+
+
 def next_wake_timeout(
     publisher: StatePublisher,
     wall_time: float,
@@ -505,15 +718,32 @@ def run(
             forced = force_is_active(
                 forced_state, once, force_deadline, monotonic_time
             )
-            state, source_updated_at, active_sessions, source_expiry_at = (
-                resolve_state_snapshot_with_expiry(
+            if forced:
+                (
+                    state,
+                    source_updated_at,
+                    active_sessions,
+                    source_expiry_at,
+                ) = resolve_state_snapshot_with_expiry(
                     state_dir,
                     active_ttl,
                     wall_time,
-                    forced_state if forced else None,
+                    forced_state,
                     force_started_at,
                 )
-            )
+                latest_event = None
+                latest_event_at = None
+                rejection_diagnostics: Dict[str, object] = {"count": 0, "reasons": {}}
+            else:
+                (
+                    state,
+                    source_updated_at,
+                    active_sessions,
+                    source_expiry_at,
+                    latest_event,
+                    latest_event_at,
+                    rejection_diagnostics,
+                ) = resolve_diagnostic_snapshot(state_dir, active_ttl, wall_time)
             record = publisher.publish_if_due(
                 state,
                 source_updated_at,
@@ -521,6 +751,9 @@ def run(
                 monotonic_time,
                 active_sessions,
                 forced,
+                latest_event,
+                latest_event_at,
+                rejection_diagnostics,
             )
             if record is not None and print_state:
                 print(state, flush=True)

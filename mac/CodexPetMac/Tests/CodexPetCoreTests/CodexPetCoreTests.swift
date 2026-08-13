@@ -262,6 +262,52 @@ final class CodexPetCoreTests: XCTestCase {
         XCTAssertThrowsError(try StateFreshnessPolicy(maximumFutureSkew: .nan))
     }
 
+    func testCurrentStateDecodesPublicationDiagnosticsAndRejectsInvalidBounds() throws {
+        let json = #"{"version":1,"state":"running","emitted_at":10,"publication_revision":7,"recovery":true,"latest_event":"PostToolUse","latest_event_at":9.5,"rejection_diagnostics":{"count":2,"reasons":{"stale_event":2}}}"#.data(using: .utf8)!
+        let decoded = try JSONDecoder.codexPet.decode(CurrentState.self, from: json)
+        XCTAssertEqual(decoded.publicationRevision, 7)
+        XCTAssertTrue(decoded.recovery)
+        XCTAssertEqual(decoded.latestEvent, "PostToolUse")
+        XCTAssertEqual(decoded.latestEventAt, 9.5)
+        XCTAssertEqual(decoded.rejectionDiagnostics.reasons, ["stale_event": 2])
+
+        let unknownEvent = #"{"version":1,"state":"idle","emitted_at":11,"publication_revision":8,"latest_event":"unknown"}"#.data(using: .utf8)!
+        XCTAssertEqual(
+            try JSONDecoder.codexPet.decode(CurrentState.self, from: unknownEvent).latestEvent,
+            "unknown"
+        )
+
+        XCTAssertThrowsError(try CurrentState(state: .idle, emittedAt: 1, publicationRevision: 0))
+        XCTAssertThrowsError(try CurrentState(state: .idle, emittedAt: 1, latestEventAt: .infinity))
+        XCTAssertThrowsError(try CurrentStateRejectionDiagnostics(count: -1))
+        XCTAssertThrowsError(try CurrentStateRejectionDiagnostics(count: 1, reasons: ["private-error": 1]))
+    }
+
+    func testPublicationOrderPolicyIsMonotonicAndLegacyCompatible() throws {
+        let legacy = try CurrentState(state: .idle, emittedAt: 10)
+        let newerLegacy = try CurrentState(state: .running, emittedAt: 11)
+        let revisioned = try CurrentState(state: .running, emittedAt: 11, publicationRevision: 2)
+        let metadataRepair = try CurrentState(
+            state: .running,
+            activeSessions: 2,
+            emittedAt: 12,
+            publicationRevision: 3,
+            latestEvent: "PostToolUse",
+            latestEventAt: 12
+        )
+        let lower = try CurrentState(state: .review, emittedAt: 13, publicationRevision: 2)
+        let conflict = try CurrentState(state: .review, emittedAt: 13, publicationRevision: 3)
+
+        XCTAssertEqual(StatePublicationOrderPolicy.decide(lastAccepted: nil, incoming: legacy), .acceptInitial)
+        XCTAssertEqual(StatePublicationOrderPolicy.decide(lastAccepted: legacy, incoming: newerLegacy), .acceptNewerLegacyTimestamp)
+        XCTAssertEqual(StatePublicationOrderPolicy.decide(lastAccepted: newerLegacy, incoming: revisioned), .acceptNewerRevision)
+        XCTAssertEqual(StatePublicationOrderPolicy.decide(lastAccepted: revisioned, incoming: metadataRepair), .acceptNewerRevision)
+        XCTAssertEqual(StatePublicationOrderPolicy.decide(lastAccepted: metadataRepair, incoming: lower), .rejectLowerRevision)
+        XCTAssertEqual(StatePublicationOrderPolicy.decide(lastAccepted: metadataRepair, incoming: conflict), .rejectEqualRevisionConflict)
+        XCTAssertEqual(StatePublicationOrderPolicy.decide(lastAccepted: metadataRepair, incoming: newerLegacy), .rejectRevisionlessRollback)
+        XCTAssertEqual(StatePublicationOrderPolicy.decide(lastAccepted: legacy, incoming: legacy), .rejectLegacyTimestampDuplicate)
+    }
+
     func testStatePresentationDecisionSuppressesHeartbeatButAllowsForcedRefresh() {
         XCTAssertEqual(
             StatePresentationDecision.decide(lastPresentedState: nil, incomingState: .idle),
@@ -952,6 +998,76 @@ final class CodexPetCoreTests: XCTestCase {
         XCTAssertTrue(try JSONDecoder.codexPet.decode(MediaMap.self, from: legacy).transitions.isEmpty)
     }
 
+    func testTransitionPlaylistMigratesEditsAndPreservesSettings() throws {
+        let legacy = Data(#"""
+        {
+          "version": 1,
+          "states": {},
+          "transitions": {
+            "idle_to_running": {"path":"one.mov","loop":true,"playback_rate":1}
+          }
+        }
+        """#.utf8)
+        var map = try JSONDecoder.codexPet.decode(MediaMap.self, from: legacy)
+        let migrated = try XCTUnwrap(map.transitionPlaylist(from: .idle, to: .running))
+        XCTAssertEqual(migrated.mode, .fixed)
+        XCTAssertEqual(migrated.fixedPath, "one.mov")
+        XCTAssertFalse(migrated.entries[0].loop)
+
+        map = try map.appendingTransitionEntry(
+            MediaEntry(path: "two.mov", loop: true),
+            from: .idle,
+            to: .running
+        )
+        map = try map.changingTransitionPlaybackMode(from: .idle, to: .running, to: .sequential)
+        map = try map.settingFixedTransitionEntry(from: .idle, to: .running, path: "two.mov")
+        map = try map.movingTransitionEntry(from: .idle, to: .running, path: "two.mov", to: 0)
+        let playlist = try XCTUnwrap(map.transitionPlaylist(from: .idle, to: .running))
+        XCTAssertEqual(playlist.entries.map(\.path), ["two.mov", "one.mov"])
+        XCTAssertEqual(playlist.mode, .sequential)
+        XCTAssertEqual(playlist.fixedPath, "two.mov")
+        XCTAssertTrue(playlist.entries.allSatisfy { !$0.loop })
+
+        let roundTrip = try JSONDecoder.codexPet.decode(MediaMap.self, from: JSONEncoder().encode(map))
+        XCTAssertEqual(roundTrip, map)
+        XCTAssertEqual(roundTrip.allTransitionEntries.map(\.path), ["two.mov", "one.mov"])
+
+        map = try map.removingTransitionEntry(from: .idle, to: .running, path: "two.mov")
+        XCTAssertEqual(map.transitionEntries(from: .idle, to: .running).map(\.path), ["one.mov"])
+        map = try map.removingTransitionEntry(from: .idle, to: .running, path: "one.mov")
+        XCTAssertNil(map.transitionPlaylist(from: .idle, to: .running))
+    }
+
+    func testTransitionSelectionCursorIsRouteIndependentAndCommitsOnce() throws {
+        let one = try MediaEntry(path: "one.mov", loop: false)
+        let two = try MediaEntry(path: "two.mov", loop: false)
+        let three = try MediaEntry(path: "three.mov", loop: false)
+        let random = try StateMediaPlaylist(mode: .random, entries: [one, two, three])
+        let sequential = try StateMediaPlaylist(mode: .sequential, entries: [one, two, three])
+        var cursor = TransitionSelectionCursor()
+
+        var first = try cursor.request(from: .idle, to: .running, playlist: random, randomIndex: { _ in 0 })
+        XCTAssertEqual(first.next()?.path, "one.mov")
+        XCTAssertTrue(first.commit(to: &cursor))
+        XCTAssertFalse(first.commit(to: &cursor))
+
+        var second = try cursor.request(from: .idle, to: .running, playlist: random, randomIndex: { _ in 0 })
+        XCTAssertEqual(second.next()?.path, "two.mov", "random must avoid an immediate repeat")
+        XCTAssertTrue(second.commit(to: &cursor))
+
+        var fallback = try cursor.request(from: .idle, to: .running, playlist: random, randomIndex: { _ in 0 })
+        XCTAssertEqual(fallback.next()?.path, "one.mov")
+        XCTAssertEqual(fallback.next()?.path, "three.mov")
+        XCTAssertEqual(fallback.next()?.path, "two.mov")
+        XCTAssertNil(fallback.next(), "each variant is tried at most once per request")
+
+        var reverse = try cursor.request(from: .running, to: .idle, playlist: sequential)
+        XCTAssertEqual(reverse.next()?.path, "one.mov", "reverse direction owns an independent cursor")
+        XCTAssertTrue(reverse.commit(to: &cursor))
+        var forward = try cursor.request(from: .idle, to: .running, playlist: sequential)
+        XCTAssertEqual(forward.next()?.path, "three.mov")
+    }
+
     func testCharacterBundleTransitionsRewriteAndRequireReferencedAssets() throws {
         let hash = String(repeating: "a", count: 64)
         let transition = try MediaEntry(
@@ -959,7 +1075,16 @@ final class CodexPetCoreTests: XCTestCase {
             posterPath: "posters/idle-running.png",
             loop: false
         )
-        let map = try MediaMap().settingTransition(from: .idle, to: .running, entry: transition)
+        let alternate = try MediaEntry(
+            path: "movies/idle-running-alt.mov",
+            posterPath: "posters/idle-running-alt.png",
+            loop: false
+        )
+        let map = try MediaMap()
+            .settingTransition(from: .idle, to: .running, entry: transition)
+            .appendingTransitionEntry(alternate, from: .idle, to: .running)
+            .changingTransitionPlaybackMode(from: .idle, to: .running, to: .random)
+            .settingFixedTransitionEntry(from: .idle, to: .running, path: alternate.path)
         let manifest = try CharacterBundleManifest(
             characterID: "transition-character",
             characterName: "Transition Character",
@@ -967,11 +1092,20 @@ final class CodexPetCoreTests: XCTestCase {
             assets: [
                 CharacterBundleAsset(role: .movie, path: transition.path, size: 1, sha256: hash),
                 CharacterBundleAsset(role: .poster, path: transition.posterPath!, size: 1, sha256: hash),
+                CharacterBundleAsset(role: .movie, path: alternate.path, size: 1, sha256: hash),
+                CharacterBundleAsset(role: .poster, path: alternate.posterPath!, size: 1, sha256: hash),
             ]
         )
         let rewritten = try manifest.mediaMap(rewritingPaths: { "installed/\($0)" })
-        XCTAssertEqual(rewritten.transition(from: .idle, to: .running)?.path, "installed/movies/idle-running.mov")
-        XCTAssertEqual(rewritten.transition(from: .idle, to: .running)?.posterPath, "installed/posters/idle-running.png")
+        XCTAssertEqual(rewritten.transition(from: .idle, to: .running)?.path, "installed/movies/idle-running-alt.mov")
+        XCTAssertEqual(rewritten.transition(from: .idle, to: .running)?.posterPath, "installed/posters/idle-running-alt.png")
+        let rewrittenPlaylist = try XCTUnwrap(rewritten.transitionPlaylist(from: .idle, to: .running))
+        XCTAssertEqual(rewrittenPlaylist.entries.map(\.path), [
+            "installed/movies/idle-running.mov",
+            "installed/movies/idle-running-alt.mov",
+        ])
+        XCTAssertEqual(rewrittenPlaylist.mode, .random)
+        XCTAssertEqual(rewrittenPlaylist.fixedPath, "installed/movies/idle-running-alt.mov")
 
         XCTAssertThrowsError(try CharacterBundleManifest(
             characterID: "transition-character",
@@ -985,8 +1119,10 @@ final class CodexPetCoreTests: XCTestCase {
             mediaMap: map,
             assets: [
                 CharacterBundleAsset(role: .movie, path: transition.path, size: 1, sha256: hash),
+                CharacterBundleAsset(role: .movie, path: alternate.path, size: 1, sha256: hash),
                 CharacterBundleAsset(role: .movie, path: "movies/unused.mov", size: 1, sha256: hash),
                 CharacterBundleAsset(role: .poster, path: transition.posterPath!, size: 1, sha256: hash),
+                CharacterBundleAsset(role: .poster, path: alternate.posterPath!, size: 1, sha256: hash),
             ]
         ))
     }

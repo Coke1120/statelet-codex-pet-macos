@@ -252,16 +252,18 @@ public enum ManagedMediaTrashRevalidator {
                 }
             }
         }
-        for entry in map.transitions.values {
-            let movie = map.resolvedURL(for: entry, relativeTo: mapURL)
-                .resolvingSymlinksInPath().standardizedFileURL
-            let report = movie.deletingPathExtension().appendingPathExtension("report.json")
-            let poster = map.resolvedPosterURL(for: entry, relativeTo: mapURL)?
-                .resolvingSymlinksInPath().standardizedFileURL
-            if targetPaths.contains(movie.path)
-                || targetPaths.contains(report.path)
-                || poster.map({ targetPaths.contains($0.path) }) == true {
-                throw ManagedMediaTrashRevalidationError.stillReferenced
+        for playlist in map.transitions.values {
+            for entry in playlist.entries {
+                let movie = map.resolvedURL(for: entry, relativeTo: mapURL)
+                    .resolvingSymlinksInPath().standardizedFileURL
+                let report = movie.deletingPathExtension().appendingPathExtension("report.json")
+                let poster = map.resolvedPosterURL(for: entry, relativeTo: mapURL)?
+                    .resolvingSymlinksInPath().standardizedFileURL
+                if targetPaths.contains(movie.path)
+                    || targetPaths.contains(report.path)
+                    || poster.map({ targetPaths.contains($0.path) }) == true {
+                    throw ManagedMediaTrashRevalidationError.stillReferenced
+                }
             }
         }
 
@@ -763,16 +765,18 @@ public enum ManagedMediaTrashRevalidator {
                 }
             }
         }
-        for entry in map.transitions.values {
-            let movie = map.resolvedURL(for: entry, relativeTo: mapURL)
-                .resolvingSymlinksInPath().standardizedFileURL
-            let report = movie.deletingPathExtension().appendingPathExtension("report.json")
-            let poster = map.resolvedPosterURL(for: entry, relativeTo: mapURL)?
-                .resolvingSymlinksInPath().standardizedFileURL
-            if targetPaths.contains(movie.path)
-                || targetPaths.contains(report.path)
-                || poster.map({ targetPaths.contains($0.path) }) == true {
-                throw ManagedMediaTrashRevalidationError.stillReferenced
+        for playlist in map.transitions.values {
+            for entry in playlist.entries {
+                let movie = map.resolvedURL(for: entry, relativeTo: mapURL)
+                    .resolvingSymlinksInPath().standardizedFileURL
+                let report = movie.deletingPathExtension().appendingPathExtension("report.json")
+                let poster = map.resolvedPosterURL(for: entry, relativeTo: mapURL)?
+                    .resolvingSymlinksInPath().standardizedFileURL
+                if targetPaths.contains(movie.path)
+                    || targetPaths.contains(report.path)
+                    || poster.map({ targetPaths.contains($0.path) }) == true {
+                    throw ManagedMediaTrashRevalidationError.stillReferenced
+                }
             }
         }
     }

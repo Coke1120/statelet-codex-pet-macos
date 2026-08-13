@@ -168,6 +168,36 @@ final class ManagedMediaRemovalTests: XCTestCase {
         XCTAssertEqual(plan.trashURLs.map(\.lastPathComponent), ["clip.mov", "clip.report.json"])
     }
 
+    func testPlansOneTransitionVariantRemovalAndRetainsRoute() throws {
+        let fixture = try makeFixture(includeSecondEntry: false)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let retainedURL = fixture.root.appendingPathComponent("imports/item/retained.mov")
+        try Data("retained".utf8).write(to: retainedURL)
+        let map = try MediaMap()
+            .settingTransition(
+                from: .idle,
+                to: .running,
+                entry: try MediaEntry(path: fixture.relativeMoviePath, loop: false)
+            )
+            .appendingTransitionEntry(
+                try MediaEntry(path: "imports/item/retained.mov", loop: false),
+                from: .idle,
+                to: .running
+            )
+
+        let plan = try ManagedMediaRemovalPlanner.plan(
+            mediaMap: map,
+            mapURL: fixture.mapURL,
+            transitionFrom: .idle,
+            transitionTo: .running,
+            path: fixture.relativeMoviePath,
+            canonicalRoot: fixture.root
+        )
+
+        XCTAssertEqual(plan.updatedMap.transitionEntries(from: .idle, to: .running).map(\.path), ["imports/item/retained.mov"])
+        XCTAssertEqual(plan.trashURLs.map(\.lastPathComponent), ["clip.mov", "clip.report.json"])
+    }
+
     func testPlansTransitionRemovalForNonDefaultCharacterMap() throws {
         let fixture = try makeFixture(includeSecondEntry: false)
         defer { try? FileManager.default.removeItem(at: fixture.root) }

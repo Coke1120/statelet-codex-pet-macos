@@ -319,7 +319,87 @@ public extension MediaMap {
     func settingTransition(from: PetState, to: PetState, entry: MediaEntry) throws -> MediaMap {
         let key = try StateTransitionKey(from: from, to: to)
         var updated = transitions
-        updated[key] = entry
+        updated[key] = try StateMediaPlaylist(entries: [entry])
+        return try replacingTransitions(updated)
+    }
+
+    func appendingTransitionEntry(_ entry: MediaEntry, from: PetState, to: PetState) throws -> MediaMap {
+        let key = try StateTransitionKey(from: from, to: to)
+        var updated = transitions
+        if let playlist = updated[key] {
+            updated[key] = try playlist.appending(entry)
+        } else {
+            updated[key] = try StateMediaPlaylist(entries: [entry])
+        }
+        return try replacingTransitions(updated)
+    }
+
+    func replacingTransitionEntry(
+        from: PetState,
+        to: PetState,
+        path: String,
+        with replacement: MediaEntry
+    ) throws -> MediaMap {
+        let key = try StateTransitionKey(from: from, to: to)
+        guard let playlist = transitions[key] else {
+            throw PetContractError.invalidValue("transition playlist was not found")
+        }
+        var updated = transitions
+        updated[key] = try playlist.replacing(path: path, with: replacement)
+        return try replacingTransitions(updated)
+    }
+
+    func removingTransitionEntry(from: PetState, to: PetState, path: String) throws -> MediaMap {
+        let key = try StateTransitionKey(from: from, to: to)
+        guard let playlist = transitions[key] else {
+            throw PetContractError.invalidValue("transition playlist was not found")
+        }
+        var updated = transitions
+        updated[key] = try playlist.removing(path: path)
+        return try replacingTransitions(updated)
+    }
+
+    func changingTransitionPlaybackMode(
+        from: PetState,
+        to: PetState,
+        to mode: MediaPlaybackMode
+    ) throws -> MediaMap {
+        let key = try StateTransitionKey(from: from, to: to)
+        guard let playlist = transitions[key] else {
+            throw PetContractError.invalidValue("transition playlist was not found")
+        }
+        var updated = transitions
+        updated[key] = try playlist.changingMode(to: mode)
+        return try replacingTransitions(updated)
+    }
+
+    func settingFixedTransitionEntry(from: PetState, to: PetState, path: String) throws -> MediaMap {
+        let key = try StateTransitionKey(from: from, to: to)
+        guard let playlist = transitions[key] else {
+            throw PetContractError.invalidValue("transition playlist was not found")
+        }
+        var updated = transitions
+        updated[key] = try StateMediaPlaylist(
+            mode: playlist.mode,
+            advanceOn: .stateEntry,
+            fixedPath: path,
+            entries: playlist.entries
+        )
+        return try replacingTransitions(updated)
+    }
+
+    func movingTransitionEntry(
+        from: PetState,
+        to: PetState,
+        path: String,
+        to destinationIndex: Int
+    ) throws -> MediaMap {
+        let key = try StateTransitionKey(from: from, to: to)
+        guard let playlist = transitions[key] else {
+            throw PetContractError.invalidValue("transition playlist was not found")
+        }
+        var updated = transitions
+        updated[key] = try playlist.movingEntry(path: path, to: destinationIndex)
         return try replacingTransitions(updated)
     }
 
@@ -340,7 +420,7 @@ public extension MediaMap {
         )
     }
 
-    private func replacingTransitions(_ transitions: [StateTransitionKey: MediaEntry]) throws -> MediaMap {
+    private func replacingTransitions(_ transitions: [StateTransitionKey: StateMediaPlaylist]) throws -> MediaMap {
         try MediaMap(
             version: version,
             defaultFormat: defaultFormat,
@@ -348,6 +428,129 @@ public extension MediaMap {
             states: states,
             transitions: transitions
         )
+    }
+}
+
+public struct TransitionSelectionRequest: Equatable, Sendable {
+    public let route: StateTransitionKey
+    public private(set) var triedPaths: Set<String>
+    public private(set) var selectedPath: String?
+    public private(set) var isCommitted: Bool
+    private let candidates: [MediaEntry]
+
+    fileprivate init(route: StateTransitionKey, candidates: [MediaEntry]) {
+        self.route = route
+        self.candidates = candidates
+        triedPaths = []
+        selectedPath = nil
+        isCommitted = false
+    }
+
+    public var remainingCount: Int {
+        candidates.lazy.filter { !triedPaths.contains(StateMediaPlaylist.normalizedPath($0.path)) }.count
+    }
+
+    /// Returns each candidate at most once for this request. Call only after a
+    /// candidate fails attestation/readiness; successful selection is committed separately.
+    public mutating func next() -> MediaEntry? {
+        guard let candidate = candidates.first(where: {
+            !triedPaths.contains(StateMediaPlaylist.normalizedPath($0.path))
+        }) else { return nil }
+        triedPaths.insert(StateMediaPlaylist.normalizedPath(candidate.path))
+        selectedPath = candidate.path
+        return candidate
+    }
+
+    /// Commits at most once, so retries and stale callbacks cannot advance the
+    /// persisted route cursor again.
+    @discardableResult
+    public mutating func commit(to cursor: inout TransitionSelectionCursor) -> Bool {
+        guard !isCommitted, let selectedPath else { return false }
+        cursor.commit(path: selectedPath, for: route)
+        isCommitted = true
+        return true
+    }
+}
+
+public struct TransitionSelectionCursor: Equatable, Sendable {
+    public private(set) var selectedPaths: [StateTransitionKey: String]
+
+    public init(selectedPaths: [StateTransitionKey: String] = [:]) {
+        self.selectedPaths = selectedPaths
+    }
+
+    public func selectedPath(for route: StateTransitionKey) -> String? {
+        selectedPaths[route]
+    }
+
+    public func selectedPath(from: PetState, to: PetState) -> String? {
+        guard let route = try? StateTransitionKey(from: from, to: to) else { return nil }
+        return selectedPath(for: route)
+    }
+
+    public func request(
+        from: PetState,
+        to: PetState,
+        playlist: StateMediaPlaylist,
+        isEligible: (MediaEntry) -> Bool = { _ in true },
+        randomIndex: (Int) -> Int = { Int.random(in: 0..<$0) }
+    ) throws -> TransitionSelectionRequest {
+        let route = try StateTransitionKey(from: from, to: to)
+        let eligible = playlist.entries.filter(isEligible)
+        guard !eligible.isEmpty else { return TransitionSelectionRequest(route: route, candidates: []) }
+        let previousPath = selectedPaths[route]
+        let ordered: [MediaEntry]
+        switch playlist.mode {
+        case .fixed:
+            let fixed = eligible.first(where: {
+                StateMediaPlaylist.pathsEqual($0.path, playlist.fixedPath)
+            })
+            ordered = (fixed.map { [$0] } ?? []) + eligible.filter {
+                !StateMediaPlaylist.pathsEqual($0.path, playlist.fixedPath)
+            }
+        case .sequential:
+            let startIndex: Int
+            if let previousPath,
+               let index = playlist.entries.firstIndex(where: {
+                   StateMediaPlaylist.pathsEqual($0.path, previousPath)
+               }) {
+                startIndex = (index + 1) % playlist.entries.count
+            } else {
+                startIndex = 0
+            }
+            ordered = (0..<playlist.entries.count).compactMap { offset in
+                let entry = playlist.entries[(startIndex + offset) % playlist.entries.count]
+                return isEligible(entry) ? entry : nil
+            }
+        case .random:
+            var pool = eligible
+            var deferredImmediateRepeat = false
+            if pool.count >= 2, let previousPath,
+               let index = pool.firstIndex(where: { StateMediaPlaylist.pathsEqual($0.path, previousPath) }) {
+                let repeated = pool.remove(at: index)
+                pool.append(repeated)
+                deferredImmediateRepeat = true
+            }
+            var randomized: [MediaEntry] = []
+            while !pool.isEmpty {
+                let selectableCount = (randomized.isEmpty && pool.count > 1 && deferredImmediateRepeat)
+                    ? pool.count - 1
+                    : pool.count
+                let rawIndex = randomIndex(selectableCount)
+                let index = ((rawIndex % selectableCount) + selectableCount) % selectableCount
+                randomized.append(pool.remove(at: index))
+            }
+            ordered = randomized
+        }
+        return TransitionSelectionRequest(route: route, candidates: ordered)
+    }
+
+    public mutating func reset(route: StateTransitionKey? = nil) {
+        if let route { selectedPaths[route] = nil } else { selectedPaths.removeAll() }
+    }
+
+    fileprivate mutating func commit(path: String, for route: StateTransitionKey) {
+        selectedPaths[route] = path
     }
 }
 

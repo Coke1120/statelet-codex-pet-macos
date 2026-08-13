@@ -322,12 +322,23 @@ class CharacterStorageHarnessTests(unittest.TestCase):
                         )
                     }
                     try write(Data("transition-report".utf8), to: transitionReport)
+                    let alternateTransitionMovie = roundtripRoot.appendingPathComponent("Transition Alternate.mov")
+                    let alternateTransitionReport = roundtripRoot.appendingPathComponent("Transition Alternate.report.json")
+                    try write(Data("alternate-transition".utf8), to: alternateTransitionMovie)
+                    try write(Data("alternate-transition-report".utf8), to: alternateTransitionReport)
                     let transitionMap = try (try storage.loadMediaMap(for: sourceEntry).map)
                         .settingTransition(
                             from: .idle,
                             to: .running,
                             entry: try MediaEntry(path: transitionMovie.path, loop: false)
                         )
+                        .appendingTransitionEntry(
+                            try MediaEntry(path: alternateTransitionMovie.path, loop: true),
+                            from: .idle,
+                            to: .running
+                        )
+                        .changingTransitionPlaybackMode(from: .idle, to: .running, to: .random)
+                        .settingFixedTransitionEntry(from: .idle, to: .running, path: alternateTransitionMovie.path)
                     let existingMapData = try storage.loadMediaMap(for: sourceEntry).encodedData
                     _ = try storage.saveMediaMap(transitionMap, for: sourceEntry, expectedData: existingMapData)
                     let recoveryCatalogBootstrap = try storage.loadCatalog()
@@ -388,12 +399,23 @@ class CharacterStorageHarnessTests(unittest.TestCase):
                     let transitionManifest = try CharacterBundleManifest.decode(
                         Data(contentsOf: transitionPackage.appendingPathComponent("manifest.json"))
                     )
-                    guard let bundledTransition = transitionManifest.mediaMap.transition(from: .idle, to: .running) else {
+                    guard let bundledPlaylist = transitionManifest.mediaMap.transitionPlaylist(from: .idle, to: .running) else {
                         throw HarnessFailure.failed("export omitted directional transition")
                     }
+                    try require(bundledPlaylist.entries.count == 2, "export dropped a transition variant")
+                    try require(bundledPlaylist.mode == .random, "export changed transition selection mode")
+                    try require(bundledPlaylist.fixedPath == bundledPlaylist.entries[1].path, "export changed transition fixed path")
+                    try require(bundledPlaylist.entries.allSatisfy { !$0.loop }, "export allowed a looping transition")
+                    let bundledTransition = bundledPlaylist.fixedEntry
                     try require(
                         transitionManifest.assets.contains(where: { $0.role == .movie && $0.path == bundledTransition.path }),
                         "transition movie was not declared"
+                    )
+                    try require(
+                        bundledPlaylist.entries.allSatisfy { entry in
+                            transitionManifest.assets.contains(where: { $0.role == .movie && $0.path == entry.path })
+                        },
+                        "one transition variant movie was not declared"
                     )
                     let transitionReportAsset = transitionManifest.assets.first(where: {
                         $0.role == .report && $0.moviePath == bundledTransition.path
@@ -423,9 +445,13 @@ class CharacterStorageHarnessTests(unittest.TestCase):
                         against: existing,
                         allowLegacyTrust: true
                     )
-                    guard let installedTransition = transitionStage.mediaMap.transition(from: .idle, to: .running) else {
+                    guard let installedPlaylist = transitionStage.mediaMap.transitionPlaylist(from: .idle, to: .running) else {
                         throw HarnessFailure.failed("import omitted directional transition")
                     }
+                    try require(installedPlaylist.entries.count == 2, "import dropped a transition variant")
+                    try require(installedPlaylist.mode == .random, "import changed transition selection mode")
+                    try require(installedPlaylist.fixedPath == installedPlaylist.entries[1].path, "import changed transition fixed path")
+                    let installedTransition = installedPlaylist.fixedEntry
                     try require(
                         installedTransition.path.hasPrefix(".character-"),
                         "import did not rewrite transition path"

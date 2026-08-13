@@ -13,6 +13,16 @@ struct PetDiagnosticsInput {
     var emittedAgeSeconds: Double?
     var observedAgeSeconds: Double?
     var activeSessionCount: Int?
+    var latestHookEvent: String?
+    var latestHookAgeSeconds: Double?
+    var observedPublicationRevision: Int?
+    var acceptedLifecycleState: String?
+    var acceptedPublicationRevision: Int?
+    var publisherRecovery: Bool?
+    var overrideStatus: String
+    var fallbackReason: String?
+    var publicationRejectionCount: Int?
+    var publicationRejectionReasons: [String: Int]
     var playbackMode: String
     var selectedClipName: String?
     var previewStatus: String
@@ -31,6 +41,16 @@ struct PetDiagnosticsInput {
         emittedAgeSeconds: Double? = nil,
         observedAgeSeconds: Double? = nil,
         activeSessionCount: Int? = nil,
+        latestHookEvent: String? = nil,
+        latestHookAgeSeconds: Double? = nil,
+        observedPublicationRevision: Int? = nil,
+        acceptedLifecycleState: String? = nil,
+        acceptedPublicationRevision: Int? = nil,
+        publisherRecovery: Bool? = nil,
+        overrideStatus: String = "inactive",
+        fallbackReason: String? = nil,
+        publicationRejectionCount: Int? = nil,
+        publicationRejectionReasons: [String: Int] = [:],
         playbackMode: String,
         selectedClipName: String? = nil,
         previewStatus: String,
@@ -48,6 +68,16 @@ struct PetDiagnosticsInput {
         self.emittedAgeSeconds = emittedAgeSeconds
         self.observedAgeSeconds = observedAgeSeconds
         self.activeSessionCount = activeSessionCount
+        self.latestHookEvent = latestHookEvent
+        self.latestHookAgeSeconds = latestHookAgeSeconds
+        self.observedPublicationRevision = observedPublicationRevision
+        self.acceptedLifecycleState = acceptedLifecycleState
+        self.acceptedPublicationRevision = acceptedPublicationRevision
+        self.publisherRecovery = publisherRecovery
+        self.overrideStatus = overrideStatus
+        self.fallbackReason = fallbackReason
+        self.publicationRejectionCount = publicationRejectionCount
+        self.publicationRejectionReasons = publicationRejectionReasons
         self.playbackMode = playbackMode
         self.selectedClipName = selectedClipName
         self.previewStatus = previewStatus
@@ -100,6 +130,16 @@ struct PetDiagnostics {
             "publisher.emitted_age: \(age(input.emittedAgeSeconds))",
             "publisher.source_age: \(age(input.observedAgeSeconds))",
             "publisher.active_sessions: \(count(input.activeSessionCount))",
+            "publisher.latest_event: \(hookEvent(input.latestHookEvent))",
+            "publisher.latest_event_age: \(age(input.latestHookAgeSeconds))",
+            "publisher.observed_revision: \(revision(input.observedPublicationRevision))",
+            "publisher.accepted_state: \(lifecycleState(input.acceptedLifecycleState))",
+            "publisher.accepted_revision: \(revision(input.acceptedPublicationRevision))",
+            "publisher.recovery: \(boolean(input.publisherRecovery))",
+            "publisher.override: \(category(input.overrideStatus, allowed: ["active", "inactive"]))",
+            "publisher.fallback_reason: \(fallbackReason(input.fallbackReason))",
+            "publisher.rejections: \(count(input.publicationRejectionCount))",
+            "publisher.rejection_categories: \(rejectionCategories(input.publicationRejectionReasons))",
             "playback.mode: \(safeLabel(input.playbackMode))",
             "playback.media: \(safeMediaKind(input.selectedClipName))",
             "preview.status: \(safeLabel(input.previewStatus))",
@@ -199,6 +239,55 @@ struct PetDiagnostics {
     private func count(_ value: Int?) -> String {
         guard let value, value >= 0 else { return "unavailable" }
         return String(min(value, 10_000))
+    }
+
+    private func revision(_ value: Int?) -> String {
+        guard let value, value > 0 else { return "unavailable" }
+        return String(value)
+    }
+
+    private func boolean(_ value: Bool?) -> String {
+        guard let value else { return "unavailable" }
+        return value ? "yes" : "no"
+    }
+
+    private func lifecycleState(_ value: String?) -> String {
+        category(value, allowed: ["idle", "running", "waiting", "review"])
+    }
+
+    private func hookEvent(_ value: String?) -> String {
+        category(value, allowed: [
+            "PermissionRequest", "PostCompact", "PostToolUse", "PreCompact", "PreToolUse",
+            "SessionEnd", "SessionStart", "Stop", "SubagentStart", "SubagentStop", "UserPromptSubmit",
+            "unknown",
+        ])
+    }
+
+    private func fallbackReason(_ value: String?) -> String {
+        category(value, allowed: [
+            "corrupt", "equal_revision_conflict", "equal_revision_duplicate", "future_skew",
+            "legacy_timestamp_duplicate", "legacy_timestamp_rollback", "lower_revision", "missing",
+            "revisionless_rollback", "stale", "unreadable",
+        ])
+    }
+
+    private func rejectionCategories(_ reasons: [String: Int]) -> String {
+        let allowed = Set([
+            "expired", "future_event", "invalid_record", "invalid_timestamp", "stale_event",
+            "equal_revision_conflict", "equal_revision_duplicate", "legacy_timestamp_duplicate",
+            "legacy_timestamp_rollback", "lower_revision", "revisionless_rollback",
+        ])
+        let entries = reasons
+            .filter { allowed.contains($0.key) && $0.value > 0 }
+            .sorted { $0.key < $1.key }
+            .prefix(8)
+            .map { "\($0.key)=\(min($0.value, 1_000_000))" }
+        return entries.isEmpty ? "none" : entries.joined(separator: ",")
+    }
+
+    private func category(_ value: String?, allowed: Set<String>) -> String {
+        guard let value, allowed.contains(value) else { return "unavailable" }
+        return value
     }
 
     private func safeMediaKind(_ value: String?) -> String {

@@ -73,16 +73,28 @@ public enum ManagedMediaRemovalPlanner {
         mapURL: URL,
         transitionFrom: PetState,
         transitionTo: PetState,
+        path: String? = nil,
         canonicalRoot: URL,
         fileManager: FileManager = .default
     ) throws -> ManagedMediaRemovalPlan {
         let context = try validateContext(mapURL: mapURL, canonicalRoot: canonicalRoot)
-        guard let entry = mediaMap.transition(from: transitionFrom, to: transitionTo) else {
+        guard let playlist = mediaMap.transitionPlaylist(from: transitionFrom, to: transitionTo) else {
             throw ManagedMediaRemovalError.entryNotFound
+        }
+        let entry: MediaEntry
+        if let path {
+            guard let selected = playlist.entry(path: path) else {
+                throw ManagedMediaRemovalError.entryNotFound
+            }
+            entry = selected
+        } else {
+            entry = playlist.fixedEntry
         }
         return try plan(
             mediaMap: mediaMap,
-            updatedMap: mediaMap.removingTransition(from: transitionFrom, to: transitionTo),
+            updatedMap: path == nil
+                ? mediaMap.removingTransition(from: transitionFrom, to: transitionTo)
+                : mediaMap.removingTransitionEntry(from: transitionFrom, to: transitionTo, path: entry.path),
             entry: entry,
             context: context,
             fileManager: fileManager
@@ -176,12 +188,14 @@ public enum ManagedMediaRemovalPlanner {
                 }
             }
         }
-        for transition in updated.transitions.values {
-            let remainingURL = updated.resolvedURL(for: transition, relativeTo: mapURL)
-                .resolvingSymlinksInPath()
-                .standardizedFileURL
-            if remainingURL.path == movie.path {
-                throw ManagedMediaRemovalError.stillReferenced
+        for playlist in updated.transitions.values {
+            for transition in playlist.entries {
+                let remainingURL = updated.resolvedURL(for: transition, relativeTo: mapURL)
+                    .resolvingSymlinksInPath()
+                    .standardizedFileURL
+                if remainingURL.path == movie.path {
+                    throw ManagedMediaRemovalError.stillReferenced
+                }
             }
         }
 

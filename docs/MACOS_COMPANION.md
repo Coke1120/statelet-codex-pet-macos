@@ -30,16 +30,22 @@ Codex hook event on stdin
   -> lifecycle badge and animation library
 ```
 
-The hook stores only:
+The hook stores one versioned record per Codex session. It contains only:
 
 - schema version;
 - mapped lifecycle state;
-- recognized event name; and
-- `updated_at` timestamp.
+- recognized event name;
+- authoritative event time and local receipt time;
+- terminal status; and
+- bounded rejection counts for stale or conflicting callbacks; and
+- bounded 24-hex hashes of Codex turn/tool correlation IDs plus closed event
+  phases, stored inside the same atomic owner-only record.
 
 The filename is the first 24 hexadecimal characters of a SHA-256 hash of the
 session identifier. Prompt text, tool output, transcript paths, and working
 directories are excluded.
+The correlation metadata is never copied into `current_state.json` or app
+diagnostics and expires with its session record.
 
 ## Event mapping
 
@@ -62,9 +68,11 @@ The state priority is:
 waiting > review > running > idle
 ```
 
-Each valid session record remains active for 900 seconds after `updated_at`.
-Records that are malformed, non-finite, expired, or more than 60 seconds in the
-future are rejected or pruned. Equal-priority records use the newest timestamp.
+`Stop` and `SessionEnd` terminalize only their own session. Each other valid
+session record remains active for 900 seconds after its authoritative event
+time. Records that are malformed, non-finite, expired, or more than 60 seconds
+in the future are rejected or pruned. A delayed callback cannot replace a newer
+event for the same session. Equal-priority records use the newest timestamp.
 
 The aggregator normally uses macOS `kqueue` directory events, so changed
 session records wake it immediately. It also wakes at session TTL,
@@ -72,15 +80,24 @@ temporary-force, and once-per-minute liveness-heartbeat deadlines. If event
 watching is unsupported or fails, bounded 250 ms polling preserves the same
 behavior. Its path-free log diagnostic reports `mode=event_driven` or
 `mode=poll_fallback` with a sanitized reason category. The aggregate contains
-separate clocks:
+separate clocks and ordering metadata:
 
 - `source_updated_at` identifies the winning session event; and
-- `emitted_at` identifies the aggregator publication time.
+- `emitted_at` identifies the aggregator publication time;
+- `publication_revision` increases monotonically across changed publications
+  and heartbeats, including aggregator restarts;
+- `latest_event` and `latest_event_at` identify the newest accepted hook event;
+  and
+- `recovery` marks the first publication after the aggregator starts.
 
-It also records the number of active sessions. Swift uses `emitted_at` for
-publisher health. It accepts publications up to 150 seconds old and no more than
-60 seconds in the future. Missing, malformed, stale, or farther-future data
-produces an Offline badge and safe Idle fallback.
+It also records the number of active sessions and bounded rejection counts.
+Swift uses `emitted_at` for publisher health and the revision to reject an
+older or conflicting snapshot that arrives after a newer one. It accepts
+publications up to 150 seconds old and no more than 60 seconds in the future.
+The watcher retries transient missing or malformed reads after atomic
+replacement and falls back to polling if its directory watch is invalidated.
+Persistent missing, malformed, stale, or farther-future data produces an
+Offline badge and safe Idle fallback.
 
 A fresh publication recovers automatically. A same-state heartbeat updates
 liveness without rebuilding playback or advancing a playlist.
@@ -118,28 +135,45 @@ hard-cut to another clip when effective `clip_end` rotation is enabled. Normal
 playlist playback has no cross-fade, warmed decoder, or weighted selection.
 
 An optional `transitions` map can bind a distinct ordered state pair such as
-`idle_to_running` to one media entry. A matching transition plays once and is
-bounded to 4 seconds. The player retains the outgoing animation until the
-transition foreground has a display-ready first frame. It prepares the
-destination on a separate lower player and starts it during the final 350 ms,
-or halfway through a shorter transition. Completion removes the foreground and
-promotes the already-running destination without clearing every layer. This is
-alpha compositing rather than an opacity cross-fade.
+`idle_to_running` to an ordered playlist. Each route has an independent
+`fixed`, `random`, or `sequential` selection mode and `fixed_path`. Fixed uses
+the selected default, Random avoids an immediate repeat when another readable
+variant exists, and Sequential follows persisted order and wraps. Existing
+single-entry transition objects decode as Fixed singleton playlists.
+
+Selection occurs once for an accepted real lifecycle change. Initial launch,
+same-state heartbeats, forced refresh, playlist rotation, Next Clip, Play Once,
+transition preview, and Temporary State do not consume a route cursor. Reduce
+Motion also skips selection and leaves the cursor unchanged. A selected
+transition plays once and is bounded to 4 seconds. The player retains the
+outgoing animation until the transition foreground has a display-ready first
+frame. It prepares the destination on a separate lower player and starts it
+during the final 350 ms, or halfway through a shorter transition. Completion
+removes the foreground and promotes the already-running destination without
+clearing every layer. This is alpha compositing rather than an opacity
+cross-fade.
 
 Transition movies require current alpha reports; reportless or opaque assets
-cannot round-trip through a character bundle. Superseding lifecycle changes
-remove stale players, observers, deadlines, and layers. Readiness failure keeps
-the last valid lower presentation visible while the newest state is retried or
-retained safely. Reduce Motion skips transition video and switches to the destination
-static presentation without an empty frame. Initial launch, same-state
-heartbeats, forced refresh, playlist rotation, Next Clip, Play Once, and
-Temporary State do not enter this path. Maps without `transitions` preserve the
-legacy direct destination commit.
+cannot round-trip through a character bundle. When a selected variant is
+unreadable or fails runtime attestation/readiness, Statelet tries each other
+eligible variant for that route at most once before committing the newest
+destination directly. Superseding lifecycle changes remove stale players,
+observers, deadlines, layers, and selection work; stale callbacks cannot commit
+a route cursor or reveal an obsolete destination. Reduce Motion skips
+transition video and switches to the destination static presentation without
+an empty frame. Maps without `transitions` preserve direct destination commit.
+
+Character export/import rewrites and preserves every transition variant,
+ordered position, selection mode, fixed/default path, poster/report reference,
+hash, and validation record. Managed removal drops only the selected route
+reference first and will not move files that another state, transition variant,
+or character map still references.
 
 Play Once and Temporary State affect only the current process. They do not edit
-the aggregate state or media map. The first fresh different producer state
-relinquishes Temporary State and preempts one-time playback. Same-state
-heartbeats preserve the temporary view.
+the aggregate state or media map. **Return to Live State** immediately restores
+the newest accepted live snapshot. The first fresh different producer state
+also relinquishes Temporary State and preempts one-time playback. Same-state
+heartbeats preserve the temporary view while still repairing publisher metadata.
 
 The FPS label is metadata-based. It reports intended playback FPS and nominal
 source FPS, not measured rendered frames.

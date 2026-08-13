@@ -117,6 +117,41 @@ Review as separate clip libraries:
   sibling `.report.json`; posters are kept and Trash remains recoverable. The
   pane footer reveals the entire media directory.
 
+### Directional transition playlists
+
+The **Transitions** category exposes all 12 ordered lifecycle routes. A route
+such as Idle → Running is independent from Running → Idle and owns its own
+ordered variants, selection mode, default path, and in-memory cursor.
+
+- **Add… → Import MP4s…** converts one or more sources and appends each accepted
+  delivery. **Add… → Add Verified MOVs…** installs one or more validated
+  MOV/report pairs. Existing variants remain in place.
+- **Replace…**, **Preview**, **Remove…**, and **Up / Down** act on one variant.
+  Preview does not change the runtime selection cursor.
+- **Fixed** uses the variant marked **Default**. **Random** avoids an immediate
+  repeat when another readable variant exists. **Sequential** follows the
+  displayed order and wraps.
+- Only an accepted real lifecycle A → B change consumes a selection. Initial
+  presentation, same-state heartbeat, refresh, state-playlist rotation, Next
+  Clip, Play Once, Temporary State, and transition preview do not.
+- Reduce Motion skips transition playback and leaves the route cursor
+  unchanged.
+
+The chosen variant keeps the outgoing state visible until its first frame is
+ready, then starts the destination underneath before the foreground completes.
+If a variant is unreadable or fails runtime attestation/readiness, Statelet
+tries each other eligible variant once for that request before committing the
+newest destination directly. A superseding lifecycle change cancels obsolete
+selection and presentation work so stale callbacks cannot advance the cursor or
+reveal an older destination.
+
+Each character retains its complete transition libraries. Secure
+`.statelet-character` export/import preserves variant order, selection mode,
+default path, movies, posters, reports, hashes, and validation records while
+rewriting paths to the package layout. A legacy single transition entry decodes
+as a Fixed singleton playlist. Removal revalidates all character maps before
+moving a managed file that might still be referenced elsewhere.
+
 ## Pet interaction and quick controls
 
 Two controls remain visible beside the pet and expose equivalent actions in the
@@ -136,9 +171,11 @@ menu-bar/right-click menu:
 - **Temporary State** offers Idle, Running, Waiting, and Review. The pet-side
   submenu calls the exit action **Return to Live State**; the menu-bar submenu
   calls it **Follow Codex**. This override is process-memory only and disappears
-  when the app exits. Same-state fresh producer heartbeats retain it. The first
-  different fresh producer state—including one that matches the previewed
-  value—relinquishes it automatically and resumes lifecycle presentation.
+  when the app exits. **Return to Live State** immediately presents the newest
+  accepted publisher snapshot. Same-state fresh producer heartbeats retain the
+  override. The first different fresh producer state—including one that matches
+  the previewed value—relinquishes it automatically and resumes lifecycle
+  presentation.
 - Temporary presentation does not overwrite or disguise publisher health. The
   menu and Settings continue to report the real publisher status and live
   state while the pet marks the requested state as a preview. Selecting a new
@@ -426,21 +463,28 @@ Codex lifecycle hooks
 ```
 
 Each hook invocation writes one privacy-safe record named with the first 24
-hexadecimal characters of the session ID's SHA-256 hash. The record contains
-only version, mapped lifecycle state, event name, and `updated_at`. It excludes
+hexadecimal characters of the session ID's SHA-256 hash. The versioned record
+contains only mapped lifecycle state, event name, authoritative event time,
+local receipt time, terminal status, bounded rejection counts, and bounded
+24-hex hashes of turn/tool correlation IDs with closed event phases. It excludes
 prompts, tool output, transcript paths, and working directories.
+Correlation metadata stays inside the owner-only session record and is never
+forwarded into `current_state.json` or diagnostics.
 `UserPromptSubmit` and subagent events map to Running; `PermissionRequest` maps
 to Waiting; compact events map to Review; and tool events map to Review for
 test, lint, typecheck, or review work and Running otherwise. `SessionStart`,
-`SessionEnd`, and `Stop` map only that session to Idle.
+`SessionEnd`, and `Stop` map only that session to Idle; SessionEnd and Stop also
+terminalize that record.
 
-Session records remain active for 900 seconds. Malformed records, non-finite
-timestamps, records more than 60 seconds in the future, and expired records are
-rejected or pruned. The aggregator chooses the greatest tuple of lifecycle
-priority and `updated_at`: `waiting > review > running > idle`, with the newest
+Nonterminal session records remain active for 900 seconds. Malformed records,
+non-finite timestamps, records more than 60 seconds in the future, and expired
+records are rejected or pruned. A delayed or conflicting callback cannot
+replace a newer event for its session. The aggregator chooses the greatest
+tuple of lifecycle priority and event time:
+`waiting > review > running > idle`, with the newest
 timestamp breaking a same-priority tie. An older Waiting session therefore
 beats a newer Running session. When that Waiting session emits Stop, only its
-record becomes Idle, so another active Review or Running session can win. With
+record becomes terminal, so another active Review or Running session can win. With
 no active record, the result is Idle with no `source_updated_at`.
 
 The aggregator normally uses macOS `kqueue` directory events to publish a
@@ -450,20 +494,31 @@ is unsupported or fails, bounded 250 ms polling preserves correctness. A
 path-free log diagnostic reports `mode=event_driven` or `mode=poll_fallback`
 with a sanitized reason category. `current_state.json` preserves the winning
 session clock as `source_updated_at`, writes the publication clock as
-`emitted_at`, and includes the active-session count. The player checks the
-publication clock every 30 seconds. Swift `CurrentState` uses legacy
-`updated_at` only when `emitted_at` is absent; `readState` does not re-aggregate
-sessions or use `source_updated_at` as a liveness clock. If the publication is
-more than 150 seconds old, more than 60 seconds in the future, missing, or
-invalid, the pet falls back to idle and reports the publisher health. A fresh
-heartbeat recovers automatically, and an unchanged heartbeat does not restart
-the movie loop or advance a Random/Sequential playlist.
+`emitted_at`, and includes the active-session count, aggregate state, latest
+accepted hook event/time, bounded rejection counts, monotonically increasing
+`publication_revision`, and a recovery marker on the first publication after
+aggregator start. The aggregator seeds the revision from a valid existing
+snapshot before publishing again.
+
+The player checks the publication clock every 30 seconds. Swift `CurrentState`
+uses legacy `updated_at` only when `emitted_at` is absent; `readState` does not
+re-aggregate sessions or use `source_updated_at` as a liveness clock. The app
+rejects older or conflicting revisions after accepting a newer snapshot. It
+retries transient missing or malformed reads caused by atomic replacement and
+uses bounded polling when the watched directory is replaced, renamed, deleted,
+or revoked. If publication remains more than 150 seconds old, more than 60
+seconds in the future, missing, or invalid, the pet falls back to idle and
+reports publisher health. A fresh publication recovers automatically, and an
+unchanged heartbeat can repair metadata without restarting the movie loop or
+advancing a Random/Sequential playlist.
 With `advance_on: state_entry`, initial presentation and an actual lifecycle
 state change are the selection boundaries. With effective `clip_end` rotation,
 natural clip completion independently advances the same-state playlist. A
 forced media refresh retains the selected clip when it remains eligible.
 
-Temporary-state preview arbitration runs after freshness validation. A stale,
+Temporary-state preview arbitration runs after freshness and publication-order
+validation. **Return to Live State** immediately restores the newest accepted
+live snapshot. A stale,
 missing, corrupt, or future-dated record still updates publisher health
 truthfully but cannot masquerade as the fresh different producer state that
 relinquishes an override. The override itself is never written to the publisher
@@ -545,14 +600,17 @@ The menu-bar item remains the recovery path and can also reveal the media
 directory or quit the player.
 
 The **Diagnostics** pane builds a sanitized, copyable status report. It contains
-only app version/build and managed-bundle status; current lifecycle, publisher
-health/source/ages and active-session count; playback mode, selected movie
-kind/extension and presentation state; conversion-tool readiness; player startup and
-aggregator plist status; and media-map, state, media-directory and logs-directory
-readability. **Copy Diagnostics** excludes absolute home paths, prompts, session
-identifiers, clip basenames, log contents, tool output, account information, and
-raw errors. Publisher source values are restricted to recognized status labels.
-**Reveal Logs** opens the managed logs folder.
+only app version/build and managed-bundle status; requested and last accepted
+live lifecycle state; publisher health/source/ages, publication and accepted
+revisions, recovery status, latest accepted hook event/time, active-session
+count, and aggregate state; bounded rejection categories/counts; preview or
+fallback override status; playback mode and selected movie kind/extension;
+conversion-tool readiness; player startup and aggregator plist status; and
+media-map, state, media-directory and logs-directory readability. **Copy
+Diagnostics** excludes absolute home paths, prompts, session identifiers, clip
+basenames, log contents, tool output, account information, credentials, and raw
+errors. Publisher source, events, and rejection reasons are restricted to
+recognized status labels. **Reveal Logs** opens the managed logs folder.
 
 **Repair Startup…** validates the installed managed app and will create or
 replace only the `statelet-v2`-marked player LaunchAgent. It refuses an

@@ -7,6 +7,7 @@ typealias CharacterPlaybackVerifier = (_ movieURL: URL, _ reportData: Data?) thr
 typealias CharacterTransitionPlaybackVerifier = (_ movieURL: URL, _ reportData: Data) throws -> Void
 typealias CharacterTransitionDurationVerifier = (_ movieURL: URL) throws -> Void
 typealias CharacterAvailableDiskBytes = (_ destination: URL) throws -> UInt64
+typealias CharacterOperationCheck = () throws -> Void
 
 struct CharacterLibraryCatalogSnapshot {
     let library: CharacterLibrary
@@ -24,6 +25,14 @@ struct CharacterTransitionRuntimeAttestation: Equatable {
     let reportSHA256: String
 
     func requireUnchanged(movieURL: URL) throws {
+        try requireUnchanged(movieURL: movieURL, operationCheck: {})
+    }
+
+    func requireUnchanged(
+        movieURL: URL,
+        operationCheck: @escaping CharacterOperationCheck
+    ) throws {
+        try operationCheck()
         let reportURL = movieURL.deletingPathExtension().appendingPathExtension("report.json")
         guard LocalFileRevision(url: movieURL) == movieRevision,
               LocalFileRevision(url: reportURL) == reportRevision else {
@@ -32,12 +41,14 @@ struct CharacterTransitionRuntimeAttestation: Equatable {
         let movie = try CharacterStorageFiles.hashRegularFile(
             movieURL,
             maximumBytes: CharacterBundleManifest.maximumMovieSize,
-            rejectHardLinks: true
+            rejectHardLinks: true,
+            operationCheck: operationCheck
         )
         let report = try CharacterStorageFiles.hashRegularFile(
             reportURL,
             maximumBytes: CharacterBundleManifest.maximumReportSize,
-            rejectHardLinks: true
+            rejectHardLinks: true,
+            operationCheck: operationCheck
         )
         guard movie.sha256 == movieSHA256,
               report.sha256 == reportSHA256 else {
@@ -234,9 +245,10 @@ final class CharacterLibraryStorage {
     static func attestRuntimeTransition(
         movieURL: URL,
         transitionPlaybackVerifier: CharacterTransitionPlaybackVerifier = CharacterLibraryStorage.defaultTransitionPlaybackVerifier,
-        transitionDurationVerifier: CharacterTransitionDurationVerifier = CharacterLibraryStorage.defaultTransitionDurationVerifier
+        transitionDurationVerifier: CharacterTransitionDurationVerifier = CharacterLibraryStorage.defaultTransitionDurationVerifier,
+        operationCheck: @escaping CharacterOperationCheck = { try Task.checkCancellation() }
     ) throws -> CharacterTransitionRuntimeAttestation {
-        try Task.checkCancellation()
+        try operationCheck()
         guard movieURL.isFileURL,
               movieURL.host.map({ $0.isEmpty || $0 == "localhost" }) ?? true else {
             throw CharacterLibraryStorageError.nonLocalURL
@@ -252,7 +264,8 @@ final class CharacterLibraryStorage {
         let movieBefore = try CharacterStorageFiles.hashRegularFile(
             movieURL,
             maximumBytes: CharacterBundleManifest.maximumMovieSize,
-            rejectHardLinks: true
+            rejectHardLinks: true,
+            operationCheck: operationCheck
         )
         let reportBefore = try CharacterStorageFiles.hashRegularFile(
             reportURL,
@@ -265,16 +278,17 @@ final class CharacterLibraryStorage {
             rejectHardLinks: true
         )
 
-        try Task.checkCancellation()
+        try operationCheck()
         try transitionPlaybackVerifier(movieURL, reportData)
-        try Task.checkCancellation()
+        try operationCheck()
         try transitionDurationVerifier(movieURL)
 
-        try Task.checkCancellation()
+        try operationCheck()
         let movieAfter = try CharacterStorageFiles.hashRegularFile(
             movieURL,
             maximumBytes: CharacterBundleManifest.maximumMovieSize,
-            rejectHardLinks: true
+            rejectHardLinks: true,
+            operationCheck: operationCheck
         )
         let reportAfter = try CharacterStorageFiles.hashRegularFile(
             reportURL,
@@ -420,9 +434,11 @@ final class CharacterLibraryStorage {
                 if let poster = media.posterPath { _ = try register(poster, role: .poster) }
             }
         }
-        for transition in loaded.map.transitions.values {
-            _ = try register(transition.path, role: .movie)
-            if let poster = transition.posterPath { _ = try register(poster, role: .poster) }
+        for playlist in loaded.map.transitions.values {
+            for transition in playlist.entries {
+                _ = try register(transition.path, role: .movie)
+                if let poster = transition.posterPath { _ = try register(poster, role: .poster) }
+            }
         }
 
         var reports: [(source: URL, path: String, moviePath: String)] = []
@@ -449,7 +465,7 @@ final class CharacterLibraryStorage {
             }
             return bundled
         }
-        let transitionMoviePaths = Set(rewrittenMap.transitions.values.map(\.path))
+        let transitionMoviePaths = Set(rewrittenMap.allTransitionEntries.map(\.path))
 
         var expectedAggregate: UInt64 = 0
         for item in sourceByBundlePath {
@@ -672,7 +688,7 @@ final class CharacterLibraryStorage {
                 }
                 return report
             }
-        let transitionMoviePaths = Set(manifest.mediaMap.transitions.values.map(\.path))
+        let transitionMoviePaths = Set(manifest.mediaMap.allTransitionEntries.map(\.path))
         for movie in manifest.assets where movie.role == .movie {
             guard let movieURL = installedByBundlePath[movie.path] else {
                 throw CharacterLibraryStorageError.invalidFile
@@ -873,14 +889,21 @@ private extension MediaMap {
                 entries: entries
             )
         }
-        let transitions = try Dictionary(uniqueKeysWithValues: self.transitions.map { key, entry in
+        let transitions = try Dictionary(uniqueKeysWithValues: self.transitions.map { key, playlist in
             (
                 key,
-                try MediaEntry(
-                    path: transform(entry.path),
-                    posterPath: try entry.posterPath.map(transform),
-                    loop: entry.loop,
-                    playbackRate: entry.playbackRate.value
+                try StateMediaPlaylist(
+                    mode: playlist.mode,
+                    advanceOn: .stateEntry,
+                    fixedPath: transform(playlist.fixedPath),
+                    entries: playlist.entries.map { entry in
+                        try MediaEntry(
+                            path: transform(entry.path),
+                            posterPath: try entry.posterPath.map(transform),
+                            loop: false,
+                            playbackRate: entry.playbackRate.value
+                        )
+                    }
                 )
             )
         })
@@ -984,11 +1007,21 @@ private enum CharacterStorageFiles {
         return data
     }
 
-    static func hashRegularFile(_ url: URL, maximumBytes: UInt64, rejectHardLinks: Bool) throws -> Digest {
+    static func hashRegularFile(
+        _ url: URL,
+        maximumBytes: UInt64,
+        rejectHardLinks: Bool,
+        operationCheck: CharacterOperationCheck = {}
+    ) throws -> Digest {
         let descriptor = Darwin.open(url.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         guard descriptor >= 0 else { throw CharacterLibraryStorageError.invalidFile }
         defer { Darwin.close(descriptor) }
-        return try hashDescriptor(descriptor, maximumBytes: maximumBytes, rejectHardLinks: rejectHardLinks)
+        return try hashDescriptor(
+            descriptor,
+            maximumBytes: maximumBytes,
+            rejectHardLinks: rejectHardLinks,
+            operationCheck: operationCheck
+        )
     }
 
     static func regularFileSize(_ url: URL, maximumBytes: UInt64, rejectHardLinks: Bool) throws -> UInt64 {
@@ -1079,16 +1112,24 @@ private enum CharacterStorageFiles {
         return Digest(size: copied, sha256: hex(hasher.finalize()))
     }
 
-    private static func hashDescriptor(_ descriptor: Int32, maximumBytes: UInt64, rejectHardLinks: Bool) throws -> Digest {
+    private static func hashDescriptor(
+        _ descriptor: Int32,
+        maximumBytes: UInt64,
+        rejectHardLinks: Bool,
+        operationCheck: CharacterOperationCheck = {}
+    ) throws -> Digest {
+        try operationCheck()
         let before = try validatedStatus(descriptor, maximumBytes: maximumBytes, rejectHardLinks: rejectHardLinks, allowEmpty: false)
         var hasher = SHA256()
         var count: UInt64 = 0
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
         while let chunk = try handle.read(upToCount: 1_048_576), !chunk.isEmpty {
+            try operationCheck()
             count += UInt64(chunk.count)
             guard count <= maximumBytes else { throw CharacterLibraryStorageError.fileTooLarge }
             hasher.update(data: chunk)
         }
+        try operationCheck()
         var after = stat()
         guard Darwin.fstat(descriptor, &after) == 0, sameIdentity(before, after), count == UInt64(before.st_size) else {
             throw CharacterLibraryStorageError.sourceChanged

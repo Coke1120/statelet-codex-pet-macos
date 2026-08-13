@@ -29,7 +29,7 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         self.assertIn("previousLifecycleState == incomingState", self.app)
         self.assertIn("trigger: presentationTrigger", self.app)
 
-    def test_failure_retries_destination_then_directly_presents_preselected_entry(self):
+    def test_failure_tries_each_transition_variant_before_destination_fallback(self):
         self.assertIn("onLifecycleTransitionFailed", self.player)
         self.assertIn('outcome: "failed"', self.app)
         retry = self.player.index("private func retryLifecycleDestination")
@@ -44,27 +44,49 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         finish_end = self.app.index("private func cancelActiveLifecycleTransition", finish)
         finish_source = self.app[finish:finish_end]
         self.assertNotIn("player.clearTransientPresentation()", finish_source)
-        self.assertIn('refreshReason: "layered_handoff_failed"', finish_source)
-        self.assertIn("preselectedEntry: active.destinationEntry", finish_source)
-        self.assertIn("advanceSelection: false", finish_source)
-        self.assertNotIn("selectedEntry(", finish_source)
+        self.assertIn('reason: "playback_failed"', finish_source)
+        self.assertIn("selectionRequest: active.selectionRequest", finish_source)
+        self.assertIn("active.selectionRequest.commit(to: &transitionSelectionCursor)", finish_source)
+
+        retry = self.app.index("private func retryLifecycleTransition(")
+        retry_end = self.app.index("private func finishLifecycleTransition(", retry)
+        retry_source = self.app[retry:retry_end]
+        self.assertIn("var selectionRequest = request.selectionRequest", retry_source)
+        self.assertIn("selectionRequest.next()", retry_source)
+        self.assertIn('refreshReason: "layered_handoff_variants_exhausted"', retry_source)
+        self.assertIn("preselectedEntry: request.destinationEntry", retry_source)
+        self.assertIn("advanceSelection: false", retry_source)
+        self.assertIn("selectionRequest: selectionRequest", retry_source)
 
         active = self.app.index("private struct ActiveLifecycleTransition")
         active_end = self.app.index("enum LifecycleTransitionCompletionDecision", active)
         active_source = self.app[active:active_end]
         self.assertIn("let destinationEntry: MediaEntry", active_source)
+        self.assertIn("var selectionRequest: TransitionSelectionRequest", active_source)
 
         transition = self.app.index("private func beginLifecycleTransition(")
         transition_end = self.app.index("private func finishLifecycleTransitionAttestation", transition)
         transition_source = self.app[transition:transition_end]
+        self.assertIn("transitionSelectionCursor.request(", transition_source)
+        self.assertIn("selectionRequest.next()", transition_source)
         self.assertIn("destinationEntry: destinationEntry", transition_source)
+        self.assertLess(
+            transition_source.index("selectionRequest.next()"),
+            transition_source.index("selectedEntry("),
+        )
         self.assertIn("Task.detached(priority: .userInitiated)", transition_source)
         self.assertIn("finishLifecycleTransitionAttestation", transition_source)
         self.assertIn("pendingLifecycleTransitionAttestationTask = verifier", transition_source)
         self.assertLess(
             transition_source.index("Task.detached(priority: .userInitiated)"),
-            transition_source.index("CharacterLibraryStorage.attestRuntimeTransition"),
+            transition_source.index("Self.attestRuntimeTransition"),
         )
+        timeout_helper = self.app.index("private static func attestRuntimeTransition(")
+        timeout_helper_end = self.app.index("private func cancelActiveLifecycleTransition", timeout_helper)
+        timeout_source = self.app[timeout_helper:timeout_helper_end]
+        self.assertIn("PortableMediaOperationRunner.run(", timeout_source)
+        self.assertIn("timeoutSeconds: timeoutSeconds", timeout_source)
+        self.assertIn("CharacterLibraryStorage.attestRuntimeTransition", timeout_source)
         attestation_finish = self.app.index("private func finishLifecycleTransitionAttestation")
         attestation_finish_end = self.app.index("private func finishLifecycleTransition(", attestation_finish)
         self.assertIn(
@@ -88,6 +110,17 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         self.assertIn("!reduceMotion", self.app)
         self.assertIn('cancelActiveLifecycleTransition(reason: "character_changed")', self.app)
         self.assertIn("lastCommittedLifecycleState = nil", self.app)
+        self.assertIn("transitionSelectionCursorsByCharacter", self.app)
+        self.assertIn(
+            "transitionSelectionCursorsByCharacter[characterLibrary.activeCharacterID]",
+            self.app,
+        )
+        activate = self.app.index("private func activateCharacter(")
+        activate_end = self.app.index("private func refreshCharacterClipCounts", activate)
+        self.assertNotIn(
+            "transitionSelectionCursor = TransitionSelectionCursor()",
+            self.app[activate:activate_end],
+        )
 
     def test_app_replacement_paths_keep_visible_content_until_authoritative_commit(self):
         self.assertIn("let hasVisiblePresentation = currentURL != nil || view.hasVisiblePoster", self.player)
@@ -154,7 +187,8 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         recovery_end = self.app.index("private static func isValidInvocationChallenge", recovery)
         recovery_source = self.app[recovery:recovery_end]
         self.assertIn("LifecycleTransitionMediaPolicy.maximumDuration", recovery_source)
-        self.assertIn("settingTransition", recovery_source)
+        self.assertIn("appendingTransitionEntry", recovery_source)
+        self.assertIn(".entry(path: journal.outputBasename) != nil", recovery_source)
         self.assertNotIn("removeItem(at: journalURL)", recovery_source)
         self.assertIn("journal and artifacts were retained for retry", recovery_source)
         self.assertNotIn("quarantineFailedRecoveryArtifacts", recovery_source)
@@ -193,7 +227,7 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
     def test_all_cleanup_exclusion_callers_include_transition_entries(self):
         helper_start = self.app.index("private func allMediaEntries(in map:")
         helper_end = self.app.index("private func applyConfiguredWindowSize", helper_start)
-        self.assertIn("Array(map.transitions.values)", self.app[helper_start:helper_end])
+        self.assertIn("map.allMediaEntries", self.app[helper_start:helper_end])
 
         for name, end_marker in (
             ("private func isMediaPathReferenced(_ url:", "private func isMediaPathReferencedByInactiveCharacter"),
@@ -218,8 +252,65 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         self.assertIn("self.mediaMapEncodedData == requestedMapData", source[callback:mutation])
         self.assertIn("catalogSnapshot?.library == self.characterLibrary", source[callback:mutation])
         self.assertIn("catalogSnapshot?.encodedData == self.characterLibraryEncodedData", source[callback:mutation])
-        self.assertIn("self.mediaMap.transition(from: source, to: destination)?.path == path", source[callback:mutation])
+        self.assertIn(
+            "self.mediaMap.transitionPlaylist(from: source, to: destination)?.entry(path: path) != nil",
+            source[callback:mutation],
+        )
         self.assertLess(mutation, publish)
+
+    def test_observed_publication_is_separate_from_accepted_rollback_barrier(self):
+        start = self.app.index("private func applyLifecycleState(_ state:")
+        end = self.app.index("private func recordPublicationRejection", start)
+        source = self.app[start:end]
+        observed = source.index("lastPublishedSnapshot = state")
+        ordering = source.index("StatePublicationOrderPolicy.decide(")
+        accepted = source.index("lastAcceptedPublishedSnapshot = state")
+        self.assertLess(observed, ordering)
+        self.assertLess(ordering, accepted)
+        self.assertIn("lastAccepted: lastAcceptedPublishedSnapshot", source)
+        self.assertIn("guard ordering.shouldAccept else", source)
+        self.assertIn('recordPublicationRejection(ordering.rejectionReason ?? "order_rejected")', source)
+
+    def test_transient_missing_or_corrupt_reads_preserve_accepted_revision_barrier(self):
+        start = self.app.index("private func applyLifecycleStateReadResult(")
+        end = self.app.index("private func applyLifecycleState(_ state:", start)
+        source = self.app[start:end]
+        self.assertIn("retryLifecycleStateReadOrReject(.missing", source)
+        self.assertIn("retryLifecycleStateReadOrReject(.corrupt", source)
+        self.assertIn("guard retryAttempt < 2 else", source)
+        self.assertNotIn("lastAcceptedPublishedSnapshot = nil", source)
+
+    def test_same_state_newer_publication_updates_metadata_without_forced_playback(self):
+        start = self.app.index("private func applyLifecycleState(_ state:")
+        end = self.app.index("private func recordPublicationRejection", start)
+        source = self.app[start:end]
+        accepted = source.index("lastAcceptedPublishedSnapshot = state")
+        playback = source.index("apply(state: state.state)", accepted)
+        self.assertLess(accepted, playback)
+        self.assertNotIn("forceRefresh: true", source[accepted:playback + 32])
+        self.assertIn("previousLifecycleState == incomingState", self.app)
+        self.assertIn("? .sameStateHeartbeat", self.app)
+
+    def test_duplicate_publication_recovers_only_while_snapshot_is_fresh(self):
+        start = self.app.index("private func applyLifecycleState(_ state:")
+        end = self.app.index("private func recordPublicationRejection", start)
+        source = self.app[start:end]
+        freshness = source.index("let freshness = freshnessPolicy.freshness(")
+        duplicate = source.index("ordering == .rejectEqualRevisionDuplicate", freshness)
+        fresh_gate = source.index("freshness == .fresh", duplicate)
+        reject = source.index("rejectPublisher(freshness == .futureSkew ? .futureSkew : .stale)")
+        self.assertLess(freshness, duplicate)
+        self.assertLess(duplicate, fresh_gate)
+        self.assertLess(fresh_gate, reject)
+
+    def test_return_to_live_presents_current_accepted_real_state(self):
+        start = self.app.index("private func stopTemporaryStatePreview(")
+        end = self.app.index("private func relinquishTemporaryStatePreview", start)
+        source = self.app[start:end]
+        self.assertIn("temporaryStatePreviewPolicy.cancel()", source)
+        self.assertIn("state: currentState", source)
+        self.assertIn('refreshReason: "follow_codex"', source)
+        self.assertIn("advanceSelection: false", source)
 
     def test_dialogue_waits_for_destination_visual_commit_on_sync_and_async_paths(self):
         presentation = self.app.index("private func startLifecyclePresentation(")
@@ -344,6 +435,14 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         self.assertIn("Darwin.unlinkat", helper_source)
         self.assertIn("Darwin.fsync(rootDescriptor)", helper_source)
         self.assertGreaterEqual(helper_source.count("errno == ENOENT"), 2)
+
+    def test_transition_mp4_batch_continues_after_individual_failure(self):
+        start = self.app.index("private func importTransitionMP4s(")
+        end = self.app.index("private func importTransitionMP4(", start)
+        source = self.app[start:end]
+        self.assertIn("Array(orderedURLs.dropFirst())", source)
+        self.assertIn("guard replacingPath == nil else { return }", source)
+        self.assertNotIn("guard succeeded", source)
 
 
 if __name__ == "__main__":

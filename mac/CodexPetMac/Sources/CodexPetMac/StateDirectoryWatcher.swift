@@ -37,8 +37,9 @@ final class StateDirectoryWatcher {
             eventMask: [.write, .rename, .delete, .link, .attrib, .revoke],
             queue: .main
         )
-        source.setEventHandler { [weak self] in
-            self?.emitIfChanged()
+        source.setEventHandler { [weak self, weak source] in
+            guard let source else { return }
+            self?.handleDirectoryEvent(source.data)
         }
         source.setCancelHandler { close(fileDescriptor) }
         self.source = source
@@ -56,13 +57,27 @@ final class StateDirectoryWatcher {
 
     deinit { stop() }
 
-    private func startPolling(emitInitial: Bool) {
+    private func startPolling(emitInitial: Bool, preserveIdentity: Bool = false) {
+        guard pollTimer == nil else { return }
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now(), repeating: .milliseconds(750))
         timer.setEventHandler { [weak self] in self?.emitIfChanged() }
         pollTimer = timer
         timer.resume()
-        prepareInitialIdentity(emitInitial: emitInitial)
+        if !preserveIdentity {
+            prepareInitialIdentity(emitInitial: emitInitial)
+        }
+    }
+
+    private func handleDirectoryEvent(_ events: DispatchSource.FileSystemEvent) {
+        emitIfChanged()
+        guard !events.intersection([.delete, .rename, .revoke]).isEmpty else { return }
+        source?.cancel()
+        source = nil
+        // Polling follows the path rather than the invalidated directory file
+        // descriptor, so a recreated directory and atomically replaced target
+        // become observable without losing the registered callback.
+        startPolling(emitInitial: false, preserveIdentity: true)
     }
 
     private func prepareInitialIdentity(emitInitial: Bool) {

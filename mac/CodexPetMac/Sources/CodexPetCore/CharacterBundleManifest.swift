@@ -152,12 +152,14 @@ public struct CharacterBundleManifest: Codable, Equatable, Sendable {
                 }
             }
         }
-        for entry in mediaMap.transitions.values {
-            try Self.requireAsset(path: entry.path, role: .movie, assetsByPath: assetsByPath)
-            referencedMoviePaths.insert(entry.path)
-            if let posterPath = entry.posterPath {
-                try Self.requireAsset(path: posterPath, role: .poster, assetsByPath: assetsByPath)
-                referencedPosterPaths.insert(posterPath)
+        for playlist in mediaMap.transitions.values {
+            for entry in playlist.entries {
+                try Self.requireAsset(path: entry.path, role: .movie, assetsByPath: assetsByPath)
+                referencedMoviePaths.insert(entry.path)
+                if let posterPath = entry.posterPath {
+                    try Self.requireAsset(path: posterPath, role: .poster, assetsByPath: assetsByPath)
+                    referencedPosterPaths.insert(posterPath)
+                }
             }
         }
         var reportedMovies = Set<String>()
@@ -209,14 +211,21 @@ public struct CharacterBundleManifest: Codable, Equatable, Sendable {
                 entries: rewrittenEntries
             )
         }
-        let rewrittenTransitions = try Dictionary(uniqueKeysWithValues: mediaMap.transitions.map { key, entry in
+        let rewrittenTransitions = try Dictionary(uniqueKeysWithValues: mediaMap.transitions.map { key, playlist in
             (
                 key,
-                try MediaEntry(
-                    path: transform(entry.path),
-                    posterPath: try entry.posterPath.map(transform),
-                    loop: entry.loop,
-                    playbackRate: entry.playbackRate.value
+                try StateMediaPlaylist(
+                    mode: playlist.mode,
+                    advanceOn: .stateEntry,
+                    fixedPath: transform(playlist.fixedPath),
+                    entries: playlist.entries.map { entry in
+                        try MediaEntry(
+                            path: transform(entry.path),
+                            posterPath: try entry.posterPath.map(transform),
+                            loop: false,
+                            playbackRate: entry.playbackRate.value
+                        )
+                    }
                 )
             )
         })
