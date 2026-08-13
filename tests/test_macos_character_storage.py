@@ -76,6 +76,10 @@ class CharacterStorageHarnessTests(unittest.TestCase):
                     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
                 }
 
+                static func sha256(_ data: Data) -> String {
+                    SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+                }
+
                 static func makeStorage(_ root: URL) throws -> CharacterLibraryStorage {
                     try FileManager.default.createDirectory(
                         at: root,
@@ -264,6 +268,25 @@ class CharacterStorageHarnessTests(unittest.TestCase):
                         runtimeAttestation.reportRevision == LocalFileRevision(url: transitionReport),
                         "runtime report revision was not current"
                     )
+                    try require(
+                        runtimeAttestation.movieSHA256 == sha256(Data("transition".utf8)),
+                        "runtime movie digest was not current"
+                    )
+                    try require(
+                        runtimeAttestation.reportSHA256 == sha256(Data("transition-report".utf8)),
+                        "runtime report digest was not current"
+                    )
+                    try runtimeAttestation.requireUnchanged(movieURL: transitionMovie)
+                    let originalMovieTimes = try FileManager.default.attributesOfItem(atPath: transitionMovie.path)
+                    try write(Data("transitioN".utf8), to: transitionMovie)
+                    try FileManager.default.setAttributes(
+                        [.modificationDate: originalMovieTimes[.modificationDate] as Any],
+                        ofItemAtPath: transitionMovie.path
+                    )
+                    try expectFailure("bind-time attestation accepted digest-changed movie bytes") {
+                        try runtimeAttestation.requireUnchanged(movieURL: transitionMovie)
+                    }
+                    try write(Data("transition".utf8), to: transitionMovie)
 
                     let runtimeReportlessMovie = roundtripRoot.appendingPathComponent("Runtime Reportless.mov")
                     try write(Data("transition".utf8), to: runtimeReportlessMovie)

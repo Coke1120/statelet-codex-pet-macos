@@ -2,6 +2,7 @@ import AVFoundation
 import AppKit
 import CodexPetCore
 import CoreVideo
+import CryptoKit
 import XCTest
 @testable import Statelet
 
@@ -422,7 +423,9 @@ final class PetPlayerPlaybackTests: XCTestCase {
                 transitionURL: movieURL,
                 transitionAttestation: CharacterTransitionRuntimeAttestation(
                     movieRevision: LocalFileRevision(url: movieURL)!,
-                    reportRevision: LocalFileRevision(url: movieURL)!
+                    reportRevision: LocalFileRevision(url: movieURL)!,
+                    movieSHA256: "",
+                    reportSHA256: ""
                 ),
                 destinationEntry: entry,
                 destinationURL: movieURL,
@@ -1031,7 +1034,13 @@ final class PetPlayerPlaybackTests: XCTestCase {
         }
         return CharacterTransitionRuntimeAttestation(
             movieRevision: try XCTUnwrap(LocalFileRevision(url: movieURL)),
-            reportRevision: try XCTUnwrap(LocalFileRevision(url: reportURL))
+            reportRevision: try XCTUnwrap(LocalFileRevision(url: reportURL)),
+            movieSHA256: SHA256.hash(data: try Data(contentsOf: movieURL))
+                .map { String(format: "%02x", $0) }
+                .joined(),
+            reportSHA256: SHA256.hash(data: try Data(contentsOf: reportURL))
+                .map { String(format: "%02x", $0) }
+                .joined()
         )
     }
 

@@ -423,6 +423,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var lastCommittedLifecycleState: PetState?
     private var pendingPresentationState: PetState?
     private var pendingLifecycleTransitionAttestation: PendingLifecycleTransitionAttestation?
+    private var pendingLifecycleTransitionAttestationTask: Task<
+        Result<CharacterTransitionRuntimeAttestation, Error>, Never
+    >?
     private var activeLifecycleTransition: ActiveLifecycleTransition?
     private var stateDialoguePresentation: StateDialoguePresentation?
     private var publisherHealth: PublisherHealth = .unknown
@@ -612,6 +615,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        pendingLifecycleTransitionAttestationTask?.cancel()
+        pendingLifecycleTransitionAttestationTask = nil
         pendingLifecycleTransitionAttestation = nil
         stateWatcher?.stop()
         mapWatcher?.stop()
@@ -1105,12 +1110,14 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         pendingLifecycleTransitionAttestation = request
         pendingPresentationState = destination
         logger.info("event=lifecycle_transition_attestation_started transition_id=\(transitionID, privacy: .public) from=\(source.rawValue, privacy: .public) to=\(destination.rawValue, privacy: .public)")
+        let verifier = Task.detached(priority: .userInitiated) {
+            Result {
+                try CharacterLibraryStorage.attestRuntimeTransition(movieURL: transitionURL)
+            }
+        }
+        pendingLifecycleTransitionAttestationTask = verifier
         Task { @MainActor [weak self] in
-            let result = await Task.detached(priority: .userInitiated) {
-                Result {
-                    try CharacterLibraryStorage.attestRuntimeTransition(movieURL: transitionURL)
-                }
-            }.value
+            let result = await verifier.value
             self?.finishLifecycleTransitionAttestation(request: request, result: result)
         }
         updateStatusMenu()
@@ -1128,6 +1135,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
               temporaryStatePreviewPolicy.previewState == nil,
               activeOneShotPreview == nil else { return }
         pendingLifecycleTransitionAttestation = nil
+        pendingLifecycleTransitionAttestationTask = nil
         switch result {
         case .failure:
             pendingPresentationState = nil
@@ -1210,6 +1218,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         if let pending = pendingLifecycleTransitionAttestation {
             cancelledPending = true
             pendingLifecycleTransitionAttestation = nil
+            pendingLifecycleTransitionAttestationTask?.cancel()
+            pendingLifecycleTransitionAttestationTask = nil
             if pendingPresentationState == pending.destination {
                 pendingPresentationState = nil
             }

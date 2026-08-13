@@ -60,6 +60,11 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         self.assertIn("destinationEntry: destinationEntry", transition_source)
         self.assertIn("Task.detached(priority: .userInitiated)", transition_source)
         self.assertIn("finishLifecycleTransitionAttestation", transition_source)
+        self.assertIn("pendingLifecycleTransitionAttestationTask = verifier", transition_source)
+        self.assertLess(
+            transition_source.index("Task.detached(priority: .userInitiated)"),
+            transition_source.index("CharacterLibraryStorage.attestRuntimeTransition"),
+        )
         attestation_finish = self.app.index("private func finishLifecycleTransitionAttestation")
         attestation_finish_end = self.app.index("private func finishLifecycleTransition(", attestation_finish)
         self.assertIn(
@@ -83,6 +88,16 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         self.assertIn("!reduceMotion", self.app)
         self.assertIn('cancelActiveLifecycleTransition(reason: "character_changed")', self.app)
         self.assertIn("lastCommittedLifecycleState = nil", self.app)
+
+    def test_app_replacement_paths_keep_visible_content_until_authoritative_commit(self):
+        self.assertIn("let hasVisiblePresentation = currentURL != nil || view.hasVisiblePoster", self.player)
+        self.assertIn("if !hasVisiblePresentation", self.player)
+        self.assertNotIn("clearTransientPresentation()", self.app)
+        self.assertNotIn("clearOneShotPresentation()", self.app)
+        self.assertIn("pendingLifecycleTransitionAttestationTask?.cancel()", self.app)
+        self.assertIn("pendingLifecycleTransitionAttestationTask = nil", self.app)
+        self.assertIn("cancelActiveOneShotWithoutRestore", self.app)
+        self.assertIn("startLifecyclePresentation(", self.app)
 
     def test_readiness_timeout_pauses_and_overlap_uses_media_time(self):
         show = self.player.index("func showLifecycleTransition")

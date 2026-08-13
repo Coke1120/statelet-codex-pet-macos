@@ -20,11 +20,27 @@ struct CharacterLibraryCatalogSnapshot {
 struct CharacterTransitionRuntimeAttestation: Equatable {
     let movieRevision: LocalFileRevision
     let reportRevision: LocalFileRevision
+    let movieSHA256: String
+    let reportSHA256: String
 
     func requireUnchanged(movieURL: URL) throws {
         let reportURL = movieURL.deletingPathExtension().appendingPathExtension("report.json")
         guard LocalFileRevision(url: movieURL) == movieRevision,
               LocalFileRevision(url: reportURL) == reportRevision else {
+            throw CharacterLibraryStorageError.sourceChanged
+        }
+        let movie = try CharacterStorageFiles.hashRegularFile(
+            movieURL,
+            maximumBytes: CharacterBundleManifest.maximumMovieSize,
+            rejectHardLinks: true
+        )
+        let report = try CharacterStorageFiles.hashRegularFile(
+            reportURL,
+            maximumBytes: CharacterBundleManifest.maximumReportSize,
+            rejectHardLinks: true
+        )
+        guard movie.sha256 == movieSHA256,
+              report.sha256 == reportSHA256 else {
             throw CharacterLibraryStorageError.sourceChanged
         }
     }
@@ -220,6 +236,7 @@ final class CharacterLibraryStorage {
         transitionPlaybackVerifier: CharacterTransitionPlaybackVerifier = CharacterLibraryStorage.defaultTransitionPlaybackVerifier,
         transitionDurationVerifier: CharacterTransitionDurationVerifier = CharacterLibraryStorage.defaultTransitionDurationVerifier
     ) throws -> CharacterTransitionRuntimeAttestation {
+        try Task.checkCancellation()
         guard movieURL.isFileURL,
               movieURL.host.map({ $0.isEmpty || $0 == "localhost" }) ?? true else {
             throw CharacterLibraryStorageError.nonLocalURL
@@ -248,9 +265,12 @@ final class CharacterLibraryStorage {
             rejectHardLinks: true
         )
 
+        try Task.checkCancellation()
         try transitionPlaybackVerifier(movieURL, reportData)
+        try Task.checkCancellation()
         try transitionDurationVerifier(movieURL)
 
+        try Task.checkCancellation()
         let movieAfter = try CharacterStorageFiles.hashRegularFile(
             movieURL,
             maximumBytes: CharacterBundleManifest.maximumMovieSize,
@@ -273,7 +293,9 @@ final class CharacterLibraryStorage {
         }
         return CharacterTransitionRuntimeAttestation(
             movieRevision: movieRevisionAfter,
-            reportRevision: reportRevisionAfter
+            reportRevision: reportRevisionAfter,
+            movieSHA256: movieAfter.sha256,
+            reportSHA256: reportAfter.sha256
         )
     }
 

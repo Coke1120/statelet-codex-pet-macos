@@ -2381,15 +2381,11 @@ final class PetPlayerController {
         reason: PlaybackFailureReason
     ) -> PlaybackStartDisposition {
         logger.error("event=playback_unavailable state=\(state.rawValue, privacy: .public) reason=\(reason.rawValue, privacy: .public)")
-        // Before replacing the queue, retain a known-good active clip for
-        // non-idle requests. Once a queued item fails, failActiveTransition
-        // stops it and truthfully presents a transparent placeholder instead.
-        let shouldRetain = PlaybackFallbackPolicy.shouldRetainCurrentPresentation(
-            hasCurrentMedia: currentURL != nil,
-            currentIsOneShot: currentPresentationIsOneShot,
-            requestedState: state
-        )
-        if !shouldRetain {
+        // Preserve any visible presentation until an atomic replacement is
+        // display-ready. Preview ownership is tracked separately by the app,
+        // so retaining pixels here does not make a one-shot authoritative.
+        let hasVisiblePresentation = currentURL != nil || view.hasVisiblePoster
+        if !hasVisiblePresentation {
             stopQueuePlayback()
             currentState = state
             currentURL = nil
