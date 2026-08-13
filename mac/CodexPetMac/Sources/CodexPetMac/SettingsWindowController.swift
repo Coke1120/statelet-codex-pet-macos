@@ -1,6 +1,42 @@
 import AppKit
 import CodexPetCore
 
+private final class SettingsAnimationsPaneView: NSView {
+    weak var statusView: NSView?
+    weak var modeView: NSView?
+    weak var libraryView: NSView?
+    weak var footerView: NSView?
+
+    override func layout() {
+        super.layout()
+        guard let statusView, let modeView, let libraryView, let footerView else { return }
+
+        let statusHeight: CGFloat = 42
+        let modeHeight: CGFloat = 24
+        let footerHeight: CGFloat = 20
+        statusView.frame = NSRect(
+            x: 0,
+            y: max(0, bounds.height - statusHeight),
+            width: bounds.width,
+            height: statusHeight
+        )
+        modeView.frame = NSRect(
+            x: 0,
+            y: max(0, statusView.frame.minY - 8 - modeHeight),
+            width: min(270, bounds.width),
+            height: modeHeight
+        )
+        footerView.frame = NSRect(x: 0, y: 0, width: bounds.width, height: footerHeight)
+        let libraryBottom = footerView.frame.maxY + 10
+        libraryView.frame = NSRect(
+            x: 0,
+            y: libraryBottom,
+            width: bounds.width,
+            height: max(0, modeView.frame.minY - 8 - libraryBottom)
+        )
+    }
+}
+
 struct SettingsSnapshot {
     let mediaMap: MediaMap
     let mediaMapURL: URL
@@ -89,6 +125,9 @@ struct WindowSettingsUpdate {
 
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private static let defaultStateLabelCustomColor = "#007AFF"
+    private static let preferredContentSize = NSSize(width: 760, height: 650)
+    private static let minimumContentSize = NSSize(width: 700, height: 570)
+    private static let screenMargin: CGFloat = 12
 
     var onImportMP4: ((PetState) -> Void)?
     var onDropMP4s: ((PetState, [URL]) -> Void)?
@@ -146,7 +185,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private let tabs = NSSegmentedControl(labels: ["Animations", "Voice", "Appearance", "General", "Diagnostics", "Prompts", "Recommendation"], trackingMode: .selectOne, target: nil, action: nil)
     private let paneHost = NSView()
-    private let animationsPane = NSView()
+    private let animationsPane = SettingsAnimationsPaneView()
     private let dialogueVoiceView = DialogueVoiceSettingsView()
     private let appearancePane = NSView()
     private let generalPane = NSView()
@@ -197,6 +236,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let launchAtLoginCheckbox = NSButton(checkboxWithTitle: "Start Statelet when I log in", target: nil, action: nil)
     private let launchAtLoginLabel = NSTextField(wrappingLabelWithString: "Checking…")
     private let repairButton = NSButton(title: "Repair Startup…", target: nil, action: nil)
+    private let animationLibraryHost = NSView()
     private let animationLibrary = AnimationLibraryView()
     private let transitionLibrary = TransitionLibraryView()
     private let animationsMode = NSSegmentedControl(
@@ -210,41 +250,50 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private var toolchainState: AlphaToolchainState = .checking
     private var activity: SettingsActivity = .idle
     private var libraryRevisionTimer: Timer?
+    private weak var displayedPane: NSView?
+    private var displayedPaneConstraints: [NSLayoutConstraint] = []
+    private weak var displayedAnimationLibrary: NSView?
+    private var displayedAnimationLibraryConstraints: [NSLayoutConstraint] = []
+    private var minimumPaneWidthConstraint: NSLayoutConstraint?
+    private var minimumPaneHeightConstraint: NSLayoutConstraint?
+    private var hasShownWindow = false
     private var aspectRatio = 1.5
     private let stateLabelPositions: [StateLabelPosition] = [.topLeft, .topRight, .bottomLeft, .bottomRight]
     private let stateLabelSizes: [StateLabelSize] = [.small, .regular, .large]
 
     init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 760, height: 650),
+            contentRect: NSRect(origin: .zero, size: Self.preferredContentSize),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Statelet Settings"
-        window.minSize = NSSize(width: 720, height: 610)
-        window.contentMinSize = NSSize(width: 700, height: 570)
+        window.contentMinSize = Self.minimumContentSize
         window.isReleasedWhenClosed = false
         window.center()
         super.init(window: window)
         window.delegate = self
         buildInterface()
+        fitWindowToVisibleScreen(usePreferredSize: true)
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     func show() {
-        if let window, window.contentLayoutRect.width < 700 || window.contentLayoutRect.height < 570 {
-            window.setContentSize(NSSize(width: 760, height: 650))
-            window.center()
-        }
         NSApp.activate(ignoringOtherApps: true)
         animationLibrary.invalidateRowCache()
         refreshRows()
         startLibraryRevisionTimer()
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
+        fitWindowToVisibleScreen(usePreferredSize: !hasShownWindow)
+        let shouldUsePreferredSize = !hasShownWindow
+        DispatchQueue.main.async { [weak self] in
+            self?.fitWindowToVisibleScreen(usePreferredSize: shouldUsePreferredSize)
+        }
+        hasShownWindow = true
     }
 
     func update(snapshot: SettingsSnapshot) {
@@ -383,25 +432,21 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         recommendationPane.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(tabs)
         contentView.addSubview(paneHost)
-        paneHost.addSubview(animationsPane)
-        paneHost.addSubview(dialogueVoiceView)
-        paneHost.addSubview(appearancePane)
-        paneHost.addSubview(generalPane)
-        paneHost.addSubview(diagnosticsPane)
-        paneHost.addSubview(helpPane)
-        paneHost.addSubview(recommendationPane)
-        for pane in [animationsPane, dialogueVoiceView, appearancePane, generalPane, diagnosticsPane, helpPane, recommendationPane] {
-            NSLayoutConstraint.activate([
-                pane.leadingAnchor.constraint(equalTo: paneHost.leadingAnchor),
-                pane.trailingAnchor.constraint(equalTo: paneHost.trailingAnchor),
-                pane.topAnchor.constraint(equalTo: paneHost.topAnchor),
-                pane.bottomAnchor.constraint(equalTo: paneHost.bottomAnchor),
-            ])
-        }
+        tabs.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let preferredTabsWidth = tabs.widthAnchor.constraint(equalToConstant: 680)
+        preferredTabsWidth.priority = .defaultHigh
+        let minimumPaneWidth = paneHost.widthAnchor.constraint(greaterThanOrEqualToConstant: 660)
+        let minimumPaneHeight = paneHost.heightAnchor.constraint(greaterThanOrEqualToConstant: 498)
+        minimumPaneWidthConstraint = minimumPaneWidth
+        minimumPaneHeightConstraint = minimumPaneHeight
         NSLayoutConstraint.activate([
+            minimumPaneWidth,
+            minimumPaneHeight,
             tabs.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 16),
             tabs.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
-            tabs.widthAnchor.constraint(equalToConstant: 680),
+            tabs.leadingAnchor.constraint(greaterThanOrEqualTo: contentView.leadingAnchor, constant: 12),
+            tabs.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -12),
+            preferredTabsWidth,
             paneHost.topAnchor.constraint(equalTo: tabs.bottomAnchor, constant: 14),
             paneHost.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
             paneHost.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
@@ -421,7 +466,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         publisherLabel.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .medium)
         publisherLabel.translatesAutoresizingMaskIntoConstraints = false
         let statusBox = NSBox()
-        statusBox.translatesAutoresizingMaskIntoConstraints = false
+        statusBox.translatesAutoresizingMaskIntoConstraints = true
         statusBox.boxType = .custom
         statusBox.cornerRadius = 8
         statusBox.borderColor = .separatorColor
@@ -461,7 +506,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                 characterSelector.widthAnchor.constraint(greaterThanOrEqualToConstant: 214),
             ])
         }
-        statusBox.heightAnchor.constraint(equalToConstant: 42).isActive = true
 
         animationLibrary.onStateSelection = { [weak self] state in
             self?.selectedAnimationState = state
@@ -519,9 +563,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             self?.onRemoveTransition?(clip.source, clip.destination, clip.path)
         }
         animationsMode.selectedSegment = 0
+        animationsMode.translatesAutoresizingMaskIntoConstraints = true
         animationsMode.target = self
         animationsMode.action = #selector(changeAnimationsMode)
         animationsMode.setAccessibilityLabel("Animation library mode")
+        animationLibraryHost.translatesAutoresizingMaskIntoConstraints = true
 
         toolsLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         toolsLabel.lineBreakMode = .byTruncatingTail
@@ -584,7 +630,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         activityRow.spacing = 8
         activityRow.isHidden = true
         let footer = NSStackView(views: [toolsRow, activityRow])
-        footer.translatesAutoresizingMaskIntoConstraints = false
+        footer.translatesAutoresizingMaskIntoConstraints = true
         footer.orientation = .vertical
         footer.alignment = .leading
         footer.spacing = 6
@@ -593,29 +639,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         animationsPane.addSubview(statusBox)
         animationsPane.addSubview(animationsMode)
-        animationsPane.addSubview(animationLibrary)
-        animationsPane.addSubview(transitionLibrary)
+        animationsPane.addSubview(animationLibraryHost)
         animationsPane.addSubview(footer)
-        transitionLibrary.isHidden = true
-        NSLayoutConstraint.activate([
-            statusBox.topAnchor.constraint(equalTo: animationsPane.topAnchor),
-            statusBox.leadingAnchor.constraint(equalTo: animationsPane.leadingAnchor),
-            statusBox.trailingAnchor.constraint(equalTo: animationsPane.trailingAnchor),
-            animationsMode.topAnchor.constraint(equalTo: statusBox.bottomAnchor, constant: 8),
-            animationsMode.leadingAnchor.constraint(equalTo: animationsPane.leadingAnchor),
-            animationsMode.widthAnchor.constraint(equalToConstant: 270),
-            animationLibrary.topAnchor.constraint(equalTo: animationsMode.bottomAnchor, constant: 8),
-            animationLibrary.leadingAnchor.constraint(equalTo: animationsPane.leadingAnchor),
-            animationLibrary.trailingAnchor.constraint(equalTo: animationsPane.trailingAnchor),
-            transitionLibrary.topAnchor.constraint(equalTo: animationsMode.bottomAnchor, constant: 8),
-            transitionLibrary.leadingAnchor.constraint(equalTo: animationsPane.leadingAnchor),
-            transitionLibrary.trailingAnchor.constraint(equalTo: animationsPane.trailingAnchor),
-            transitionLibrary.bottomAnchor.constraint(equalTo: animationLibrary.bottomAnchor),
-            footer.topAnchor.constraint(equalTo: animationLibrary.bottomAnchor, constant: 10),
-            footer.leadingAnchor.constraint(equalTo: animationsPane.leadingAnchor),
-            footer.trailingAnchor.constraint(equalTo: animationsPane.trailingAnchor),
-            footer.bottomAnchor.constraint(equalTo: animationsPane.bottomAnchor),
-        ])
+        animationsPane.statusView = statusBox
+        animationsPane.modeView = animationsMode
+        animationsPane.libraryView = animationLibraryHost
+        animationsPane.footerView = footer
+        changeAnimationsMode()
     }
 
     private func configureDialogueVoicePane() {
@@ -1104,7 +1134,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         label.alignment = .left
         label.widthAnchor.constraint(equalToConstant: 110).isActive = true
         if control is NSSlider {
-            control.widthAnchor.constraint(greaterThanOrEqualToConstant: 360).isActive = true
+            control.widthAnchor.constraint(greaterThanOrEqualToConstant: 130).isActive = true
+            control.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         }
         var views: [NSView] = [label, control]
         if let value {
@@ -1238,9 +1269,23 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     @objc private func changeAnimationsMode() {
-        let showingTransitions = animationsMode.selectedSegment == 1
-        animationLibrary.isHidden = showingTransitions
-        transitionLibrary.isHidden = !showingTransitions
+        let selectedLibrary: NSView = animationsMode.selectedSegment == 1
+            ? transitionLibrary
+            : animationLibrary
+        guard displayedAnimationLibrary !== selectedLibrary else { return }
+
+        NSLayoutConstraint.deactivate(displayedAnimationLibraryConstraints)
+        displayedAnimationLibraryConstraints.removeAll()
+        displayedAnimationLibrary?.removeFromSuperview()
+        animationLibraryHost.addSubview(selectedLibrary)
+        displayedAnimationLibraryConstraints = [
+            selectedLibrary.leadingAnchor.constraint(equalTo: animationLibraryHost.leadingAnchor),
+            selectedLibrary.trailingAnchor.constraint(equalTo: animationLibraryHost.trailingAnchor),
+            selectedLibrary.topAnchor.constraint(equalTo: animationLibraryHost.topAnchor),
+            selectedLibrary.bottomAnchor.constraint(equalTo: animationLibraryHost.bottomAnchor),
+        ]
+        NSLayoutConstraint.activate(displayedAnimationLibraryConstraints)
+        displayedAnimationLibrary = selectedLibrary
     }
 
     private var activeCharacterName: String {
@@ -1372,14 +1417,71 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         libraryRevisionTimer = nil
     }
 
+    func windowDidChangeScreen(_ notification: Notification) {
+        fitWindowToVisibleScreen(usePreferredSize: false)
+    }
+
     @objc private func changePane() {
-        animationsPane.isHidden = tabs.selectedSegment != 0
-        dialogueVoiceView.isHidden = tabs.selectedSegment != 1
-        appearancePane.isHidden = tabs.selectedSegment != 2
-        generalPane.isHidden = tabs.selectedSegment != 3
-        diagnosticsPane.isHidden = tabs.selectedSegment != 4
-        helpPane.isHidden = tabs.selectedSegment != 5
-        recommendationPane.isHidden = tabs.selectedSegment != 6
+        let panes = [
+            animationsPane,
+            dialogueVoiceView,
+            appearancePane,
+            generalPane,
+            diagnosticsPane,
+            helpPane,
+            recommendationPane,
+        ]
+        let index = max(0, min(tabs.selectedSegment, panes.count - 1))
+        let selectedPane = panes[index]
+        guard displayedPane !== selectedPane else { return }
+        let preservedContentSize = window?.contentLayoutRect.size
+
+        NSLayoutConstraint.deactivate(displayedPaneConstraints)
+        displayedPaneConstraints.removeAll()
+        displayedPane?.removeFromSuperview()
+        paneHost.addSubview(selectedPane)
+        displayedPaneConstraints = [
+            selectedPane.leadingAnchor.constraint(equalTo: paneHost.leadingAnchor),
+            selectedPane.trailingAnchor.constraint(equalTo: paneHost.trailingAnchor),
+            selectedPane.topAnchor.constraint(equalTo: paneHost.topAnchor),
+            selectedPane.bottomAnchor.constraint(equalTo: paneHost.bottomAnchor),
+        ]
+        NSLayoutConstraint.activate(displayedPaneConstraints)
+        displayedPane = selectedPane
+        if let preservedContentSize {
+            window?.setContentSize(preservedContentSize)
+        }
+    }
+
+    private func fitWindowToVisibleScreen(usePreferredSize: Bool) {
+        guard let window,
+              let screen = window.screen ?? NSScreen.main ?? NSScreen.screens.first else { return }
+        let safeFrame = screen.visibleFrame.insetBy(dx: Self.screenMargin, dy: Self.screenMargin)
+        guard safeFrame.width > 0, safeFrame.height > 0 else { return }
+
+        let maximumContentSize = window.contentRect(forFrameRect: safeFrame).size
+        let effectiveMinimumSize = NSSize(
+            width: min(Self.minimumContentSize.width, maximumContentSize.width),
+            height: min(Self.minimumContentSize.height, maximumContentSize.height)
+        )
+        minimumPaneWidthConstraint?.constant = max(0, effectiveMinimumSize.width - 40)
+        minimumPaneHeightConstraint?.constant = max(0, effectiveMinimumSize.height - 72)
+        window.contentMinSize = effectiveMinimumSize
+
+        let currentSize = window.contentLayoutRect.size
+        let requestedSize = usePreferredSize ? Self.preferredContentSize : currentSize
+        let targetSize = NSSize(
+            width: min(max(requestedSize.width, effectiveMinimumSize.width), maximumContentSize.width),
+            height: min(max(requestedSize.height, effectiveMinimumSize.height), maximumContentSize.height)
+        )
+        window.setContentSize(targetSize)
+
+        var frame = window.frame
+        frame.origin.x = min(max(frame.origin.x, safeFrame.minX), safeFrame.maxX - frame.width)
+        frame.origin.y = min(max(frame.origin.y, safeFrame.minY), safeFrame.maxY - frame.height)
+        window.setFrame(frame, display: false)
+        window.contentView?.layoutSubtreeIfNeeded()
+        window.displayIfNeeded()
     }
 
     @objc private func helpStateChanged() { updateHelpPrompt() }

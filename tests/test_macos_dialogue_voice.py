@@ -57,7 +57,9 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         labels = re.findall(r'"([^"]+)"', tab_match.group("labels"))
         self.assertEqual(len(labels), 7)
         self.assertEqual(labels[1], "Voice")
-        self.assertIn("dialogueVoiceView.isHidden = tabs.selectedSegment != 1", self.settings)
+        self.assertIn("dialogueVoiceView,", self.settings)
+        self.assertIn("let selectedPane = panes[index]", self.settings)
+        self.assertIn("paneHost.addSubview(selectedPane)", self.settings)
 
         required_accessibility_labels = {
             "GPT-SoVITS API base URL",
