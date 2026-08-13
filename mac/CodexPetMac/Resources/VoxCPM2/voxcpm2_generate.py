@@ -6,7 +6,7 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 def fail():
-    sys.stderr.write("QWEN_TTS_FAILED\n")
+    sys.stderr.write("VOXCPM2_FAILED\n")
     raise SystemExit(1)
 
 try:

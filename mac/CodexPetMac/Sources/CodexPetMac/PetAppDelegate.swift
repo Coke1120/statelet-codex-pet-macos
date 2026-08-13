@@ -1671,16 +1671,16 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         guard !reduceMotion,
               activeOneShotPreview == nil,
               let mediaMapURL,
-              let transitionEntry = mediaMap.inStateTransition(for: state),
-              let destinationEntry = selectedEntry(
-                  for: state,
-                  advance: true,
-                  useManualPreviewCursor: false
-              ) else { return false }
+              let transitionEntry = mediaMap.inStateTransition(for: state) else { return false }
         let transitionURL = mediaMap.resolvedURL(for: transitionEntry, relativeTo: mediaMapURL)
+        guard FileManager.default.isReadableFile(atPath: transitionURL.path) else { return false }
+        guard let destinationEntry = selectedEntry(
+            for: state,
+            advance: true,
+            useManualPreviewCursor: false
+        ) else { return false }
         let destinationURL = mediaMap.resolvedURL(for: destinationEntry, relativeTo: mediaMapURL)
-        guard FileManager.default.isReadableFile(atPath: transitionURL.path),
-              FileManager.default.isReadableFile(atPath: destinationURL.path) else { return false }
+        guard FileManager.default.isReadableFile(atPath: destinationURL.path) else { return false }
         cancelActiveLifecycleTransition(reason: "superseded_in_state")
         transitionSequence &+= 1
         let transitionID = transitionSequence
@@ -2977,6 +2977,60 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 sourceURL: packageURL,
                 pythonExecutableURL: pythonURL
             )
+        }
+    }
+
+    private func chooseVoxCPM2Snapshot(referenceText: String) {
+        guard let window = settingsController?.window else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Choose VoxCPM2 Snapshot"
+        panel.message = "Choose a trusted complete openbmb/VoxCPM2 snapshot. Statelet fingerprints the external tree and never uploads or bundles it."
+        panel.prompt = "Use Snapshot"; panel.canChooseFiles = false; panel.canChooseDirectories = true
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let snapshot = panel.url else { return }
+            self?.chooseVoxCPM2Reference(snapshotURL: snapshot, referenceText: referenceText)
+        }
+    }
+
+    private func chooseVoxCPM2Reference(snapshotURL: URL, referenceText: String) {
+        guard let window = settingsController?.window else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Choose VoxCPM2 Reference WAV"
+        panel.message = "Choose one trusted reference WAV that you own or may use. Statelet keeps a private managed copy."
+        panel.prompt = "Use Reference"; panel.allowedContentTypes = [.wav]
+        panel.canChooseFiles = true; panel.canChooseDirectories = false
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let reference = panel.url else { return }
+            self?.chooseVoxCPM2Python(snapshotURL: snapshotURL, referenceURL: reference, referenceText: referenceText)
+        }
+    }
+
+    private func chooseVoxCPM2Python(snapshotURL: URL, referenceURL: URL, referenceText: String) {
+        guard let window = settingsController?.window else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Choose VoxCPM2 Python Runtime"
+        panel.message = "Choose a trusted Python executable whose environment provides voxcpm, PyTorch, and soundfile."
+        panel.prompt = "Use Runtime"; panel.canChooseFiles = true; panel.canChooseDirectories = false
+        panel.resolvesAliases = false
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let python = panel.url else { return }
+            self?.dialogueVoiceCoordinator.configureVoxCPM2Profile(
+                snapshotURL: snapshotURL, referenceAudioURL: referenceURL,
+                referenceText: referenceText, pythonExecutableURL: python
+            )
+        }
+    }
+
+    private func confirmVoxCPM2ProfileRemoval(_ profile: VoxCPM2VoiceProfile) {
+        guard let window = settingsController?.window else { return }
+        let alert = NSAlert(); alert.alertStyle = .warning
+        alert.messageText = "Remove \(profile.name)?"
+        alert.informativeText = "Statelet removes its managed reference and generated speech. The external snapshot, dialogue text, and other providers remain untouched."
+        alert.addButton(withTitle: "Remove VoxCPM2 Profile"); alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            do { try self?.dialogueVoiceCoordinator.removeProfile(provider: .voxcpm2) }
+            catch { self?.presentSettingsError(error.localizedDescription) }
         }
     }
 

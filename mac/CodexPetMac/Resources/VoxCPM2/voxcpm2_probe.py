@@ -12,5 +12,5 @@ try:
     if not callable(getattr(VoxCPM, "from_pretrained", None)):
         raise RuntimeError()
 except BaseException:
-    sys.stderr.write("QWEN_TTS_FAILED\n")
+    sys.stderr.write("VOXCPM2_FAILED\n")
     raise SystemExit(1)
