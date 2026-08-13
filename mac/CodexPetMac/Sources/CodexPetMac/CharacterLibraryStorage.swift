@@ -15,6 +15,12 @@ struct CharacterLibraryCatalogSnapshot {
     let encodedData: Data?
 }
 
+struct GlobalTransitionLibrarySnapshot {
+    let library: GlobalTransitionLibrary
+    /// Nil means the global transition file was absent and `library` is empty.
+    let encodedData: Data?
+}
+
 /// The exact file identities covered by a synchronous runtime transition
 /// attestation. Any cache keyed by this value must miss when either sibling is
 /// replaced; callers should re-attest immediately before accepting playback.
@@ -190,11 +196,13 @@ final class StagedCharacterImport {
 final class CharacterLibraryStorage {
     static let maximumCatalogBytes: UInt64 = 1_048_576
     static let maximumMediaMapBytes: UInt64 = 1_048_576
+    static let maximumGlobalTransitionLibraryBytes: UInt64 = 1_048_576
     static let minimumFreeSpaceReserveBytes: UInt64 = 67_108_864
 
     let rootMediaMapURL: URL
     var mediaMapURL: URL { rootMediaMapURL }
     let catalogURL: URL
+    let globalTransitionLibraryURL: URL
     private let rootURL: URL
     private let playbackVerifier: CharacterPlaybackVerifier
     private let transitionPlaybackVerifier: CharacterTransitionPlaybackVerifier
@@ -212,6 +220,7 @@ final class CharacterLibraryStorage {
         rootMediaMapURL = mediaMapURL
         rootURL = rootMediaMapURL.deletingLastPathComponent()
         self.catalogURL = catalogURL ?? rootURL.appendingPathComponent("character-library.json")
+        globalTransitionLibraryURL = rootURL.appendingPathComponent("global-transitions.json")
         self.playbackVerifier = playbackVerifier
         self.transitionPlaybackVerifier = transitionPlaybackVerifier
         self.transitionDurationVerifier = transitionDurationVerifier
@@ -232,6 +241,24 @@ final class CharacterLibraryStorage {
         )
         return CharacterLibraryCatalogSnapshot(
             library: try JSONDecoder.codexPet.decode(CharacterLibrary.self, from: data),
+            encodedData: data
+        )
+    }
+
+    func loadGlobalTransitionLibrary() throws -> GlobalTransitionLibrarySnapshot {
+        try requireSameRootBasename(globalTransitionLibraryURL)
+        guard CharacterStorageFiles.pathExistsNoFollow(globalTransitionLibraryURL) else {
+            return GlobalTransitionLibrarySnapshot(
+                library: try GlobalTransitionLibrary(),
+                encodedData: nil
+            )
+        }
+        let data = try CharacterStorageFiles.readRegularFile(
+            globalTransitionLibraryURL,
+            maximumBytes: Self.maximumGlobalTransitionLibraryBytes
+        )
+        return GlobalTransitionLibrarySnapshot(
+            library: try JSONDecoder.codexPet.decode(GlobalTransitionLibrary.self, from: data),
             encodedData: data
         )
     }
@@ -334,6 +361,44 @@ final class CharacterLibraryStorage {
             try CharacterStorageFiles.atomicWrite(data, to: catalogURL, expectedData: expectedData)
         }
         return data
+    }
+
+    @discardableResult
+    func saveGlobalTransitionLibrary(
+        _ library: GlobalTransitionLibrary,
+        expectedData: Data?
+    ) throws -> Data {
+        try requireSameRootBasename(globalTransitionLibraryURL)
+        let data = try Self.encoder.encode(library)
+        guard UInt64(data.count) <= Self.maximumGlobalTransitionLibraryBytes else {
+            throw CharacterLibraryStorageError.fileTooLarge
+        }
+        try CharacterStorageFiles.withExclusiveLock(in: rootURL, name: ".global-transitions.lock") {
+            let current: Data?
+            if CharacterStorageFiles.pathExistsNoFollow(globalTransitionLibraryURL) {
+                current = try CharacterStorageFiles.readRegularFile(
+                    globalTransitionLibraryURL,
+                    maximumBytes: Self.maximumGlobalTransitionLibraryBytes
+                )
+            } else {
+                current = nil
+            }
+            guard current == expectedData else { throw CharacterLibraryStorageError.catalogConflict }
+            try CharacterStorageFiles.atomicWrite(
+                data,
+                to: globalTransitionLibraryURL,
+                expectedData: expectedData
+            )
+        }
+        return data
+    }
+
+    @discardableResult
+    func saveRecoveredGlobalTransitionLibrary(
+        _ library: GlobalTransitionLibrary,
+        expectedData: Data?
+    ) throws -> Data {
+        try saveGlobalTransitionLibrary(library, expectedData: expectedData)
     }
 
     func loadMediaMap(for entry: CharacterLibraryEntry) throws -> (map: MediaMap, encodedData: Data) {

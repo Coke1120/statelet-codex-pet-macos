@@ -11,8 +11,8 @@ transparent desktop presence. It runs without a development board, keeps its
 runtime data on the Mac, and uses AppKit and AVFoundation rather than a browser
 runtime.
 
-Statelet 1.7.0 (build 12) requires macOS 13 or newer. The first public release
-is source-only: the build script creates an ad-hoc-signed app for personal local
+Statelet 1.7.1 (build 13) requires macOS 13 or newer. The public release remains
+source-only: the build script creates an ad-hoc-signed app for personal local
 use, not a Developer ID-signed or notarized public binary.
 
 > **No character or animation media is bundled.** Import media that you own or
@@ -186,12 +186,17 @@ The Animations pane also provides:
 - clip reordering, relinking, fixed selection, and Reduce Motion posters; and
 - state-only removal or eligible managed-file moves to macOS Trash.
 
-The **Transitions** mode in the same pane can assign an optional directional
-clip to every distinct source → destination lifecycle pair for the active
-character. Import an MP4 for conversion or a verified transparent MOV, then
-preview, replace, or remove it. A configured clip plays once before Statelet
-commits the destination animation; clips are limited to 4 seconds and must
-carry a current alpha-validation report. During a real lifecycle handoff,
+The **Transitions** mode in the same pane exposes a Character/Global scope
+selector for every distinct source → destination lifecycle pair. **Character**
+edits the active character's route; **Global** edits a separate shared library.
+An existing character route overrides the matching Global route, while a
+missing character route falls back to Global. Import MP4s for conversion or
+verified transparent MOVs, then preview, replace, reorder, or remove individual
+variants. Character bundles include only that character's local transition
+playlists and assets; they never include or modify the Global library. A
+configured variant plays once before Statelet commits the destination
+animation; clips are limited to 4 seconds and must carry a current
+alpha-validation report. During a real lifecycle handoff,
 Statelet retains the outgoing animation until the transition's first frame is
 display-ready, composites the transparent transition above it, and starts the
 destination animation below the foreground before the transition ends. The
@@ -301,8 +306,8 @@ Statelet uses one canonical identity for new builds and installations:
 | Application Support | `~/Library/Application Support/Statelet` |
 | LaunchAgents | `com.coke1120.statelet.state-aggregator`, `com.coke1120.statelet.mac-player` |
 | Managed marker | `statelet-v2` |
-| App version | `1.7.0` |
-| Build number | `12` |
+| App version | `1.7.1` |
+| Build number | `13` |
 
 ## Uninstall
 
@@ -314,10 +319,10 @@ bash mac/CodexPetMac/scripts/uninstall.sh
 
 The uninstaller removes only the marked Statelet app, component directory,
 LaunchAgents, and exact widget hook commands. It preserves animation media,
-`media-map.json`, `character-library.json`, hidden character maps and assets,
-state, session records, and logs so reinstall and recovery do not discard user
-data. Use Finder if you later choose to move that preserved Application Support
-data to Trash.
+`media-map.json`, `global-transitions.json`, `character-library.json`, hidden
+character maps and assets, state, session records, and logs so reinstall and
+recovery do not discard user data. Use Finder if you later choose to move that
+preserved Application Support data to Trash.
 
 ## Development
 

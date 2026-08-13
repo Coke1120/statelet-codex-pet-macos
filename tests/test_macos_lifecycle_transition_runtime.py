@@ -46,7 +46,8 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         self.assertNotIn("player.clearTransientPresentation()", finish_source)
         self.assertIn('reason: "playback_failed"', finish_source)
         self.assertIn("selectionRequest: active.selectionRequest", finish_source)
-        self.assertIn("active.selectionRequest.commit(to: &transitionSelectionCursor)", finish_source)
+        self.assertIn("active.selectionRequest.commit(to: &cursor)", finish_source)
+        self.assertIn("setTransitionSelectionCursor(cursor, for: active.transitionScope)", finish_source)
 
         retry = self.app.index("private func retryLifecycleTransition(")
         retry_end = self.app.index("private func finishLifecycleTransition(", retry)
@@ -67,7 +68,9 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         transition = self.app.index("private func beginLifecycleTransition(")
         transition_end = self.app.index("private func finishLifecycleTransitionAttestation", transition)
         transition_source = self.app[transition:transition_end]
-        self.assertIn("transitionSelectionCursor.request(", transition_source)
+        self.assertIn("transitionSelectionCursor(", transition_source)
+        self.assertIn("for: resolvedTransition.scope", transition_source)
+        self.assertIn(").request(", transition_source)
         self.assertIn("selectionRequest.next()", transition_source)
         self.assertIn("destinationEntry: destinationEntry", transition_source)
         self.assertLess(
@@ -110,9 +113,9 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         self.assertIn("!reduceMotion", self.app)
         self.assertIn('cancelActiveLifecycleTransition(reason: "character_changed")', self.app)
         self.assertIn("lastCommittedLifecycleState = nil", self.app)
-        self.assertIn("transitionSelectionCursorsByCharacter", self.app)
+        self.assertIn("transitionSelectionCursorsByCharacterAndScope", self.app)
         self.assertIn(
-            "transitionSelectionCursorsByCharacter[characterLibrary.activeCharacterID]",
+            '"\\(characterLibrary.activeCharacterID):\\(scope.rawValue)"',
             self.app,
         )
         activate = self.app.index("private func activateCharacter(")
@@ -121,6 +124,107 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
             "transitionSelectionCursor = TransitionSelectionCursor()",
             self.app[activate:activate_end],
         )
+
+    def test_lifecycle_route_availability_uses_character_first_global_fallback_resolver(self):
+        start = self.app.index("private func apply(state:")
+        end = self.app.index("private func beginLifecycleTransition(", start)
+        source = self.app[start:end]
+        resolver = source.index("TransitionLibraryResolver.resolve(")
+        policy = source.index("LifecycleTransitionPolicy.source(", resolver)
+        self.assertIn("character: mediaMap", source[resolver:policy])
+        self.assertIn("global: globalTransitionLibrary", source[resolver:policy])
+        self.assertIn("hasConfiguredMedia: configuredTransition != nil", source[policy:])
+
+    def test_lifecycle_playback_uses_resolved_character_or_global_route(self):
+        start = self.app.index("private func beginLifecycleTransition(")
+        end = self.app.index("private func finishLifecycleTransitionAttestation", start)
+        source = self.app[start:end]
+        resolver = source.index("TransitionLibraryResolver.resolve(")
+        playlist = source.index("let transitionPlaylist = resolvedTransition.playlist", resolver)
+        self.assertIn("character: mediaMap", source[resolver:playlist])
+        self.assertIn("global: globalTransitionLibrary", source[resolver:playlist])
+        self.assertIn("playlist: transitionPlaylist", source[playlist:])
+
+    def test_transition_file_resolution_uses_the_resolved_library_root(self):
+        start = self.app.index("private func beginLifecycleTransition(")
+        end = self.app.index("private func finishLifecycleTransitionAttestation", start)
+        source = self.app[start:end]
+        root = source.index("let transitionLibraryURL = resolvedTransition.scope == .character")
+        request = source.index("let request = PendingLifecycleTransitionAttestation(", root)
+        root_source = source[root:request]
+        self.assertIn("? mediaMapURL", root_source)
+        self.assertIn(": characterLibraryStorage.globalTransitionLibraryURL", root_source)
+        self.assertGreaterEqual(root_source.count("relativeTo: transitionLibraryURL"), 2)
+        self.assertIn("transitionScope: resolvedTransition.scope", source[request:])
+
+    def test_transition_retry_preserves_scope_and_reuses_its_library_root(self):
+        start = self.app.index("private func retryLifecycleTransition(")
+        end = self.app.index("private func finishLifecycleTransition(", start)
+        source = self.app[start:end]
+        root = source.index("let transitionLibraryURL = request.transitionScope == .character")
+        retry = source.index("let retry = PendingLifecycleTransitionAttestation(", root)
+        self.assertIn("? mediaMapURL!", source[root:retry])
+        self.assertIn(": characterLibraryStorage.globalTransitionLibraryURL", source[root:retry])
+        self.assertIn("relativeTo: transitionLibraryURL", source[root:retry])
+        self.assertIn("transitionScope: request.transitionScope", source[retry:])
+
+    def test_global_transition_watcher_triggers_reload(self):
+        start = self.app.index("private func installWatchers()")
+        end = self.app.index("private func installMapWatcher()", start)
+        source = self.app[start:end]
+        self.assertIn("fileURL: characterLibraryStorage.globalTransitionLibraryURL", source)
+        self.assertIn("handleGlobalTransitionLibraryReloadRequest()", source)
+
+    def test_startup_closes_global_library_race_before_first_state_read(self):
+        start = self.app.index("if let forcedState = options.forcedState")
+        end = self.app.index("installHealthCheckTimer()", start)
+        source = self.app[start:end]
+        watchers = source.index("installWatchers()")
+        global_reload = source.index("handleGlobalTransitionLibraryReloadRequest()", watchers)
+        state_read = source.index("readState(from: options.stateURL)", global_reload)
+        self.assertLess(watchers, global_reload)
+        self.assertLess(global_reload, state_read)
+
+    def test_health_check_reloads_global_transition_library(self):
+        start = self.app.index("private func installHealthCheckTimer()")
+        end = self.app.index("private func handleMediaMapReloadRequest()", start)
+        source = self.app[start:end]
+        character_reload = source.index("self.handleCharacterLibraryReloadRequest()")
+        global_reload = source.index("self.handleGlobalTransitionLibraryReloadRequest()")
+        state_read = source.index("self.readState(", global_reload)
+        self.assertLess(character_reload, global_reload)
+        self.assertLess(global_reload, state_read)
+
+    def test_global_transition_reload_refreshes_playback_only_when_changed(self):
+        start = self.app.index("private func handleGlobalTransitionLibraryReloadRequest()")
+        end = self.app.index("private func applyDeferredGlobalTransitionLibraryReloadIfNeeded", start)
+        source = self.app[start:end]
+        self.assertIn("let previous = globalTransitionLibrary", source)
+        self.assertIn("guard loadGlobalTransitionLibrary() else { return }", source)
+        changed = source.index("if previous != globalTransitionLibrary")
+        self.assertIn("apply(state: currentState, forceRefresh: true)", source[changed:])
+
+    def test_transition_selection_history_is_isolated_by_library_scope(self):
+        storage_start = self.app.index("private var transitionSelectionCursorsByCharacterAndScope")
+        storage_end = self.app.index("private var pendingRecoveryNotice", storage_start)
+        storage = self.app[storage_start:storage_end]
+        self.assertIn("TransitionLibraryScope", storage)
+        self.assertIn("private func transitionSelectionCursor(", storage)
+        self.assertIn("for scope: TransitionLibraryScope", storage)
+        self.assertIn("setTransitionSelectionCursor(", storage)
+
+        begin = self.app.index("private func beginLifecycleTransition(")
+        begin_end = self.app.index("private func finishLifecycleTransitionAttestation", begin)
+        begin_source = self.app[begin:begin_end]
+        self.assertIn("transitionSelectionCursor(", begin_source)
+        self.assertIn("for: resolvedTransition.scope", begin_source)
+
+        finish = self.app.index("private func finishLifecycleTransition(")
+        finish_end = self.app.index("private static func attestRuntimeTransition", finish)
+        finish_source = self.app[finish:finish_end]
+        self.assertIn("active.selectionRequest.commit", finish_source)
+        self.assertIn("setTransitionSelectionCursor(", finish_source)
+        self.assertIn("for: active.transitionScope", finish_source)
 
     def test_app_replacement_paths_keep_visible_content_until_authoritative_commit(self):
         self.assertIn("let hasVisiblePresentation = currentURL != nil || view.hasVisiblePoster", self.player)
@@ -175,10 +279,15 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         self.assertIn('case characterID = "character_id"', self.app)
         self.assertIn('case mediaMapBasename = "media_map_basename"', self.app)
         self.assertIn('case mediaMapSHA256 = "media_map_sha256"', self.app)
+        self.assertIn('case transitionScope = "transition_scope"', self.app)
+        self.assertIn(
+            'case globalTransitionLibrarySHA256 = "global_transition_library_sha256"',
+            self.app,
+        )
         self.assertIn("let owner = try? recoveryOwner(for: journal)", self.app)
         self.assertIn("saveRecoveredMediaMap(", self.app)
-        self.assertIn("expectedData: owner.encodedData", self.app)
-        self.assertIn("expectedCatalogData: owner.catalogEncodedData", self.app)
+        self.assertIn("expectedData: characterOwner.encodedData", self.app)
+        self.assertIn("expectedCatalogData: characterOwner.catalogEncodedData", self.app)
         self.assertIn('throw PetContractError.invalidValue("legacy recovery owner is ambiguous")', self.app)
         self.assertIn("catalogSnapshot.encodedData == characterLibraryEncodedData", self.app)
         self.assertIn("Self.isValidRecoveryRoute(journal)", self.app)
@@ -188,11 +297,42 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         recovery_source = self.app[recovery:recovery_end]
         self.assertIn("LifecycleTransitionMediaPolicy.maximumDuration", recovery_source)
         self.assertIn("appendingTransitionEntry", recovery_source)
-        self.assertIn(".entry(path: journal.outputBasename) != nil", recovery_source)
+        self.assertIn(".entry(path: journal.outputBasename) == nil", recovery_source)
         self.assertNotIn("removeItem(at: journalURL)", recovery_source)
         self.assertIn("journal and artifacts were retained for retry", recovery_source)
         self.assertNotIn("quarantineFailedRecoveryArtifacts", recovery_source)
         self.assertIn("requireValidatedFilesUnchanged", recovery_source)
+
+    def test_global_transition_conversion_journal_carries_scope_and_expected_digest(self):
+        start = self.app.index("private func importTransitionMP4")
+        end = self.app.index("private func previewTransition", start)
+        source = self.app[start:end]
+        journal = source.index("ActiveConversionJournal(")
+        conversion = source.index("conversionCoordinator.convert(", journal)
+        journal_source = source[journal:conversion]
+        self.assertIn("transitionScope: scope", journal_source)
+        self.assertIn("globalTransitionLibrarySHA256:", journal_source)
+        self.assertNotIn("if scope == .character", source[:conversion])
+
+    def test_recovery_publishes_transition_to_recorded_scope_with_digest_barrier(self):
+        start = self.app.index("private func recoverInterruptedConversionIfPresent")
+        end = self.app.index("private func recoveryOwner(for journal:", start)
+        source = self.app[start:end]
+        self.assertIn("case let .global(globalOwner)", source)
+        self.assertIn("globalOwner.encodedData", source)
+        self.assertIn("saveRecoveredGlobalTransitionLibrary", source)
+        self.assertIn("saveRecoveredMediaMap", source)
+        self.assertIn("applyPublishedGlobalTransitionLibrary", source)
+
+    def test_recovery_rejects_incomplete_or_changed_global_scope_ownership(self):
+        start = self.app.index("private func recoveryOwner(for journal:")
+        end = self.app.index("private static func isValidInvocationChallenge", start)
+        source = self.app[start:end]
+        self.assertIn("journal.transitionScope", source)
+        self.assertIn("globalTransitionLibrarySHA256", source)
+        self.assertIn("loadGlobalTransitionLibrary", source)
+        self.assertIn("sha256Hex", source)
+        self.assertIn("conversion recovery", source)
 
     def test_recovery_updates_journal_owner_without_replacing_different_active_character(self):
         owner = self.app.index("private func recoveryOwner(for journal:")
@@ -206,12 +346,12 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         recovery_end = self.app.index("private func recoveryOwner(for journal:", recovery)
         recovery_source = self.app[recovery:recovery_end]
         save = recovery_source.index("saveRecoveredMediaMap(")
-        active_branch = recovery_source.index("if owner.isActive", save)
+        active_branch = recovery_source.index("if characterOwner.isActive", save)
         self.assertLess(save, active_branch)
-        self.assertIn("for: owner.entry", recovery_source[save:active_branch])
+        self.assertIn("for: characterOwner.entry", recovery_source[save:active_branch])
         self.assertIn("self.mediaMapEncodedData = encoded", recovery_source[active_branch:])
         self.assertIn("self.applyPublishedMediaMap(updated)", recovery_source[active_branch:])
-        self.assertIn("self.characterClipCounts[owner.entry.id]", recovery_source[active_branch:])
+        self.assertIn("self.characterClipCounts[characterOwner.entry.id]", recovery_source[active_branch:])
 
     def test_malformed_recovery_journal_is_retained_before_async_recovery_starts(self):
         recovery = self.app.index("private func recoverInterruptedConversionIfPresent")
@@ -238,6 +378,21 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
             start = self.app.index(name)
             end = self.app.index(end_marker, start)
             self.assertIn("allMediaEntries(in:", self.app[start:end], name)
+
+    def test_global_transition_references_are_checked_before_character_cleanup_references(self):
+        start = self.app.index("private func isMediaPathReferenced(_ url:")
+        end = self.app.index("private func isMediaPathReferencedByInactiveCharacter", start)
+        source = self.app[start:end]
+        global_check = source.index("globalTransitionLibraryReferences(url)")
+        character_check = source.index("allCharacterMediaMaps()", global_check)
+        self.assertLess(global_check, character_check)
+
+    def test_unused_media_cleanup_includes_global_transition_references(self):
+        start = self.app.index("private func unusedMediaCandidates()")
+        end = self.app.index("private func isInsideManagedMedia", start)
+        source = self.app[start:end]
+        self.assertIn("characterLibraryStorage.globalTransitionLibraryURL", source)
+        self.assertIn("globalTransitionLibrary.allEntries", source)
 
     def test_transition_removal_revalidates_character_map_and_route_after_confirmation(self):
         start = self.app.index("private func removeTransition")
@@ -349,7 +504,7 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         source = self.app[start:end]
         installed = source.index("let installed = try await prepareVerifiedMovie")
         cleanup = source.index("removeItem(at: installed.directory)", installed)
-        publish = source.index("try publishMediaMap(updated)", installed)
+        publish = source.index("try updateTransitionLibrary(", installed)
         nested_catch = source.index("} catch {", publish)
         self.assertLess(publish, nested_catch)
         self.assertLess(nested_catch, cleanup)
@@ -408,7 +563,7 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         clear_journal_call = cancellation_source.index(
             "removeCancelledTransitionArtifact(self.conversionJournalURL)"
         )
-        clear_journal = cancellation_source.rindex("guard self.", 0, clear_journal_call)
+        clear_journal = cancellation_source.rindex("guard self.removeCancelledTransitionArtifact")
         self.assertLess(cleanup_guard, clear_journal)
         blocked_source = cancellation_source[cleanup_guard:clear_journal]
         self.assertIn("cleanup could not be verified", blocked_source)
@@ -417,7 +572,7 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         journal_guard_source = cancellation_source[
             clear_journal:cancellation_source.index("self.activeTransitionConversionID = nil", clear_journal)
         ]
-        self.assertIn("guard self.removeCancelledTransitionArtifact", journal_guard_source)
+        self.assertIn("self.removeCancelledTransitionArtifact", journal_guard_source)
         self.assertIn("recovery record could not be cleared", journal_guard_source)
         self.assertNotIn("mediaMutationInProgress = false", journal_guard_source)
         self.assertIn("activeTransitionConversionID = nil", cancellation_source)

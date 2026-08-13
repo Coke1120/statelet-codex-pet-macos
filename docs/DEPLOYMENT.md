@@ -1,7 +1,7 @@
 # Deploy Statelet on macOS
 
 This guide covers building, installing, upgrading, starting automatically, and
-uninstalling Statelet 1.7.0 (build 12) on macOS 13 or newer.
+uninstalling Statelet 1.7.1 (build 13) on macOS 13 or newer.
 
 The first public release is source-only. The maintained build script produces
 an ad-hoc-signed `.app` for personal local use. It does not produce a DMG,
@@ -106,8 +106,9 @@ The installer:
 - creates marked state-aggregator and player LaunchAgents;
 - merges Statelet's commands into `~/.codex/hooks.json` without replacing
   unrelated commands; and
-- preserves an existing `media-map.json`, `character-library.json`, hidden
-  per-character maps/assets, and user media during upgrades.
+- preserves an existing `media-map.json`, `global-transitions.json`,
+  `character-library.json`, hidden per-character maps/assets, and user media
+  during upgrades.
 
 An unmanaged app or LaunchAgent at a managed destination causes installation to
 fail before replacement. See [Legacy identity migration](#legacy-identity-migration)
@@ -218,10 +219,11 @@ bash mac/CodexPetMac/scripts/build_app.sh
 bash mac/CodexPetMac/scripts/install.sh
 ```
 
-Do not uninstall first. A managed upgrade preserves media, the media map, and
-the current start-at-login choice. Multi-character installations also preserve
-the authoritative catalog sidecar and every profile map; the installer does not
-merge profile data into the legacy root map.
+Do not uninstall first. A managed upgrade preserves media, the media map, the
+separate Global transition library, and the current start-at-login choice.
+Multi-character installations also preserve the authoritative catalog sidecar
+and every profile map; the installer does not merge profile data into the
+legacy root map.
 
 New builds and installations use the canonical Statelet identity:
 
@@ -250,6 +252,7 @@ does not commit.
 ```text
 ~/Applications/Statelet.app
 ~/Library/Application Support/Statelet/media/media-map.json
+~/Library/Application Support/Statelet/media/global-transitions.json
 ~/Library/Application Support/Statelet/media/character-library.json
 ~/Library/Application Support/Statelet/media/.character-<id>.media-map.json
 ~/Library/Application Support/Statelet/media/.character-<id>.assets/
@@ -295,6 +298,7 @@ It intentionally preserves:
 - animation movies and posters;
 - converter reports;
 - `media-map.json`;
+- `global-transitions.json`;
 - `character-library.json`;
 - hidden `.character-<id>.media-map.json` files and imported asset trees;
 - aggregate state and per-session records; and

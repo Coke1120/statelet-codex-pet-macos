@@ -28,6 +28,7 @@ public struct ManagedMediaTrashSnapshot: Equatable, Sendable {
     fileprivate let targets: [ManagedMediaTrashTarget]
     fileprivate let maps: [ManagedMediaMapSnapshot]
     fileprivate let catalog: ManagedMediaCatalogSnapshot?
+    fileprivate let globalTransitionLibrary: ManagedMediaGlobalTransitionLibrarySnapshot?
 
     public var targetURLs: [URL] { targets.map(\.url) }
 }
@@ -63,6 +64,22 @@ public struct ManagedMediaTrashMap: Sendable {
     }
 }
 
+public struct ManagedMediaTrashGlobalTransitionLibrary: Sendable {
+    public let url: URL
+    public let library: GlobalTransitionLibrary
+    public let expectedEncodedData: Data?
+
+    public init(
+        url: URL,
+        library: GlobalTransitionLibrary,
+        expectedEncodedData: Data?
+    ) {
+        self.url = url
+        self.library = library
+        self.expectedEncodedData = expectedEncodedData
+    }
+}
+
 private struct ManagedMediaMapSnapshot: Equatable, Sendable {
     let url: URL
     let map: MediaMap
@@ -82,6 +99,12 @@ private struct ManagedMediaFileSnapshot: Equatable, Sendable {
 
 private struct ManagedMediaCatalogSnapshot: Equatable, Sendable {
     let url: URL
+    let file: ManagedMediaFileSnapshot?
+}
+
+private struct ManagedMediaGlobalTransitionLibrarySnapshot: Equatable, Sendable {
+    let url: URL
+    let library: GlobalTransitionLibrary
     let file: ManagedMediaFileSnapshot?
 }
 
@@ -112,7 +135,12 @@ public enum ManagedMediaTrashRevalidator {
         guard decoded == plannedMediaMap else {
             throw ManagedMediaTrashRevalidationError.mediaMapChangedBeforePublish
         }
-        return ManagedMediaTrashSnapshot(targets: targets, maps: [map], catalog: nil)
+        return ManagedMediaTrashSnapshot(
+            targets: targets,
+            maps: [map],
+            catalog: nil,
+            globalTransitionLibrary: nil
+        )
     }
 
     /// Captures the catalog and every character map as one removal CAS domain.
@@ -121,6 +149,7 @@ public enum ManagedMediaTrashRevalidator {
         targetURLs: [URL],
         maps: [ManagedMediaTrashMap],
         catalogURL: URL?,
+        globalTransitionLibrary: ManagedMediaTrashGlobalTransitionLibrary? = nil,
         canonicalRoot: URL
     ) throws -> ManagedMediaTrashSnapshot {
         guard !targetURLs.isEmpty, !maps.isEmpty else {
@@ -153,8 +182,64 @@ public enum ManagedMediaTrashRevalidator {
             }
             return snapshot
         }
+        let capturedGlobalTransitionLibrary = try globalTransitionLibrary.map {
+            try captureGlobalTransitionLibrary($0, root: root)
+        }
         try validateCatalog(catalog, root: root)
-        return ManagedMediaTrashSnapshot(targets: targets, maps: capturedMaps, catalog: catalog)
+        try validateGlobalTransitionLibrary(
+            capturedGlobalTransitionLibrary,
+            root: root,
+            rejectingReferencesTo: targets
+        )
+        return ManagedMediaTrashSnapshot(
+            targets: targets,
+            maps: capturedMaps,
+            catalog: catalog,
+            globalTransitionLibrary: capturedGlobalTransitionLibrary
+        )
+    }
+
+    /// Captures unused-media candidates together with every character map,
+    /// catalog, and the optional Global transition library. The same snapshot
+    /// can be revalidated immediately before each recoverable Trash move.
+    public static func captureUnusedLibrary(
+        targetURLs: [URL],
+        maps: [ManagedMediaTrashMap],
+        catalogURL: URL?,
+        globalTransitionLibrary: ManagedMediaTrashGlobalTransitionLibrary,
+        canonicalRoot: URL
+    ) throws -> ManagedMediaTrashSnapshot {
+        try captureLibrary(
+            targetURLs: targetURLs,
+            maps: maps,
+            catalogURL: catalogURL,
+            globalTransitionLibrary: globalTransitionLibrary,
+            canonicalRoot: canonicalRoot
+        )
+    }
+
+    /// Fail-closed validation for unused-media cleanup. Unlike a mapped-entry
+    /// removal, no map is published before this check, so every captured file
+    /// must remain byte-identical and no captured target may become referenced.
+    public static func validateUnusedLibraryUnchanged(
+        snapshot: ManagedMediaTrashSnapshot,
+        canonicalRoot: URL
+    ) throws {
+        let root = try validateRoot(canonicalRoot)
+        try validateCatalog(snapshot.catalog, root: root)
+        try validateGlobalTransitionLibrary(
+            snapshot.globalTransitionLibrary,
+            root: root,
+            rejectingReferencesTo: snapshot.targets
+        )
+        for expected in snapshot.maps {
+            let current = try inspectMap(try validateManagedFile(expected.url, root: root))
+            guard current == expected else {
+                throw ManagedMediaTrashRevalidationError.mediaMapChangedBeforePublish
+            }
+            try rejectReferences(in: current.map, mapURL: current.url, targets: snapshot.targets)
+        }
+        try validateTargets(snapshot.targets, root: root)
     }
 
     /// Compare-and-swap guard for the map used to create the removal plan.
@@ -182,6 +267,7 @@ public enum ManagedMediaTrashRevalidator {
     ) throws {
         let root = try validateRoot(canonicalRoot)
         try validateCatalog(snapshot.catalog, root: root)
+        try validateGlobalTransitionLibrary(snapshot.globalTransitionLibrary, root: root)
         for expected in snapshot.maps {
             let current = try inspectMap(try validateManagedFile(expected.url, root: root))
             guard current == expected else {
@@ -201,6 +287,11 @@ public enum ManagedMediaTrashRevalidator {
     ) throws {
         let root = try validateRoot(canonicalRoot)
         try validateCatalog(snapshot.catalog, root: root)
+        try validateGlobalTransitionLibrary(
+            snapshot.globalTransitionLibrary,
+            root: root,
+            rejectingReferencesTo: snapshot.targets
+        )
         let publishedURL = try validateManagedFile(publishedMap.url, root: root)
         for expected in snapshot.maps {
             let current = try inspectMap(try validateManagedFile(expected.url, root: root))
@@ -485,6 +576,11 @@ public enum ManagedMediaTrashRevalidator {
     ) throws -> URL {
         let root = try validateRoot(canonicalRoot)
         try validateCatalog(snapshot.catalog, root: root)
+        try validateGlobalTransitionLibrary(
+            snapshot.globalTransitionLibrary,
+            root: root,
+            rejectingReferencesTo: snapshot.targets
+        )
         let publishedURL = try validateManagedFile(publishedMap.url, root: root)
         for expected in snapshot.maps {
             let current = try inspectMap(try validateManagedFile(expected.url, root: root))
@@ -745,6 +841,84 @@ public enum ManagedMediaTrashRevalidator {
         }
     }
 
+    private static func captureGlobalTransitionLibrary(
+        _ planned: ManagedMediaTrashGlobalTransitionLibrary,
+        root: URL
+    ) throws -> ManagedMediaGlobalTransitionLibrarySnapshot {
+        let url = try validateManagedFile(planned.url, root: root)
+        let file = try inspectOptionalFile(url, maximumBytes: 1_048_576)
+        guard file?.data == planned.expectedEncodedData else {
+            throw ManagedMediaTrashRevalidationError.mediaMapChangedBeforePublish
+        }
+        let decoded: GlobalTransitionLibrary
+        if let file {
+            do {
+                decoded = try JSONDecoder.codexPet.decode(
+                    GlobalTransitionLibrary.self,
+                    from: file.data
+                )
+            } catch {
+                throw ManagedMediaTrashRevalidationError.mediaMapUnreadable
+            }
+        } else {
+            decoded = try GlobalTransitionLibrary()
+        }
+        guard decoded == planned.library else {
+            throw ManagedMediaTrashRevalidationError.mediaMapChangedBeforePublish
+        }
+        return ManagedMediaGlobalTransitionLibrarySnapshot(
+            url: url,
+            library: decoded,
+            file: file
+        )
+    }
+
+    private static func validateGlobalTransitionLibrary(
+        _ expected: ManagedMediaGlobalTransitionLibrarySnapshot?,
+        root: URL,
+        rejectingReferencesTo targets: [ManagedMediaTrashTarget]? = nil
+    ) throws {
+        guard let expected else { return }
+        let url = try validateManagedFile(expected.url, root: root)
+        let file = try inspectOptionalFile(url, maximumBytes: 1_048_576)
+        let library: GlobalTransitionLibrary
+        if let file {
+            do {
+                library = try JSONDecoder.codexPet.decode(
+                    GlobalTransitionLibrary.self,
+                    from: file.data
+                )
+            } catch {
+                throw ManagedMediaTrashRevalidationError.mediaMapUnreadable
+            }
+        } else {
+            library = try GlobalTransitionLibrary()
+        }
+        guard library == expected.library else {
+            throw ManagedMediaTrashRevalidationError.mediaMapChangedBeforePublish
+        }
+        if let targets {
+            try rejectReferences(in: library, libraryURL: url, targets: targets)
+        }
+        guard file == expected.file else {
+            throw ManagedMediaTrashRevalidationError.mediaMapChangedBeforePublish
+        }
+    }
+
+    private static func inspectOptionalFile(
+        _ url: URL,
+        maximumBytes: Int64
+    ) throws -> ManagedMediaFileSnapshot? {
+        var info = stat()
+        if lstat(url.path, &info) == 0 {
+            return try inspectFile(url, maximumBytes: maximumBytes)
+        }
+        guard errno == ENOENT else {
+            throw ManagedMediaTrashRevalidationError.mediaMapUnreadable
+        }
+        return nil
+    }
+
     private static func rejectReferences(
         in map: MediaMap,
         mapURL: URL,
@@ -777,6 +951,26 @@ public enum ManagedMediaTrashRevalidator {
                     || poster.map({ targetPaths.contains($0.path) }) == true {
                     throw ManagedMediaTrashRevalidationError.stillReferenced
                 }
+            }
+        }
+    }
+
+    private static func rejectReferences(
+        in library: GlobalTransitionLibrary,
+        libraryURL: URL,
+        targets: [ManagedMediaTrashTarget]
+    ) throws {
+        let targetPaths = Set(targets.map { $0.url.path })
+        for entry in library.allTransitionEntries {
+            let movie = library.resolvedURL(for: entry, relativeTo: libraryURL)
+                .resolvingSymlinksInPath().standardizedFileURL
+            let report = movie.deletingPathExtension().appendingPathExtension("report.json")
+            let poster = library.resolvedPosterURL(for: entry, relativeTo: libraryURL)?
+                .resolvingSymlinksInPath().standardizedFileURL
+            if targetPaths.contains(movie.path)
+                || targetPaths.contains(report.path)
+                || poster.map({ targetPaths.contains($0.path) }) == true {
+                throw ManagedMediaTrashRevalidationError.stillReferenced
             }
         }
     }

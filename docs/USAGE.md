@@ -210,10 +210,19 @@ The Actions menu can:
 
 ### Directional lifecycle transitions
 
-Choose **Transitions** in Settings → Animations to configure the active
-character's optional source → destination playlists. All 12 distinct ordered
-pairs are available: `Idle → Running` and `Running → Idle`, for example, are
-separate libraries with independent modes, defaults, and runtime cursors.
+Choose **Transitions** in Settings → Animations, then use the scope selector:
+
+- **Character** edits optional source → destination playlists owned by the
+  active character.
+- **Global** edits a separate shared transition library available to every
+  character.
+
+All 12 distinct ordered pairs are available: `Idle → Running` and
+`Running → Idle`, for example, are separate libraries with independent modes,
+defaults, and runtime cursors. For each route, an existing Character playlist
+overrides Global. If that character has no local playlist for the route,
+Statelet falls back to the Global playlist. Removing the local route therefore
+restores Global fallback rather than copying or deleting the shared route.
 
 Each variant row provides **Preview**, **Replace…**, **Up / Down**, and
 **Remove…**. Use **Add… → Import MP4s…** to convert one or more MP4s, or
@@ -259,15 +268,18 @@ Reduce Motion enabled, preview is unavailable and runtime transition video is
 skipped; Statelet switches to the destination static presentation without an
 intermediate blank frame or advancing the route cursor.
 
-Transition playlists are stored per character. Secure `.statelet-character`
-round trips preserve every variant, order, mode, default path, movie/poster/
-report reference, hash binding, and validation status while rewriting paths to
-the package layout. Removing a variant first removes only the active
-character's route reference; managed-file Trash eligibility is revalidated
-across every state, transition route, and character map before any file move.
-Existing maps and bundles with one transition decode as Fixed singleton
-playlists. Maps without transitions continue switching directly to destination
-animations.
+Character transition playlists are stored with their character; the separate
+Global library is stored in `global-transitions.json`. Secure
+`.statelet-character` round trips preserve every character-local variant,
+order, mode, default path, movie/poster/report reference, hash binding, and
+validation status while rewriting paths to the package layout. They exclude
+Global routes and assets, so importing a bundle cannot replace the receiving
+installation's shared library. Removing a variant first removes only the
+currently selected scope's route reference; managed-file Trash eligibility is
+revalidated across every state, character route, Global route, and character
+map before any file move. Existing maps and bundles with one transition decode
+as Fixed singleton playlists. When neither the character nor Global defines a
+route, Statelet switches directly to the destination animation.
 
 ## Import MP4 animations
 

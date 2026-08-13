@@ -87,6 +87,56 @@ class MacAnimationLibraryUISourceTests(unittest.TestCase):
         self.assertIn('labelWithString: "LIFECYCLE TRANSITIONS"', self.source)
         self.assertIn('labels: ["State Animations", "Transitions"]', self.controller)
 
+    def test_transition_editor_has_character_and_global_scope_selector(self) -> None:
+        self.assertIn("TransitionLibraryScope", self.source)
+        self.assertIn('labels: ["Character", "Global"]', self.source)
+        self.assertIn('setAccessibilityLabel("Transition library scope")', self.source)
+        self.assertIn("private var selectedTransitionScope: TransitionLibraryScope = .character", self.controller)
+        self.assertIn("transitionLibrary.onScopeChange", self.controller)
+        self.assertIn("self?.selectedTransitionScope = scope", self.controller)
+
+    def test_transition_scope_selects_snapshot_library_without_changing_character(self) -> None:
+        self.assertIn("let globalTransitionLibrary: GlobalTransitionLibrary", self.controller)
+        self.assertIn("let globalTransitionLibraryURL: URL", self.controller)
+        self.assertIn("switch selectedTransitionScope", self.controller)
+        self.assertIn("snapshot.globalTransitionLibrary", self.controller)
+        self.assertIn("snapshot.globalTransitionLibraryURL", self.controller)
+        self.assertIn("scope: selectedTransitionScope", self.controller)
+        self.assertNotIn("onCharacterSelection?(scope", self.controller)
+
+    def test_transition_editing_callbacks_include_selected_scope(self) -> None:
+        for callback in (
+            "onImportTransitionMP4",
+            "onUseTransitionMovie",
+            "onReplaceTransitionMP4",
+            "onReplaceTransitionMovie",
+            "onPreviewTransition",
+            "onRemoveTransition",
+            "onMoveTransition",
+            "onTransitionModeChange",
+            "onSetFixedTransition",
+        ):
+            self.assertRegex(
+                self.controller,
+                rf"var {callback}: \(\(TransitionLibraryScope,",
+            )
+        self.assertIn("self.selectedTransitionScope, source, destination", self.controller)
+
+    def test_transition_guidance_and_accessibility_identify_scope(self) -> None:
+        self.assertIn("scope: TransitionLibraryScope", self.source)
+        self.assertIn('scope == .character ? "Character" : "Global"', self.source)
+        self.assertIn('"Global directional lifecycle transitions"', self.source)
+
+    def test_empty_character_route_reports_global_fallback(self) -> None:
+        self.assertIn("let usesGlobalFallback: Bool", self.source)
+        self.assertIn("globalFallbackRoutes: Set<StateTransitionKey>", self.source)
+        self.assertIn("scope == .character && key.map(globalFallbackRoutes.contains) == true", self.source)
+        self.assertIn('"Using Global fallback"', self.source)
+        self.assertIn(
+            "globalFallbackRoutes: Set(snapshot.globalTransitionLibrary.transitions.keys)",
+            self.controller,
+        )
+
     def test_transition_editor_exposes_per_variant_editing_callbacks(self) -> None:
         for callback in (
             "onImportTransitionMP4",
@@ -111,7 +161,7 @@ class MacAnimationLibraryUISourceTests(unittest.TestCase):
         self.assertIn("let grouped = Dictionary(grouping: clips)", self.source)
         self.assertIn("let routeClips = (grouped[pair] ?? []).sorted", self.source)
         self.assertIn("guard !routeClips.isEmpty else", self.source)
-        self.assertIn("clip: nil, position: 0, count: 0, mode: .fixed", self.source)
+        self.assertIn("usesGlobalFallback: scope == .character", self.source)
         self.assertIn("playlist.entries.enumerated().map", self.controller)
         self.assertIn("position: index", self.controller)
         self.assertIn("count: playlist.entries.count", self.controller)
@@ -144,7 +194,7 @@ class MacAnimationLibraryUISourceTests(unittest.TestCase):
         self.assertIn("clip?.exists == false ? .systemRed", self.source)
         self.assertIn('"The transition movie file is missing. Replace or remove it."', self.source)
         self.assertIn("FileManager.default.isReadableFile(", self.controller)
-        self.assertIn("snapshot.mediaMap.resolvedURL(for: entry", self.controller)
+        self.assertIn("resolveTransitionURL(entry).path", self.controller)
 
     def test_transition_editor_documents_duration_and_destination_commit(self) -> None:
         self.assertIn("Maximum duration: 4 seconds.", self.source)

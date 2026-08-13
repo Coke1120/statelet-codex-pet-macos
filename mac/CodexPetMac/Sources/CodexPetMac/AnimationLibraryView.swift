@@ -41,6 +41,7 @@ private struct SettingsTransitionRowModel {
     let position: Int
     let count: Int
     let mode: MediaPlaybackMode
+    let usesGlobalFallback: Bool
 
     var isPlaceholder: Bool { clip == nil }
 }
@@ -991,6 +992,7 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
 }
 
 final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDelegate {
+    var onScopeChange: ((TransitionLibraryScope) -> Void)?
     var onImportMP4: ((PetState, PetState) -> Void)?
     var onUseMovie: ((PetState, PetState) -> Void)?
     var onReplaceMP4: ((PetState, PetState, String) -> Void)?
@@ -1003,6 +1005,12 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
 
     private let tableView = NSTableView()
     private let scrollView = NSScrollView()
+    private let scopeControl = NSSegmentedControl(
+        labels: ["Character", "Global"],
+        trackingMode: .selectOne,
+        target: nil,
+        action: nil
+    )
     private let guidance = NSTextField(
         wrappingLabelWithString: "Optional directional clips play once before the destination animation. Maximum duration: 4 seconds."
     )
@@ -1010,6 +1018,7 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
     private var previewPath: String?
     private var reduceMotion = false
     private var busy = false
+    private var scope: TransitionLibraryScope = .character
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1028,6 +1037,16 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
         guidance.textColor = .secondaryLabelColor
         guidance.maximumNumberOfLines = 2
         guidance.setAccessibilityLabel("Lifecycle transition guidance")
+        scopeControl.selectedSegment = TransitionLibraryScope.allCases.firstIndex(of: .character) ?? 0
+        scopeControl.target = self
+        scopeControl.action = #selector(changeScope)
+        scopeControl.setAccessibilityLabel("Transition library scope")
+        scopeControl.setAccessibilityHelp("Choose whether to edit transitions for the active character or the global transition library.")
+        let header = NSStackView(views: [title, scopeControl])
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.distribution = .fill
+        header.spacing = 12
 
         tableView.delegate = self
         tableView.dataSource = self
@@ -1054,15 +1073,15 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
         scrollView.autohidesScrollers = true
         scrollView.documentView = tableView
 
-        for view in [title, guidance, scrollView] {
+        for view in [header, guidance, scrollView] {
             view.translatesAutoresizingMaskIntoConstraints = false
             addSubview(view)
         }
         NSLayoutConstraint.activate([
-            title.topAnchor.constraint(equalTo: topAnchor),
-            title.leadingAnchor.constraint(equalTo: leadingAnchor),
-            title.trailingAnchor.constraint(equalTo: trailingAnchor),
-            guidance.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 5),
+            header.topAnchor.constraint(equalTo: topAnchor),
+            header.leadingAnchor.constraint(equalTo: leadingAnchor),
+            header.trailingAnchor.constraint(equalTo: trailingAnchor),
+            guidance.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 5),
             guidance.leadingAnchor.constraint(equalTo: leadingAnchor),
             guidance.trailingAnchor.constraint(equalTo: trailingAnchor),
             scrollView.topAnchor.constraint(equalTo: guidance.bottomAnchor, constant: 8),
@@ -1090,10 +1109,12 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
 
     func update(
         clips: [SettingsTransitionClip],
+        globalFallbackRoutes: Set<StateTransitionKey>,
         previewPath: String?,
         reduceMotion: Bool,
         busy: Bool,
-        characterName: String
+        characterName: String,
+        scope: TransitionLibraryScope
     ) {
         let pairs = PetState.allCases.flatMap { source in
             PetState.allCases.compactMap { destination in
@@ -1106,21 +1127,51 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
         rows = pairs.flatMap { pair -> [SettingsTransitionRowModel] in
             let routeClips = (grouped[pair] ?? []).sorted { $0.position < $1.position }
             guard !routeClips.isEmpty else {
-                return [SettingsTransitionRowModel(pair: pair, clip: nil, position: 0, count: 0, mode: .fixed)]
+                let key = try? StateTransitionKey(from: pair.source, to: pair.destination)
+                return [SettingsTransitionRowModel(
+                    pair: pair,
+                    clip: nil,
+                    position: 0,
+                    count: 0,
+                    mode: .fixed,
+                    usesGlobalFallback: scope == .character && key.map(globalFallbackRoutes.contains) == true
+                )]
             }
             return routeClips.map {
-                SettingsTransitionRowModel(pair: pair, clip: $0, position: $0.position, count: $0.count, mode: $0.mode)
+                SettingsTransitionRowModel(
+                    pair: pair,
+                    clip: $0,
+                    position: $0.position,
+                    count: $0.count,
+                    mode: $0.mode,
+                    usesGlobalFallback: false
+                )
             }
         }
         self.previewPath = previewPath
         self.reduceMotion = reduceMotion
         self.busy = busy
+        self.scope = scope
+        scopeControl.selectedSegment = TransitionLibraryScope.allCases.firstIndex(of: scope) ?? 0
+        scopeControl.setAccessibilityValue(scope == .character ? "Character" : "Global")
+        let libraryName = scope == .character ? characterName : "Global"
         guidance.stringValue = reduceMotion
-            ? "Reduce Motion is on. Transition video preview and playback are skipped; the destination fallback is presented."
-            : "Optional directional clips for \(characterName) play once before the destination animation. Maximum duration: 4 seconds."
+            ? "Reduce Motion is on for \(libraryName) transitions. Video preview and playback are skipped; the destination fallback is presented."
+            : "Optional directional clips for \(libraryName) play once before the destination animation. Maximum duration: 4 seconds."
         guidance.setAccessibilityHelp(guidance.stringValue)
-        tableView.setAccessibilityLabel("\(characterName) directional lifecycle transitions")
+        tableView.setAccessibilityLabel(scope == .character
+            ? "\(characterName) directional lifecycle transitions"
+            : "Global directional lifecycle transitions")
         tableView.reloadData()
+    }
+
+    @objc private func changeScope() {
+        guard TransitionLibraryScope.allCases.indices.contains(scopeControl.selectedSegment) else { return }
+        let selected = TransitionLibraryScope.allCases[scopeControl.selectedSegment]
+        guard selected != scope else { return }
+        scope = selected
+        scopeControl.setAccessibilityValue(selected == .character ? "Character" : "Global")
+        onScopeChange?(selected)
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
@@ -1144,7 +1195,9 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
         case TransitionColumn.clip:
             let clipStatus: String
             if clip == nil {
-                clipStatus = "Destination animation is used directly"
+                clipStatus = model.usesGlobalFallback
+                    ? "Using Global fallback"
+                    : "Destination animation is used directly"
             } else if clip?.exists == false {
                 clipStatus = "Movie file is missing"
             } else {

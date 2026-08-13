@@ -4,7 +4,8 @@ Statelet is a personal-local Codex lifecycle companion for macOS 13 or newer.
 It is an AppKit accessory application: the transparent panel can be moved by dragging
 its body and resized from any border or corner without taking keyboard focus,
 AVFoundation owns exactly one decoder, and the menu-bar item keeps click-through
-recoverable. The current app version is 1.7.0. New builds and installations use
+recoverable. The current app version is 1.7.1 (build 13). New builds and
+installations use
 `Statelet.app`, bundle identifier `com.coke1120.Statelet`, `CFBundleName` and
 executable `Statelet`, Application Support under
 `~/Library/Application Support/Statelet`, `com.coke1120.statelet.*`
@@ -119,9 +120,13 @@ Review as separate clip libraries:
 
 ### Directional transition playlists
 
-The **Transitions** category exposes all 12 ordered lifecycle routes. A route
-such as Idle → Running is independent from Running → Idle and owns its own
-ordered variants, selection mode, default path, and in-memory cursor.
+The **Transitions** category exposes all 12 ordered lifecycle routes and a
+Character/Global scope selector. **Character** edits routes owned by the active
+character. **Global** edits the separate shared `global-transitions.json`
+library. A character route overrides the matching Global route; when the local
+route is absent, runtime selection falls back to Global. A route such as
+Idle → Running is independent from Running → Idle and owns its own ordered
+variants, selection mode, default path, and in-memory cursor.
 
 - **Add… → Import MP4s…** converts one or more sources and appends each accepted
   delivery. **Add… → Add Verified MOVs…** installs one or more validated
@@ -145,11 +150,13 @@ newest destination directly. A superseding lifecycle change cancels obsolete
 selection and presentation work so stale callbacks cannot advance the cursor or
 reveal an older destination.
 
-Each character retains its complete transition libraries. Secure
-`.statelet-character` export/import preserves variant order, selection mode,
-default path, movies, posters, reports, hashes, and validation records while
-rewriting paths to the package layout. A legacy single transition entry decodes
-as a Fixed singleton playlist. Removal revalidates all character maps before
+Each character retains its complete local transition libraries. Secure
+`.statelet-character` export/import preserves local variant order, selection
+mode, default path, movies, posters, reports, hashes, and validation records
+while rewriting paths to the package layout. Bundles exclude Global routes and
+assets, so importing a character never changes the installation's shared
+library. A legacy single transition entry decodes as a Fixed singleton
+playlist. Removal revalidates all character maps and the Global library before
 moving a managed file that might still be referenced elsewhere.
 
 ## Pet interaction and quick controls
@@ -408,11 +415,12 @@ media. Settings imports authorized media into:
 ~/Library/Application Support/Statelet/media/
 ```
 
-The installer preserves `media-map.json`, `character-library.json`, hidden
-per-character maps/assets, and user media on upgrade. You can still manage the
-root `media-map.json` directly for legacy/default developer workflows. Relative
-paths resolve beside each character's map. `Examples/media-map.json` documents
-all three playback modes across the four lifecycle states. Each state contains:
+The installer preserves `media-map.json`, `global-transitions.json`,
+`character-library.json`, hidden per-character maps/assets, and user media on
+upgrade. You can still manage the root `media-map.json` directly for
+legacy/default developer workflows. Relative paths resolve beside each
+character's map. `Examples/media-map.json` documents all three playback modes
+across the four lifecycle states. Each state contains:
 
 - `mode`: `fixed`, `random`, or `sequential`;
 - `advance_on`: `state_entry` or `clip_end`; omitted values decode as
@@ -652,8 +660,9 @@ bash mac/CodexPetMac/scripts/uninstall.sh
 
 Uninstall preflights ownership before staging or changing launchd. It removes
 only the canonical `statelet-v2`-managed `Statelet.app`, component, LaunchAgents,
-and exact Statelet hook commands. It preserves user media, voice, characters,
-state, sessions, logs, and all legacy artifacts. Unmarked canonical targets
+and exact Statelet hook commands. It preserves user media, the separate Global
+transition library, voice, characters, state, sessions, logs, and all legacy
+artifacts. Unmarked canonical targets
 cause a fail-closed refusal instead of deletion. Unrelated commands and settings
 remain unchanged.
 

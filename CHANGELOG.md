@@ -5,6 +5,47 @@ versioning for the public source release.
 
 ## Unreleased
 
+## [1.7.1] - 2026-08-14
+
+### Added
+
+- Directional lifecycle routes now support ordered variants, batch import,
+  per-variant replacement, and independent Fixed, Random, or Sequential
+  selection.
+- Directional transition playlists can be edited either for the active
+  character or in a separate shared **Global** library. A character route takes
+  precedence when present; an unconfigured character route falls back to its
+  matching Global route.
+- The Transitions pane provides a Character/Global scope selector for all 12
+  ordered lifecycle routes.
+
+### Changed
+
+- Character bundles remain character-scoped: export and import include the
+  selected character's transition playlists and assets, but never copy or
+  modify the installation's Global transition library.
+- Lifecycle hooks correlate turn and tool callbacks inside privacy-safe
+  per-session records, while the aggregate publication remains free of those
+  identifiers.
+
+### Fixed
+
+- Transition selection retries other eligible variants after runtime failure,
+  commits its cursor only after accepted presentation, and prevents superseded
+  callbacks from revealing a stale destination.
+- Lifecycle publication recovers from replaced watched directories and stale
+  aggregate files while keeping retry and watcher diagnostics path-free.
+
+### Distribution notes
+
+- No character or animation media is bundled.
+- This release remains source-only. The local builder produces an
+  ad-hoc-signed app for personal local use; a public binary still requires
+  Developer ID signing, notarization, stapling, and clean-Mac Gatekeeper
+  verification.
+
+## [1.7.0] - 2026-08-13
+
 ### Added
 
 - Dialogue messages and generated voice can be owned by Idle, Running, Waiting,
@@ -69,4 +110,6 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
+[1.7.1]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.7.1
+[1.7.0]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.7.0
 [1.6.0]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.6.0

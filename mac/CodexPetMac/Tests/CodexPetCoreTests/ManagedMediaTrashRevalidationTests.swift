@@ -350,6 +350,106 @@ final class ManagedMediaTrashRevalidationTests: XCTestCase {
         }
     }
 
+    func testLibrarySnapshotRejectsGlobalReferenceAddedBeforeQuarantine() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let globalURL = fixture.root.appendingPathComponent("global-transitions.json")
+        let empty = try GlobalTransitionLibrary()
+        let emptyData = try writeGlobalLibrary(empty, to: globalURL)
+        let snapshot = try ManagedMediaTrashRevalidator.captureLibrary(
+            targetURLs: [fixture.movieURL, fixture.reportURL],
+            maps: [ManagedMediaTrashMap(url: fixture.mapURL, map: fixture.map)],
+            catalogURL: nil,
+            globalTransitionLibrary: ManagedMediaTrashGlobalTransitionLibrary(
+                url: globalURL,
+                library: empty,
+                expectedEncodedData: emptyData
+            ),
+            canonicalRoot: fixture.root
+        )
+        let published = try MediaMap()
+        try writeMap(published, to: fixture.mapURL)
+        let referenced = try empty.settingTransition(
+            from: .idle,
+            to: .running,
+            entry: try MediaEntry(path: fixture.relativeMoviePath, loop: false)
+        )
+        _ = try writeGlobalLibrary(referenced, to: globalURL)
+
+        XCTAssertThrowsError(
+            try ManagedMediaTrashRevalidator.quarantineLibraryAfterPublish(
+                snapshot: snapshot,
+                publishedMap: ManagedMediaTrashMap(url: fixture.mapURL, map: published),
+                canonicalRoot: fixture.root
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? ManagedMediaTrashRevalidationError,
+                .mediaMapChangedBeforePublish
+            )
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.movieURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.reportURL.path))
+    }
+
+    func testLibrarySnapshotRejectsCorruptGlobalFile() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let globalURL = fixture.root.appendingPathComponent("global-transitions.json")
+        let corrupt = Data("not-json".utf8)
+        try corrupt.write(to: globalURL)
+
+        XCTAssertThrowsError(
+            try ManagedMediaTrashRevalidator.captureLibrary(
+                targetURLs: [fixture.movieURL],
+                maps: [ManagedMediaTrashMap(url: fixture.mapURL, map: fixture.map)],
+                catalogURL: nil,
+                globalTransitionLibrary: ManagedMediaTrashGlobalTransitionLibrary(
+                    url: globalURL,
+                    library: try GlobalTransitionLibrary(),
+                    expectedEncodedData: corrupt
+                ),
+                canonicalRoot: fixture.root
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? ManagedMediaTrashRevalidationError,
+                .mediaMapUnreadable
+            )
+        }
+    }
+
+    func testUnusedLibrarySnapshotRejectsGlobalFileCreatedAfterMissingCapture() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let globalURL = fixture.root.appendingPathComponent("global-transitions.json")
+        let empty = try GlobalTransitionLibrary()
+        let snapshot = try ManagedMediaTrashRevalidator.captureUnusedLibrary(
+            targetURLs: [fixture.movieURL],
+            maps: [ManagedMediaTrashMap(url: fixture.mapURL, map: fixture.map)],
+            catalogURL: nil,
+            globalTransitionLibrary: ManagedMediaTrashGlobalTransitionLibrary(
+                url: globalURL,
+                library: empty,
+                expectedEncodedData: nil
+            ),
+            canonicalRoot: fixture.root
+        )
+        _ = try writeGlobalLibrary(empty, to: globalURL)
+
+        XCTAssertThrowsError(
+            try ManagedMediaTrashRevalidator.validateUnusedLibraryUnchanged(
+                snapshot: snapshot,
+                canonicalRoot: fixture.root
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? ManagedMediaTrashRevalidationError,
+                .mediaMapChangedBeforePublish
+            )
+        }
+    }
+
     func testLibrarySnapshotRejectsSymlinkedMap() throws {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -614,6 +714,16 @@ final class ManagedMediaTrashRevalidationTests: XCTestCase {
 
     private func writeCatalog(_ catalog: CharacterLibrary, to url: URL) throws {
         try JSONEncoder().encode(catalog).write(to: url, options: .atomic)
+    }
+
+    @discardableResult
+    private func writeGlobalLibrary(
+        _ library: GlobalTransitionLibrary,
+        to url: URL
+    ) throws -> Data {
+        let data = try JSONEncoder().encode(library)
+        try data.write(to: url, options: .atomic)
+        return data
     }
 
     private struct Fixture {

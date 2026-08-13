@@ -1,7 +1,7 @@
 # Statelet lifecycle and media reference
 
-This reference documents the internal contracts behind Statelet 1.7.0 (build
-12), the native Codex lifecycle companion for macOS. Start with
+This reference documents the internal contracts behind Statelet 1.7.1 (build
+13), the native Codex lifecycle companion for macOS. Start with
 [Deployment](DEPLOYMENT.md) for installation or [Using Statelet](USAGE.md) for
 daily operation.
 
@@ -135,11 +135,18 @@ hard-cut to another clip when effective `clip_end` rotation is enabled. Normal
 playlist playback has no cross-fade, warmed decoder, or weighted selection.
 
 An optional `transitions` map can bind a distinct ordered state pair such as
-`idle_to_running` to an ordered playlist. Each route has an independent
-`fixed`, `random`, or `sequential` selection mode and `fixed_path`. Fixed uses
-the selected default, Random avoids an immediate repeat when another readable
-variant exists, and Sequential follows persisted order and wraps. Existing
-single-entry transition objects decode as Fixed singleton playlists.
+`idle_to_running` to an ordered playlist. Character maps keep character-local
+routes, while `global-transitions.json` stores a separate shared Global
+library. Runtime resolution is per route: a configured active-character route
+overrides the matching Global route, and an absent character route falls back
+to Global. The Transitions pane's Character/Global scope selector edits those
+stores independently.
+
+Each route has an independent `fixed`, `random`, or `sequential` selection mode
+and `fixed_path`. Fixed uses the selected default, Random avoids an immediate
+repeat when another readable variant exists, and Sequential follows persisted
+order and wraps. Existing single-entry transition objects decode as Fixed
+singleton playlists.
 
 Selection occurs once for an accepted real lifecycle change. Initial launch,
 same-state heartbeats, forced refresh, playlist rotation, Next Clip, Play Once,
@@ -163,11 +170,13 @@ a route cursor or reveal an obsolete destination. Reduce Motion skips
 transition video and switches to the destination static presentation without
 an empty frame. Maps without `transitions` preserve direct destination commit.
 
-Character export/import rewrites and preserves every transition variant,
-ordered position, selection mode, fixed/default path, poster/report reference,
-hash, and validation record. Managed removal drops only the selected route
-reference first and will not move files that another state, transition variant,
-or character map still references.
+Character export/import rewrites and preserves every character-local transition
+variant, ordered position, selection mode, fixed/default path, poster/report
+reference, hash, and validation record. Bundles exclude the Global transition
+library, so importing or exporting a character never modifies shared routes.
+Managed removal drops only the selected route reference first and will not move
+files that another state, transition variant, character map, or Global route
+still references.
 
 Play Once and Temporary State affect only the current process. They do not edit
 the aggregate state or media map. **Return to Live State** immediately restores

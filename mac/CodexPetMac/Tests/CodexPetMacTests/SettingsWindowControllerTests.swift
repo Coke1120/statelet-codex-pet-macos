@@ -35,12 +35,23 @@ final class SettingsWindowControllerTests: XCTestCase {
         animationModes.selectedSegment = 1
         NSApp.sendAction(animationModes.action!, to: animationModes.target, from: animationModes)
         Self.pumpMainRunLoop(for: 0.05)
+        let transitionScope = try XCTUnwrap(
+            Self.descendants(of: window.contentView).compactMap { $0 as? NSSegmentedControl }.first {
+                $0.accessibilityLabel() == "Transition library scope"
+            }
+        )
+        XCTAssertEqual(transitionScope.selectedSegment, 0)
         let transitionsHeight = try XCTUnwrap(
             Self.descendants(of: window.contentView).first {
                 $0.accessibilityLabel() == "Directional lifecycle transitions"
             }
         ).frame.height
         XCTAssertGreaterThan(transitionsHeight, 100)
+
+        transitionScope.selectedSegment = 1
+        NSApp.sendAction(transitionScope.action!, to: transitionScope.target, from: transitionScope)
+        Self.pumpMainRunLoop(for: 0.05)
+        XCTAssertEqual(transitionScope.accessibilityValue() as? String, "Global")
 
         for section in 0 ..< tabs.segmentCount {
             tabs.selectedSegment = section
