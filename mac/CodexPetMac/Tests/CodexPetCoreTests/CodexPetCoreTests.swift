@@ -35,6 +35,53 @@ private func validAlphaReportJSON() -> String {
 }
 
 final class CodexPetCoreTests: XCTestCase {
+    func testLayeredLifecycleHandoffKeepsAVisibleThenPrerollsBUnderTransition() {
+        var handoff = LayeredLifecycleHandoff(id: 7, source: .idle, destination: .running)
+        XCTAssertEqual(handoff.lowerLayer, .outgoing(.idle))
+        XCTAssertTrue(handoff.preservesVisibleContent)
+        XCTAssertFalse(handoff.transitionVisible)
+
+        XCTAssertEqual(handoff.transitionBecameReady(id: 7), .revealTransition)
+        XCTAssertTrue(handoff.transitionVisible)
+        XCTAssertEqual(handoff.lowerLayer, .outgoing(.idle))
+        XCTAssertEqual(handoff.visibleLayers, [.outgoing(.idle), .transitionForeground])
+
+        XCTAssertEqual(handoff.destinationBecameReady(id: 7), .none)
+        XCTAssertEqual(handoff.destinationPrerollCueReached(id: 7), .startDestinationPreroll(.running))
+        XCTAssertEqual(handoff.destinationBecameReady(id: 7), .revealDestination(.running))
+        XCTAssertEqual(handoff.lowerLayer, .destination(.running))
+        XCTAssertTrue(handoff.transitionVisible)
+        XCTAssertTrue(handoff.destinationPrerollStarted)
+        XCTAssertEqual(handoff.visibleLayers, [.destination(.running), .transitionForeground])
+
+        XCTAssertEqual(handoff.transitionFinished(id: 7), .finish(.running))
+        XCTAssertFalse(handoff.transitionVisible)
+        XCTAssertEqual(handoff.lowerLayer, .destination(.running))
+        XCTAssertTrue(handoff.preservesVisibleContent)
+    }
+
+    func testLayeredLifecycleHandoffRejectsStaleCallbacksAndKeepsFallbackVisible() {
+        var handoff = LayeredLifecycleHandoff(id: 12, source: .running, destination: .review)
+        XCTAssertEqual(handoff.transitionBecameReady(id: 11), .none)
+        XCTAssertEqual(handoff.destinationPrerollCueReached(id: 11), .none)
+        XCTAssertEqual(handoff.destinationBecameReady(id: 11), .none)
+        XCTAssertEqual(handoff.transitionFinished(id: 11), .none)
+        XCTAssertEqual(handoff.lowerLayer, .outgoing(.running))
+
+        XCTAssertEqual(handoff.transitionBecameReady(id: 12), .revealTransition)
+        XCTAssertEqual(handoff.destinationPrerollCueReached(id: 12), .startDestinationPreroll(.review))
+        XCTAssertEqual(handoff.destinationFailed(id: 12), .none)
+        XCTAssertEqual(handoff.lowerLayer, .outgoing(.running))
+        XCTAssertEqual(handoff.transitionFailed(id: 12), .fallBack(.review))
+        XCTAssertFalse(handoff.transitionVisible)
+        XCTAssertTrue(handoff.preservesVisibleContent)
+    }
+
+    func testLayeredLifecycleHandoffUsesDeterministicBoundedOverlap() {
+        XCTAssertEqual(LayeredLifecycleHandoffPolicy.destinationPrerollTime(duration: 4), 3.65, accuracy: 0.0001)
+        XCTAssertEqual(LayeredLifecycleHandoffPolicy.destinationPrerollTime(duration: 0.2), 0.1, accuracy: 0.0001)
+        XCTAssertEqual(LayeredLifecycleHandoffPolicy.destinationPrerollTime(duration: 0), 0)
+    }
     func testAlphaConversionProgressParserAcceptsMonotonicPathSafeJSONL() throws {
         var parser = AlphaConversionProgressParser()
         let first = try XCTUnwrap(parser.parseLine(

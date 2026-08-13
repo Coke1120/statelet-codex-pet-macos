@@ -188,7 +188,7 @@ The default advance policy is `state_entry`. It selects a clip when the real
 lifecycle enters the state. For Random and Sequential libraries with at least
 two entries, enable **Continue with another clip when this clip ends** to use
 `clip_end`. Statelet hard-cuts to the next clip with one AVFoundation decoder.
-It does not use a cross-fade or second warmed decoder.
+Normal playlist rotation does not use a cross-fade or second warmed decoder.
 
 The clip table shows order, filename, readiness, fixed state, poster state, and
 preview state. Each row provides **Preview** or **Stop**, **Actions…**, and
@@ -212,14 +212,30 @@ settings. Each row offers **Import…** or **Replace…**, **Preview**, and
 MOV/report pair using the same validation and managed-media safety boundary as
 state animation clips.
 
-A transition clip is decorative and must be no longer than 4 seconds. It plays
-once, then Statelet commits the destination state's normal animation. The same
-single AVFoundation decoder is reused; there is no cross-fade or second warmed
-decoder. With Reduce Motion enabled, preview is unavailable and runtime
-transition video is skipped so the destination fallback appears immediately.
+A transition clip is decorative, must be no longer than 4 seconds, and must
+retain a working alpha channel backed by its current converter report. Reportless
+or visually opaque transition assets are rejected, including during character
+bundle import and export.
 
-Transitions are stored per character and round-trip in secure
-`.statelet-character` bundles. Removing a transition first removes only the
+For a real A → B lifecycle change, Statelet keeps A attached while it prepares
+the transition and B. The transition becomes a foreground layer only after its
+first frame is display-ready. B then starts below that foreground before the
+transition ends; the default lead-in is the final 350 ms, or half of a shorter
+clip. When the foreground completes, only that layer is removed and the already
+running B animation continues. A newer lifecycle event cancels every obsolete
+player, readiness observer, deadline, and layer before it can reveal a stale
+destination. If either new asset fails, the last valid lower presentation stays
+visible while Statelet retries or safely retains it for the newest authoritative
+state; it never substitutes an empty lower layer.
+
+This handoff is transparent layer compositing, not an opacity cross-fade. With
+Reduce Motion enabled, preview is unavailable and runtime transition video is
+skipped; Statelet switches to the destination static presentation without an
+intermediate blank frame.
+
+Transitions are stored per character and round-trip, with their movie/report
+hash binding and validation status, in secure `.statelet-character` bundles.
+Removing a transition first removes only the
 active character's reference; managed-file Trash eligibility is revalidated
 before any file move. Maps and imported character bundles without transitions
 remain compatible and continue switching directly to destination animations.

@@ -4,6 +4,7 @@ import Darwin
 import Foundation
 
 typealias CharacterPlaybackVerifier = (_ movieURL: URL, _ reportData: Data?) throws -> Void
+typealias CharacterTransitionPlaybackVerifier = (_ movieURL: URL, _ reportData: Data) throws -> Void
 typealias CharacterTransitionDurationVerifier = (_ movieURL: URL) throws -> Void
 typealias CharacterAvailableDiskBytes = (_ destination: URL) throws -> UInt64
 
@@ -11,6 +12,14 @@ struct CharacterLibraryCatalogSnapshot {
     let library: CharacterLibrary
     /// Nil means the catalog was absent and `library` is the legacy bootstrap.
     let encodedData: Data?
+}
+
+/// The exact file identities covered by a synchronous runtime transition
+/// attestation. Any cache keyed by this value must miss when either sibling is
+/// replaced; callers should re-attest immediately before accepting playback.
+struct CharacterTransitionRuntimeAttestation: Equatable {
+    let movieRevision: LocalFileRevision
+    let reportRevision: LocalFileRevision
 }
 
 enum CharacterLibraryStorageError: LocalizedError {
@@ -24,6 +33,7 @@ enum CharacterLibraryStorageError: LocalizedError {
     case destinationExists
     case undeclaredReport
     case legacyTrustRequired
+    case transitionAlphaReportRequired
     case characterLimitReached
     case invalidPlayback
     case commitFailed
@@ -40,6 +50,7 @@ enum CharacterLibraryStorageError: LocalizedError {
         case .destinationExists: return "The character destination already exists."
         case .undeclaredReport: return "The character package declares conflicting reports."
         case .legacyTrustRequired: return "Reportless movies require explicit legacy trust."
+        case .transitionAlphaReportRequired: return "Transition movies require a current validated alpha report."
         case .characterLimitReached: return "The character library has reached its 256-character limit."
         case .invalidPlayback: return "A character movie failed the playback safety checks."
         case .commitFailed: return "The character could not be committed atomically."
@@ -151,6 +162,7 @@ final class CharacterLibraryStorage {
     let catalogURL: URL
     private let rootURL: URL
     private let playbackVerifier: CharacterPlaybackVerifier
+    private let transitionPlaybackVerifier: CharacterTransitionPlaybackVerifier
     private let transitionDurationVerifier: CharacterTransitionDurationVerifier
     private let availableDiskBytes: CharacterAvailableDiskBytes
 
@@ -158,6 +170,7 @@ final class CharacterLibraryStorage {
         mediaMapURL: URL,
         catalogURL: URL? = nil,
         playbackVerifier: @escaping CharacterPlaybackVerifier = CharacterLibraryStorage.defaultPlaybackVerifier,
+        transitionPlaybackVerifier: @escaping CharacterTransitionPlaybackVerifier = CharacterLibraryStorage.defaultTransitionPlaybackVerifier,
         transitionDurationVerifier: @escaping CharacterTransitionDurationVerifier = CharacterLibraryStorage.defaultTransitionDurationVerifier,
         availableDiskBytes: @escaping CharacterAvailableDiskBytes = CharacterStorageFiles.systemAvailableDiskBytes
     ) {
@@ -165,6 +178,7 @@ final class CharacterLibraryStorage {
         rootURL = rootMediaMapURL.deletingLastPathComponent()
         self.catalogURL = catalogURL ?? rootURL.appendingPathComponent("character-library.json")
         self.playbackVerifier = playbackVerifier
+        self.transitionPlaybackVerifier = transitionPlaybackVerifier
         self.transitionDurationVerifier = transitionDurationVerifier
         self.availableDiskBytes = availableDiskBytes
     }
@@ -184,6 +198,74 @@ final class CharacterLibraryStorage {
         return CharacterLibraryCatalogSnapshot(
             library: try JSONDecoder.codexPet.decode(CharacterLibrary.self, from: data),
             encodedData: data
+        )
+    }
+
+    /// Re-attests a configured transition at its runtime location. This is
+    /// intentionally synchronous and uncached: validation binds a current
+    /// sibling report to the exact movie basename and bytes, exercises the
+    /// AVFoundation playback gate and duration limit, then proves neither file
+    /// changed during validation. The returned revisions are safe cache keys
+    /// only when both still match at the next use.
+    static func attestRuntimeTransition(
+        movieURL: URL,
+        transitionPlaybackVerifier: CharacterTransitionPlaybackVerifier = CharacterLibraryStorage.defaultTransitionPlaybackVerifier,
+        transitionDurationVerifier: CharacterTransitionDurationVerifier = CharacterLibraryStorage.defaultTransitionDurationVerifier
+    ) throws -> CharacterTransitionRuntimeAttestation {
+        guard movieURL.isFileURL,
+              movieURL.host.map({ $0.isEmpty || $0 == "localhost" }) ?? true else {
+            throw CharacterLibraryStorageError.nonLocalURL
+        }
+        let reportURL = movieURL.deletingPathExtension().appendingPathExtension("report.json")
+        guard CharacterStorageFiles.pathExistsNoFollow(reportURL) else {
+            throw CharacterLibraryStorageError.transitionAlphaReportRequired
+        }
+        guard let movieRevisionBefore = LocalFileRevision(url: movieURL),
+              let reportRevisionBefore = LocalFileRevision(url: reportURL) else {
+            throw CharacterLibraryStorageError.invalidFile
+        }
+        let movieBefore = try CharacterStorageFiles.hashRegularFile(
+            movieURL,
+            maximumBytes: CharacterBundleManifest.maximumMovieSize,
+            rejectHardLinks: true
+        )
+        let reportBefore = try CharacterStorageFiles.hashRegularFile(
+            reportURL,
+            maximumBytes: CharacterBundleManifest.maximumReportSize,
+            rejectHardLinks: true
+        )
+        let reportData = try CharacterStorageFiles.readRegularFile(
+            reportURL,
+            maximumBytes: CharacterBundleManifest.maximumReportSize,
+            rejectHardLinks: true
+        )
+
+        try transitionPlaybackVerifier(movieURL, reportData)
+        try transitionDurationVerifier(movieURL)
+
+        let movieAfter = try CharacterStorageFiles.hashRegularFile(
+            movieURL,
+            maximumBytes: CharacterBundleManifest.maximumMovieSize,
+            rejectHardLinks: true
+        )
+        let reportAfter = try CharacterStorageFiles.hashRegularFile(
+            reportURL,
+            maximumBytes: CharacterBundleManifest.maximumReportSize,
+            rejectHardLinks: true
+        )
+        guard let movieRevisionAfter = LocalFileRevision(url: movieURL),
+              let reportRevisionAfter = LocalFileRevision(url: reportURL),
+              movieRevisionAfter == movieRevisionBefore,
+              reportRevisionAfter == reportRevisionBefore,
+              movieAfter.size == movieBefore.size,
+              movieAfter.sha256 == movieBefore.sha256,
+              reportAfter.size == reportBefore.size,
+              reportAfter.sha256 == reportBefore.sha256 else {
+            throw CharacterLibraryStorageError.sourceChanged
+        }
+        return CharacterTransitionRuntimeAttestation(
+            movieRevision: movieRevisionAfter,
+            reportRevision: reportRevisionAfter
         )
     }
 
@@ -417,9 +499,14 @@ final class CharacterLibraryStorage {
                     maximumBytes: CharacterBundleManifest.maximumReportSize
                 )
             }
-            try playbackVerifier(movieURL, reportData)
             if transitionMoviePaths.contains(movie.path) {
+                guard let reportData else {
+                    throw CharacterLibraryStorageError.transitionAlphaReportRequired
+                }
+                try transitionPlaybackVerifier(movieURL, reportData)
                 try transitionDurationVerifier(movieURL)
+            } else {
+                try playbackVerifier(movieURL, reportData)
             }
             let movieAfter = try CharacterStorageFiles.hashRegularFile(
                 movieURL,
@@ -555,6 +642,7 @@ final class CharacterLibraryStorage {
                 }
                 return report
             }
+        let transitionMoviePaths = Set(manifest.mediaMap.transitions.values.map(\.path))
         for movie in manifest.assets where movie.role == .movie {
             guard let movieURL = installedByBundlePath[movie.path] else {
                 throw CharacterLibraryStorageError.invalidFile
@@ -566,13 +654,20 @@ final class CharacterLibraryStorage {
                     maximumBytes: CharacterBundleManifest.maximumReportSize,
                     rejectHardLinks: true
                 )
+            } else if transitionMoviePaths.contains(movie.path) {
+                throw CharacterLibraryStorageError.transitionAlphaReportRequired
             } else {
                 guard allowLegacyTrust else { throw CharacterLibraryStorageError.legacyTrustRequired }
                 reportData = nil
             }
-            try playbackVerifier(movieURL, reportData)
-            if manifest.mediaMap.transitions.values.contains(where: { $0.path == movie.path }) {
+            if transitionMoviePaths.contains(movie.path) {
+                guard let reportData else {
+                    throw CharacterLibraryStorageError.transitionAlphaReportRequired
+                }
+                try transitionPlaybackVerifier(movieURL, reportData)
                 try transitionDurationVerifier(movieURL)
+            } else {
+                try playbackVerifier(movieURL, reportData)
             }
             let after = try CharacterStorageFiles.hashRegularFile(
                 movieURL,
@@ -645,6 +740,10 @@ final class CharacterLibraryStorage {
                 throw CharacterLibraryStorageError.invalidPlayback
             }
         }
+    }
+
+    static func defaultTransitionPlaybackVerifier(movieURL: URL, reportData: Data) throws {
+        try defaultPlaybackVerifier(movieURL: movieURL, reportData: reportData)
     }
 
     static func defaultTransitionDurationVerifier(movieURL: URL) throws {

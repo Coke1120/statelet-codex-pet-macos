@@ -140,6 +140,20 @@ final class PetPlayerPlaybackTests: XCTestCase {
         )
     }
 
+    func testSlowTransitionCueUsesMediaTimeScaledByPlaybackRate() {
+        let sourceDuration = 4.0
+        let playbackRate = 0.5
+        let visibleDuration = sourceDuration / playbackRate
+        let cueWallTime = LayeredLifecycleHandoffPolicy.destinationPrerollTime(
+            duration: visibleDuration
+        )
+        let cueMediaTime = cueWallTime * playbackRate
+
+        XCTAssertEqual(cueWallTime, 7.65, accuracy: 0.001)
+        XCTAssertEqual(cueMediaTime, 3.825, accuracy: 0.001)
+        XCTAssertLessThan(cueMediaTime, sourceDuration)
+    }
+
     func testRapidLifecycleTransitionOnlyCommitsNewestAuthoritativeDestination() {
         XCTAssertEqual(
             LifecycleTransitionCompletionDecision.decide(
@@ -216,7 +230,7 @@ final class PetPlayerPlaybackTests: XCTestCase {
     }
 
     @MainActor
-    func testLifecycleTransitionUsesSingleQueueAndEndsExactlyOnce() async throws {
+    func testLifecycleTransitionRetainsOutgoingThenPrerollsAndPromotesDestination() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("statelet-transition-test-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -226,26 +240,73 @@ final class PetPlayerPlaybackTests: XCTestCase {
 
         let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         let controller = PetPlayerController(view: view)
-        let entry = try MediaEntry(path: movieURL.lastPathComponent) // loop defaults true
+        let entry = try MediaEntry(path: movieURL.lastPathComponent)
+        XCTAssertEqual(
+            controller.show(
+                state: .idle,
+                entry: entry,
+                url: movieURL,
+                posterURL: nil,
+                transitionID: 43,
+                startedAt: DispatchTime.now().uptimeNanoseconds
+            ),
+            .preparing
+        )
+        try await Self.waitUntil("outgoing presentation did not become ready") {
+            controller.currentURL == movieURL
+        }
+        let outgoingPlayer = try XCTUnwrap(view.playerLayer.player)
         var endedIDs: [UInt64] = []
         controller.onLifecycleTransitionEnded = { endedIDs.append($0) }
 
         XCTAssertEqual(
             controller.showLifecycleTransition(
+                sourceState: .idle,
                 destinationState: .running,
-                entry: entry,
-                url: movieURL,
+                transitionEntry: entry,
+                transitionURL: movieURL,
+                destinationEntry: entry,
+                destinationURL: movieURL,
                 transitionID: 44,
                 startedAt: DispatchTime.now().uptimeNanoseconds
             ),
             .preparing
         )
-        XCTAssertTrue(view.playerLayer.player is AVQueuePlayer)
+        XCTAssertTrue(view.playerLayer.player === outgoingPlayer)
+        XCTAssertTrue(view.destinationPlayerLayer.player is AVQueuePlayer)
+        XCTAssertNotNil(view.lifecycleTransitionPlayerLayer.player)
+        XCTAssertTrue(view.destinationPlayerLayer.isHidden)
+        XCTAssertTrue(view.lifecycleTransitionPlayerLayer.isHidden)
+        XCTAssertLessThan(view.playerLayer.zPosition, view.destinationPlayerLayer.zPosition)
+        XCTAssertLessThan(
+            view.destinationPlayerLayer.zPosition,
+            view.lifecycleTransitionPlayerLayer.zPosition
+        )
+
+        try await Self.waitUntil("transition foreground never became visible") {
+            !view.lifecycleTransitionPlayerLayer.isHidden
+        }
+        XCTAssertTrue(view.playerLayer.player === outgoingPlayer)
+        try await Self.waitUntil("destination did not begin underneath transition") {
+            !view.destinationPlayerLayer.isHidden
+                && (view.destinationPlayerLayer.player?.currentTime().seconds ?? 0) > 0
+        }
+        XCTAssertFalse(view.lifecycleTransitionPlayerLayer.isHidden)
         try await Self.waitUntil("transition did not end exactly once") {
             endedIDs == [44]
         }
         try await Task.sleep(nanoseconds: 150_000_000)
         XCTAssertEqual(endedIDs, [44])
+        XCTAssertFalse(view.playerLayer.isHidden)
+        XCTAssertNil(view.lifecycleTransitionPlayerLayer.player)
+        XCTAssertTrue(view.destinationPlayerLayer.isHidden)
+        XCTAssertFalse(view.playerLayer.player === outgoingPlayer)
+        XCTAssertEqual(controller.currentState, .running)
+        XCTAssertEqual(controller.currentURL, movieURL)
+        XCTAssertNotNil(view.playerLayer.superlayer)
+        XCTAssertEqual(view.playerLayer.zPosition, 0)
+        XCTAssertEqual(view.destinationPlayerLayer.zPosition, 1)
+        XCTAssertEqual(view.lifecycleTransitionPlayerLayer.zPosition, 2)
         controller.clearTransientPresentation()
     }
 
@@ -261,12 +322,27 @@ final class PetPlayerPlaybackTests: XCTestCase {
         let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         let controller = PetPlayerController(view: view)
         let entry = try MediaEntry(path: movieURL.lastPathComponent)
+        _ = controller.show(
+            state: .idle,
+            entry: entry,
+            url: movieURL,
+            posterURL: nil,
+            transitionID: 50,
+            startedAt: DispatchTime.now().uptimeNanoseconds
+        )
+        try await Self.waitUntil("outgoing presentation did not become ready") {
+            controller.currentURL == movieURL
+        }
+        let outgoingPlayer = view.playerLayer.player
         var endedIDs: [UInt64] = []
         controller.onLifecycleTransitionEnded = { endedIDs.append($0) }
         _ = controller.showLifecycleTransition(
+            sourceState: .idle,
             destinationState: .running,
-            entry: entry,
-            url: movieURL,
+            transitionEntry: entry,
+            transitionURL: movieURL,
+            destinationEntry: entry,
+            destinationURL: movieURL,
             transitionID: 51,
             startedAt: DispatchTime.now().uptimeNanoseconds
         )
@@ -280,6 +356,222 @@ final class PetPlayerPlaybackTests: XCTestCase {
         )
         try await Task.sleep(nanoseconds: 1_300_000_000)
         XCTAssertTrue(endedIDs.isEmpty)
+        XCTAssertTrue(view.lifecycleTransitionPlayerLayer.isHidden)
+        XCTAssertNil(view.lifecycleTransitionPlayerLayer.player)
+        XCTAssertFalse(view.playerLayer.player === outgoingPlayer)
+        controller.clearTransientPresentation()
+    }
+
+    @MainActor
+    func testLifecycleTransitionCancellationRetainsOutgoingWithoutBlanking() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("statelet-transition-retain-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let movieURL = directory.appendingPathComponent("transition.mov")
+        try await Self.writeTestMovie(to: movieURL)
+        let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
+        let controller = PetPlayerController(view: view)
+        let entry = try MediaEntry(path: movieURL.lastPathComponent)
+        _ = controller.show(
+            state: .idle,
+            entry: entry,
+            url: movieURL,
+            posterURL: nil,
+            transitionID: 60,
+            startedAt: DispatchTime.now().uptimeNanoseconds
+        )
+        try await Self.waitUntil("outgoing presentation did not become ready") {
+            controller.currentURL == movieURL
+        }
+        let outgoingPlayer = view.playerLayer.player
+        _ = controller.showLifecycleTransition(
+            sourceState: .idle,
+            destinationState: .running,
+            transitionEntry: entry,
+            transitionURL: movieURL,
+            destinationEntry: entry,
+            destinationURL: movieURL,
+            transitionID: 61,
+            startedAt: DispatchTime.now().uptimeNanoseconds
+        )
+        controller.cancelLifecycleTransition()
+
+        XCTAssertTrue(view.playerLayer.player === outgoingPlayer)
+        XCTAssertFalse(view.playerLayer.isHidden)
+        XCTAssertNil(view.destinationPlayerLayer.player)
+        XCTAssertNil(view.lifecycleTransitionPlayerLayer.player)
+        XCTAssertEqual(controller.currentURL, movieURL)
+        controller.clearTransientPresentation()
+    }
+
+    @MainActor
+    func testReduceMotionBypassesLayeredLifecycleVideoWithoutClearingPoster() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("statelet-transition-reduce-motion-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let movieURL = directory.appendingPathComponent("unreadable.mov")
+        let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
+        let controller = PetPlayerController(view: view)
+        controller.setReduceMotion(true)
+        let entry = try MediaEntry(path: movieURL.lastPathComponent)
+
+        XCTAssertEqual(
+            controller.showLifecycleTransition(
+                sourceState: .idle,
+                destinationState: .running,
+                transitionEntry: entry,
+                transitionURL: movieURL,
+                destinationEntry: entry,
+                destinationURL: movieURL,
+                transitionID: 70,
+                startedAt: DispatchTime.now().uptimeNanoseconds
+            ),
+            .failed
+        )
+        XCTAssertNil(view.destinationPlayerLayer.player)
+        XCTAssertNil(view.lifecycleTransitionPlayerLayer.player)
+    }
+
+    @MainActor
+    func testDirectReplacementRetainsVisibleBaseUntilStandbyIsReady() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("statelet-direct-retention-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let movieURL = directory.appendingPathComponent("movie.mov")
+        try await Self.writeTestMovie(to: movieURL)
+        let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
+        let controller = PetPlayerController(view: view)
+        let entry = try MediaEntry(path: movieURL.lastPathComponent)
+        _ = controller.show(
+            state: .idle,
+            entry: entry,
+            url: movieURL,
+            posterURL: nil,
+            transitionID: 71,
+            startedAt: DispatchTime.now().uptimeNanoseconds
+        )
+        try await Self.waitUntil("initial direct presentation did not become ready") {
+            controller.currentURL == movieURL
+        }
+        let outgoingPlayer = view.playerLayer.player
+        _ = controller.show(
+            state: .running,
+            entry: entry,
+            url: movieURL,
+            posterURL: nil,
+            transitionID: 72,
+            startedAt: DispatchTime.now().uptimeNanoseconds
+        )
+        XCTAssertTrue(view.playerLayer.player === outgoingPlayer)
+        XCTAssertFalse(view.playerLayer.isHidden)
+        XCTAssertTrue(view.destinationPlayerLayer.isHidden)
+        try await Self.waitUntil("direct replacement was not atomically promoted") {
+            controller.currentState == .running
+                && view.playerLayer.player !== outgoingPlayer
+        }
+        XCTAssertNil(view.destinationPlayerLayer.player)
+    }
+
+    @MainActor
+    func testReduceMotionWithoutPosterRetainsExistingPresentation() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("statelet-reduce-retention-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let movieURL = directory.appendingPathComponent("movie.mov")
+        try await Self.writeTestMovie(to: movieURL)
+        let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
+        let controller = PetPlayerController(view: view)
+        let entry = try MediaEntry(path: movieURL.lastPathComponent)
+        _ = controller.show(
+            state: .idle,
+            entry: entry,
+            url: movieURL,
+            posterURL: nil,
+            transitionID: 73,
+            startedAt: DispatchTime.now().uptimeNanoseconds
+        )
+        try await Self.waitUntil("initial presentation did not become ready") {
+            controller.currentURL == movieURL
+        }
+        let player = view.playerLayer.player
+        controller.setReduceMotion(true)
+        XCTAssertEqual(
+            controller.show(
+                state: .running,
+                entry: entry,
+                url: movieURL,
+                posterURL: nil,
+                transitionID: 74,
+                startedAt: DispatchTime.now().uptimeNanoseconds
+            ),
+            .failed
+        )
+        XCTAssertTrue(view.playerLayer.player === player)
+        XCTAssertFalse(view.playerLayer.isHidden)
+        XCTAssertEqual(controller.currentState, .idle)
+    }
+
+    @MainActor
+    func testRapidLifecycleHandoffCancelsObsoleteLayersBeforePreparingNewestDestination() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("statelet-transition-rapid-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let movieURL = directory.appendingPathComponent("transition.mov")
+        try await Self.writeTestMovie(to: movieURL)
+        let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
+        let controller = PetPlayerController(view: view)
+        let entry = try MediaEntry(path: movieURL.lastPathComponent)
+        _ = controller.show(
+            state: .idle,
+            entry: entry,
+            url: movieURL,
+            posterURL: nil,
+            transitionID: 80,
+            startedAt: DispatchTime.now().uptimeNanoseconds
+        )
+        try await Self.waitUntil("outgoing presentation did not become ready") {
+            controller.currentURL == movieURL
+        }
+        var endedIDs: [UInt64] = []
+        controller.onLifecycleTransitionEnded = { endedIDs.append($0) }
+        _ = controller.showLifecycleTransition(
+            sourceState: .idle,
+            destinationState: .running,
+            transitionEntry: entry,
+            transitionURL: movieURL,
+            destinationEntry: entry,
+            destinationURL: movieURL,
+            transitionID: 81,
+            startedAt: DispatchTime.now().uptimeNanoseconds
+        )
+        let obsoleteDestinationPlayer = view.destinationPlayerLayer.player
+        let obsoleteTransitionPlayer = view.lifecycleTransitionPlayerLayer.player
+
+        _ = controller.showLifecycleTransition(
+            sourceState: .idle,
+            destinationState: .review,
+            transitionEntry: entry,
+            transitionURL: movieURL,
+            destinationEntry: entry,
+            destinationURL: movieURL,
+            transitionID: 82,
+            startedAt: DispatchTime.now().uptimeNanoseconds
+        )
+
+        XCTAssertFalse(view.destinationPlayerLayer.player === obsoleteDestinationPlayer)
+        XCTAssertFalse(view.lifecycleTransitionPlayerLayer.player === obsoleteTransitionPlayer)
+        XCTAssertTrue(endedIDs.isEmpty)
+        controller.cancelLifecycleTransition()
+        try await Task.sleep(nanoseconds: 1_300_000_000)
+        XCTAssertTrue(endedIDs.isEmpty)
+        XCTAssertNil(view.destinationPlayerLayer.player)
+        XCTAssertNil(view.lifecycleTransitionPlayerLayer.player)
+        XCTAssertFalse(view.playerLayer.isHidden)
         controller.clearTransientPresentation()
     }
 

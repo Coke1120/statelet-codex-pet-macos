@@ -3792,6 +3792,152 @@ class MacOSAlphaSyntheticMatteTests(unittest.TestCase):
         self.assertGreater(int(rgba[4:8, 4:8, 3].mean()), 200)
 
 
+@unittest.skipIf(alpha.np is None, "NumPy is required")
+class MacOSAlphaTransitionCompositeTests(unittest.TestCase):
+    @staticmethod
+    def _transition_frames():
+        np = alpha.np
+        assert np is not None
+        height, width = 48, 64
+        yy, xx = np.mgrid[0:height, 0:width]
+        frames = []
+        for center_x in (25.0, 39.0):
+            distance = np.sqrt(((xx - center_x) / 1.15) ** 2 + (yy - 24.0) ** 2)
+            alpha_values = np.clip((15.0 - distance) / 3.0, 0.0, 1.0)
+            rgba = np.zeros((height, width, 4), dtype=np.uint8)
+            rgba[:, :, :3] = (214, 184, 156)
+            rgba[:, :, 3] = np.rint(alpha_values * 255.0).astype(np.uint8)
+            frames.append(rgba)
+        return frames
+
+    @staticmethod
+    def _lower_state_backgrounds(height: int, width: int):
+        np = alpha.np
+        assert np is not None
+        yy, xx = np.mgrid[0:height, 0:width]
+
+        running = np.empty((height, width, 3), dtype=np.uint8)
+        running[:, :, 0] = 25 + (xx * 35 // max(width - 1, 1))
+        running[:, :, 1] = 74 + (yy * 24 // max(height - 1, 1))
+        running[:, :, 2] = 142
+
+        waiting = np.empty((height, width, 3), dtype=np.uint8)
+        waiting[:, :, 0] = 132
+        waiting[:, :, 1] = 82 + (xx * 34 // max(width - 1, 1))
+        waiting[:, :, 2] = 35 + (yy * 20 // max(height - 1, 1))
+
+        checkerboard = alpha._background_pattern(
+            "checkerboard", height=height, width=width
+        )
+        return {
+            "running": running,
+            "waiting": waiting,
+            "checkerboard": checkerboard,
+        }
+
+    def test_layered_transition_composite_reveals_every_lower_state_without_fringe(self):
+        np = alpha.np
+        assert np is not None
+        frames = self._transition_frames()
+        backgrounds = self._lower_state_backgrounds(*frames[0].shape[:2])
+
+        self.assertFalse(
+            np.array_equal(backgrounds["running"], backgrounds["waiting"])
+        )
+        self.assertFalse(
+            np.array_equal(frames[0][:, :, 3], frames[1][:, :, 3]),
+            "the synthetic transition must exercise more than one visual frame",
+        )
+        for frame_index, rgba in enumerate(frames):
+            with self.subTest(frame=frame_index, gate="alpha-contract"):
+                alpha_values = rgba[:, :, 3]
+                transparent = alpha_values == 0
+                semitransparent = (alpha_values > 0) & (alpha_values < 255)
+                opaque = alpha_values == 255
+
+                self.assertGreater(
+                    int(transparent.sum()), rgba.shape[0] * rgba.shape[1] // 2
+                )
+                self.assertGreater(int(semitransparent.sum()), 0)
+                self.assertGreater(int(opaque.sum()), 0)
+                self.assertFalse(bool(np.all(opaque)))
+                self.assertTrue(bool(np.all(alpha_values[0, :] == 0)))
+                self.assertTrue(bool(np.all(alpha_values[-1, :] == 0)))
+                self.assertTrue(bool(np.all(alpha_values[:, 0] == 0)))
+                self.assertTrue(bool(np.all(alpha_values[:, -1] == 0)))
+
+                frame_metrics = alpha.frame_quality(
+                    rgba,
+                    max_outer_edge_alpha=alpha.DEFAULT_MAX_BORDER_ALPHA,
+                )
+                self.assertLessEqual(
+                    frame_metrics["outer_edge_alpha_maximum"],
+                    alpha.DEFAULT_MAX_BORDER_ALPHA,
+                )
+                composite_metrics = alpha.composite_quality(rgba)
+                self.assertEqual(
+                    composite_metrics["maximum_delivery_green_fringe_ratio"], 0.0
+                )
+                self.assertEqual(
+                    composite_metrics["maximum_delivery_magenta_fringe_ratio"], 0.0
+                )
+                self.assertEqual(
+                    composite_metrics["introduced_green_fringe_pixels"], 0
+                )
+                self.assertEqual(
+                    composite_metrics["introduced_magenta_fringe_pixels"], 0
+                )
+
+            foreground = rgba[:, :, :3]
+            composites = {}
+            for background_name, background in backgrounds.items():
+                with self.subTest(frame=frame_index, background=background_name):
+                    composite = alpha.composite_rgba(rgba, background)
+                    composites[background_name] = composite
+                    self.assertTrue(
+                        bool(
+                            np.array_equal(
+                                composite[transparent], background[transparent]
+                            )
+                        ),
+                        "fully transparent transition pixels must reveal the lower layer exactly",
+                    )
+                    self.assertTrue(
+                        bool(np.array_equal(composite[opaque], foreground[opaque])),
+                        "fully opaque transition pixels must retain the foreground exactly",
+                    )
+
+                    lower = np.minimum(
+                        foreground[semitransparent], background[semitransparent]
+                    )
+                    upper = np.maximum(
+                        foreground[semitransparent], background[semitransparent]
+                    )
+                    blended = composite[semitransparent]
+                    self.assertTrue(bool(np.all(blended >= lower)))
+                    self.assertTrue(bool(np.all(blended <= upper)))
+                    self.assertTrue(
+                        bool(np.any(blended != background[semitransparent])),
+                        "soft edges must contribute transition colour without hiding the lower layer",
+                    )
+                    self.assertTrue(
+                        bool(np.any(blended != foreground[semitransparent])),
+                        "soft edges must retain lower-layer contribution",
+                    )
+                    self.assertTrue(bool(np.array_equal(composite[0, 0], background[0, 0])))
+                    self.assertTrue(
+                        bool(np.array_equal(composite[-1, -1], background[-1, -1]))
+                    )
+
+            self.assertFalse(
+                np.array_equal(
+                    composites["running"][transparent],
+                    composites["waiting"][transparent],
+                ),
+                "transparent regions must preserve distinct lower lifecycle states",
+            )
+
+
 @unittest.skipUnless(
     alpha.np is not None
     and alpha.Image is not None

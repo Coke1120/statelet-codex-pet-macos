@@ -1055,12 +1055,25 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         advanceSelection: Bool
     ) -> Bool {
         guard !reduceMotion,
-              let entry = mediaMap.transition(from: source, to: destination) else {
+              let transitionEntry = mediaMap.transition(from: source, to: destination),
+              let destinationEntry = selectedEntry(
+                  for: destination,
+                  advance: advanceSelection,
+                  useManualPreviewCursor: false
+              ) else {
             return false
         }
-        let url = mediaMap.resolvedURL(for: entry, relativeTo: mediaMapURL)
-        guard FileManager.default.isReadableFile(atPath: url.path) else {
+        let transitionURL = mediaMap.resolvedURL(for: transitionEntry, relativeTo: mediaMapURL)
+        let destinationURL = mediaMap.resolvedURL(for: destinationEntry, relativeTo: mediaMapURL)
+        guard FileManager.default.isReadableFile(atPath: transitionURL.path),
+              FileManager.default.isReadableFile(atPath: destinationURL.path) else {
             logger.error("event=lifecycle_transition_unavailable from=\(source.rawValue, privacy: .public) to=\(destination.rawValue, privacy: .public) reason=unreadable")
+            return false
+        }
+        do {
+            _ = try CharacterLibraryStorage.attestRuntimeTransition(movieURL: transitionURL)
+        } catch {
+            logger.error("event=lifecycle_transition_unavailable from=\(source.rawValue, privacy: .public) to=\(destination.rawValue, privacy: .public) reason=attestation_failed")
             return false
         }
 
@@ -1079,12 +1092,17 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             advanceSelection: advanceSelection
         )
         pendingPresentationState = destination
+        let continuousRotation = mediaMap.playlist(for: destination)?.isContinuousRotationEffective == true
         let result = player.showLifecycleTransition(
+            sourceState: source,
             destinationState: destination,
-            entry: entry,
-            url: url,
+            transitionEntry: transitionEntry,
+            transitionURL: transitionURL,
+            destinationEntry: destinationEntry,
+            destinationURL: destinationURL,
             transitionID: transitionID,
-            startedAt: DispatchTime.now().uptimeNanoseconds
+            startedAt: DispatchTime.now().uptimeNanoseconds,
+            advancePlaylistWhenEnded: continuousRotation
         )
         guard result == .preparing else {
             activeLifecycleTransition = nil
@@ -1109,20 +1127,23 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
               ) == .commit(active.destination) else { return }
         activeLifecycleTransition = nil
         pendingPresentationState = nil
-        player.clearTransientPresentation()
         logger.info("event=lifecycle_transition_finished transition_id=\(transitionID, privacy: .public) from=\(active.source.rawValue, privacy: .public) to=\(active.destination.rawValue, privacy: .public) outcome=\(outcome, privacy: .public)")
-        startLifecyclePresentation(
-            state: active.destination,
-            advanceSelection: active.advanceSelection,
-            refreshReason: "lifecycle_transition_\(outcome)"
-        )
+        if outcome == "completed" {
+            lastPresentedState = active.destination
+            lastCommittedLifecycleState = active.destination
+            presentStateOwnedDialogueIfNeeded(for: active.destination)
+        } else {
+            lastPresentedState = nil
+        }
+        updateStatusMenu()
+        refreshSettings()
     }
 
     private func cancelActiveLifecycleTransition(reason: String) {
         guard let active = activeLifecycleTransition else { return }
         activeLifecycleTransition = nil
         pendingPresentationState = nil
-        player.clearTransientPresentation()
+        player.cancelLifecycleTransition()
         logger.info("event=lifecycle_transition_cancelled transition_id=\(active.id, privacy: .public) from=\(active.source.rawValue, privacy: .public) to=\(active.destination.rawValue, privacy: .public) reason=\(reason, privacy: .public)")
     }
 

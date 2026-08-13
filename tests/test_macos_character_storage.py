@@ -35,6 +35,8 @@ class CharacterStorageSourceTests(unittest.TestCase):
             "maximumAggregateSize",
             "characterLimitReached",
             "AlphaPlaybackProcessValidator",
+            "attestRuntimeTransition(",
+            "CharacterTransitionRuntimeAttestation",
         ):
             self.assertIn(contract, source)
 
@@ -85,6 +87,11 @@ class CharacterStorageHarnessTests(unittest.TestCase):
                         playbackVerifier: { movie, _ in
                             let data = try Data(contentsOf: movie)
                             guard !data.isEmpty else { throw HarnessFailure.failed("empty movie") }
+                        },
+                        transitionPlaybackVerifier: { movie, report in
+                            guard !(try Data(contentsOf: movie)).isEmpty, !report.isEmpty else {
+                                throw HarnessFailure.failed("invalid transition alpha contract")
+                            }
                         },
                         transitionDurationVerifier: { _ in }
                     )
@@ -232,6 +239,66 @@ class CharacterStorageHarnessTests(unittest.TestCase):
                     let transitionReport = roundtripRoot.appendingPathComponent("Idle to Running.report.json")
                     try write(Data("transition".utf8), to: transitionMovie)
                     try write(Data("transition-report".utf8), to: transitionReport)
+                    var runtimeAlphaChecks = 0
+                    var runtimeDurationChecks = 0
+                    let runtimeAttestation = try CharacterLibraryStorage.attestRuntimeTransition(
+                        movieURL: transitionMovie,
+                        transitionPlaybackVerifier: { movie, report in
+                            let movieData = try Data(contentsOf: movie)
+                            try require(movieData == Data("transition".utf8), "runtime verifier saw wrong movie")
+                            try require(report == Data("transition-report".utf8), "runtime verifier saw wrong report")
+                            runtimeAlphaChecks += 1
+                        },
+                        transitionDurationVerifier: { movie in
+                            try require(movie == transitionMovie, "runtime duration verifier saw wrong movie")
+                            runtimeDurationChecks += 1
+                        }
+                    )
+                    try require(runtimeAlphaChecks == 1, "runtime alpha verifier was not called exactly once")
+                    try require(runtimeDurationChecks == 1, "runtime duration verifier was not called exactly once")
+                    try require(
+                        runtimeAttestation.movieRevision == LocalFileRevision(url: transitionMovie),
+                        "runtime movie revision was not current"
+                    )
+                    try require(
+                        runtimeAttestation.reportRevision == LocalFileRevision(url: transitionReport),
+                        "runtime report revision was not current"
+                    )
+
+                    let runtimeReportlessMovie = roundtripRoot.appendingPathComponent("Runtime Reportless.mov")
+                    try write(Data("transition".utf8), to: runtimeReportlessMovie)
+                    try expectFailure("runtime attestation accepted a reportless transition") {
+                        _ = try CharacterLibraryStorage.attestRuntimeTransition(
+                            movieURL: runtimeReportlessMovie,
+                            transitionPlaybackVerifier: { _, _ in },
+                            transitionDurationVerifier: { _ in }
+                        )
+                    }
+                    try expectFailure("runtime attestation accepted an opaque transition") {
+                        _ = try CharacterLibraryStorage.attestRuntimeTransition(
+                            movieURL: transitionMovie,
+                            transitionPlaybackVerifier: { _, _ in throw HarnessFailure.failed("opaque") },
+                            transitionDurationVerifier: { _ in }
+                        )
+                    }
+                    try expectFailure("runtime attestation accepted replaced movie bytes") {
+                        _ = try CharacterLibraryStorage.attestRuntimeTransition(
+                            movieURL: transitionMovie,
+                            transitionPlaybackVerifier: { movie, _ in try write(Data("replacement".utf8), to: movie) },
+                            transitionDurationVerifier: { _ in }
+                        )
+                    }
+                    try write(Data("transition".utf8), to: transitionMovie)
+                    try expectFailure("runtime attestation accepted replaced report bytes") {
+                        _ = try CharacterLibraryStorage.attestRuntimeTransition(
+                            movieURL: transitionMovie,
+                            transitionPlaybackVerifier: { _, _ in
+                                try write(Data("replacement-report".utf8), to: transitionReport)
+                            },
+                            transitionDurationVerifier: { _ in }
+                        )
+                    }
+                    try write(Data("transition-report".utf8), to: transitionReport)
                     let transitionMap = try (try storage.loadMediaMap(for: sourceEntry).map)
                         .settingTransition(
                             from: .idle,
@@ -317,6 +384,7 @@ class CharacterStorageHarnessTests(unittest.TestCase):
                     let durationRejectingStorage = CharacterLibraryStorage(
                         mediaMapURL: storage.rootMediaMapURL,
                         playbackVerifier: { _, _ in },
+                        transitionPlaybackVerifier: { _, _ in },
                         transitionDurationVerifier: { _ in throw HarnessFailure.failed("transition too long") }
                     )
                     let tooLongPackage = base.appendingPathComponent("transition-too-long.statelet-character", isDirectory: true)
@@ -343,6 +411,7 @@ class CharacterStorageHarnessTests(unittest.TestCase):
                     let rejectingImportStorage = CharacterLibraryStorage(
                         mediaMapURL: storage.rootMediaMapURL,
                         playbackVerifier: { _, _ in },
+                        transitionPlaybackVerifier: { _, _ in },
                         transitionDurationVerifier: { _ in throw HarnessFailure.failed("transition too long") }
                     )
                     let beforeDurationImport = Set(try FileManager.default.contentsOfDirectory(atPath: roundtripRoot.path))
@@ -355,6 +424,79 @@ class CharacterStorageHarnessTests(unittest.TestCase):
                     }
                     let afterDurationImport = Set(try FileManager.default.contentsOfDirectory(atPath: roundtripRoot.path))
                     try require(beforeDurationImport == afterDurationImport, "failed duration import leaked staging or final artifacts")
+
+                    let opaqueRejectingStorage = CharacterLibraryStorage(
+                        mediaMapURL: storage.rootMediaMapURL,
+                        playbackVerifier: { _, _ in },
+                        transitionPlaybackVerifier: { _, _ in
+                            throw HarnessFailure.failed("opaque transition")
+                        },
+                        transitionDurationVerifier: { _ in }
+                    )
+                    let opaquePackage = base.appendingPathComponent("transition-opaque.statelet-character", isDirectory: true)
+                    try expectFailure("export accepted transition rejected by alpha verifier") {
+                        try opaqueRejectingStorage.exportCharacter(sourceEntry, to: opaquePackage)
+                    }
+                    try require(!FileManager.default.fileExists(atPath: opaquePackage.path), "opaque export left a package")
+                    try expectFailure("import accepted transition rejected by alpha verifier") {
+                        _ = try opaqueRejectingStorage.stageImport(
+                            from: transitionPackage,
+                            against: existing,
+                            allowLegacyTrust: true
+                        )
+                    }
+
+                    let transitionReportlessPackage = base.appendingPathComponent("transition-reportless.statelet-character", isDirectory: true)
+                    try FileManager.default.copyItem(at: transitionPackage, to: transitionReportlessPackage)
+                    let transitionReportlessManifest = try CharacterBundleManifest(
+                        characterID: transitionManifest.characterID,
+                        characterName: transitionManifest.characterName,
+                        mediaMap: transitionManifest.mediaMap,
+                        assets: transitionManifest.assets.filter {
+                            !($0.role == .report && $0.moviePath == bundledTransition.path)
+                        }
+                    )
+                    let transitionEncoder = JSONEncoder()
+                    transitionEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                    try write(
+                        try transitionEncoder.encode(transitionReportlessManifest),
+                        to: transitionReportlessPackage.appendingPathComponent("manifest.json")
+                    )
+                    try expectFailure("legacy trust allowed a reportless transition") {
+                        _ = try storage.stageImport(
+                            from: transitionReportlessPackage,
+                            against: existing,
+                            allowLegacyTrust: true
+                        )
+                    }
+
+                    let tamperedTransitionPackage = base.appendingPathComponent("transition-tampered-report.statelet-character", isDirectory: true)
+                    try FileManager.default.copyItem(at: transitionPackage, to: tamperedTransitionPackage)
+                    guard let transitionReportAsset else {
+                        throw HarnessFailure.failed("missing transition report for tamper test")
+                    }
+                    try write(
+                        Data("tampered-transition-report".utf8),
+                        to: tamperedTransitionPackage.appendingPathComponent(transitionReportAsset.path)
+                    )
+                    try expectFailure("tampered transition report imported") {
+                        _ = try storage.stageImport(
+                            from: tamperedTransitionPackage,
+                            against: existing,
+                            allowLegacyTrust: true
+                        )
+                    }
+
+                    try FileManager.default.removeItem(at: transitionReport)
+                    let sourceReportlessPackage = base.appendingPathComponent("transition-source-reportless.statelet-character", isDirectory: true)
+                    try expectFailure("export accepted a reportless source transition") {
+                        try storage.exportCharacter(sourceEntry, to: sourceReportlessPackage)
+                    }
+                    try require(
+                        !FileManager.default.fileExists(atPath: sourceReportlessPackage.path),
+                        "reportless transition export left a package"
+                    )
+                    try write(Data("transition-report".utf8), to: transitionReport)
 
                     // A committed import can be rolled back when the caller's catalog CAS fails.
                     let rollbackStage = try storage.stageImport(from: package, against: existing, allowLegacyTrust: true)
@@ -436,6 +578,12 @@ class CharacterStorageHarnessTests(unittest.TestCase):
                     try expectFailure("reportless movie did not require trust") {
                         _ = try storage.stageImport(from: reportlessPackage, against: existing, allowLegacyTrust: false)
                     }
+                    let legacyStateStage = try storage.stageImport(
+                        from: reportlessPackage,
+                        against: existing,
+                        allowLegacyTrust: true
+                    )
+                    legacyStateStage.discard()
                     print("character-storage-ok")
                 }
             }

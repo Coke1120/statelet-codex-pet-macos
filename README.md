@@ -172,8 +172,9 @@ Each state has an independent library:
 The default `state_entry` policy changes selection when the real lifecycle
 enters a state. Random and Sequential libraries with at least two entries can
 enable **Continue with another clip when this clip ends**. Statelet then
-hard-cuts to the next eligible clip using one AVFoundation decoder. It does not
-cross-fade, warm a second decoder, or support weighted selection.
+hard-cuts to the next eligible clip using one AVFoundation decoder. Normal
+playlist changes do not cross-fade, warm a second decoder, or support weighted
+selection.
 
 The Animations pane also provides:
 
@@ -189,11 +190,16 @@ The **Transitions** mode in the same pane can assign an optional directional
 clip to every distinct source → destination lifecycle pair for the active
 character. Import an MP4 for conversion or a verified transparent MOV, then
 preview, replace, or remove it. A configured clip plays once before Statelet
-commits the destination animation; clips are limited to 4 seconds. Playback
-still uses the existing single AVFoundation decoder, with a hard cut and no
-cross-fade or warmed second decoder. Reduce Motion skips transition video and
-presents the destination fallback immediately. Existing maps without a
-`transitions` object retain their current direct-to-destination behavior.
+commits the destination animation; clips are limited to 4 seconds and must
+carry a current alpha-validation report. During a real lifecycle handoff,
+Statelet retains the outgoing animation until the transition's first frame is
+display-ready, composites the transparent transition above it, and starts the
+destination animation below the foreground before the transition ends. The
+default overlap is deterministic: at most 350 ms, or half of a shorter clip.
+This is layered alpha compositing, not an opacity cross-fade. Reduce Motion
+skips transition video and presents the destination's static fallback without
+clearing the current presentation first. Existing maps without a `transitions`
+object retain their current direct-to-destination behavior.
 
 Read [Using Statelet](docs/USAGE.md) for the full interaction, animation,
 appearance, resize, FPS, prompts, deletion, and recovery behavior.

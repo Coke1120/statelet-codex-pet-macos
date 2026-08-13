@@ -203,6 +203,26 @@ private func runDialogueVoiceSelfTest() throws {
 
 private func runSelfTest() throws {
     try runDialogueVoiceSelfTest()
+    var handoff = LayeredLifecycleHandoff(id: 17, source: .idle, destination: .running)
+    try require(handoff.lowerLayer == .outgoing(.idle), "layered handoff hid the outgoing state")
+    try require(handoff.transitionBecameReady(id: 17) == .revealTransition, "transition did not become foreground")
+    try require(handoff.lowerLayer == .outgoing(.idle), "transition readiness removed the outgoing state")
+    try require(
+        handoff.destinationPrerollCueReached(id: 17) == .startDestinationPreroll(.running),
+        "destination did not pre-roll below the transition"
+    )
+    try require(
+        handoff.destinationBecameReady(id: 17) == .revealDestination(.running),
+        "ready destination was not revealed below the transition"
+    )
+    try require(handoff.transitionVisible, "destination pre-roll removed the transition early")
+    try require(handoff.transitionFinished(id: 17) == .finish(.running), "handoff did not finish on destination")
+    try require(handoff.preservesVisibleContent, "layered handoff exposed an empty presentation")
+    try require(handoff.transitionFinished(id: 16) == .none, "stale handoff callback changed state")
+    try require(
+        abs(LayeredLifecycleHandoffPolicy.destinationPrerollTime(duration: 4) - 3.65) < 0.0001,
+        "layered handoff overlap is not deterministic"
+    )
     var progressParser = AlphaConversionProgressParser()
     let noiseProgress = try progressParser.parseLine("converter startup noise")
     try require(noiseProgress == nil, "progress parser accepted noise")

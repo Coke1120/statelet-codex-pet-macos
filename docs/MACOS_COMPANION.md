@@ -113,18 +113,28 @@ manual migration is required.
 
 ## Playback and preview contract
 
-Statelet uses exactly one AVFoundation decoder. A real lifecycle change
-preempts the current clip. Natural completion can hard-cut to another clip when
-effective `clip_end` rotation is enabled. There is no cross-fade, second warmed
-decoder, or weighted selection.
+Normal Statelet playback uses one AVFoundation decoder. Natural completion can
+hard-cut to another clip when effective `clip_end` rotation is enabled. Normal
+playlist playback has no cross-fade, warmed decoder, or weighted selection.
 
 An optional `transitions` map can bind a distinct ordered state pair such as
 `idle_to_running` to one media entry. A matching transition plays once and is
-bounded to 4 seconds, after which the destination animation is committed on the
-same decoder. Reduce Motion skips transition video and presents the destination
-fallback. Initial launch, same-state heartbeats, forced refresh, playlist
-rotation, Next Clip, Play Once, and Temporary State do not enter this path.
-Maps without `transitions` preserve the legacy direct destination commit.
+bounded to 4 seconds. The player retains the outgoing animation until the
+transition foreground has a display-ready first frame. It prepares the
+destination on a separate lower player and starts it during the final 350 ms,
+or halfway through a shorter transition. Completion removes the foreground and
+promotes the already-running destination without clearing every layer. This is
+alpha compositing rather than an opacity cross-fade.
+
+Transition movies require current alpha reports; reportless or opaque assets
+cannot round-trip through a character bundle. Superseding lifecycle changes
+remove stale players, observers, deadlines, and layers. Readiness failure keeps
+the last valid lower presentation visible while the newest state is retried or
+retained safely. Reduce Motion skips transition video and switches to the destination
+static presentation without an empty frame. Initial launch, same-state
+heartbeats, forced refresh, playlist rotation, Next Clip, Play Once, and
+Temporary State do not enter this path. Maps without `transitions` preserve the
+legacy direct destination commit.
 
 Play Once and Temporary State affect only the current process. They do not edit
 the aggregate state or media map. The first fresh different producer state
