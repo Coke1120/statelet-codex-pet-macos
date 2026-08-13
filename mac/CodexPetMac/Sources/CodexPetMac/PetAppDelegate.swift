@@ -1626,6 +1626,52 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         )
     }
 
+    private func beginInStateTransition(state: PetState) -> Bool {
+        guard !reduceMotion,
+              activeOneShotPreview == nil,
+              let mediaMapURL,
+              let transitionEntry = mediaMap.inStateTransition(for: state),
+              let destinationEntry = selectedEntry(
+                  for: state,
+                  advance: true,
+                  useManualPreviewCursor: false
+              ) else { return false }
+        let transitionURL = mediaMap.resolvedURL(for: transitionEntry, relativeTo: mediaMapURL)
+        let destinationURL = mediaMap.resolvedURL(for: destinationEntry, relativeTo: mediaMapURL)
+        guard FileManager.default.isReadableFile(atPath: transitionURL.path),
+              FileManager.default.isReadableFile(atPath: destinationURL.path) else { return false }
+        cancelActiveLifecycleTransition(reason: "superseded_in_state")
+        transitionSequence &+= 1
+        let transitionID = transitionSequence
+        let request = PendingLifecycleTransitionAttestation(
+            id: transitionID,
+            source: state,
+            destination: state,
+            transitionEntry: transitionEntry,
+            transitionURL: transitionURL,
+            destinationEntry: destinationEntry,
+            destinationURL: destinationURL,
+            transitionScope: .character,
+            selectionRequest: nil,
+            isInState: true
+        )
+        pendingLifecycleTransitionAttestation = request
+        pendingPresentationState = state
+        let verifier = Task.detached(priority: .userInitiated) {
+            await Self.attestRuntimeTransition(
+                movieURL: transitionURL,
+                timeoutSeconds: Self.transitionAttestationTimeoutSeconds
+            )
+        }
+        pendingLifecycleTransitionAttestationTask = verifier
+        Task { @MainActor [weak self] in
+            let result = await verifier.value
+            self?.finishLifecycleTransitionAttestation(request: request, result: result)
+        }
+        logger.info("event=in_state_transition_attestation_started transition_id=\(transitionID, privacy: .public) state=\(state.rawValue, privacy: .public)")
+        return true
+    }
+
     private func handlePresentationEvent(
         transitionID: UInt64,
         state: PetState,
@@ -2316,6 +2362,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         controller.onRemoveQwenProfile = { [weak self] profile in
             self?.confirmQwenVoiceProfileRemoval(profile)
         }
+        controller.onConfigureVoxCPM2Profile = { [weak self] transcript in
+            self?.chooseVoxCPM2Snapshot(referenceText: transcript)
+        }
+        controller.onRemoveVoxCPM2Profile = { [weak self] profile in
+            self?.confirmVoxCPM2ProfileRemoval(profile)
+        }
         controller.onDialogueVoicePlaybackSettingsChange = { [weak self] settings in
             self?.updateDialogueVoicePlaybackSettings(settings)
         }
@@ -2790,6 +2842,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             panel.message = "Choose reference audio that you own or are authorized to use. Statelet keeps a private local copy."
             panel.prompt = "Import Reference Audio"
             panel.allowedContentTypes = [.audio]
+        case .voxcpm2ReferenceAudio:
+            panel.title = "Import VoxCPM2 Reference Audio"
+            panel.message = "Choose a trusted WAV that you own or are authorized to use."
+            panel.prompt = "Import Reference Audio"
+            panel.allowedContentTypes = [.wav]
         }
         panel.beginSheetModal(for: settingsWindow) { [weak self] response in
             guard response == .OK, let sourceURL = panel.url else { return }

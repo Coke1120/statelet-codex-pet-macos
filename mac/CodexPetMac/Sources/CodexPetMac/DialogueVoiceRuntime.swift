@@ -9,19 +9,21 @@ enum DialogueVoiceAssetKind: String, Sendable {
     case gptWeight = "gpt"
     case sovitsWeight = "sovits"
     case referenceAudio = "reference"
+    case voxcpm2ReferenceAudio = "voxcpm2-reference"
 
     var allowedExtensions: Set<String> {
         switch self {
         case .gptWeight: return ["ckpt"]
         case .sovitsWeight: return ["pth"]
         case .referenceAudio: return ["wav", "flac", "mp3", "m4a", "aac", "ogg"]
+        case .voxcpm2ReferenceAudio: return ["wav"]
         }
     }
 
     var maximumBytes: UInt64 {
         switch self {
         case .gptWeight, .sovitsWeight: return 4_294_967_296
-        case .referenceAudio: return 67_108_864
+        case .referenceAudio, .voxcpm2ReferenceAudio: return 67_108_864
         }
     }
 }
@@ -945,6 +947,101 @@ enum Qwen3TTSProfileValidator {
         guard Darwin.fstat(descriptor, &final) == 0,
               DialogueVoiceFileIdentity(final) == identity else { throw DialogueVoiceRuntimeError.sourceChanged }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func sha256FileForVoiceProvider(_ url: URL, maximumBytes: UInt64) throws -> String {
+        try sha256RegularFile(url, maximumBytes: maximumBytes)
+    }
+}
+
+struct VoxCPM2ValidatedProfile: Equatable, Sendable {
+    let snapshotRoot: URL
+    let pythonExecutable: URL
+    let referenceAudio: URL
+    let identityTokens: [String]
+}
+
+enum VoxCPM2ProfileValidator {
+    static let maximumSnapshotBytes: UInt64 = 8_589_934_592
+    private static let requiredFiles = ["model.safetensors", "audiovae.pth", "config.json"]
+    private static let tokenizerCandidates = [
+        "tokenization_voxcpm2.py", "tokenizer.json", "tokenizer_config.json",
+    ]
+
+    static func validate(profile: VoxCPM2VoiceProfile, applicationSupportRoot: URL) throws -> VoxCPM2ValidatedProfile {
+        let snapshot = URL(fileURLWithPath: profile.snapshotPath, isDirectory: true).standardizedFileURL
+        guard snapshot.path == profile.snapshotPath else { throw DialogueVoiceRuntimeError.invalidManagedPath }
+        let treeBefore = try snapshotTree(snapshot)
+        guard treeBefore.digest == profile.snapshotTreeSHA256 else { throw DialogueVoiceRuntimeError.inputFingerprintMismatch }
+        let runtime = try Qwen3TTSProfileValidator.validatePythonExecutable(
+            at: URL(fileURLWithPath: profile.pythonExecutablePath)
+        )
+        guard runtime.finalTargetSHA256 == profile.pythonExecutableSHA256 else {
+            throw DialogueVoiceRuntimeError.inputFingerprintMismatch
+        }
+        let referenceIdentity = try DialogueVoiceAssetInstaller.managedFileIdentity(
+            relativePath: profile.referenceAudioRelativePath, root: applicationSupportRoot,
+            maximumBytes: DialogueVoiceAssetKind.voxcpm2ReferenceAudio.maximumBytes
+        )
+        try DialogueVoiceAssetInstaller.validateReferenceAudio(
+            relativePath: profile.referenceAudioRelativePath, root: applicationSupportRoot
+        )
+        let referenceDigest = try DialogueVoiceAssetInstaller.sha256ManagedFile(
+            relativePath: profile.referenceAudioRelativePath, root: applicationSupportRoot,
+            maximumBytes: DialogueVoiceAssetKind.voxcpm2ReferenceAudio.maximumBytes
+        )
+        guard referenceDigest == profile.referenceAudioSHA256,
+              Qwen3TTSProfileValidator.computeInputFingerprint(components: profile.inputFingerprintComponents)
+                == profile.inputFingerprint else { throw DialogueVoiceRuntimeError.inputFingerprintMismatch }
+        let treeAfter = try snapshotTree(snapshot)
+        guard treeBefore == treeAfter else { throw DialogueVoiceRuntimeError.sourceChanged }
+        return VoxCPM2ValidatedProfile(
+            snapshotRoot: snapshot,
+            pythonExecutable: URL(fileURLWithPath: runtime.invocationPath),
+            referenceAudio: applicationSupportRoot.appendingPathComponent(profile.referenceAudioRelativePath),
+            identityTokens: treeAfter.identityTokens + [runtime.stableIdentityToken, referenceIdentity]
+        )
+    }
+
+    static func computeSnapshotTreeSHA256(snapshotRoot: URL) throws -> String {
+        try snapshotTree(snapshotRoot).digest
+    }
+
+    private static func snapshotTree(_ root: URL) throws -> (digest: String, identityTokens: [String]) {
+        var rootStatus = stat()
+        guard Darwin.lstat(root.path, &rootStatus) == 0,
+              rootStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
+              let enumerator = FileManager.default.enumerator(atPath: root.path) else {
+            throw DialogueVoiceRuntimeError.invalidSource
+        }
+        var entries: [(String, URL, UInt64, String)] = []
+        var total: UInt64 = 0
+        while let relative = enumerator.nextObject() as? String {
+            guard !relative.hasPrefix("/"), !relative.split(separator: "/").contains("..") else {
+                throw DialogueVoiceRuntimeError.invalidSource
+            }
+            let url = root.appendingPathComponent(relative).standardizedFileURL
+            guard url.path.hasPrefix(root.path + "/") else { throw DialogueVoiceRuntimeError.invalidSource }
+            var status = stat()
+            guard Darwin.lstat(url.path, &status) == 0 else { throw DialogueVoiceRuntimeError.invalidSource }
+            let kind = status.st_mode & mode_t(S_IFMT)
+            if kind == mode_t(S_IFDIR) { continue }
+            guard kind == mode_t(S_IFREG), status.st_size > 0 else { throw DialogueVoiceRuntimeError.invalidSource }
+            let size = UInt64(status.st_size)
+            let (next, overflow) = total.addingReportingOverflow(size)
+            guard !overflow, next <= maximumSnapshotBytes else { throw DialogueVoiceRuntimeError.sourceTooLarge }
+            total = next
+            let digest = try Qwen3TTSProfileValidator.sha256FileForVoiceProvider(url, maximumBytes: size)
+            entries.append((relative, url, size, digest))
+        }
+        let names = Set(entries.map(\.0))
+        guard requiredFiles.allSatisfy(names.contains), tokenizerCandidates.contains(where: names.contains) else {
+            throw DialogueVoiceRuntimeError.profileRejected
+        }
+        let components = entries.sorted { $0.0 < $1.0 }.flatMap { [$0.0, $0.3] }
+        let digest = Qwen3TTSProfileValidator.computeInputFingerprint(components: components)
+        let tokens = entries.sorted { $0.0 < $1.0 }.map { "\($0.0):\($0.2):\($0.3)" }
+        return (digest, tokens)
     }
 }
 
@@ -2637,6 +2734,109 @@ actor Qwen3TTSClient {
         return UInt32(data[offset]) | UInt32(data[offset + 1]) << 8
             | UInt32(data[offset + 2]) << 16 | UInt32(data[offset + 3]) << 24
     }
+}
+
+actor VoxCPM2Client {
+    typealias Runner = @Sendable (Qwen3TTSProcessInvocation) async throws -> Void
+    private static let maximumAudioBytes = 67_108_864
+    private let helperExecutableURL: URL?
+    private let probeExecutableURL: URL?
+    private let runner: Runner
+
+    init(helperExecutableURL: URL? = nil, probeExecutableURL: URL? = nil,
+         runner: @escaping Runner = { try await Qwen3TTSProcessRunner().run($0) }) {
+        self.helperExecutableURL = helperExecutableURL
+        self.probeExecutableURL = probeExecutableURL
+        self.runner = runner
+    }
+
+    func validateProfile(_ profile: VoxCPM2VoiceProfile, applicationSupportRoot: URL) async throws {
+        let validated = try VoxCPM2ProfileValidator.validate(profile: profile, applicationSupportRoot: applicationSupportRoot)
+        let probe = try resolveResource(probeExecutableURL, named: "voxcpm2_probe.py")
+        let job = applicationSupportRoot.appendingPathComponent("voice/tmp/\(UUID().uuidString.lowercased())", isDirectory: true)
+        try DialogueVoiceAssetInstaller.ensurePrivateDirectory(job)
+        defer { try? FileManager.default.removeItem(at: job) }
+        let request = try JSONSerialization.data(withJSONObject: ["snapshot_root": validated.snapshotRoot.path])
+        try await runner(Qwen3TTSProcessInvocation(
+            executableURL: validated.pythonExecutable, helperURL: probe, currentDirectoryURL: job,
+            environment: Self.environment(home: job), standardInput: request,
+            outputURL: job.appendingPathComponent("probe.ok"), timeout: 30, requiresOutputFile: false
+        ))
+    }
+
+    func synthesize(profile: VoxCPM2VoiceProfile, line: DialogueLine,
+                    applicationSupportRoot: URL, expectedIdentityTokens: [String]?) async throws -> Data {
+        try Task.checkCancellation()
+        guard !line.text.isEmpty, line.text.count <= 1_000 else { throw DialogueVoiceRuntimeError.requestRejected }
+        let validated = try VoxCPM2ProfileValidator.validate(profile: profile, applicationSupportRoot: applicationSupportRoot)
+        if let expectedIdentityTokens, expectedIdentityTokens != validated.identityTokens {
+            throw DialogueVoiceRuntimeError.inputFingerprintMismatch
+        }
+        let helper = try resolveResource(helperExecutableURL, named: "voxcpm2_generate.py")
+        let job = applicationSupportRoot.appendingPathComponent("voice/tmp/\(UUID().uuidString.lowercased())", isDirectory: true)
+        try DialogueVoiceAssetInstaller.ensurePrivateDirectory(job)
+        defer { try? FileManager.default.removeItem(at: job) }
+        let output = job.appendingPathComponent("result.wav")
+        let request = try JSONSerialization.data(withJSONObject: [
+            "snapshot_root": validated.snapshotRoot.path, "reference_file": validated.referenceAudio.path,
+            "reference_text": profile.referenceText, "text": line.text, "output_file": output.path,
+            "cfg_value": profile.parameters.cfgValue,
+            "inference_timesteps": profile.parameters.inferenceTimesteps,
+            "seed": profile.parameters.seed, "load_denoiser": false, "optimize": false,
+        ], options: [.sortedKeys])
+        guard request.count <= 262_144 else { throw DialogueVoiceRuntimeError.requestRejected }
+        try await runner(Qwen3TTSProcessInvocation(
+            executableURL: validated.pythonExecutable, helperURL: helper, currentDirectoryURL: job,
+            environment: Self.environment(home: job), standardInput: request, outputURL: output, timeout: 120
+        ))
+        try Task.checkCancellation()
+        let after = try VoxCPM2ProfileValidator.validate(profile: profile, applicationSupportRoot: applicationSupportRoot)
+        guard after.identityTokens == validated.identityTokens else { throw DialogueVoiceRuntimeError.sourceChanged }
+        let data = try DialogueVoiceAssetInstaller.readManagedFile(
+            relativePath: "voice/tmp/\(job.lastPathComponent)/result.wav", root: applicationSupportRoot,
+            maximumBytes: UInt64(Self.maximumAudioBytes)
+        )
+        guard Self.isValidOutputWAV(data) else { throw DialogueVoiceRuntimeError.invalidAudio }
+        return data
+    }
+
+    static func isValidOutputWAV(_ data: Data) -> Bool {
+        guard data.count >= 44, data.count <= maximumAudioBytes,
+              data.prefix(4) == Data("RIFF".utf8), data.dropFirst(8).prefix(4) == Data("WAVE".utf8),
+              let declared = u32(data, 4), Int(declared) + 8 == data.count else { return false }
+        var offset = 12; var format = false; var audio = false
+        while offset + 8 <= data.count {
+            let id = data.subdata(in: offset..<offset+4); guard let raw = u32(data, offset+4) else { return false }
+            let size = Int(raw), start = offset + 8; guard size <= data.count - start else { return false }
+            if id == Data("fmt ".utf8) {
+                guard !format, size >= 16, u16(data,start) == 1, u16(data,start+2) == 1,
+                      u32(data,start+4) == 48_000, u32(data,start+8) == 96_000,
+                      u16(data,start+12) == 2, u16(data,start+14) == 16 else { return false }
+                format = true
+            } else if id == Data("data".utf8) {
+                guard format, !audio, size > 0, size % 2 == 0, size / 2 <= 48_000 * 60 else { return false }
+                audio = true
+            }
+            offset = start + size + (size & 1)
+        }
+        return format && audio && offset == data.count
+    }
+
+    private static func environment(home: URL) -> [String:String] { [
+        "HOME": home.path, "PATH": "/usr/bin:/bin", "LC_ALL": "en_US.UTF-8",
+        "PYTHONNOUSERSITE": "1", "PYTHONDONTWRITEBYTECODE": "1", "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1", "NO_PROXY": "*",
+    ] }
+    private func resolveResource(_ explicit: URL?, named: String) throws -> URL {
+        let url = explicit ?? Bundle.main.resourceURL?.appendingPathComponent("VoxCPM2/\(named)")
+        guard let url, url.isFileURL else { throw DialogueVoiceRuntimeError.inferenceUnavailable }
+        var status = stat(); guard Darwin.lstat(url.path, &status) == 0,
+              status.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG), status.st_size > 0,
+              status.st_size <= 1_048_576 else { throw DialogueVoiceRuntimeError.inferenceUnavailable }
+        return url
+    }
+    private static func u16(_ d: Data,_ o:Int)->UInt16? { guard o+2<=d.count else{return nil}; return UInt16(d[o])|UInt16(d[o+1])<<8 }
+    private static func u32(_ d: Data,_ o:Int)->UInt32? { guard o+4<=d.count else{return nil}; return UInt32(d[o])|UInt32(d[o+1])<<8|UInt32(d[o+2])<<16|UInt32(d[o+3])<<24 }
 }
 
 struct DialogueVoiceAudioPublisher: Sendable {

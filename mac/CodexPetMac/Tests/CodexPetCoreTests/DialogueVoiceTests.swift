@@ -920,4 +920,38 @@ final class DialogueVoiceTests: XCTestCase {
             "/managed/root/audio/ready.wav"
         )
     }
+
+    func testVoxCPM2ProviderPersistsCompletePinnedProfile() throws {
+        let provisional = try VoxCPM2VoiceProfile(
+            name: "VoxCPM2 Voice", snapshotPath: "/private/models/VoxCPM2",
+            snapshotTreeSHA256: String(repeating: "a", count: 64),
+            pythonExecutablePath: "/private/venv/bin/python",
+            pythonExecutableSHA256: String(repeating: "b", count: 64),
+            referenceAudioRelativePath: "voice/assets/voxcpm2-reference/ref.wav",
+            referenceAudioSHA256: String(repeating: "c", count: 64),
+            referenceText: "正確な文字起こし。", inputFingerprint: String(repeating: "d", count: 64)
+        )
+        let library = try DialogueVoiceLibrary(voxcpm2Profile: provisional, activeProviderKind: .voxcpm2)
+        let decoded = try JSONDecoder().decode(
+            DialogueVoiceLibrary.self, from: JSONEncoder().encode(library)
+        )
+        XCTAssertEqual(decoded.activeProviderKind, .voxcpm2)
+        XCTAssertEqual(decoded.voxcpm2Profile, provisional)
+        XCTAssertTrue(decoded.referencedManagedPaths.contains(provisional.referenceAudioRelativePath))
+        XCTAssertEqual(provisional.parameters, .verifiedDefaults)
+    }
+
+    func testVoxCPM2RejectsExternalReferenceAndUnsafeRuntimePaths() throws {
+        XCTAssertThrowsError(try VoxCPM2VoiceProfile(
+            name: "Vox", snapshotPath: "/models/VoxCPM2",
+            snapshotTreeSHA256: String(repeating: "a", count: 64),
+            pythonExecutablePath: "relative/python",
+            pythonExecutableSHA256: String(repeating: "b", count: 64),
+            referenceAudioRelativePath: "voice/assets/reference/ref.wav",
+            referenceAudioSHA256: String(repeating: "c", count: 64),
+            referenceText: "reference", inputFingerprint: String(repeating: "d", count: 64)
+        ))
+        XCTAssertThrowsError(try VoxCPM2SynthesisParameters(loadDenoiser: true))
+        XCTAssertThrowsError(try VoxCPM2SynthesisParameters(optimize: true))
+    }
 }

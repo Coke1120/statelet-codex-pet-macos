@@ -1943,6 +1943,24 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
+    func testVoxCPM2SnapshotDigestCoversCompleteTreeAndRejectsSymlinks() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        for (name, value) in [
+            ("model.safetensors", "model"), ("audiovae.pth", "vae"),
+            ("config.json", "{}"), ("tokenization_voxcpm2.py", "# tokenizer"),
+        ] { try Data(value.utf8).write(to: root.appendingPathComponent(name)) }
+        let first = try VoxCPM2ProfileValidator.computeSnapshotTreeSHA256(snapshotRoot: root)
+        try Data("changed".utf8).write(to: root.appendingPathComponent("config.json"))
+        XCTAssertNotEqual(first, try VoxCPM2ProfileValidator.computeSnapshotTreeSHA256(snapshotRoot: root))
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("unsafe"), withDestinationURL: root.appendingPathComponent("config.json")
+        )
+        XCTAssertThrowsError(try VoxCPM2ProfileValidator.computeSnapshotTreeSHA256(snapshotRoot: root))
+    }
+
     private func appendUInt16(_ value: UInt16, to data: inout Data) {
         data.append(UInt8(value & 0xff))
         data.append(UInt8((value >> 8) & 0xff))

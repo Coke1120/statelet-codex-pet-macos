@@ -170,6 +170,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     var onConfigureQwenProfile: (() -> Void)?
     var onSelectVoiceProvider: ((DialogueVoiceProviderKind) -> Void)?
     var onRemoveQwenProfile: ((Qwen3TTSVoiceProfile) -> Void)?
+    var onConfigureVoxCPM2Profile: ((String) -> Void)?
+    var onRemoveVoxCPM2Profile: ((VoxCPM2VoiceProfile) -> Void)?
     var onAddDialogueLine: ((String, String, PetState) -> Void)?
     var onUpdateDialogueLine: ((DialogueLine, String, String, PetState) -> Void)?
     var onDeleteDialogueLine: ((DialogueLine) -> Void)?
@@ -712,6 +714,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         }
         dialogueVoiceView.onRemoveQwenProfile = { [weak self] profile in
             self?.onRemoveQwenProfile?(profile)
+        }
+        dialogueVoiceView.onConfigureVoxCPM2Profile = { [weak self] transcript in
+            self?.onConfigureVoxCPM2Profile?(transcript)
+        }
+        dialogueVoiceView.onRemoveVoxCPM2Profile = { [weak self] profile in
+            self?.onRemoveVoxCPM2Profile?(profile)
         }
         dialogueVoiceView.onAddLine = { [weak self] text, language, state in
             self?.onAddDialogueLine?(text, language, state)
