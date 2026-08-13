@@ -1845,6 +1845,9 @@ final class PetPlayerController {
             activeLifecycleHandoff = handoff
             view.lifecycleTransitionPlayerLayer.isHidden = true
             startLifecycleDestination(transitionID: transitionID)
+            if activeLifecycleHandoff?.destinationVisible == true {
+                promoteLifecycleDestination(transitionID: transitionID)
+            }
             return
         }
         logger.error("event=lifecycle_handoff_failed transition_id=\(transitionID, privacy: .public) reason=\(reason, privacy: .public)")
