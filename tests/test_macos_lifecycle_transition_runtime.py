@@ -29,7 +29,7 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         self.assertIn("previousLifecycleState == incomingState", self.app)
         self.assertIn("trigger: presentationTrigger", self.app)
 
-    def test_failure_retries_destination_behind_retained_lower_layer(self):
+    def test_failure_retries_destination_then_directly_presents_preselected_entry(self):
         self.assertIn("onLifecycleTransitionFailed", self.player)
         self.assertIn('outcome: "failed"', self.app)
         retry = self.player.index("private func retryLifecycleDestination")
@@ -44,7 +44,25 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         finish_end = self.app.index("private func cancelActiveLifecycleTransition", finish)
         finish_source = self.app[finish:finish_end]
         self.assertNotIn("player.clearTransientPresentation()", finish_source)
-        self.assertNotIn("startLifecyclePresentation(", finish_source)
+        self.assertIn('refreshReason: "layered_handoff_failed"', finish_source)
+        self.assertIn("preselectedEntry: active.destinationEntry", finish_source)
+        self.assertIn("advanceSelection: false", finish_source)
+        self.assertNotIn("selectedEntry(", finish_source)
+
+        active = self.app.index("private struct ActiveLifecycleTransition")
+        active_end = self.app.index("enum LifecycleTransitionCompletionDecision", active)
+        active_source = self.app[active:active_end]
+        self.assertIn("let destinationEntry: MediaEntry", active_source)
+
+        transition = self.app.index("private func startLifecycleTransition(")
+        transition_end = self.app.index("private func finishLifecycleTransition", transition)
+        transition_source = self.app[transition:transition_end]
+        self.assertIn("destinationEntry: destinationEntry", transition_source)
+
+        presentation = self.app.index("private func startLifecyclePresentation(")
+        presentation_end = self.app.index("private func advancePlaylistAfterClipEnd", presentation)
+        presentation_source = self.app[presentation:presentation_end]
+        self.assertIn("let entry = preselectedEntry ?? selectedEntry(", presentation_source)
 
     def test_dialogue_only_starts_from_destination_presentation_commit(self):
         finish = self.app.index("private func finishLifecycleTransition")
@@ -58,15 +76,20 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         self.assertIn('cancelActiveLifecycleTransition(reason: "character_changed")', self.app)
         self.assertIn("lastCommittedLifecycleState = nil", self.app)
 
-    def test_duration_deadline_starts_after_display_readiness(self):
+    def test_readiness_timeout_pauses_and_overlap_uses_media_time(self):
         show = self.player.index("func showLifecycleTransition")
         end = self.player.index("func setReduceMotion", show)
         source = self.player[show:end]
-        self.assertIn("scheduleLifecycleTransitionTimeout", source)
-        self.assertIn("startedAt: startedAt", source)
-        timeout = self.player.index("private func scheduleLifecycleTransitionTimeout")
-        timeout_end = self.player.index("private func abortLifecycleTransition", timeout)
-        self.assertIn("LifecycleTransitionDeadline.uptimeNanoseconds", self.player[timeout:timeout_end])
+        self.assertIn("cancelDirectReplacement()", source)
+        self.assertIn("scheduleLifecycleReadinessTimeout", source)
+        self.assertIn("addBoundaryTimeObserver", self.player)
+        self.assertIn("lifecycleReadinessTimeoutWorkItem?.cancel()", self.player)
+        self.assertIn("lifecyclePlaybackStallTimeoutWorkItem?.cancel()", self.player)
+        self.assertIn("handleLifecyclePlaybackStallTimeout", self.player)
+        self.assertIn("let reasonsBefore = suspensionPolicy.reasons", self.player)
+        self.assertIn("guard suspensionPolicy.reasons != reasonsBefore else", self.player)
+        self.assertNotIn("LifecycleTransitionDeadline", self.player)
+        self.assertNotIn("scheduleLifecycleTransitionTimeout", self.player)
 
     def test_layered_handoff_keeps_explicit_lower_and_foreground_layers(self):
         self.assertIn("destinationPlayerLayer", self.player)
@@ -80,6 +103,7 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         self.assertIn("view.revealLifecycleTransition()", self.player)
         self.assertIn("view.revealLifecycleDestination()", self.player)
         self.assertIn("LayeredLifecycleHandoffPolicy.destinationPrerollTime", self.player)
+        self.assertIn("CharacterLibraryStorage.attestRuntimeTransition", self.app)
 
     def test_publisher_rejection_cancels_transition_and_forces_idle_without_transition(self):
         start = self.app.index("private func rejectPublisher")

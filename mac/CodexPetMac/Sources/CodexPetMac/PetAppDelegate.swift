@@ -249,7 +249,7 @@ private struct ActiveLifecycleTransition {
     let id: UInt64
     let source: PetState
     let destination: PetState
-    let advanceSelection: Bool
+    let destinationEntry: MediaEntry
 }
 
 enum LifecycleTransitionCompletionDecision: Equatable {
@@ -1089,7 +1089,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             id: transitionID,
             source: source,
             destination: destination,
-            advanceSelection: advanceSelection
+            destinationEntry: destinationEntry
         )
         pendingPresentationState = destination
         let continuousRotation = mediaMap.playlist(for: destination)?.isContinuousRotationEffective == true
@@ -1133,7 +1133,13 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             lastCommittedLifecycleState = active.destination
             presentStateOwnedDialogueIfNeeded(for: active.destination)
         } else {
-            lastPresentedState = nil
+            startLifecyclePresentation(
+                state: active.destination,
+                advanceSelection: false,
+                refreshReason: "layered_handoff_failed",
+                preselectedEntry: active.destinationEntry
+            )
+            return
         }
         updateStatusMenu()
         refreshSettings()
@@ -1152,7 +1158,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         advanceSelection: Bool,
         refreshReason: String,
         useManualPreviewCursor: Bool = false,
-        explicitUserAdvance: Bool = false
+        explicitUserAdvance: Bool = false,
+        preselectedEntry: MediaEntry? = nil
     ) {
         if stateDialoguePresentation?.state != state {
             let keepSpokenMessage = dialogueVoiceCoordinator.isAutomaticPlaybackActive
@@ -1165,7 +1172,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         let started = DispatchTime.now().uptimeNanoseconds
         transitionSequence &+= 1
         let transitionID = transitionSequence
-        let entry = selectedEntry(
+        let entry = preselectedEntry ?? selectedEntry(
             for: state,
             advance: advanceSelection,
             useManualPreviewCursor: useManualPreviewCursor,

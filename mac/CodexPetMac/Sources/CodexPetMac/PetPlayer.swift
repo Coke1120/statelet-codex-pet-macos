@@ -32,22 +32,6 @@ enum PlaybackPresentationEvent {
     case failed
 }
 
-enum LifecycleTransitionDeadline {
-    static func uptimeNanoseconds(
-        startedAt: UInt64,
-        maximumDuration: TimeInterval = LifecycleTransitionMediaPolicy.maximumDuration
-    ) -> UInt64 {
-        guard maximumDuration.isFinite, maximumDuration > 0 else { return startedAt }
-        let boundedDuration = maximumDuration
-        let durationNanoseconds = UInt64(min(
-            Double(UInt64.max),
-            boundedDuration * 1_000_000_000
-        ))
-        let (deadline, overflow) = startedAt.addingReportingOverflow(durationNanoseconds)
-        return overflow ? UInt64.max : deadline
-    }
-}
-
 enum PlaybackPresentationStatus: Equatable {
     case awaiting
     case preparing(PetState)
@@ -955,6 +939,7 @@ final class PetPlayerView: NSView {
 
 final class PetPlayerController {
     private static let readinessTimeout: DispatchTimeInterval = .seconds(8)
+    private static let lifecyclePlaybackStallTimeout: DispatchTimeInterval = .seconds(8)
     private static let maximumCachedFrameRates = 32
 
     private struct ActiveTransition {
@@ -990,6 +975,7 @@ final class PetPlayerController {
         var transitionDisplayReset = false
         var transitionVisible = false
         var transitionEnded = false
+        var lastObservedTransitionTime: TimeInterval = 0
     }
 
     private struct ActiveDirectReplacement {
@@ -997,6 +983,7 @@ final class PetPlayerController {
         let state: PetState
         let url: URL
         let entry: MediaEntry
+        let item: AVPlayerItem
         let player: AVQueuePlayer
         var looper: AVPlayerLooper?
         let startedAt: UInt64
@@ -1018,7 +1005,8 @@ final class PetPlayerController {
     private var failedToEndObserver: NSObjectProtocol?
     private var didPlayToEndObserver: NSObjectProtocol?
     private var readinessTimeoutWorkItem: DispatchWorkItem?
-    private var lifecycleTransitionTimeoutWorkItem: DispatchWorkItem?
+    private var lifecycleReadinessTimeoutWorkItem: DispatchWorkItem?
+    private var lifecyclePlaybackStallTimeoutWorkItem: DispatchWorkItem?
     private var lifecycleCueTimeObserver: Any?
     private var lifecycleDestinationCurrentItemObservation: NSKeyValueObservation?
     private var lifecycleDestinationItemObservation: NSKeyValueObservation?
@@ -1097,8 +1085,6 @@ final class PetPlayerController {
                 self.logger.info("event=playlist_clip_ended transition_id=\(transition.id, privacy: .public) state=\(transition.state.rawValue, privacy: .public)")
                 self.onPlaylistClipEnded?(transition.id, transition.state)
             } else if self.lifecycleTransitionEndID == transition.id {
-                self.lifecycleTransitionTimeoutWorkItem?.cancel()
-                self.lifecycleTransitionTimeoutWorkItem = nil
                 self.lifecycleTransitionEndID = nil
                 self.logger.info("event=lifecycle_transition_ended transition_id=\(transition.id, privacy: .public)")
                 self.onLifecycleTransitionEnded?(transition.id)
@@ -1108,7 +1094,10 @@ final class PetPlayerController {
 
     deinit {
         readinessTimeoutWorkItem?.cancel()
-        lifecycleTransitionTimeoutWorkItem?.cancel()
+        cancelLifecycleHandoff(notifyFailure: false)
+        cancelDirectReplacement()
+        directTimeoutWorkItem?.cancel()
+        lifecyclePlaybackStallTimeoutWorkItem?.cancel()
         fpsLoadingTask?.cancel()
         if let failedToEndObserver {
             NotificationCenter.default.removeObserver(failedToEndObserver)
@@ -1119,9 +1108,9 @@ final class PetPlayerController {
         removeLifecycleNotificationObservers()
     }
 
-    /// Hard-cuts to a new asset. Video is only committed as presented after
-    /// both the actual queued item and the AVPlayerLayer pass their readiness
-    /// gates. Reduce Motion remains an immediate static presentation.
+    /// Atomically replaces the visible asset after both the queued item and
+    /// standby AVPlayerLayer pass their readiness gates. Reduce Motion uses a
+    /// decoded static presentation without clearing the existing content first.
     @discardableResult
     func show(
         state: PetState,
@@ -1163,6 +1152,7 @@ final class PetPlayerController {
             state: state,
             url: url,
             entry: entry,
+            item: item,
             player: replacementPlayer,
             looper: replacementLooper,
             startedAt: startedAt,
@@ -1230,6 +1220,7 @@ final class PetPlayerController {
               FileManager.default.isReadableFile(atPath: destinationURL.path) else {
             return .failed
         }
+        cancelDirectReplacement()
         cancelLifecycleHandoff(notifyFailure: false)
 
         let destinationPlayer = AVQueuePlayer()
@@ -1335,7 +1326,7 @@ final class PetPlayerController {
                 }
             }
         }
-        scheduleLifecycleTransitionTimeout(transitionID: transitionID, startedAt: startedAt)
+        scheduleLifecycleReadinessTimeout(transitionID: transitionID)
         presentationStatus = .preparing(destinationState)
         return .preparing
     }
@@ -1376,8 +1367,9 @@ final class PetPlayerController {
     /// system suspension has cleared. Replacing media while suspended updates
     /// the intended rate without losing the new item or its current time.
     func setSuspended(_ suspended: Bool, for reason: PlaybackSuspensionReason) {
+        let reasonsBefore = suspensionPolicy.reasons
         let directive = suspensionPolicy.setSuspended(suspended, for: reason)
-        guard directive != .none else { return }
+        guard suspensionPolicy.reasons != reasonsBefore else { return }
         applyPlaybackDirective(directive)
         if suspensionPolicy.reasons.isEmpty {
             if let transition = activeTransition,
@@ -1391,8 +1383,10 @@ final class PetPlayerController {
             activeDirectReplacement?.player.pause()
             activeLifecycleHandoff?.transitionPlayer.pause()
             activeLifecycleHandoff?.destinationPlayer.pause()
-            lifecycleTransitionTimeoutWorkItem?.cancel()
-            lifecycleTransitionTimeoutWorkItem = nil
+            lifecycleReadinessTimeoutWorkItem?.cancel()
+            lifecycleReadinessTimeoutWorkItem = nil
+            lifecyclePlaybackStallTimeoutWorkItem?.cancel()
+            lifecyclePlaybackStallTimeoutWorkItem = nil
             readinessTimeoutWorkItem?.cancel()
             readinessTimeoutWorkItem = nil
             directTimeoutWorkItem?.cancel()
@@ -1416,6 +1410,7 @@ final class PetPlayerController {
     /// is restored, so a manual preview cannot become fallback content.
     func clearTransientPresentation() {
         cancelLifecycleHandoff(notifyFailure: false)
+        cancelDirectReplacement()
         invalidateActiveTransition()
         stopQueuePlayback()
         currentURL = nil
@@ -1490,7 +1485,8 @@ final class PetPlayerController {
         guard let replacement = activeDirectReplacement,
               replacement.id == transitionID,
               replacement.itemReady,
-              replacement.displayReady else { return }
+              replacement.displayReady,
+              suspensionPolicy.reasons.isEmpty else { return }
         directTimeoutWorkItem?.cancel()
         directTimeoutWorkItem = nil
         clearDirectReplacementObservers()
@@ -1527,6 +1523,13 @@ final class PetPlayerController {
         activeItemIdentifiers = Set(queuePlayer.items().map(ObjectIdentifier.init))
         observeCurrentItem(queuePlayer.currentItem)
         activeDirectReplacement = nil
+        let item = replacement.item
+        loadFPSIfNeeded(
+            for: replacement.url,
+            asset: queuePlayer.currentItem?.asset ?? item.asset,
+            playbackRate: replacement.entry.playbackRate.value,
+            transitionID: replacement.id
+        )
         view.showPoster(nil)
         view.showPlaceholder(nil)
         view.updateAccessibility(state: replacement.state, reducedMotion: false)
@@ -1684,12 +1687,14 @@ final class PetPlayerController {
               handoff.id == transitionID,
               handoff.transitionItemReady,
               handoff.transitionDisplayReady,
-              !handoff.transitionVisible else { return }
+              !handoff.transitionVisible,
+              suspensionPolicy.reasons.isEmpty else { return }
         handoff.transitionVisible = true
         activeLifecycleHandoff = handoff
         view.revealLifecycleTransition()
-        lifecycleTransitionTimeoutWorkItem?.cancel()
-        lifecycleTransitionTimeoutWorkItem = nil
+        lifecycleReadinessTimeoutWorkItem?.cancel()
+        lifecycleReadinessTimeoutWorkItem = nil
+        scheduleLifecyclePlaybackStallTimeout(transitionID: transitionID)
         if suspensionPolicy.reasons.isEmpty {
             handoff.transitionPlayer.playImmediately(
                 atRate: Float(max(handoff.transitionPlaybackRate, 0.01))
@@ -1739,7 +1744,8 @@ final class PetPlayerController {
               handoff.destinationStarted,
               handoff.destinationItemReady,
               handoff.destinationDisplayReady,
-              !handoff.destinationVisible else { return }
+              !handoff.destinationVisible,
+              suspensionPolicy.reasons.isEmpty else { return }
         handoff.destinationVisible = true
         activeLifecycleHandoff = handoff
         view.revealLifecycleDestination()
@@ -1754,9 +1760,14 @@ final class PetPlayerController {
               handoff.id == transitionID else { return }
         handoff.transitionEnded = true
         activeLifecycleHandoff = handoff
+        lifecyclePlaybackStallTimeoutWorkItem?.cancel()
+        lifecyclePlaybackStallTimeoutWorkItem = nil
+        view.lifecycleTransitionPlayerLayer.isHidden = true
         startLifecycleDestination(transitionID: transitionID)
         if activeLifecycleHandoff?.destinationVisible == true {
             promoteLifecycleDestination(transitionID: transitionID)
+        } else {
+            scheduleLifecycleReadinessTimeout(transitionID: transitionID)
         }
     }
 
@@ -1797,8 +1808,10 @@ final class PetPlayerController {
         observeCurrentItem(queuePlayer.currentItem)
         activeLifecycleHandoff = nil
         lifecycleTransitionEndID = nil
-        lifecycleTransitionTimeoutWorkItem?.cancel()
-        lifecycleTransitionTimeoutWorkItem = nil
+        lifecycleReadinessTimeoutWorkItem?.cancel()
+        lifecycleReadinessTimeoutWorkItem = nil
+        lifecyclePlaybackStallTimeoutWorkItem?.cancel()
+        lifecyclePlaybackStallTimeoutWorkItem = nil
         removeLifecycleCueTimeObserver(from: handoff.transitionPlayer)
         view.showPoster(nil)
         view.showPlaceholder(nil)
@@ -1808,18 +1821,21 @@ final class PetPlayerController {
     }
 
     private func resumeLifecycleHandoffIfNeeded() {
-        if let replacement = activeDirectReplacement {
-            replacement.player.playImmediately(atRate: Float(replacement.entry.playbackRate.value))
-            scheduleDirectReadinessTimeout(transitionID: replacement.id)
+        if let replacementID = activeDirectReplacement?.id {
+            tryPromoteDirectReplacement(transitionID: replacementID)
+            if let replacement = activeDirectReplacement, replacement.id == replacementID {
+                replacement.player.playImmediately(atRate: Float(replacement.entry.playbackRate.value))
+                scheduleDirectReadinessTimeout(transitionID: replacement.id)
+            }
         }
-        guard let handoff = activeLifecycleHandoff else { return }
-        if !handoff.transitionVisible {
-            scheduleLifecycleTransitionTimeout(
-                transitionID: handoff.id,
-                startedAt: DispatchTime.now().uptimeNanoseconds
-            )
+        guard let handoffID = activeLifecycleHandoff?.id else { return }
+        tryRevealLifecycleTransition(transitionID: handoffID)
+        guard let handoff = activeLifecycleHandoff, handoff.id == handoffID else { return }
+        if !handoff.transitionVisible || (handoff.transitionEnded && !handoff.destinationVisible) {
+            scheduleLifecycleReadinessTimeout(transitionID: handoff.id)
         }
         if handoff.transitionVisible, !handoff.transitionEnded {
+            scheduleLifecyclePlaybackStallTimeout(transitionID: handoff.id)
             handoff.transitionPlayer.playImmediately(
                 atRate: Float(max(handoff.transitionPlaybackRate, 0.01))
             )
@@ -1828,6 +1844,7 @@ final class PetPlayerController {
             handoff.destinationPlayer.playImmediately(
                 atRate: Float(handoff.destinationEntry.playbackRate.value)
             )
+            tryRevealLifecycleDestination(transitionID: handoff.id)
         }
     }
 
@@ -1843,10 +1860,14 @@ final class PetPlayerController {
         if reason.hasPrefix("transition_") {
             handoff.transitionEnded = true
             activeLifecycleHandoff = handoff
+            lifecyclePlaybackStallTimeoutWorkItem?.cancel()
+            lifecyclePlaybackStallTimeoutWorkItem = nil
             view.lifecycleTransitionPlayerLayer.isHidden = true
             startLifecycleDestination(transitionID: transitionID)
             if activeLifecycleHandoff?.destinationVisible == true {
                 promoteLifecycleDestination(transitionID: transitionID)
+            } else {
+                scheduleLifecycleReadinessTimeout(transitionID: transitionID)
             }
             return
         }
@@ -1856,7 +1877,7 @@ final class PetPlayerController {
 
     /// A destination decode failure gets one fresh item attempt on the hidden
     /// lower layer. The committed outgoing layer is never detached during the
-    /// retry, and the authoritative four-second deadline still bounds it.
+    /// retry, and the suspension-aware readiness watchdog still bounds it.
     private func retryLifecycleDestination(transitionID: UInt64) {
         guard var handoff = activeLifecycleHandoff,
               handoff.id == transitionID else { return }
@@ -1916,6 +1937,10 @@ final class PetPlayerController {
     }
 
     private func cancelLifecycleHandoff(notifyFailure: Bool) {
+        lifecycleReadinessTimeoutWorkItem?.cancel()
+        lifecycleReadinessTimeoutWorkItem = nil
+        lifecyclePlaybackStallTimeoutWorkItem?.cancel()
+        lifecyclePlaybackStallTimeoutWorkItem = nil
         guard let handoff = activeLifecycleHandoff else {
             clearLifecycleHandoffObservers()
             view.cancelLifecycleHandoffLayers()
@@ -1923,8 +1948,6 @@ final class PetPlayerController {
         }
         activeLifecycleHandoff = nil
         lifecycleTransitionEndID = nil
-        lifecycleTransitionTimeoutWorkItem?.cancel()
-        lifecycleTransitionTimeoutWorkItem = nil
         removeLifecycleCueTimeObserver(from: handoff.transitionPlayer)
         clearLifecycleHandoffObservers()
         handoff.transitionPlayer.pause()
@@ -2109,8 +2132,6 @@ final class PetPlayerController {
         oneShotEndTransitionID = nil
         playlistEndTransitionID = nil
         lifecycleTransitionEndID = nil
-        lifecycleTransitionTimeoutWorkItem?.cancel()
-        lifecycleTransitionTimeoutWorkItem = nil
         readinessTimeoutWorkItem?.cancel()
         readinessTimeoutWorkItem = nil
         fpsLoadingTask?.cancel()
@@ -2151,33 +2172,103 @@ final class PetPlayerController {
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.readinessTimeout, execute: workItem)
     }
 
-    private func scheduleLifecycleTransitionTimeout(transitionID: UInt64, startedAt: UInt64) {
-        lifecycleTransitionTimeoutWorkItem?.cancel()
+    private func scheduleLifecycleReadinessTimeout(transitionID: UInt64) {
+        guard suspensionPolicy.canStartReadinessDeadline else { return }
+        lifecycleReadinessTimeoutWorkItem?.cancel()
+        lifecycleReadinessTimeoutWorkItem = nil
         let workItem = DispatchWorkItem { [weak self] in
-            guard let self,
-                  self.lifecycleTransitionEndID == transitionID,
-                  self.activeLifecycleHandoff?.id == transitionID else { return }
-            self.abortLifecycleTransition(transitionID: transitionID)
+            self?.lifecycleReadinessTimeoutWorkItem = nil
+            self?.handleLifecycleReadinessTimeout(transitionID: transitionID)
         }
-        lifecycleTransitionTimeoutWorkItem = workItem
+        lifecycleReadinessTimeoutWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.readinessTimeout, execute: workItem)
+    }
+
+    private func handleLifecycleReadinessTimeout(transitionID: UInt64) {
+        guard let handoff = activeLifecycleHandoff,
+              handoff.id == transitionID,
+              !handoff.transitionVisible || (handoff.transitionEnded && !handoff.destinationVisible) else {
+            return
+        }
+        logger.error(
+            "event=lifecycle_transition_readiness_timeout transition_id=\(transitionID, privacy: .public)"
+        )
+        startLifecycleDestination(transitionID: transitionID)
+        if activeLifecycleHandoff?.destinationVisible == true {
+            promoteLifecycleDestination(transitionID: transitionID)
+        } else {
+            cancelLifecycleHandoff(notifyFailure: true)
+        }
+    }
+
+    private func scheduleLifecyclePlaybackStallTimeout(transitionID: UInt64) {
+        guard suspensionPolicy.canStartReadinessDeadline else { return }
+        lifecyclePlaybackStallTimeoutWorkItem?.cancel()
+        lifecyclePlaybackStallTimeoutWorkItem = nil
+        if var handoff = activeLifecycleHandoff, handoff.id == transitionID {
+            let currentTime = handoff.transitionPlayer.currentTime().seconds
+            handoff.lastObservedTransitionTime = currentTime.isFinite ? currentTime : 0
+            activeLifecycleHandoff = handoff
+        }
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.lifecyclePlaybackStallTimeoutWorkItem = nil
+            self?.handleLifecyclePlaybackStallTimeout(transitionID: transitionID)
+        }
+        lifecyclePlaybackStallTimeoutWorkItem = workItem
         DispatchQueue.main.asyncAfter(
-            deadline: DispatchTime(uptimeNanoseconds: LifecycleTransitionDeadline.uptimeNanoseconds(
-                startedAt: startedAt
-            )),
+            deadline: .now() + Self.lifecyclePlaybackStallTimeout,
             execute: workItem
         )
     }
 
-    private func abortLifecycleTransition(transitionID: UInt64) {
-        guard lifecycleTransitionEndID == transitionID,
-              activeLifecycleHandoff?.id == transitionID else { return }
-        logger.error("event=lifecycle_transition_timeout transition_id=\(transitionID, privacy: .public)")
+    private func handleLifecyclePlaybackStallTimeout(transitionID: UInt64) {
+        guard var handoff = activeLifecycleHandoff,
+              handoff.id == transitionID,
+              handoff.transitionVisible,
+              !handoff.transitionEnded else { return }
+        let currentTime = handoff.transitionPlayer.currentTime().seconds
+        if currentTime.isFinite,
+           currentTime > handoff.lastObservedTransitionTime + 0.01 {
+            handoff.lastObservedTransitionTime = currentTime
+            activeLifecycleHandoff = handoff
+            scheduleLifecyclePlaybackStallTimeout(transitionID: transitionID)
+            return
+        }
+        logger.error(
+            "event=lifecycle_transition_playback_stalled transition_id=\(transitionID, privacy: .public)"
+        )
+        handoff.transitionEnded = true
+        activeLifecycleHandoff = handoff
+        view.lifecycleTransitionPlayerLayer.isHidden = true
         startLifecycleDestination(transitionID: transitionID)
         if activeLifecycleHandoff?.destinationVisible == true {
             promoteLifecycleDestination(transitionID: transitionID)
-            return
+        } else {
+            scheduleLifecycleReadinessTimeout(transitionID: transitionID)
         }
-        cancelLifecycleHandoff(notifyFailure: true)
+    }
+
+    /// Deterministic test seam for the same fail-closed action used by the
+    /// readiness work item; kept internal to the Statelet module.
+    func fireLifecycleReadinessTimeoutForTesting(transitionID: UInt64) {
+        handleLifecycleReadinessTimeout(transitionID: transitionID)
+    }
+
+    var hasPendingLifecycleReadinessTimeoutForTesting: Bool {
+        lifecycleReadinessTimeoutWorkItem != nil
+    }
+
+    func fireLifecyclePlaybackStallTimeoutForTesting(transitionID: UInt64) {
+        if var handoff = activeLifecycleHandoff, handoff.id == transitionID {
+            let currentTime = handoff.transitionPlayer.currentTime().seconds
+            handoff.lastObservedTransitionTime = currentTime.isFinite ? currentTime : 0
+            activeLifecycleHandoff = handoff
+        }
+        handleLifecyclePlaybackStallTimeout(transitionID: transitionID)
+    }
+
+    var hasPendingLifecyclePlaybackStallTimeoutForTesting: Bool {
+        lifecyclePlaybackStallTimeoutWorkItem != nil
     }
 
     private func invalidateActiveTransition() {
@@ -2189,8 +2280,10 @@ final class PetPlayerController {
         oneShotEndTransitionID = nil
         playlistEndTransitionID = nil
         lifecycleTransitionEndID = nil
-        lifecycleTransitionTimeoutWorkItem?.cancel()
-        lifecycleTransitionTimeoutWorkItem = nil
+        lifecycleReadinessTimeoutWorkItem?.cancel()
+        lifecycleReadinessTimeoutWorkItem = nil
+        lifecyclePlaybackStallTimeoutWorkItem?.cancel()
+        lifecyclePlaybackStallTimeoutWorkItem = nil
         itemStatusObservation = nil
         observedCurrentItemIdentifier = nil
         readyItemIdentifier = nil
