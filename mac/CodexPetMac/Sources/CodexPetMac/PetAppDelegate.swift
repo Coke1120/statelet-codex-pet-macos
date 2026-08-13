@@ -1204,6 +1204,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         advanceSelection: Bool
     ) -> Bool {
         guard !reduceMotion,
+              let mediaMapURL,
               let transitionPlaylist = mediaMap.transitionPlaylist(from: source, to: destination)
         else {
             return false
