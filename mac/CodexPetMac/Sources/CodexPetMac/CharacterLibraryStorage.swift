@@ -980,12 +980,24 @@ private extension MediaMap {
                 )
             )
         })
+        let inStateTransitions = try Dictionary(uniqueKeysWithValues: self.inStateTransitions.map { state, entry in
+            (
+                state,
+                try MediaEntry(
+                    path: transform(entry.path),
+                    posterPath: try entry.posterPath.map(transform),
+                    loop: false,
+                    playbackRate: entry.playbackRate.value
+                )
+            )
+        })
         return try MediaMap(
             version: version,
             defaultFormat: defaultFormat,
             window: window,
             states: states,
-            transitions: transitions
+            transitions: transitions,
+            inStateTransitions: inStateTransitions
         )
     }
 }
