@@ -58,7 +58,9 @@ jobs:
           fi
 
       - name: Run Swift tests
-        run: swift test -c release --package-path mac/CodexPetMac
+        run: >-
+          swift test -c release --package-path mac/CodexPetMac
+          --skip PetPlayerPlaybackIntegrationTests
 
       - name: Run Swift core self-test
         run: swift run --package-path mac/CodexPetMac -c release codex-pet-core-self-test

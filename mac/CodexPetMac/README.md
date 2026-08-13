@@ -631,6 +631,20 @@ The full `swift test` command requires Xcode/XCTest. Command Line Tools alone
 can build the app and run the core self-test but may not provide the XCTest
 module.
 
+The AVPlayer integration suite writes and decodes real movies and therefore
+requires a logged-in, GUI-capable Mac. Opt in explicitly on such a machine:
+
+```bash
+STATELET_RUN_AVPLAYER_INTEGRATION=1 swift test -c release \
+  --package-path mac/CodexPetMac \
+  --filter PetPlayerPlaybackIntegrationTests
+```
+
+Hosted CI still compiles that suite, but excludes it from execution because the
+hosted macOS decoder service can abort the test process before XCTest reports a
+failure. The deterministic playback-policy, lifecycle reducer, and PetPlayer UI
+tests continue to run normally.
+
 The signed app invokes the bundled converter with Python `-B` and sets
 `PYTHONDONTWRITEBYTECODE=1`. Preserve both controls when changing or debugging
 the launcher; they prevent Python bytecode caches from modifying signed app

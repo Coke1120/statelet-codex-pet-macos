@@ -4,6 +4,13 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 PET_PLAYER = ROOT / "mac/CodexPetMac/Sources/CodexPetMac/PetPlayer.swift"
+PLAYBACK_INTEGRATION_TESTS = (
+    ROOT / "mac/CodexPetMac/Tests/CodexPetMacTests/PetPlayerPlaybackTests.swift"
+)
+PLAYBACK_HEADLESS_TESTS = (
+    ROOT / "mac/CodexPetMac/Tests/CodexPetMacTests/PetPlayerPlaybackHeadlessTests.swift"
+)
+CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 
 
 def source() -> str:
@@ -11,6 +18,19 @@ def source() -> str:
 
 
 class PetPlayerPlaybackSourceTests(unittest.TestCase):
+    def test_hosted_ci_excludes_only_opt_in_avplayer_integration_tests(self) -> None:
+        integration = PLAYBACK_INTEGRATION_TESTS.read_text(encoding="utf-8")
+        headless = PLAYBACK_HEADLESS_TESTS.read_text(encoding="utf-8")
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn("final class PetPlayerPlaybackIntegrationTests", integration)
+        self.assertIn('STATELET_RUN_AVPLAYER_INTEGRATION"] == "1"', integration)
+        self.assertIn("final class PetPlayerPlaybackHeadlessTests", headless)
+        self.assertNotIn("writeTestMovie", headless)
+        self.assertNotIn("AVPlayer", headless)
+        self.assertIn("--skip PetPlayerPlaybackIntegrationTests", workflow)
+        self.assertNotIn("--skip PetPlayerPlaybackHeadlessTests", workflow)
+
     def test_looper_resume_is_deferred_until_current_item_arrives(self) -> None:
         text = source()
 
