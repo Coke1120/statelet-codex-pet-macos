@@ -108,6 +108,59 @@ final class SettingsWindowControllerTests: XCTestCase {
         }
     }
 
+    func testHelpAndPromptsSectionsRemainDistinctAndExposeUpdateControls() throws {
+        let controller = SettingsWindowController()
+        let window = try XCTUnwrap(controller.window)
+        controller.show()
+        Self.pumpMainRunLoop(for: 0.1)
+        defer {
+            window.close()
+            Self.pumpMainRunLoop(for: 0.05)
+        }
+
+        let tabs = try XCTUnwrap(
+            Self.descendants(of: window.contentView).compactMap { $0 as? NSSegmentedControl }.first {
+                $0.accessibilityLabel() == "Settings section"
+            }
+        )
+        XCTAssertEqual(tabs.segmentCount, 8)
+        XCTAssertEqual(tabs.label(forSegment: 5), "Help")
+        XCTAssertEqual(tabs.label(forSegment: 6), "Prompts")
+
+        tabs.selectedSegment = 5
+        NSApp.sendAction(tabs.action!, to: tabs.target, from: tabs)
+        Self.pumpMainRunLoop(for: 0.05)
+        XCTAssertNotNil(
+            Self.descendants(of: window.contentView).compactMap { $0 as? NSTextField }.first {
+                $0.stringValue == "Using Statelet"
+            }
+        )
+        XCTAssertNotNil(
+            Self.descendants(of: window.contentView).compactMap { $0 as? NSButton }.first {
+                $0.accessibilityLabel() == "Check for Statelet updates"
+            }
+        )
+        XCTAssertNotNil(
+            Self.descendants(of: window.contentView).compactMap { $0 as? NSButton }.first {
+                $0.accessibilityLabel() == "Automatically install verified updates"
+            }
+        )
+        XCTAssertNotNil(
+            Self.descendants(of: window.contentView).compactMap { $0 as? NSButton }.first {
+                $0.accessibilityLabel() == "Cancel Statelet update"
+            }
+        )
+
+        tabs.selectedSegment = 6
+        NSApp.sendAction(tabs.action!, to: tabs.target, from: tabs)
+        Self.pumpMainRunLoop(for: 0.05)
+        XCTAssertNotNil(
+            Self.descendants(of: window.contentView).compactMap { $0 as? NSTextField }.first {
+                $0.stringValue == "Generate conversion-friendly animation"
+            }
+        )
+    }
+
     func testInitialPaneDoesNotInflateRequestedWindowSize() throws {
         let controller = SettingsWindowController()
         let window = try XCTUnwrap(controller.window)

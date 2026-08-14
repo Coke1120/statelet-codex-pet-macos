@@ -40,6 +40,7 @@ use, not a Developer ID-signed or notarized public binary.
   posters, appearance controls, diagnostics, and recoverable media cleanup.
 - Supports an optional character-owned same-state transition for each lifecycle
   state, triggered only by automatic continuous `clip_end` rotation.
+- Includes a dedicated Settings → Help guide and privacy-safe in-app update checks.
 - Runs the lifecycle publisher with the Python standard library; Python media
   packages are needed only for optional MP4 conversion.
 

@@ -7,6 +7,13 @@ The first public release is source-only. The maintained build script produces
 an ad-hoc-signed `.app` for personal local use. It does not produce a DMG,
 Developer ID signature, notarization ticket, or App Store package.
 
+The in-app updater follows the same boundary: it will show release metadata,
+but it will not install an artifact until the signed release build embeds the
+authorized Developer ID team identifier in `StateletUpdateSigningTeamIdentifier`
+and publishes a matching `Statelet*.zip` with a GitHub SHA-256 digest. This
+prevents the current source-only/ad-hoc build from treating an arbitrary
+trusted certificate as a Statelet publisher.
+
 ## Choose a deployment path
 
 | Goal | Procedure | Result |

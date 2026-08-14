@@ -171,6 +171,21 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         return true
     }
 
+    /// Update installation must wait for voice imports, validation, generation,
+    /// and playback to finish. The activity text is intentionally treated as a
+    /// conservative busy signal because several operations span async tasks.
+    var isBusyForUpdateInstall: Bool {
+        if activeGenerationTask != nil || activeImportTask != nil || profileValidationTask != nil {
+            return true
+        }
+        if audioPlayer.isPlaying || automaticPlaybackTask != nil {
+            return true
+        }
+        let busyPrefixes = ["importing ", "validating ", "generating ", "refreshing ", "playing "]
+        guard let activity = activityMessage?.lowercased() else { return false }
+        return busyPrefixes.contains { activity.hasPrefix($0) }
+    }
+
     init(
         applicationSupportRoot: URL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(StateletIdentity.applicationSupportRelativePath, isDirectory: true),

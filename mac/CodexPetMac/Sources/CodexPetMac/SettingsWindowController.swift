@@ -207,6 +207,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     var onRepairInstallation: (() -> Void)?
     var onLaunchAtLoginChange: ((Bool) -> Void)?
     var onCleanUnusedMedia: (() -> Void)?
+    var onCheckForUpdates: (() -> Void)?
+    var onCancelUpdate: (() -> Void)?
+    var onInstallUpdate: (() -> Void)?
+    var onAutomaticInstallChange: ((Bool) -> Void)?
     var onImportVoiceAsset: ((DialogueVoiceAssetKind, DialogueVoiceProfileDraft) -> Void)?
     var onSaveVoiceProfile: ((DialogueVoiceProfileDraft) -> Void)?
     var onRemoveVoiceProfile: ((GPTSoVITSVoiceProfile) -> Void)?
@@ -239,7 +243,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     var onTransitionModeChange: ((TransitionLibraryScope, PetState, PetState, MediaPlaybackMode) -> Void)?
     var onSetFixedTransition: ((TransitionLibraryScope, PetState, PetState, String) -> Void)?
 
-    private let tabs = NSSegmentedControl(labels: ["Animations", "Voice", "Appearance", "General", "Diagnostics", "Prompts", "Recommendation"], trackingMode: .selectOne, target: nil, action: nil)
+    private let tabs = NSSegmentedControl(labels: ["Animations", "Voice", "Appearance", "General", "Diagnostics", "Help", "Prompts", "Recommendation"], trackingMode: .selectOne, target: nil, action: nil)
     private let paneHost = NSView()
     private let animationsPane = SettingsAnimationsPaneView()
     private let dialogueVoiceView = DialogueVoiceSettingsView()
@@ -247,6 +251,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let generalPane = NSView()
     private let diagnosticsPane = NSView()
     private let helpPane = NSView()
+    private let promptsPane = NSView()
     private let recommendationPane = NSView()
     private let publisherLabel = NSTextField(labelWithString: "Lifecycle status: Checking")
     private let characterSelector = CharacterProfileSelectorView()
@@ -289,6 +294,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let reduceMotionLabel = NSTextField(labelWithString: "Reduce Motion: Checking")
     private let helpStatePopup = NSPopUpButton()
     private let helpPromptTextView = NSTextView()
+    private let updateStatusLabel = NSTextField(wrappingLabelWithString: "Checking for updates…")
+    private let updateVersionLabel = NSTextField(labelWithString: "Installed version: Checking…")
+    private let updateNotesLabel = NSTextField(wrappingLabelWithString: "")
+    private let updateProgress = NSProgressIndicator()
+    private let checkForUpdatesButton = NSButton(title: "Check Now", target: nil, action: nil)
+    private let cancelUpdateButton = NSButton(title: "Cancel", target: nil, action: nil)
+    private let installUpdateButton = NSButton(title: "Install Update", target: nil, action: nil)
+    private let automaticInstallCheckbox = NSButton(checkboxWithTitle: "Automatically install verified updates at the next safe restart", target: nil, action: nil)
     private let diagnosticsTextView = NSTextView()
     private let launchAtLoginCheckbox = NSButton(checkboxWithTitle: "Start Statelet when I log in", target: nil, action: nil)
     private let launchAtLoginLabel = NSTextField(wrappingLabelWithString: "Checking…")
@@ -443,6 +456,31 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         dialogueVoiceView.update(snapshot: snapshot)
     }
 
+    func update(update snapshot: StateletUpdateSnapshot) {
+        let installed = snapshot.installedVersion
+        if let candidate = snapshot.candidateVersion {
+            updateVersionLabel.stringValue = "Installed: \(installed) · Available: \(candidate)"
+        } else {
+            updateVersionLabel.stringValue = "Installed version: \(installed)"
+        }
+        updateStatusLabel.stringValue = snapshot.status
+        let status = snapshot.status.lowercased()
+        updateStatusLabel.textColor = status.contains("unable") || status.contains("could not") || status.contains("failed")
+            ? .systemRed
+            : (snapshot.isReadyToInstall ? .systemGreen : .secondaryLabelColor)
+        updateNotesLabel.stringValue = snapshot.releaseNotes ?? ""
+        updateNotesLabel.isHidden = snapshot.releaseNotes == nil
+        updateProgress.isHidden = snapshot.progress == nil
+        if let progress = snapshot.progress {
+            updateProgress.doubleValue = min(max(progress, 0), 1) * 100
+        }
+        checkForUpdatesButton.isEnabled = !snapshot.isChecking
+        cancelUpdateButton.isEnabled = snapshot.isChecking
+        installUpdateButton.isEnabled = snapshot.isReadyToInstall && !snapshot.isChecking
+        automaticInstallCheckbox.state = snapshot.automaticInstallEnabled ? .on : .off
+        automaticInstallCheckbox.isEnabled = !snapshot.isChecking
+    }
+
     func update(
         activity: SettingsActivity,
         progressValue: Double? = nil,
@@ -514,6 +552,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         generalPane.translatesAutoresizingMaskIntoConstraints = false
         diagnosticsPane.translatesAutoresizingMaskIntoConstraints = false
         helpPane.translatesAutoresizingMaskIntoConstraints = false
+        promptsPane.translatesAutoresizingMaskIntoConstraints = false
         recommendationPane.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(tabs)
         contentView.addSubview(paneHost)
@@ -543,6 +582,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         buildGeneralPane()
         buildDiagnosticsPane()
         buildHelpPane()
+        buildPromptsPane()
         buildRecommendationPane()
         changePane()
     }
@@ -1125,6 +1165,120 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func buildHelpPane() {
+        let title = NSTextField(labelWithString: "Using Statelet")
+        title.font = .systemFont(ofSize: 18, weight: .semibold)
+        let introduction = NSTextField(wrappingLabelWithString: "Statelet is a local-first Codex companion. This guide keeps the supported workflow, recovery paths and privacy boundary in one place.")
+        introduction.textColor = .secondaryLabelColor
+
+        let quickStart = makeSection(
+            title: "First launch",
+            content: NSTextField(wrappingLabelWithString: "Open the Statelet menu-bar icon and choose Settings. Start with Animations → Idle, import a verified MP4 that you own or are authorized to use, then restart Codex if it was already running when Statelet was installed. If click-through is enabled, the menu-bar icon remains the recovery path.")
+        )
+        let lifecycle = makeSection(
+            title: "Lifecycle states",
+            content: NSTextField(wrappingLabelWithString: "Idle means no active Codex turn. Running means Codex is working. Waiting means Codex needs input or permission. Review means tests, lint, type checks or review work are active. Statelet keeps these records local and does not store prompts or tool output.")
+        )
+        let media = makeSection(
+            title: "Animation and voice",
+            content: NSTextField(wrappingLabelWithString: "Animation imports run through HEVC-with-alpha and playback validation. Use the Animations pane for playlists, transitions and Reduce Motion posters. Voice providers run locally; model files, reference audio, dialogue and generated speech stay in private Application Support and are never bundled in releases.")
+        )
+        let recovery = makeSection(
+            title: "Recovery and diagnostics",
+            content: NSTextField(wrappingLabelWithString: "Use Diagnostics → Refresh when startup, conversion or lifecycle data looks stale. Repair Startup only touches Statelet-managed LaunchAgents. The app keeps the current media and settings when a conversion, update check or installation step fails.")
+        )
+
+        let docsButton = NSButton(title: "Open Usage Guide", target: self, action: #selector(openUsageGuide))
+        docsButton.bezelStyle = .rounded
+        docsButton.setAccessibilityLabel("Open Statelet usage guide")
+        let releaseButton = NSButton(title: "Open Releases", target: self, action: #selector(openReleasesPage))
+        releaseButton.bezelStyle = .rounded
+        releaseButton.setAccessibilityLabel("Open Statelet releases")
+        let supportButton = NSButton(title: "Open Support", target: self, action: #selector(openSupportPage))
+        supportButton.bezelStyle = .rounded
+        supportButton.setAccessibilityLabel("Open Statelet support")
+        let links = NSStackView(views: [docsButton, releaseButton, supportButton])
+        links.orientation = .horizontal
+        links.alignment = .centerY
+        links.spacing = 8
+
+        updateVersionLabel.stringValue = "Installed version: \(StateletVersion.current().description)"
+        updateVersionLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)
+        updateStatusLabel.textColor = .secondaryLabelColor
+        updateStatusLabel.setAccessibilityLabel("Update status")
+        checkForUpdatesButton.target = self
+        checkForUpdatesButton.action = #selector(checkForUpdates)
+        checkForUpdatesButton.bezelStyle = .rounded
+        checkForUpdatesButton.setAccessibilityLabel("Check for Statelet updates")
+        cancelUpdateButton.target = self
+        cancelUpdateButton.action = #selector(cancelUpdate)
+        cancelUpdateButton.bezelStyle = .rounded
+        cancelUpdateButton.isEnabled = false
+        cancelUpdateButton.setAccessibilityLabel("Cancel Statelet update")
+        installUpdateButton.target = self
+        installUpdateButton.action = #selector(installUpdate)
+        installUpdateButton.bezelStyle = .rounded
+        installUpdateButton.isEnabled = false
+        installUpdateButton.setAccessibilityLabel("Install verified Statelet update")
+        automaticInstallCheckbox.target = self
+        automaticInstallCheckbox.action = #selector(automaticInstallChanged)
+        automaticInstallCheckbox.setAccessibilityLabel("Automatically install verified updates")
+        automaticInstallCheckbox.setAccessibilityHelp("Download verified updates in the background and install them only at a safe restart boundary.")
+        updateProgress.isIndeterminate = false
+        updateProgress.isHidden = true
+        updateProgress.controlSize = .small
+        let updateButtons = NSStackView(views: [checkForUpdatesButton, cancelUpdateButton, installUpdateButton])
+        updateButtons.orientation = .horizontal
+        updateButtons.alignment = .centerY
+        updateButtons.spacing = 8
+        updateNotesLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        updateNotesLabel.textColor = .secondaryLabelColor
+        updateNotesLabel.isHidden = true
+        let updateStack = NSStackView(views: [updateVersionLabel, updateStatusLabel, updateNotesLabel, updateProgress, updateButtons, automaticInstallCheckbox])
+        updateStack.orientation = .vertical
+        updateStack.alignment = .leading
+        updateStack.spacing = 8
+        let updateBox = makeSection(title: "Updates", content: updateStack)
+
+        let stack = NSStackView(views: [title, introduction, quickStart, lifecycle, media, recovery, links, updateBox])
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 14
+        for view in [quickStart, lifecycle, media, recovery, updateBox] {
+            view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+
+        let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.borderType = .noBorder
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+        scroll.setAccessibilityLabel("Settings pane scroll area")
+        let document = NSView()
+        document.translatesAutoresizingMaskIntoConstraints = false
+        scroll.documentView = document
+        document.addSubview(stack)
+        helpPane.addSubview(scroll)
+        NSLayoutConstraint.activate([
+            scroll.leadingAnchor.constraint(equalTo: helpPane.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: helpPane.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: helpPane.topAnchor),
+            scroll.bottomAnchor.constraint(equalTo: helpPane.bottomAnchor),
+            document.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            document.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
+            document.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            document.heightAnchor.constraint(greaterThanOrEqualTo: scroll.contentView.heightAnchor),
+            stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 4),
+            stack.leadingAnchor.constraint(equalTo: document.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: document.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -4),
+        ])
+    }
+
+    private func buildPromptsPane() {
         let title = NSTextField(labelWithString: "Generate conversion-friendly animation")
         title.font = .systemFont(ofSize: 18, weight: .semibold)
         let introduction = NSTextField(wrappingLabelWithString: "Use these copy-ready prompts with an authorized video generator. Replace [CHARACTER DESCRIPTION] with your character, and only use media you own or are authorized to use.")
@@ -1163,6 +1317,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         scroll.borderType = .bezelBorder
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
+        scroll.setAccessibilityLabel("Settings pane scroll area")
         scroll.documentView = helpPromptTextView
 
         let checklist = NSTextField(wrappingLabelWithString: "Before import, inspect the generated MP4. The first and last frames should be pixel-identical for a seamless loop. Require a completely uniform RGB #00FF00 pure green background; no white background, scene, floor, material texture, shadow, reflection, particles, text, logo, watermark. Also reject cuts, camera movement, gradients, motion blur, green spill on the character, or any foreground touching the frame edge.")
@@ -1171,26 +1326,26 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         for view in [title, introduction, promptControls, checklist] {
             view.translatesAutoresizingMaskIntoConstraints = false
-            helpPane.addSubview(view)
+            promptsPane.addSubview(view)
         }
-        helpPane.addSubview(scroll)
+        promptsPane.addSubview(scroll)
         NSLayoutConstraint.activate([
-            title.topAnchor.constraint(equalTo: helpPane.topAnchor, constant: 4),
-            title.leadingAnchor.constraint(equalTo: helpPane.leadingAnchor),
-            title.trailingAnchor.constraint(equalTo: helpPane.trailingAnchor),
+            title.topAnchor.constraint(equalTo: promptsPane.topAnchor, constant: 4),
+            title.leadingAnchor.constraint(equalTo: promptsPane.leadingAnchor),
+            title.trailingAnchor.constraint(equalTo: promptsPane.trailingAnchor),
             introduction.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 8),
-            introduction.leadingAnchor.constraint(equalTo: helpPane.leadingAnchor),
-            introduction.trailingAnchor.constraint(equalTo: helpPane.trailingAnchor),
+            introduction.leadingAnchor.constraint(equalTo: promptsPane.leadingAnchor),
+            introduction.trailingAnchor.constraint(equalTo: promptsPane.trailingAnchor),
             promptControls.topAnchor.constraint(equalTo: introduction.bottomAnchor, constant: 14),
-            promptControls.leadingAnchor.constraint(equalTo: helpPane.leadingAnchor),
+            promptControls.leadingAnchor.constraint(equalTo: promptsPane.leadingAnchor),
             scroll.topAnchor.constraint(equalTo: promptControls.bottomAnchor, constant: 10),
-            scroll.leadingAnchor.constraint(equalTo: helpPane.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: helpPane.trailingAnchor),
+            scroll.leadingAnchor.constraint(equalTo: promptsPane.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: promptsPane.trailingAnchor),
             scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 330),
             checklist.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 12),
-            checklist.leadingAnchor.constraint(equalTo: helpPane.leadingAnchor),
-            checklist.trailingAnchor.constraint(equalTo: helpPane.trailingAnchor),
-            checklist.bottomAnchor.constraint(lessThanOrEqualTo: helpPane.bottomAnchor),
+            checklist.leadingAnchor.constraint(equalTo: promptsPane.leadingAnchor),
+            checklist.trailingAnchor.constraint(equalTo: promptsPane.trailingAnchor),
+            checklist.bottomAnchor.constraint(lessThanOrEqualTo: promptsPane.bottomAnchor),
         ])
         updateHelpPrompt()
     }
@@ -1624,6 +1779,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             generalPane,
             diagnosticsPane,
             helpPane,
+            promptsPane,
             recommendationPane,
         ]
         let index = max(0, min(tabs.selectedSegment, panes.count - 1))
@@ -1693,6 +1849,31 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     @objc private func helpStateChanged() { updateHelpPrompt() }
+
+    @objc private func checkForUpdates() { onCheckForUpdates?() }
+
+    @objc private func cancelUpdate() { onCancelUpdate?() }
+
+    @objc private func installUpdate() { onInstallUpdate?() }
+
+    @objc private func automaticInstallChanged() {
+        onAutomaticInstallChange?(automaticInstallCheckbox.state == .on)
+    }
+
+    @objc private func openUsageGuide() {
+        guard let url = URL(string: "https://github.com/Coke1120/statelet-codex-pet-macos/blob/main/docs/USAGE.md") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc private func openReleasesPage() {
+        guard let url = URL(string: "https://github.com/Coke1120/statelet-codex-pet-macos/releases") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc private func openSupportPage() {
+        guard let url = URL(string: "https://github.com/Coke1120/statelet-codex-pet-macos/issues") else { return }
+        NSWorkspace.shared.open(url)
+    }
 
     @objc private func copyHelpPrompt() {
         let pasteboard = NSPasteboard.general

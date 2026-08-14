@@ -50,15 +50,17 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         cls.gitignore = read(ROOT / ".gitignore")
         cls.ci = read(ROOT / ".github" / "workflows" / "ci.yml")
 
-    def test_voice_is_the_seventh_accessible_settings_pane(self) -> None:
+    def test_voice_help_and_prompts_are_distinct_accessible_settings_panes(self) -> None:
         tab_match = re.search(
             r"NSSegmentedControl\(labels:\s*\[(?P<labels>[^]]+)\]",
             self.settings,
         )
         self.assertIsNotNone(tab_match, "Settings tab labels were not found")
         labels = re.findall(r'"([^"]+)"', tab_match.group("labels"))
-        self.assertEqual(len(labels), 7)
+        self.assertEqual(len(labels), 8)
         self.assertEqual(labels[1], "Voice")
+        self.assertEqual(labels[5], "Help")
+        self.assertEqual(labels[6], "Prompts")
         self.assertIn("dialogueVoiceView,", self.settings)
         self.assertIn("let selectedPane = panes[index]", self.settings)
         self.assertIn("paneHost.addSubview(selectedPane)", self.settings)

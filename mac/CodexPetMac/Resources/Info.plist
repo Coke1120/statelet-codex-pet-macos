@@ -43,6 +43,8 @@
 	<string>13</string>
 	<key>StateletManaged</key>
 	<string>statelet-v2</string>
+	<key>StateletUpdateSigningTeamIdentifier</key>
+	<string>$(STATELET_UPDATE_SIGNING_TEAM_IDENTIFIER)</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>LSUIElement</key>
