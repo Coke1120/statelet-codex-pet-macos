@@ -818,6 +818,8 @@ enum Qwen3TTSProfileValidator {
         var token: String { launcher.token + ":" + target.path + ":" + targetIdentity.token }
     }
 
+    private static let maximumPythonLauncherResolutionSteps = 32
+
     private static func pythonLauncherIdentity(_ url: URL) throws -> PythonLauncherIdentity {
         var launcherStatus = stat()
         guard Darwin.lstat(url.path, &launcherStatus) == 0 else {
@@ -828,15 +830,7 @@ enum Qwen3TTSProfileValidator {
         if kind == mode_t(S_IFREG) {
             target = url
         } else if kind == mode_t(S_IFLNK) {
-            var buffer = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
-            let length = Darwin.readlink(url.path, &buffer, Int(PATH_MAX))
-            guard length > 0 else { throw DialogueVoiceRuntimeError.inferenceUnavailable }
-            let raw = String(decoding: buffer.prefix(length).map(UInt8.init(bitPattern:)), as: UTF8.self)
-            guard raw.hasPrefix("/"), !raw.contains("/../"), !raw.hasSuffix("/..") else {
-                throw DialogueVoiceRuntimeError.inferenceUnavailable
-            }
-            target = URL(fileURLWithPath: raw).standardizedFileURL
-            guard target.path == raw else { throw DialogueVoiceRuntimeError.inferenceUnavailable }
+            target = try resolvePythonLauncherTarget(startingAt: url)
         } else {
             throw DialogueVoiceRuntimeError.inferenceUnavailable
         }
@@ -848,6 +842,51 @@ enum Qwen3TTSProfileValidator {
             launcher: DialogueVoiceFileIdentity(launcherStatus), target: target,
             targetIdentity: DialogueVoiceFileIdentity(targetStatus)
         )
+    }
+
+    private static func resolvePythonLauncherTarget(startingAt launcher: URL) throws -> URL {
+        var candidate = launcher
+        var visited = Set<String>()
+        for _ in 0..<maximumPythonLauncherResolutionSteps {
+            guard visited.insert(candidate.path).inserted else {
+                throw DialogueVoiceRuntimeError.inferenceUnavailable
+            }
+            var status = stat()
+            guard Darwin.lstat(candidate.path, &status) == 0 else {
+                throw DialogueVoiceRuntimeError.inferenceUnavailable
+            }
+            let kind = status.st_mode & mode_t(S_IFMT)
+            if kind == mode_t(S_IFREG) { return candidate }
+            guard kind == mode_t(S_IFLNK) else {
+                throw DialogueVoiceRuntimeError.inferenceUnavailable
+            }
+            var buffer = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
+            let length = Darwin.readlink(candidate.path, &buffer, Int(PATH_MAX))
+            guard length > 0, length < Int(PATH_MAX) else {
+                throw DialogueVoiceRuntimeError.inferenceUnavailable
+            }
+            let raw = String(
+                decoding: buffer.prefix(length).map(UInt8.init(bitPattern:)),
+                as: UTF8.self
+            )
+            if raw.hasPrefix("/") {
+                let absolute = URL(fileURLWithPath: raw).standardizedFileURL
+                guard absolute.path == raw else {
+                    throw DialogueVoiceRuntimeError.inferenceUnavailable
+                }
+                candidate = absolute
+            } else {
+                let components = raw.split(separator: "/", omittingEmptySubsequences: false)
+                guard !components.contains("..") else {
+                    throw DialogueVoiceRuntimeError.inferenceUnavailable
+                }
+                candidate = URL(
+                    fileURLWithPath: raw,
+                    relativeTo: candidate.deletingLastPathComponent()
+                ).standardizedFileURL.absoluteURL
+            }
+        }
+        throw DialogueVoiceRuntimeError.inferenceUnavailable
     }
 
     static func computePackageTreeSHA256(packageRoot: URL) throws -> String {

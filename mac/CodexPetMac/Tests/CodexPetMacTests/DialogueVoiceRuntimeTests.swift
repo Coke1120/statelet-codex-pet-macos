@@ -899,27 +899,138 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         XCTAssertTrue(waitForProcessExit(publishedChild), "leader descendant escaped finalization")
     }
 
-    func testQwenPythonRuntimeIdentityPreservesRegularAndAbsoluteSymlinkInvocation() throws {
+    func testQwenPythonRuntimeIdentityPreservesLegacyRegularAndAbsoluteSymlinkTokens() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let executable = root.appendingPathComponent("python-real")
-        let launcher = root.appendingPathComponent("python-venv")
+        let absoluteLauncher = root.appendingPathComponent("python-absolute")
         try Data("fixture python".utf8).write(to: executable)
         XCTAssertEqual(chmod(executable.path, 0o700), 0)
-        XCTAssertEqual(symlink(executable.path, launcher.path), 0)
+        XCTAssertEqual(symlink(executable.path, absoluteLauncher.path), 0)
 
         let regular = try Qwen3TTSProfileValidator.validatePythonExecutable(at: executable)
-        let linked = try Qwen3TTSProfileValidator.validatePythonExecutable(at: launcher)
+        let absolute = try Qwen3TTSProfileValidator.validatePythonExecutable(at: absoluteLauncher)
+        let executableToken = try legacyVoiceFileIdentityToken(at: executable)
+        let launcherToken = try legacyVoiceFileIdentityToken(at: absoluteLauncher)
         XCTAssertEqual(regular.invocationPath, executable.path)
-        XCTAssertEqual(linked.invocationPath, launcher.path)
-        XCTAssertEqual(regular.finalTargetSHA256, linked.finalTargetSHA256)
-        XCTAssertNotEqual(regular.stableIdentityToken, linked.stableIdentityToken)
+        XCTAssertEqual(absolute.invocationPath, absoluteLauncher.path)
         XCTAssertEqual(
-            Qwen3TTSProfileValidator.computeInputFingerprint(components: ["a", "bc"]),
-            Qwen3TTSProfileValidator.computeInputFingerprint(components: ["a", "bc"])
+            regular.stableIdentityToken,
+            "\(executableToken):\(executable.path):\(executableToken)"
         )
+        XCTAssertEqual(
+            absolute.stableIdentityToken,
+            "\(launcherToken):\(executable.path):\(executableToken)"
+        )
+        XCTAssertEqual(regular.finalTargetSHA256, absolute.finalTargetSHA256)
+    }
+
+    func testQwenPythonRuntimeIdentityAcceptsDirectRelativeSymlink() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let executable = root.appendingPathComponent("python-real")
+        let launcher = root.appendingPathComponent("python-relative")
+        try Data("fixture python".utf8).write(to: executable)
+        XCTAssertEqual(chmod(executable.path, 0o700), 0)
+        XCTAssertEqual(symlink(executable.lastPathComponent, launcher.path), 0)
+
+        let regular = try Qwen3TTSProfileValidator.validatePythonExecutable(at: executable)
+        let relative = try Qwen3TTSProfileValidator.validatePythonExecutable(at: launcher)
+        XCTAssertEqual(relative.invocationPath, launcher.path)
+        XCTAssertEqual(relative.finalTargetSHA256, regular.finalTargetSHA256)
+    }
+
+    func testQwenPythonRuntimeIdentityAcceptsChainedVirtualenvLauncher() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let executable = root.appendingPathComponent("python-real")
+        let launcher = root.appendingPathComponent("python")
+        let intermediate = root.appendingPathComponent("python3")
+        try Data("fixture python".utf8).write(to: executable)
+        XCTAssertEqual(chmod(executable.path, 0o700), 0)
+        XCTAssertEqual(symlink("python3", launcher.path), 0)
+        XCTAssertEqual(symlink(executable.path, intermediate.path), 0)
+
+        let regular = try Qwen3TTSProfileValidator.validatePythonExecutable(at: executable)
+        let venv = try Qwen3TTSProfileValidator.validatePythonExecutable(at: launcher)
+        XCTAssertEqual(venv.invocationPath, launcher.path)
+        XCTAssertEqual(venv.finalTargetSHA256, regular.finalTargetSHA256)
+    }
+
+    func testQwenPythonRuntimeIdentityRejectsParentTraversalTargets() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let launcherRoot = root.appendingPathComponent("launcher", isDirectory: true)
+        let attackerRoot = root.appendingPathComponent("attacker", isDirectory: true)
+        let pivotTarget = attackerRoot.appendingPathComponent("pivot-target", isDirectory: true)
+        let nested = launcherRoot.appendingPathComponent("nested", isDirectory: true)
+        for directory in [launcherRoot, pivotTarget, nested] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        let localExecutable = launcherRoot.appendingPathComponent("python-real")
+        let attackerExecutable = attackerRoot.appendingPathComponent("python-real")
+        let pivot = launcherRoot.appendingPathComponent("pivot")
+        let relativeLauncher = launcherRoot.appendingPathComponent("python-relative")
+        let absoluteLauncher = launcherRoot.appendingPathComponent("python-absolute")
+        try Data("validated local python".utf8).write(to: localExecutable)
+        try Data("unvalidated attacker python".utf8).write(to: attackerExecutable)
+        XCTAssertEqual(chmod(localExecutable.path, 0o700), 0)
+        XCTAssertEqual(chmod(attackerExecutable.path, 0o700), 0)
+        try FileManager.default.createSymbolicLink(at: pivot, withDestinationURL: pivotTarget)
+        XCTAssertEqual(symlink("pivot/../python-real", relativeLauncher.path), 0)
+        XCTAssertEqual(
+            symlink("\(launcherRoot.path)/nested/../python-real", absoluteLauncher.path),
+            0
+        )
+
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: relativeLauncher.path))
+        XCTAssertEqual(
+            try Data(contentsOf: relativeLauncher),
+            try Data(contentsOf: attackerExecutable)
+        )
+        assertQwenRuntimeUnavailable(at: relativeLauncher)
+        assertQwenRuntimeUnavailable(at: absoluteLauncher)
+    }
+
+    func testQwenPythonRuntimeIdentityRejectsDanglingAndCyclicSymlinks() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let dangling = root.appendingPathComponent("python-dangling")
+        let firstLoop = root.appendingPathComponent("python-loop-a")
+        let secondLoop = root.appendingPathComponent("python-loop-b")
+        XCTAssertEqual(symlink("missing-python", dangling.path), 0)
+        XCTAssertEqual(symlink(secondLoop.lastPathComponent, firstLoop.path), 0)
+        XCTAssertEqual(symlink(firstLoop.lastPathComponent, secondLoop.path), 0)
+
+        assertQwenRuntimeUnavailable(at: dangling)
+        assertQwenRuntimeUnavailable(at: firstLoop)
+    }
+
+    func testQwenPythonRuntimeIdentityRejectsExcessiveSymlinkDepth() throws {
+        let root = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let executable = root.appendingPathComponent("python-real")
+        try Data("fixture python".utf8).write(to: executable)
+        XCTAssertEqual(chmod(executable.path, 0o700), 0)
+        let excessive = try makeRelativeSymlinkChain(
+            count: 64,
+            prefix: "rejected",
+            root: root,
+            target: executable
+        )
+
+        assertQwenRuntimeUnavailable(at: excessive)
     }
 
     func testFingerprintIsStableAndChangesWithEverySynthesisInput() throws {
@@ -1842,6 +1953,60 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             line: line
         )
         XCTAssertEqual(number.doubleValue, expected, accuracy: 0.000_001, file: file, line: line)
+    }
+
+    private func assertQwenRuntimeUnavailable(
+        at url: URL,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertThrowsError(
+            try Qwen3TTSProfileValidator.validatePythonExecutable(at: url),
+            file: file,
+            line: line
+        ) { error in
+            XCTAssertEqual(
+                error as? DialogueVoiceRuntimeError,
+                .inferenceUnavailable,
+                file: file,
+                line: line
+            )
+        }
+    }
+
+    private func makeRelativeSymlinkChain(
+        count: Int,
+        prefix: String,
+        root: URL,
+        target: URL
+    ) throws -> URL {
+        precondition(count > 0)
+        let links = (0..<count).map { root.appendingPathComponent("\(prefix)-\($0)") }
+        for index in links.indices {
+            let destination = index == links.index(before: links.endIndex)
+                ? target.path
+                : links[links.index(after: index)].lastPathComponent
+            guard symlink(destination, links[index].path) == 0 else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+            }
+        }
+        return links[0]
+    }
+
+    private func legacyVoiceFileIdentityToken(at url: URL) throws -> String {
+        var status = stat()
+        guard Darwin.lstat(url.path, &status) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        return [
+            UInt64(status.st_dev),
+            UInt64(status.st_ino),
+            UInt64(bitPattern: Int64(status.st_size)),
+            UInt64(bitPattern: Int64(status.st_mtimespec.tv_sec)),
+            UInt64(bitPattern: Int64(status.st_mtimespec.tv_nsec)),
+            UInt64(bitPattern: Int64(status.st_ctimespec.tv_sec)),
+            UInt64(bitPattern: Int64(status.st_ctimespec.tv_nsec)),
+        ].map(String.init).joined(separator: ":")
     }
 
     private func readPublishedPID(_ url: URL) -> Int32? {
