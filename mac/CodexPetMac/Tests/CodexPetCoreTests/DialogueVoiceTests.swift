@@ -56,7 +56,7 @@ final class DialogueVoiceTests: XCTestCase {
             id: UUID(uuidString: "CCCCCCCC-DDDD-EEEE-FFFF-000000000000")!,
             revision: revision,
             name: "VoxCPM2 Test Voice",
-            snapshotPath: "/opt/statelet/VoxCPM2",
+            snapshotPath: "voice/packages/voxcpm2/12345678-1234-1234-1234-123456789abc",
             snapshotTreeSHA256: String(repeating: "7", count: 64),
             pythonExecutablePath: "/opt/statelet/venv/bin/python",
             pythonExecutableSHA256: String(repeating: "8", count: 64),
@@ -950,7 +950,8 @@ final class DialogueVoiceTests: XCTestCase {
 
     func testVoxCPM2ProviderPersistsCompletePinnedProfile() throws {
         let provisional = try VoxCPM2VoiceProfile(
-            name: "VoxCPM2 Voice", snapshotPath: "/private/models/VoxCPM2",
+            name: "VoxCPM2 Voice",
+            snapshotPath: "voice/packages/voxcpm2/12345678-1234-1234-1234-123456789abc",
             snapshotTreeSHA256: String(repeating: "a", count: 64),
             pythonExecutablePath: "/private/venv/bin/python",
             pythonExecutableSHA256: String(repeating: "b", count: 64),
@@ -964,8 +965,19 @@ final class DialogueVoiceTests: XCTestCase {
         )
         XCTAssertEqual(decoded.activeProviderKind, .voxcpm2)
         XCTAssertEqual(decoded.voxcpm2Profile, provisional)
+        XCTAssertTrue(decoded.referencedManagedPaths.contains(provisional.snapshotPath))
         XCTAssertTrue(decoded.referencedManagedPaths.contains(provisional.referenceAudioRelativePath))
         XCTAssertEqual(provisional.parameters, .verifiedDefaults)
+
+        var legacyObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(provisional))
+                as? [String: Any]
+        )
+        legacyObject["snapshotPath"] = "/private/models/VoxCPM2"
+        let legacyData = try JSONSerialization.data(withJSONObject: legacyObject)
+        XCTAssertThrowsError(try JSONDecoder().decode(VoxCPM2VoiceProfile.self, from: legacyData)) {
+            XCTAssertEqual($0 as? DialogueVoiceError, .invalidManagedPath)
+        }
     }
 
     func testVoxCPM2RejectsExternalReferenceAndUnsafeRuntimePaths() throws {
@@ -977,6 +989,17 @@ final class DialogueVoiceTests: XCTestCase {
             referenceAudioRelativePath: "voice/assets/reference/ref.wav",
             referenceAudioSHA256: String(repeating: "c", count: 64),
             referenceText: "reference", inputFingerprint: String(repeating: "d", count: 64)
+        ))
+        XCTAssertThrowsError(try VoxCPM2VoiceProfile(
+            name: "Vox",
+            snapshotPath: "voice/packages/voxcpm2/not-a-uuid",
+            snapshotTreeSHA256: String(repeating: "a", count: 64),
+            pythonExecutablePath: "/models/python",
+            pythonExecutableSHA256: String(repeating: "b", count: 64),
+            referenceAudioRelativePath: "voice/assets/voxcpm2-reference/ref.wav",
+            referenceAudioSHA256: String(repeating: "c", count: 64),
+            referenceText: "reference",
+            inputFingerprint: String(repeating: "d", count: 64)
         ))
         XCTAssertThrowsError(try VoxCPM2SynthesisParameters(loadDenoiser: true))
         XCTAssertThrowsError(try VoxCPM2SynthesisParameters(optimize: true))

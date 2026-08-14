@@ -220,12 +220,12 @@ lifecycle state is presented, Statelet shows its selected message on the pet
 and plays ready audio without interrupting speech already in progress; the
 latest state-entry voice waits until the active clip finishes. Voice Setup
 supports local GPT-SoVITS, Qwen3-TTS, and VoxCPM2 profiles. Profiles may remain
-configured, while one selected provider is active. Imported assets and Qwen
-packages are copied into private Application Support storage; the large
-VoxCPM2 snapshot remains in its selected external folder and is bound by a
-complete-tree fingerprint. None of these private inputs is added to the
-repository or release bundle. Persisted fingerprints bind model, reference,
-language, settings, and runtime inputs and are revalidated at launch.
+configured, while one selected provider is active. Imported assets, Qwen
+packages, and VoxCPM2 snapshots are copied into private Application Support
+storage and bound by complete-tree fingerprints. None of these private inputs
+is added to the repository or release bundle. Persisted fingerprints bind
+model, reference, language, settings, and runtime inputs and are revalidated at
+launch.
 
 GPT-SoVITS accepts separate user-selected GPT `.ckpt` and SoVITS `.pth` weights,
 reference inputs, and a numeric-loopback API v2 endpoint such as
@@ -233,7 +233,7 @@ reference inputs, and a numeric-loopback API v2 endpoint such as
 the Python executable from a trusted local MLX Audio environment. Qwen runs
 locally with offline model-loading flags, accepts Japanese lines of 500
 characters or fewer, and publishes only validated 24 kHz mono PCM16 WAV output.
-VoxCPM2 accepts the complete external handover folder (not only
+VoxCPM2 accepts the complete source handover folder (not only
 `model.safetensors`), one WAV reference and its exact transcript, plus a
 trusted Python runtime. Its bounded offline probe loads the snapshot, reports
 only a sanitized `mps`, `cuda`, or `cpu` device category, and requires a 48 kHz
@@ -296,7 +296,7 @@ a public report.
 - No TTS runtime, model weights, reference recordings, dialogue, or generated
   speech is bundled. Voice generation requires either a user-managed local
   GPT-SoVITS API v2 service, a trusted local Qwen3-TTS handover, or a complete
-  external VoxCPM2 handover with a working Python environment.
+  VoxCPM2 handover with a working Python environment.
 - MP4 conversion needs additional local tools and can take several minutes
   because every accepted delivery passes Apple round-trip and all-frame checks.
 - Statelet exposes four lifecycle states and one active decoder.

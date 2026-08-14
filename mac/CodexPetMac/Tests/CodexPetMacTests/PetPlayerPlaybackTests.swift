@@ -110,17 +110,23 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
             .appendingPathComponent("statelet-same-state-transition-test-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let movieURL = directory.appendingPathComponent("same-state.mov")
-        try Self.writeTestMovie(to: movieURL)
+        let outgoingURL = directory.appendingPathComponent("same-state-outgoing.mov")
+        let transitionURL = directory.appendingPathComponent("same-state-transition.mov")
+        let destinationURL = directory.appendingPathComponent("same-state-destination.mov")
+        for url in [outgoingURL, transitionURL, destinationURL] {
+            try Self.writeTestMovie(to: url)
+        }
 
         let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         let controller = PetPlayerController(view: view)
-        let entry = try MediaEntry(path: movieURL.lastPathComponent)
+        let outgoingEntry = try MediaEntry(path: outgoingURL.lastPathComponent)
+        let transitionEntry = try MediaEntry(path: transitionURL.lastPathComponent)
+        let destinationEntry = try MediaEntry(path: destinationURL.lastPathComponent)
         XCTAssertEqual(
             controller.show(
                 state: .running,
-                entry: entry,
-                url: movieURL,
+                entry: outgoingEntry,
+                url: outgoingURL,
                 posterURL: nil,
                 transitionID: 143,
                 startedAt: DispatchTime.now().uptimeNanoseconds,
@@ -129,7 +135,7 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
             .preparing
         )
         try Self.waitUntil("same-state outgoing presentation did not become ready") {
-            controller.currentURL == movieURL
+            controller.currentURL == outgoingURL
         }
         let outgoingPlayer = try XCTUnwrap(view.playerLayer.player)
         var endedIDs: [UInt64] = []
@@ -139,11 +145,11 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
             controller.showLifecycleTransition(
                 sourceState: .running,
                 destinationState: .running,
-                transitionEntry: entry,
-                transitionURL: movieURL,
-                transitionAttestation: try Self.testTransitionAttestation(for: movieURL),
-                destinationEntry: entry,
-                destinationURL: movieURL,
+                transitionEntry: transitionEntry,
+                transitionURL: transitionURL,
+                transitionAttestation: try Self.testTransitionAttestation(for: transitionURL),
+                destinationEntry: destinationEntry,
+                destinationURL: destinationURL,
                 transitionID: 144,
                 startedAt: DispatchTime.now().uptimeNanoseconds,
                 advancePlaylistWhenEnded: true
@@ -168,7 +174,9 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
                 && view.destinationPlayerLayer.isHidden
         }
         XCTAssertEqual(controller.currentState, .running)
-        XCTAssertEqual(controller.currentURL, movieURL)
+        XCTAssertEqual(controller.currentURL, destinationURL)
+        XCTAssertNotEqual(controller.currentURL, outgoingURL)
+        XCTAssertNotEqual(controller.currentURL, transitionURL)
         XCTAssertFalse(view.playerLayer.isHidden)
         XCTAssertNil(view.lifecycleTransitionPlayerLayer.player)
         controller.clearTransientPresentation()

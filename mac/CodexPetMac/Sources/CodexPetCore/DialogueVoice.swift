@@ -153,9 +153,26 @@ private enum DialogueVoiceValidation {
             "voice/assets/sovits/",
             "voice/assets/reference/",
             "voice/packages/qwen/",
+            "voice/packages/voxcpm2/",
             "voice/assets/voxcpm2-reference/",
             "voice/generated/",
         ].contains(where: { path.hasPrefix($0) }) else {
+            throw DialogueVoiceError.invalidManagedPath
+        }
+        return path
+    }
+
+    static func voxCPM2SnapshotPath(_ value: String) throws -> String {
+        let path = try managedPath(value)
+        let components = path.split(separator: "/", omittingEmptySubsequences: false)
+        guard components.count == 4,
+              components[0] == "voice",
+              components[1] == "packages",
+              components[2] == "voxcpm2" else {
+            throw DialogueVoiceError.invalidManagedPath
+        }
+        let token = String(components[3])
+        guard UUID(uuidString: token) != nil, token == token.lowercased() else {
             throw DialogueVoiceError.invalidManagedPath
         }
         return path
@@ -219,8 +236,9 @@ public struct VoxCPM2SynthesisParameters: Codable, Equatable, Sendable {
     }
 }
 
-/// A pinned, local-only VoxCPM2 zero-shot profile. The large snapshot remains
-/// external by design; its canonical tree digest is revalidated before use.
+/// A pinned, local-only VoxCPM2 zero-shot profile. `snapshotPath` retains its
+/// persisted field name for schema compatibility, but stores only a managed
+/// Application Support-relative package path.
 public struct VoxCPM2VoiceProfile: Codable, Equatable, Sendable {
     public let id: UUID
     public let revision: Int
@@ -246,7 +264,7 @@ public struct VoxCPM2VoiceProfile: Codable, Equatable, Sendable {
         guard revision > 0 else { throw DialogueVoiceError.invalidProfile }
         self.id = id; self.revision = revision
         self.name = try DialogueVoiceValidation.nonBlank(name, maximum: DialogueVoiceValidation.maximumLabelLength, error: .invalidProfile)
-        self.snapshotPath = try DialogueVoiceValidation.absoluteExecutablePath(snapshotPath)
+        self.snapshotPath = try DialogueVoiceValidation.voxCPM2SnapshotPath(snapshotPath)
         self.snapshotTreeSHA256 = try DialogueVoiceValidation.sha256(snapshotTreeSHA256)
         self.pythonExecutablePath = try DialogueVoiceValidation.absoluteExecutablePath(pythonExecutablePath)
         self.pythonExecutableSHA256 = try DialogueVoiceValidation.sha256(pythonExecutableSHA256)
@@ -261,11 +279,40 @@ public struct VoxCPM2VoiceProfile: Codable, Equatable, Sendable {
     }
 
     public var inputFingerprintComponents: [String] {
-        ["statelet-voxcpm2-profile-v1", snapshotPath, snapshotTreeSHA256,
+        ["statelet-voxcpm2-profile-v2", snapshotPath, snapshotTreeSHA256,
          pythonExecutablePath, pythonExecutableSHA256, referenceAudioRelativePath,
          referenceAudioSHA256, referenceText, defaultTextLanguage,
          String(parameters.cfgValue), String(parameters.inferenceTimesteps),
          String(parameters.seed), String(parameters.loadDenoiser), String(parameters.optimize)]
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, revision, name, snapshotPath, snapshotTreeSHA256
+        case pythonExecutablePath, pythonExecutableSHA256
+        case referenceAudioRelativePath, referenceAudioSHA256, referenceText
+        case defaultTextLanguage, parameters, inputFingerprint
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            id: container.decode(UUID.self, forKey: .id),
+            revision: container.decode(Int.self, forKey: .revision),
+            name: container.decode(String.self, forKey: .name),
+            snapshotPath: container.decode(String.self, forKey: .snapshotPath),
+            snapshotTreeSHA256: container.decode(String.self, forKey: .snapshotTreeSHA256),
+            pythonExecutablePath: container.decode(String.self, forKey: .pythonExecutablePath),
+            pythonExecutableSHA256: container.decode(String.self, forKey: .pythonExecutableSHA256),
+            referenceAudioRelativePath: container.decode(
+                String.self,
+                forKey: .referenceAudioRelativePath
+            ),
+            referenceAudioSHA256: container.decode(String.self, forKey: .referenceAudioSHA256),
+            referenceText: container.decode(String.self, forKey: .referenceText),
+            defaultTextLanguage: container.decode(String.self, forKey: .defaultTextLanguage),
+            parameters: container.decode(VoxCPM2SynthesisParameters.self, forKey: .parameters),
+            inputFingerprint: container.decode(String.self, forKey: .inputFingerprint)
+        )
     }
 }
 
@@ -1392,7 +1439,10 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
         if let qwenProfile {
             paths.insert(qwenProfile.packageRootRelativePath)
         }
-        if let voxcpm2Profile { paths.insert(voxcpm2Profile.referenceAudioRelativePath) }
+        if let voxcpm2Profile {
+            paths.insert(voxcpm2Profile.snapshotPath)
+            paths.insert(voxcpm2Profile.referenceAudioRelativePath)
+        }
         return paths
     }
 

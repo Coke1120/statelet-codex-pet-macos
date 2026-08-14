@@ -388,7 +388,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         qwenGrid.column(at: 1).xPlacement = .fill
         let qwenActions = buttonRow([importQwenButton, useQwenButton, removeQwenButton])
         let voxTitle = sectionTitle("VOXCPM2 PROFILE")
-        let voxHelp = helpLabel("Pin a trusted external VoxCPM2 snapshot and Python runtime, copy one private reference WAV, and enter its exact transcript.")
+        let voxHelp = helpLabel("Privately import a trusted VoxCPM2 snapshot, select its Python runtime and reference WAV, then enter the exact transcript.")
         let voxGrid = NSGridView(views: [
             [fieldLabel("Provider status"), voxStatusLabel],
             [fieldLabel("Snapshot"), voxSnapshotLabel],
@@ -634,9 +634,9 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             (importQwenButton, #selector(importQwenProfile), "Import Qwen handover package", "Choose a trusted self-contained Qwen3-TTS handover package and Python runtime for private local use."),
             (useQwenButton, #selector(useQwenProfile), "Use Qwen3-TTS", "Make the configured Qwen3-TTS profile the active voice provider."),
             (removeQwenButton, #selector(removeQwenProfile), "Remove Qwen profile", "Remove the configured Qwen3-TTS profile after confirmation by the app."),
-            (importVoxButton, #selector(importVoxProfile), "Configure VoxCPM2", "Choose the trusted snapshot, reference WAV, and Python runtime."),
+            (importVoxButton, #selector(importVoxProfile), "Configure VoxCPM2", "Choose the trusted snapshot to copy privately, its reference WAV, and Python runtime."),
             (useVoxButton, #selector(useVoxProfile), "Use VoxCPM2", "Make the configured VoxCPM2 profile active."),
-            (removeVoxButton, #selector(removeVoxProfile), "Remove VoxCPM2 profile", "Remove its private reference and generated speech after confirmation."),
+            (removeVoxButton, #selector(removeVoxProfile), "Remove VoxCPM2 profile", "Remove its managed snapshot, private reference, and generated speech after confirmation."),
             (addLineButton, #selector(addLine), "Add dialogue line", "Save this text as a new line and request pre-generation."),
             (updateLineButton, #selector(updateLine), "Update selected dialogue line", "Save changes to the selected line and request new audio."),
             (clearEditorButton, #selector(clearEditor), "Clear dialogue editor", "Clear the editor and selection without deleting a saved line."),

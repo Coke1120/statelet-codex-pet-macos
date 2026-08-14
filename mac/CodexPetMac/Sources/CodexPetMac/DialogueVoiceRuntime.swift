@@ -427,6 +427,7 @@ struct Qwen3TTSPackageInstaller: Sendable {
             throw DialogueVoiceRuntimeError.invalidSource
         }
         defer { Darwin.closedir(stream) }
+        Darwin.rewinddir(stream)
         while let entry = Darwin.readdir(stream) {
             let name = withUnsafePointer(to: &entry.pointee.d_name) { pointer in
                 pointer.withMemoryRebound(to: CChar.self, capacity: Int(MAXNAMLEN) + 1) {
@@ -656,6 +657,929 @@ struct Qwen3TTSPackageInstaller: Sendable {
         return file
     }
 
+}
+
+enum VoxCPM2SnapshotTree {
+    static let maximumBytes: UInt64 = 8_589_934_592
+    static let maximumEntryCount = 100_000
+    static let maximumDepth = 32
+    static let requiredFiles = ["model.safetensors", "audiovae.pth", "config.json"]
+    static let tokenizerCandidates = [
+        "tokenization_voxcpm2.py", "tokenizer.json", "tokenizer_config.json",
+    ]
+
+    enum ModelLayout: Equatable {
+        case root
+        case nested
+    }
+
+    struct Snapshot: Equatable {
+        let digest: String
+        let identityTokens: [String]
+        let usesNestedModelRoot: Bool
+    }
+
+    private struct Entry {
+        let relativePath: String
+        let size: UInt64
+        let digest: String
+    }
+
+    private struct Budget {
+        var bytes: UInt64 = 0
+        var entries = 0
+    }
+
+    static func checkedEntryCount(_ value: Int) throws -> Int {
+        guard value <= maximumEntryCount else {
+            throw DialogueVoiceRuntimeError.sourceTooLarge
+        }
+        return value
+    }
+
+    static func checkedDepth(_ value: Int) throws -> Int {
+        guard value <= maximumDepth else {
+            throw DialogueVoiceRuntimeError.invalidSource
+        }
+        return value
+    }
+
+    static func validatedModelLayout(relativePaths: [String]) throws -> ModelLayout {
+        let names = Set(relativePaths)
+        let rootComplete = requiredFiles.allSatisfy(names.contains)
+            && tokenizerCandidates.contains(where: names.contains)
+        let nestedComplete = requiredFiles.allSatisfy { names.contains("model/\($0)") }
+            && tokenizerCandidates.contains { names.contains("model/\($0)") }
+        guard rootComplete != nestedComplete else {
+            throw DialogueVoiceRuntimeError.profileRejected
+        }
+        return nestedComplete ? .nested : .root
+    }
+
+    static func scan(
+        rootDescriptor: Int32,
+        hashChunkObserver: (@Sendable () -> Void)? = nil
+    ) throws -> Snapshot {
+        try Task.checkCancellation()
+        var rootStatus = stat()
+        guard Darwin.fstat(rootDescriptor, &rootStatus) == 0,
+              rootStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
+            throw DialogueVoiceRuntimeError.invalidSource
+        }
+        let rootIdentity = DialogueVoiceFileIdentity(rootStatus)
+        var budget = Budget()
+        var entries: [Entry] = []
+        try scanDirectory(
+            descriptor: rootDescriptor,
+            prefix: "",
+            depth: 0,
+            budget: &budget,
+            entries: &entries,
+            hashChunkObserver: hashChunkObserver
+        )
+        var finalRootStatus = stat()
+        guard budget.bytes > 0,
+              Darwin.fstat(rootDescriptor, &finalRootStatus) == 0,
+              DialogueVoiceFileIdentity(finalRootStatus) == rootIdentity else {
+            throw DialogueVoiceRuntimeError.sourceChanged
+        }
+        let sorted = entries.sorted { $0.relativePath < $1.relativePath }
+        let layout = try validatedModelLayout(relativePaths: sorted.map(\.relativePath))
+        let components = sorted.flatMap { [$0.relativePath, $0.digest] }
+        let digest = Qwen3TTSProfileValidator.computeInputFingerprint(components: components)
+        return Snapshot(
+            digest: digest,
+            identityTokens: ["root:\(rootIdentity.token)"] + sorted.map {
+                "\($0.relativePath):\($0.size):\($0.digest)"
+            },
+            usesNestedModelRoot: layout == .nested
+        )
+    }
+
+    private static func scanDirectory(
+        descriptor: Int32,
+        prefix: String,
+        depth: Int,
+        budget: inout Budget,
+        entries: inout [Entry],
+        hashChunkObserver: (@Sendable () -> Void)?
+    ) throws {
+        try Task.checkCancellation()
+        _ = try checkedDepth(depth)
+        var initialStatus = stat()
+        guard Darwin.fstat(descriptor, &initialStatus) == 0,
+              initialStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
+            throw DialogueVoiceRuntimeError.invalidSource
+        }
+        let initialIdentity = DialogueVoiceFileIdentity(initialStatus)
+        let duplicate = Darwin.dup(descriptor)
+        guard duplicate >= 0, let stream = Darwin.fdopendir(duplicate) else {
+            if duplicate >= 0 { Darwin.close(duplicate) }
+            throw DialogueVoiceRuntimeError.invalidSource
+        }
+        defer { Darwin.closedir(stream) }
+        Darwin.rewinddir(stream)
+        while let entry = Darwin.readdir(stream) {
+            try Task.checkCancellation()
+            let name = withUnsafePointer(to: &entry.pointee.d_name) { pointer in
+                pointer.withMemoryRebound(to: CChar.self, capacity: Int(MAXNAMLEN) + 1) {
+                    String(cString: $0)
+                }
+            }
+            guard name != ".", name != ".." else { continue }
+            guard !name.isEmpty,
+                  !name.contains("/"),
+                  !name.contains("\\"),
+                  !name.contains(":") else {
+                throw DialogueVoiceRuntimeError.invalidSource
+            }
+            budget.entries += 1
+            _ = try checkedEntryCount(budget.entries)
+            let relative = prefix.isEmpty ? name : "\(prefix)/\(name)"
+            var status = stat()
+            guard name.withCString({
+                Darwin.fstatat(descriptor, $0, &status, AT_SYMLINK_NOFOLLOW)
+            }) == 0 else {
+                throw DialogueVoiceRuntimeError.invalidSource
+            }
+            let kind = status.st_mode & mode_t(S_IFMT)
+            if kind == mode_t(S_IFDIR) {
+                let child = name.withCString {
+                    Darwin.openat(
+                        descriptor,
+                        $0,
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+                    )
+                }
+                guard child >= 0 else { throw DialogueVoiceRuntimeError.invalidSource }
+                var opened = stat()
+                guard Darwin.fstat(child, &opened) == 0,
+                      DialogueVoiceFileIdentity(opened) == DialogueVoiceFileIdentity(status) else {
+                    Darwin.close(child)
+                    throw DialogueVoiceRuntimeError.sourceChanged
+                }
+                do {
+                    try scanDirectory(
+                        descriptor: child,
+                        prefix: relative,
+                        depth: depth + 1,
+                        budget: &budget,
+                        entries: &entries,
+                        hashChunkObserver: hashChunkObserver
+                    )
+                    Darwin.close(child)
+                } catch {
+                    Darwin.close(child)
+                    throw error
+                }
+                continue
+            }
+            guard kind == mode_t(S_IFREG), status.st_size > 0 else {
+                throw DialogueVoiceRuntimeError.invalidSource
+            }
+            let size = UInt64(status.st_size)
+            let (next, overflow) = budget.bytes.addingReportingOverflow(size)
+            guard !overflow, next <= maximumBytes else {
+                throw DialogueVoiceRuntimeError.sourceTooLarge
+            }
+            budget.bytes = next
+            let fileDescriptor = name.withCString {
+                Darwin.openat(
+                    descriptor,
+                    $0,
+                    O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+                )
+            }
+            guard fileDescriptor >= 0 else {
+                throw DialogueVoiceRuntimeError.invalidSource
+            }
+            var openedStatus = stat()
+            let expectedIdentity = DialogueVoiceFileIdentity(status)
+            guard Darwin.fstat(fileDescriptor, &openedStatus) == 0,
+                  DialogueVoiceFileIdentity(openedStatus) == expectedIdentity else {
+                Darwin.close(fileDescriptor)
+                throw DialogueVoiceRuntimeError.sourceChanged
+            }
+            do {
+                let digest = try hashRegularFile(
+                    descriptor: fileDescriptor,
+                    expectedIdentity: expectedIdentity,
+                    expectedSize: size,
+                    hashChunkObserver: hashChunkObserver
+                )
+                Darwin.close(fileDescriptor)
+                entries.append(Entry(
+                    relativePath: relative,
+                    size: size,
+                    digest: digest
+                ))
+            } catch {
+                Darwin.close(fileDescriptor)
+                throw error
+            }
+        }
+        var finalStatus = stat()
+        guard Darwin.fstat(descriptor, &finalStatus) == 0,
+              DialogueVoiceFileIdentity(finalStatus) == initialIdentity else {
+            throw DialogueVoiceRuntimeError.sourceChanged
+        }
+    }
+
+    private static func hashRegularFile(
+        descriptor: Int32,
+        expectedIdentity: DialogueVoiceFileIdentity,
+        expectedSize: UInt64,
+        hashChunkObserver: (@Sendable () -> Void)?
+    ) throws -> String {
+        var hasher = SHA256()
+        var total: UInt64 = 0
+        var buffer = [UInt8](repeating: 0, count: 1_048_576)
+        while true {
+            try Task.checkCancellation()
+            let count = buffer.withUnsafeMutableBytes {
+                Darwin.read(descriptor, $0.baseAddress, $0.count)
+            }
+            if count == 0 { break }
+            guard count > 0 else {
+                if errno == EINTR { continue }
+                throw DialogueVoiceRuntimeError.invalidSource
+            }
+            total += UInt64(count)
+            guard total <= expectedSize else {
+                throw DialogueVoiceRuntimeError.sourceChanged
+            }
+            hasher.update(data: Data(buffer.prefix(count)))
+            hashChunkObserver?()
+        }
+        var finalStatus = stat()
+        guard total == expectedSize,
+              Darwin.fstat(descriptor, &finalStatus) == 0,
+              DialogueVoiceFileIdentity(finalStatus) == expectedIdentity else {
+            throw DialogueVoiceRuntimeError.sourceChanged
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+private enum VoxCPM2ManagedStorage {
+    private static let packageComponents = ["voice", "packages", "voxcpm2"]
+
+    static func openPackagesRoot(
+        applicationSupportRoot: URL,
+        createIfMissing: Bool
+    ) throws -> Int32 {
+        guard applicationSupportRoot.isFileURL else {
+            throw DialogueVoiceRuntimeError.invalidManagedPath
+        }
+        let standardizedRoot = applicationSupportRoot.standardizedFileURL
+        var namedRootStatus = stat()
+        guard Darwin.lstat(standardizedRoot.path, &namedRootStatus) == 0,
+              namedRootStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
+              namedRootStatus.st_uid == Darwin.geteuid() else {
+            throw DialogueVoiceRuntimeError.invalidManagedPath
+        }
+        var current = Darwin.open(
+            standardizedRoot.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard current >= 0 else { throw DialogueVoiceRuntimeError.invalidManagedPath }
+        var openedRootStatus = stat()
+        guard Darwin.fstat(current, &openedRootStatus) == 0,
+              DialogueVoiceDirectoryIdentity(openedRootStatus)
+                == DialogueVoiceDirectoryIdentity(namedRootStatus) else {
+            Darwin.close(current)
+            throw DialogueVoiceRuntimeError.invalidManagedPath
+        }
+
+        for component in packageComponents {
+            var namedStatus = stat()
+            let statusResult = component.withCString {
+                Darwin.fstatat(current, $0, &namedStatus, AT_SYMLINK_NOFOLLOW)
+            }
+            if statusResult != 0 {
+                guard createIfMissing, errno == ENOENT,
+                      component.withCString({ Darwin.mkdirat(current, $0, 0o700) }) == 0,
+                      Darwin.fsync(current) == 0,
+                      component.withCString({
+                          Darwin.fstatat(current, $0, &namedStatus, AT_SYMLINK_NOFOLLOW)
+                      }) == 0 else {
+                    Darwin.close(current)
+                    throw DialogueVoiceRuntimeError.invalidManagedPath
+                }
+            }
+            guard namedStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
+                  namedStatus.st_uid == Darwin.geteuid() else {
+                Darwin.close(current)
+                throw DialogueVoiceRuntimeError.invalidManagedPath
+            }
+            let next = component.withCString {
+                Darwin.openat(
+                    current,
+                    $0,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+                )
+            }
+            guard next >= 0 else {
+                Darwin.close(current)
+                throw DialogueVoiceRuntimeError.invalidManagedPath
+            }
+            var openedStatus = stat()
+            guard Darwin.fstat(next, &openedStatus) == 0,
+                  DialogueVoiceDirectoryIdentity(openedStatus)
+                    == DialogueVoiceDirectoryIdentity(namedStatus),
+                  Darwin.fchmod(next, mode_t(S_IRWXU)) == 0,
+                  Darwin.fsync(next) == 0 else {
+                Darwin.close(next)
+                Darwin.close(current)
+                throw DialogueVoiceRuntimeError.invalidManagedPath
+            }
+            Darwin.close(current)
+            current = next
+        }
+        return current
+    }
+
+    static func withOpenSnapshot<T>(
+        relativePath: String,
+        applicationSupportRoot: URL,
+        _ body: (Int32, URL) throws -> T
+    ) throws -> T {
+        let components = relativePath.split(separator: "/", omittingEmptySubsequences: false)
+        guard components.count == 4,
+              components[0] == "voice",
+              components[1] == "packages",
+              components[2] == "voxcpm2" else {
+            throw DialogueVoiceRuntimeError.invalidManagedPath
+        }
+        let leaf = String(components[3])
+        guard UUID(uuidString: leaf) != nil, leaf == leaf.lowercased() else {
+            throw DialogueVoiceRuntimeError.invalidManagedPath
+        }
+        let packagesDescriptor = try openPackagesRoot(
+            applicationSupportRoot: applicationSupportRoot,
+            createIfMissing: false
+        )
+        defer { Darwin.close(packagesDescriptor) }
+        var namedStatus = stat()
+        guard leaf.withCString({
+            Darwin.fstatat(packagesDescriptor, $0, &namedStatus, AT_SYMLINK_NOFOLLOW)
+        }) == 0,
+              namedStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
+            throw DialogueVoiceRuntimeError.invalidManagedPath
+        }
+        let snapshotDescriptor = leaf.withCString {
+            Darwin.openat(
+                packagesDescriptor,
+                $0,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+            )
+        }
+        guard snapshotDescriptor >= 0 else {
+            throw DialogueVoiceRuntimeError.invalidManagedPath
+        }
+        defer { Darwin.close(snapshotDescriptor) }
+        var openedStatus = stat()
+        let expectedIdentity = DialogueVoiceDirectoryIdentity(namedStatus)
+        guard Darwin.fstat(snapshotDescriptor, &openedStatus) == 0,
+              DialogueVoiceDirectoryIdentity(openedStatus) == expectedIdentity else {
+            throw DialogueVoiceRuntimeError.invalidManagedPath
+        }
+        let url = applicationSupportRoot.standardizedFileURL
+            .appendingPathComponent(relativePath, isDirectory: true)
+            .standardizedFileURL
+        let result = try body(snapshotDescriptor, url)
+        var finalNamedStatus = stat()
+        guard leaf.withCString({
+            Darwin.fstatat(packagesDescriptor, $0, &finalNamedStatus, AT_SYMLINK_NOFOLLOW)
+        }) == 0,
+              DialogueVoiceDirectoryIdentity(finalNamedStatus) == expectedIdentity else {
+            throw DialogueVoiceRuntimeError.sourceChanged
+        }
+        let verificationPackages = try openPackagesRoot(
+            applicationSupportRoot: applicationSupportRoot,
+            createIfMissing: false
+        )
+        defer { Darwin.close(verificationPackages) }
+        var verificationStatus = stat()
+        guard leaf.withCString({
+            Darwin.fstatat(verificationPackages, $0, &verificationStatus, AT_SYMLINK_NOFOLLOW)
+        }) == 0,
+              DialogueVoiceDirectoryIdentity(verificationStatus) == expectedIdentity else {
+            throw DialogueVoiceRuntimeError.sourceChanged
+        }
+        return result
+    }
+}
+
+struct VoxCPM2ImportedSnapshot: Equatable, Sendable {
+    let snapshotRootRelativePath: String
+    let treeSHA256: String
+}
+
+/// Copies a complete VoxCPM2 handover into Statelet's private Application
+/// Support tree before it can be persisted or executed. All source traversal
+/// and reads are descriptor-bound so a path replacement cannot redirect an
+/// in-progress import.
+struct VoxCPM2SnapshotInstaller: Sendable {
+    private struct SourceFile: Equatable {
+        let relativePath: String
+        let identity: DialogueVoiceFileIdentity
+        let size: UInt64
+    }
+
+    static let maximumPackageBytes = VoxCPM2SnapshotTree.maximumBytes
+    private static let freeSpaceReserveBytes: UInt64 = 268_435_456
+
+    let applicationSupportRoot: URL
+    private let afterPublish: (@Sendable () throws -> Void)?
+
+    init(
+        applicationSupportRoot: URL,
+        afterPublish: (@Sendable () throws -> Void)? = nil
+    ) {
+        self.applicationSupportRoot = applicationSupportRoot
+        self.afterPublish = afterPublish
+    }
+
+    static func managedRelativePaths(destinationToken token: String) throws -> (
+        destination: String,
+        staging: String
+    ) {
+        guard UUID(uuidString: token) != nil, token == token.lowercased() else {
+            throw DialogueVoiceRuntimeError.invalidManagedPath
+        }
+        return (
+            destination: "voice/packages/voxcpm2/\(token)",
+            staging: "voice/packages/voxcpm2/.\(token).partial"
+        )
+    }
+
+    static func checkedAggregateSize(
+        _ sizes: some Sequence<UInt64>,
+        maximum: UInt64 = maximumPackageBytes
+    ) throws -> UInt64 {
+        var total: UInt64 = 0
+        for size in sizes {
+            try Task.checkCancellation()
+            let (next, overflow) = total.addingReportingOverflow(size)
+            guard !overflow, next <= maximum else {
+                throw DialogueVoiceRuntimeError.sourceTooLarge
+            }
+            total = next
+        }
+        guard total > 0 else { throw DialogueVoiceRuntimeError.sourceTooLarge }
+        return total
+    }
+
+    func install(
+        sourceURL: URL,
+        destinationToken: String? = nil
+    ) throws -> VoxCPM2ImportedSnapshot {
+        try Task.checkCancellation()
+        guard sourceURL.isFileURL,
+              sourceURL.host.map({ $0.isEmpty || $0 == "localhost" }) ?? true else {
+            throw DialogueVoiceRuntimeError.invalidSource
+        }
+        let rootDescriptor = Darwin.open(
+            sourceURL.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard rootDescriptor >= 0 else { throw DialogueVoiceRuntimeError.invalidSource }
+        defer { Darwin.close(rootDescriptor) }
+        var rootStatus = stat()
+        guard Darwin.fstat(rootDescriptor, &rootStatus) == 0,
+              rootStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
+            throw DialogueVoiceRuntimeError.invalidSource
+        }
+        let rootIdentity = DialogueVoiceFileIdentity(rootStatus)
+        let files = try enumerate(rootDescriptor)
+        let total = try Self.checkedAggregateSize(files.lazy.map(\.size))
+        try validateRequiredFiles(files.map(\.relativePath))
+
+        let available = try applicationSupportRoot.resourceValues(
+            forKeys: [.volumeAvailableCapacityForImportantUsageKey]
+        ).volumeAvailableCapacityForImportantUsage ?? 0
+        let requiredCapacity = total.addingReportingOverflow(Self.freeSpaceReserveBytes)
+        guard !requiredCapacity.overflow,
+              available > 0,
+              UInt64(available) > requiredCapacity.partialValue else {
+            throw DialogueVoiceRuntimeError.sourceTooLarge
+        }
+
+        let packagesDescriptor = try VoxCPM2ManagedStorage.openPackagesRoot(
+            applicationSupportRoot: applicationSupportRoot,
+            createIfMissing: true
+        )
+        defer { Darwin.close(packagesDescriptor) }
+        var packagesStatus = stat()
+        guard Darwin.fstat(packagesDescriptor, &packagesStatus) == 0,
+              packagesStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
+            throw DialogueVoiceRuntimeError.copyFailed
+        }
+        let packagesIdentity = DialogueVoiceDirectoryIdentity(packagesStatus)
+        let token = destinationToken ?? UUID().uuidString.lowercased()
+        let managedPaths = try Self.managedRelativePaths(destinationToken: token)
+        let stageName = ".\(token).partial"
+        let destinationName = token
+        guard stageName.withCString({ Darwin.mkdirat(packagesDescriptor, $0, 0o700) }) == 0,
+              Darwin.fsync(packagesDescriptor) == 0 else {
+            throw DialogueVoiceRuntimeError.copyFailed
+        }
+        let stageDescriptor = stageName.withCString {
+            Darwin.openat(
+                packagesDescriptor,
+                $0,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+            )
+        }
+        guard stageDescriptor >= 0 else {
+            stageName.withCString { _ = Darwin.unlinkat(packagesDescriptor, $0, AT_REMOVEDIR) }
+            throw DialogueVoiceRuntimeError.copyFailed
+        }
+        defer { Darwin.close(stageDescriptor) }
+        var stageStatus = stat()
+        guard Darwin.fstat(stageDescriptor, &stageStatus) == 0,
+              stageStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
+            throw DialogueVoiceRuntimeError.copyFailed
+        }
+        let stageIdentity = DialogueVoiceDirectoryIdentity(stageStatus)
+        var cleanupPath = managedPaths.staging
+        do {
+            var stagedDigests: [String: String] = [:]
+            for file in files {
+                try Task.checkCancellation()
+                stagedDigests[file.relativePath] = try copyRegularFile(
+                    file,
+                    rootDescriptor: rootDescriptor,
+                    stagingDescriptor: stageDescriptor
+                )
+            }
+            let finalFiles = try enumerate(rootDescriptor)
+            var finalRootStatus = stat()
+            guard finalFiles == files,
+                  Darwin.fstat(rootDescriptor, &finalRootStatus) == 0,
+                  DialogueVoiceFileIdentity(finalRootStatus) == rootIdentity,
+                  Darwin.fsync(stageDescriptor) == 0 else {
+                throw DialogueVoiceRuntimeError.sourceChanged
+            }
+            let treeDigest = Self.treeDigest(stagedDigests)
+
+            var finalPackagesStatus = stat()
+            var finalStageStatus = stat()
+            var namedStageStatus = stat()
+            guard Darwin.fstat(packagesDescriptor, &finalPackagesStatus) == 0,
+                  DialogueVoiceDirectoryIdentity(finalPackagesStatus) == packagesIdentity,
+                  Darwin.fstat(stageDescriptor, &finalStageStatus) == 0,
+                  DialogueVoiceDirectoryIdentity(finalStageStatus) == stageIdentity,
+                  stageName.withCString({
+                      Darwin.fstatat(packagesDescriptor, $0, &namedStageStatus, AT_SYMLINK_NOFOLLOW)
+                  }) == 0,
+                  DialogueVoiceDirectoryIdentity(namedStageStatus) == stageIdentity else {
+                throw DialogueVoiceRuntimeError.copyFailed
+            }
+            guard stageName.withCString({ stagePointer in
+                destinationName.withCString { destinationPointer in
+                    Darwin.renameatx_np(
+                        packagesDescriptor,
+                        stagePointer,
+                        packagesDescriptor,
+                        destinationPointer,
+                        UInt32(RENAME_EXCL)
+                    )
+                }
+            }) == 0 else {
+                throw DialogueVoiceRuntimeError.copyFailed
+            }
+            cleanupPath = managedPaths.destination
+            try afterPublish?()
+            guard Darwin.fsync(packagesDescriptor) == 0 else {
+                throw DialogueVoiceRuntimeError.copyFailed
+            }
+            var publishedStatus = stat()
+            guard destinationName.withCString({
+                Darwin.fstatat(packagesDescriptor, $0, &publishedStatus, AT_SYMLINK_NOFOLLOW)
+            }) == 0,
+                  DialogueVoiceDirectoryIdentity(publishedStatus) == stageIdentity else {
+                throw DialogueVoiceRuntimeError.copyFailed
+            }
+            return VoxCPM2ImportedSnapshot(
+                snapshotRootRelativePath: managedPaths.destination,
+                treeSHA256: treeDigest
+            )
+        } catch {
+            do {
+                try removeManagedPackage(relativePath: cleanupPath)
+            } catch {
+                throw DialogueVoiceRuntimeError.copyFailed
+            }
+            throw error
+        }
+    }
+
+    func removeManagedPackage(relativePath: String) throws {
+        let components = relativePath.split(separator: "/", omittingEmptySubsequences: false)
+        guard components.count == 4,
+              components[0] == "voice",
+              components[1] == "packages",
+              components[2] == "voxcpm2" else {
+            throw DialogueVoiceRuntimeError.invalidManagedPath
+        }
+        let leaf = String(components[3])
+        let token: String
+        if leaf.hasPrefix("."), leaf.hasSuffix(".partial") {
+            token = String(leaf.dropFirst().dropLast(".partial".count))
+        } else {
+            token = leaf
+        }
+        guard UUID(uuidString: token) != nil, token == token.lowercased() else {
+            throw DialogueVoiceRuntimeError.invalidManagedPath
+        }
+        _ = try DialogueVoiceAssetInstaller.removeManagedDirectory(
+            relativePath: relativePath,
+            root: applicationSupportRoot,
+            maximumBytes: Self.maximumPackageBytes
+        )
+    }
+
+    private func validateRequiredFiles(_ relativePaths: [String]) throws {
+        _ = try VoxCPM2SnapshotTree.validatedModelLayout(relativePaths: relativePaths)
+    }
+
+    private func enumerate(_ rootDescriptor: Int32) throws -> [SourceFile] {
+        var result: [SourceFile] = []
+        var entryCount = 0
+        try enumerateDirectory(
+            descriptor: rootDescriptor,
+            prefix: "",
+            depth: 0,
+            entryCount: &entryCount,
+            result: &result
+        )
+        return result.sorted { $0.relativePath < $1.relativePath }
+    }
+
+    private func enumerateDirectory(
+        descriptor: Int32,
+        prefix: String,
+        depth: Int,
+        entryCount: inout Int,
+        result: inout [SourceFile]
+    ) throws {
+        try Task.checkCancellation()
+        guard depth <= VoxCPM2SnapshotTree.maximumDepth else {
+            throw DialogueVoiceRuntimeError.invalidSource
+        }
+        let duplicate = Darwin.dup(descriptor)
+        guard duplicate >= 0, let stream = Darwin.fdopendir(duplicate) else {
+            if duplicate >= 0 { Darwin.close(duplicate) }
+            throw DialogueVoiceRuntimeError.invalidSource
+        }
+        defer { Darwin.closedir(stream) }
+        Darwin.rewinddir(stream)
+        while let entry = Darwin.readdir(stream) {
+            try Task.checkCancellation()
+            let name = withUnsafePointer(to: &entry.pointee.d_name) { pointer in
+                pointer.withMemoryRebound(to: CChar.self, capacity: Int(MAXNAMLEN) + 1) {
+                    String(cString: $0)
+                }
+            }
+            guard name != ".", name != ".." else { continue }
+            guard !name.isEmpty,
+                  !name.contains("/"),
+                  !name.contains("\\"),
+                  !name.contains(":") else {
+                throw DialogueVoiceRuntimeError.invalidSource
+            }
+            entryCount += 1
+            guard entryCount <= VoxCPM2SnapshotTree.maximumEntryCount else {
+                throw DialogueVoiceRuntimeError.sourceTooLarge
+            }
+            let relative = prefix.isEmpty ? name : "\(prefix)/\(name)"
+            var status = stat()
+            guard name.withCString({
+                Darwin.fstatat(descriptor, $0, &status, AT_SYMLINK_NOFOLLOW)
+            }) == 0 else {
+                throw DialogueVoiceRuntimeError.invalidSource
+            }
+            let kind = status.st_mode & mode_t(S_IFMT)
+            if kind == mode_t(S_IFDIR) {
+                let child = name.withCString {
+                    Darwin.openat(
+                        descriptor,
+                        $0,
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+                    )
+                }
+                guard child >= 0 else { throw DialogueVoiceRuntimeError.invalidSource }
+                defer { Darwin.close(child) }
+                var opened = stat()
+                guard Darwin.fstat(child, &opened) == 0,
+                      DialogueVoiceFileIdentity(opened) == DialogueVoiceFileIdentity(status) else {
+                    throw DialogueVoiceRuntimeError.sourceChanged
+                }
+                try enumerateDirectory(
+                    descriptor: child,
+                    prefix: relative,
+                    depth: depth + 1,
+                    entryCount: &entryCount,
+                    result: &result
+                )
+                continue
+            }
+            guard kind == mode_t(S_IFREG), status.st_size > 0 else {
+                throw DialogueVoiceRuntimeError.invalidSource
+            }
+            result.append(SourceFile(
+                relativePath: relative,
+                identity: DialogueVoiceFileIdentity(status),
+                size: UInt64(status.st_size)
+            ))
+        }
+    }
+
+    private func copyRegularFile(
+        _ source: SourceFile,
+        rootDescriptor: Int32,
+        stagingDescriptor: Int32
+    ) throws -> String {
+        try Task.checkCancellation()
+        let sourceDescriptor = try openSourceFile(
+            relativePath: source.relativePath,
+            rootDescriptor: rootDescriptor
+        )
+        defer { Darwin.close(sourceDescriptor) }
+        var sourceStatus = stat()
+        guard Darwin.fstat(sourceDescriptor, &sourceStatus) == 0,
+              DialogueVoiceFileIdentity(sourceStatus) == source.identity else {
+            throw DialogueVoiceRuntimeError.sourceChanged
+        }
+        let destinationParent = try openOrCreateDestinationParent(
+            relativePath: source.relativePath,
+            stagingDescriptor: stagingDescriptor
+        )
+        defer { Darwin.close(destinationParent.descriptor) }
+        let destinationDescriptor = destinationParent.name.withCString {
+            Darwin.openat(
+                destinationParent.descriptor,
+                $0,
+                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                mode_t(S_IRUSR | S_IWUSR)
+            )
+        }
+        guard destinationDescriptor >= 0 else {
+            throw DialogueVoiceRuntimeError.copyFailed
+        }
+        defer { Darwin.close(destinationDescriptor) }
+        var copied: UInt64 = 0
+        var hasher = SHA256()
+        var buffer = [UInt8](repeating: 0, count: 1_048_576)
+        while true {
+            try Task.checkCancellation()
+            let count = buffer.withUnsafeMutableBytes {
+                Darwin.read(sourceDescriptor, $0.baseAddress, $0.count)
+            }
+            if count == 0 { break }
+            guard count > 0 else {
+                if errno == EINTR { continue }
+                throw DialogueVoiceRuntimeError.copyFailed
+            }
+            var offset = 0
+            while offset < count {
+                try Task.checkCancellation()
+                let written = buffer.withUnsafeBytes {
+                    Darwin.write(
+                        destinationDescriptor,
+                        $0.baseAddress?.advanced(by: offset),
+                        count - offset
+                    )
+                }
+                guard written > 0 else {
+                    if written < 0, errno == EINTR { continue }
+                    throw DialogueVoiceRuntimeError.copyFailed
+                }
+                offset += written
+            }
+            copied += UInt64(count)
+            guard copied <= source.size else {
+                throw DialogueVoiceRuntimeError.sourceChanged
+            }
+            hasher.update(data: Data(buffer.prefix(count)))
+        }
+        var finalSource = stat()
+        guard copied == source.size,
+              Darwin.fstat(sourceDescriptor, &finalSource) == 0,
+              DialogueVoiceFileIdentity(finalSource) == source.identity,
+              Darwin.fchmod(destinationDescriptor, mode_t(S_IRUSR | S_IWUSR)) == 0,
+              Darwin.fsync(destinationDescriptor) == 0,
+              Darwin.fsync(destinationParent.descriptor) == 0 else {
+            throw DialogueVoiceRuntimeError.sourceChanged
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func openSourceFile(
+        relativePath: String,
+        rootDescriptor: Int32
+    ) throws -> Int32 {
+        let components = relativePath.split(separator: "/", omittingEmptySubsequences: false)
+        guard !components.isEmpty,
+              components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+            throw DialogueVoiceRuntimeError.invalidSource
+        }
+        var current = Darwin.dup(rootDescriptor)
+        guard current >= 0 else { throw DialogueVoiceRuntimeError.invalidSource }
+        for component in components.dropLast() {
+            try Task.checkCancellation()
+            let next = component.withCString {
+                Darwin.openat(
+                    current,
+                    $0,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+                )
+            }
+            Darwin.close(current)
+            guard next >= 0 else { throw DialogueVoiceRuntimeError.sourceChanged }
+            current = next
+        }
+        let file = components.last!.withCString {
+            Darwin.openat(
+                current,
+                $0,
+                O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+            )
+        }
+        Darwin.close(current)
+        guard file >= 0 else { throw DialogueVoiceRuntimeError.sourceChanged }
+        var status = stat()
+        guard Darwin.fstat(file, &status) == 0,
+              status.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              status.st_size > 0 else {
+            Darwin.close(file)
+            throw DialogueVoiceRuntimeError.invalidSource
+        }
+        return file
+    }
+
+    private func openOrCreateDestinationParent(
+        relativePath: String,
+        stagingDescriptor: Int32
+    ) throws -> (descriptor: Int32, name: String) {
+        let components = relativePath.split(separator: "/", omittingEmptySubsequences: false)
+        guard !components.isEmpty,
+              components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+            throw DialogueVoiceRuntimeError.invalidSource
+        }
+        var current = Darwin.dup(stagingDescriptor)
+        guard current >= 0 else { throw DialogueVoiceRuntimeError.copyFailed }
+        for component in components.dropLast() {
+            try Task.checkCancellation()
+            let opened = component.withCString {
+                Darwin.openat(
+                    current,
+                    $0,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+                )
+            }
+            if opened >= 0 {
+                Darwin.close(current)
+                current = opened
+                continue
+            }
+            guard errno == ENOENT else {
+                Darwin.close(current)
+                throw DialogueVoiceRuntimeError.copyFailed
+            }
+            let mkdirResult = component.withCString {
+                Darwin.mkdirat(current, $0, 0o700)
+            }
+            guard mkdirResult == 0 || errno == EEXIST else {
+                Darwin.close(current)
+                throw DialogueVoiceRuntimeError.copyFailed
+            }
+            if mkdirResult == 0, Darwin.fsync(current) != 0 {
+                Darwin.close(current)
+                throw DialogueVoiceRuntimeError.copyFailed
+            }
+            let created = component.withCString {
+                Darwin.openat(
+                    current,
+                    $0,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+                )
+            }
+            Darwin.close(current)
+            guard created >= 0 else { throw DialogueVoiceRuntimeError.copyFailed }
+            current = created
+        }
+        return (current, String(components.last!))
+    }
+
+    private static func treeDigest(_ digests: [String: String]) -> String {
+        let components = digests.sorted(by: { $0.key < $1.key }).flatMap {
+            [$0.key, $0.value]
+        }
+        return Qwen3TTSProfileValidator.computeInputFingerprint(components: components)
+    }
 }
 
 enum Qwen3TTSProfileValidator {
@@ -1011,16 +1935,14 @@ struct VoxCPM2ProbeResult: Equatable, Sendable {
 }
 
 enum VoxCPM2ProfileValidator {
-    static let maximumSnapshotBytes: UInt64 = 8_589_934_592
-    private static let requiredFiles = ["model.safetensors", "audiovae.pth", "config.json"]
-    private static let tokenizerCandidates = [
-        "tokenization_voxcpm2.py", "tokenizer.json", "tokenizer_config.json",
-    ]
+    static let maximumSnapshotBytes = VoxCPM2SnapshotInstaller.maximumPackageBytes
 
     static func validate(profile: VoxCPM2VoiceProfile, applicationSupportRoot: URL) throws -> VoxCPM2ValidatedProfile {
-        let snapshot = URL(fileURLWithPath: profile.snapshotPath, isDirectory: true).standardizedFileURL
-        guard snapshot.path == profile.snapshotPath else { throw DialogueVoiceRuntimeError.invalidManagedPath }
-        let treeBefore = try snapshotTree(snapshot)
+        try Task.checkCancellation()
+        let treeBefore = try managedSnapshotTree(
+            relativePath: profile.snapshotPath,
+            applicationSupportRoot: applicationSupportRoot
+        )
         guard treeBefore.digest == profile.snapshotTreeSHA256 else { throw DialogueVoiceRuntimeError.inputFingerprintMismatch }
         let runtime = try Qwen3TTSProfileValidator.validatePythonExecutable(
             at: URL(fileURLWithPath: profile.pythonExecutablePath)
@@ -1042,78 +1964,56 @@ enum VoxCPM2ProfileValidator {
         guard referenceDigest == profile.referenceAudioSHA256,
               Qwen3TTSProfileValidator.computeInputFingerprint(components: profile.inputFingerprintComponents)
                 == profile.inputFingerprint else { throw DialogueVoiceRuntimeError.inputFingerprintMismatch }
-        let treeAfter = try snapshotTree(snapshot)
+        let treeAfter = try managedSnapshotTree(
+            relativePath: profile.snapshotPath,
+            applicationSupportRoot: applicationSupportRoot
+        )
         guard treeBefore == treeAfter else { throw DialogueVoiceRuntimeError.sourceChanged }
+        let snapshot = applicationSupportRoot.standardizedFileURL
+            .appendingPathComponent(profile.snapshotPath, isDirectory: true)
+            .standardizedFileURL
         return VoxCPM2ValidatedProfile(
             snapshotRoot: snapshot,
-            modelRoot: modelRoot(snapshot),
+            modelRoot: treeAfter.usesNestedModelRoot
+                ? snapshot.appendingPathComponent("model", isDirectory: true)
+                : snapshot,
             pythonExecutable: URL(fileURLWithPath: runtime.invocationPath),
             referenceAudio: applicationSupportRoot.appendingPathComponent(profile.referenceAudioRelativePath),
             identityTokens: treeAfter.identityTokens + [runtime.stableIdentityToken, referenceIdentity]
         )
     }
 
-    static func computeSnapshotTreeSHA256(snapshotRoot: URL) throws -> String {
-        try snapshotTree(snapshotRoot).digest
-    }
-
-    private static func snapshotTree(_ root: URL) throws -> (digest: String, identityTokens: [String]) {
-        var rootStatus = stat()
-        guard Darwin.lstat(root.path, &rootStatus) == 0,
-              rootStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
-              let enumerator = FileManager.default.enumerator(atPath: root.path) else {
+    static func computeSnapshotTreeSHA256(
+        snapshotRoot: URL,
+        hashChunkObserver: (@Sendable () -> Void)? = nil
+    ) throws -> String {
+        try Task.checkCancellation()
+        guard snapshotRoot.isFileURL else {
             throw DialogueVoiceRuntimeError.invalidSource
         }
-        var entries: [(String, URL, UInt64, String)] = []
-        var total: UInt64 = 0
-        while let relative = enumerator.nextObject() as? String {
-            guard !relative.hasPrefix("/"), !relative.split(separator: "/").contains("..") else {
-                throw DialogueVoiceRuntimeError.invalidSource
-            }
-            let url = root.appendingPathComponent(relative).standardizedFileURL
-            guard url.path.hasPrefix(root.path + "/") else { throw DialogueVoiceRuntimeError.invalidSource }
-            var status = stat()
-            guard Darwin.lstat(url.path, &status) == 0 else { throw DialogueVoiceRuntimeError.invalidSource }
-            let kind = status.st_mode & mode_t(S_IFMT)
-            if kind == mode_t(S_IFDIR) { continue }
-            guard kind == mode_t(S_IFREG), status.st_size > 0 else { throw DialogueVoiceRuntimeError.invalidSource }
-            let size = UInt64(status.st_size)
-            let (next, overflow) = total.addingReportingOverflow(size)
-            guard !overflow, next <= maximumSnapshotBytes else { throw DialogueVoiceRuntimeError.sourceTooLarge }
-            total = next
-            let digest = try Qwen3TTSProfileValidator.sha256FileForVoiceProvider(url, maximumBytes: size)
-            entries.append((relative, url, size, digest))
-        }
-        let names = Set(entries.map(\.0))
-        func containsSnapshotFile(_ name: String) -> Bool {
-            names.contains(name) || names.contains("model/\(name)")
-        }
-        guard requiredFiles.allSatisfy(containsSnapshotFile),
-              tokenizerCandidates.contains(where: containsSnapshotFile) else {
-            throw DialogueVoiceRuntimeError.profileRejected
-        }
-        let components = entries.sorted { $0.0 < $1.0 }.flatMap { [$0.0, $0.3] }
-        let digest = Qwen3TTSProfileValidator.computeInputFingerprint(components: components)
-        let tokens = entries.sorted { $0.0 < $1.0 }.map { "\($0.0):\($0.2):\($0.3)" }
-        return (digest, tokens)
+        let descriptor = Darwin.open(
+            snapshotRoot.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard descriptor >= 0 else { throw DialogueVoiceRuntimeError.invalidSource }
+        defer { Darwin.close(descriptor) }
+        return try VoxCPM2SnapshotTree.scan(
+            rootDescriptor: descriptor,
+            hashChunkObserver: hashChunkObserver
+        ).digest
     }
 
-    private static func modelRoot(_ snapshot: URL) -> URL {
-        let nested = snapshot.appendingPathComponent("model", isDirectory: true)
-        var status = stat()
-        guard Darwin.lstat(nested.path, &status) == 0,
-              status.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else { return snapshot }
-        func isRegular(_ name: String) -> Bool {
-            var nestedStatus = stat()
-            let url = nested.appendingPathComponent(name)
-            return Darwin.lstat(url.path, &nestedStatus) == 0
-                && nestedStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG)
+    private static func managedSnapshotTree(
+        relativePath: String,
+        applicationSupportRoot: URL
+    ) throws -> VoxCPM2SnapshotTree.Snapshot {
+        try VoxCPM2ManagedStorage.withOpenSnapshot(
+            relativePath: relativePath,
+            applicationSupportRoot: applicationSupportRoot
+        ) { descriptor, _ in
+            try VoxCPM2SnapshotTree.scan(rootDescriptor: descriptor)
         }
-        let hasRequired = requiredFiles.allSatisfy(isRegular)
-        let hasTokenizer = tokenizerCandidates.contains(where: isRegular)
-        return hasRequired && hasTokenizer ? nested : snapshot
     }
-
 }
 
 private func qwenPackageURL(relativePath: String, root: URL) throws -> URL {
@@ -1288,7 +2188,31 @@ private struct DialogueVoiceDirectoryIdentity: Equatable {
 struct DialogueVoiceAssetInstaller: Sendable {
     let applicationSupportRoot: URL
 
-    func install(sourceURL: URL, kind: DialogueVoiceAssetKind) throws -> DialogueVoiceInstalledAsset {
+    static func managedRelativePaths(
+        kind: DialogueVoiceAssetKind,
+        destinationToken token: String,
+        fileExtension: String
+    ) throws -> (destination: String, staging: String) {
+        guard let uuid = UUID(uuidString: token),
+              uuid.uuidString.lowercased() == token,
+              !fileExtension.isEmpty,
+              fileExtension == fileExtension.lowercased(),
+              kind.allowedExtensions.contains(fileExtension) else {
+            throw DialogueVoiceRuntimeError.invalidManagedPath
+        }
+        let filename = "\(token).\(fileExtension)"
+        let root = "voice/assets/\(kind.rawValue)"
+        return (
+            destination: "\(root)/\(filename)",
+            staging: "\(root)/.\(filename).partial"
+        )
+    }
+
+    func install(
+        sourceURL: URL,
+        kind: DialogueVoiceAssetKind,
+        destinationToken: String? = nil
+    ) throws -> DialogueVoiceInstalledAsset {
         try Task.checkCancellation()
         guard sourceURL.isFileURL,
               sourceURL.host.map({ $0.isEmpty || $0 == "localhost" }) ?? true else {
@@ -1324,8 +2248,14 @@ struct DialogueVoiceAssetInstaller: Sendable {
             try Self.ensurePrivateDirectory(directory)
         }
 
-        let filename = "\(UUID().uuidString.lowercased()).\(fileExtension)"
-        let temporaryName = ".\(filename).partial"
+        let token = destinationToken ?? UUID().uuidString.lowercased()
+        let managedPaths = try Self.managedRelativePaths(
+            kind: kind,
+            destinationToken: token,
+            fileExtension: fileExtension
+        )
+        let filename = String(managedPaths.destination.split(separator: "/").last!)
+        let temporaryName = String(managedPaths.staging.split(separator: "/").last!)
         let directoryDescriptor = Darwin.open(
             destinationDirectory.path,
             O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
@@ -1423,7 +2353,7 @@ struct DialogueVoiceAssetInstaller: Sendable {
             throw DialogueVoiceRuntimeError.copyFailed
         }
         let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
-        let relativePath = "voice/assets/\(kind.rawValue)/\(filename)"
+        let relativePath = managedPaths.destination
         if kind == .referenceAudio {
             try Self.validateReferenceAudio(relativePath: relativePath, root: applicationSupportRoot)
         }
@@ -1584,7 +2514,7 @@ struct DialogueVoiceAssetInstaller: Sendable {
         if statusResult != 0, errno == ENOENT { return false }
         guard statusResult == 0,
               currentStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
-              currentStatus.st_size > 0,
+              currentStatus.st_size >= 0,
               UInt64(currentStatus.st_size) <= maximumBytes else {
             throw DialogueVoiceRuntimeError.invalidManagedPath
         }
@@ -2853,9 +3783,17 @@ actor VoxCPM2Client {
             environment: Self.environment(home: job), standardInput: request,
             outputURL: marker, timeout: 30
         ))
-        let data = try Data(contentsOf: marker, options: [.mappedIfSafe])
-        guard data.count <= 4_096,
-              let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let data: Data
+        do {
+            data = try DialogueVoiceAssetInstaller.readManagedFile(
+                relativePath: "voice/tmp/\(job.lastPathComponent)/probe.json",
+                root: applicationSupportRoot,
+                maximumBytes: 4_096
+            )
+        } catch {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               object["schema"] as? Int == 1,
               let sampleRate = object["sample_rate"] as? Int,
               sampleRate == 48_000,

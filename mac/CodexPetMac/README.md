@@ -50,11 +50,11 @@ XCTest module in that smaller toolchain.
 ## Local voice providers
 
 Voice Setup supports GPT-SoVITS, Qwen3-TTS, and VoxCPM2 while keeping only one
-provider active. VoxCPM2 imports the complete external handover directory,
-one WAV reference with its exact transcript, and a trusted Python runtime. The
-snapshot remains external and is fingerprinted as a complete tree; Statelet
-copies only the reference into private Application Support. Its bounded probe
-loads the snapshot offline, confirms a sanitized `mps`, `cuda`, or `cpu`
+provider active. VoxCPM2 imports the complete source handover directory, one
+WAV reference with its exact transcript, and a trusted Python runtime. Statelet
+descriptor-copies and fingerprints both the snapshot and reference in private
+Application Support, then executes only the managed snapshot. Its bounded
+probe loads the snapshot offline, confirms a sanitized `mps`, `cuda`, or `cpu`
 device category and a 48 kHz model rate, and its helper runs under an OS
 network-denied child-process policy. MPS uses the upstream float32 stability
 path and may be slow on Apple Silicon. See [Using Statelet](../../docs/USAGE.md#voxcpm2-setup-and-recovery)

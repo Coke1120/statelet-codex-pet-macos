@@ -22,11 +22,12 @@ in private local storage. Never commit, bundle, diagnose-upload, or log them.
      local Python executable whose environment provides MLX Audio. The current
      Statelet profile is Japanese-only and accepts at most 500 characters per
      line. Read [references/qwen3-tts-mlx.md](references/qwen3-tts-mlx.md).
-   - For VoxCPM2, require the complete external snapshot folder, one trusted
+   - For VoxCPM2, require the complete source snapshot folder, one trusted
      WAV reference and exact transcript, and a trusted Python executable. The
-     snapshot stays external but is fingerprinted as a complete regular-file
-     tree. The bounded probe must load it offline, report `mps`, `cuda`, or
-     `cpu`, and confirm a 48 kHz model output rate. Read
+     snapshot is copied into Statelet's private managed storage through a
+     descriptor-bound staged import and fingerprinted as a complete
+     regular-file tree. The bounded probe must load only that managed copy
+     offline, report `mps`, `cuda`, or `cpu`, and confirm a 48 kHz model output rate. Read
      [references/voxcpm2.md](references/voxcpm2.md).
 3. Import through **Settings → Voice → Voice Setup** so Statelet copies and
    fingerprints private inputs below Application Support. Select the provider
@@ -83,8 +84,9 @@ in private local storage. Never commit, bundle, diagnose-upload, or log them.
 - VoxCPM2 import is rejected before generation: confirm that the selected
   folder contains the full snapshot (including `model.safetensors`,
   `audiovae.pth`, config, tokenizer assets, and tokenization code), contains no
-  symbolic links or special files, and still matches its stored tree digest.
-  Do not replace files in place; re-import the complete handover if the probe
+  symbolic links or special files, fits the 8 GiB aggregate limit, and can be
+  copied into private Application Support with adequate free space. Re-import
+  the complete handover if the managed copy fails its stored tree digest or the probe
   reports an incompatible device or sample rate.
 - Keep Statelet's per-job GPT and SoVITS activation as an integrity reassertion.
   Configure the local service to make repeated activation of the same absolute,
@@ -111,7 +113,8 @@ in private local storage. Never commit, bundle, diagnose-upload, or log them.
   regeneration before judging playback. Removing Qwen deletes Statelet's
   managed package and generated speech while preserving dialogue text and a
   separately configured GPT-SoVITS profile. VoxCPM2 removal preserves the
-  external snapshot and removes only Statelet's managed reference and speech.
+  selected source folder and removes Statelet's managed snapshot, reference,
+  and speech.
 - `swift test` cannot import XCTest under Command Line Tools: use local builds
   and source checks for iteration, then require the repository full-Xcode CI
   before merge.

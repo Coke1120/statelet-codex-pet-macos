@@ -25,6 +25,7 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
     private struct VoxFixture {
         let profile: VoxCPM2VoiceProfile
         let snapshot: URL
+        let sourceSnapshot: URL
         let python: URL
         let helper: URL
     }
@@ -1107,6 +1108,83 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: outsideFile.path))
     }
 
+    func testManagedVoiceAssetPathsAreDeterministicAndTokenBound() throws {
+        let token = "12345678-1234-1234-1234-123456789abc"
+        let paths = try DialogueVoiceAssetInstaller.managedRelativePaths(
+            kind: .voxcpm2ReferenceAudio,
+            destinationToken: token,
+            fileExtension: "wav"
+        )
+        XCTAssertEqual(
+            paths.destination,
+            "voice/assets/voxcpm2-reference/\(token).wav"
+        )
+        XCTAssertEqual(
+            paths.staging,
+            "voice/assets/voxcpm2-reference/.\(token).wav.partial"
+        )
+
+        for invalidToken in [
+            "not-a-uuid",
+            "12345678-1234-1234-1234-123456789ABC",
+        ] {
+            XCTAssertThrowsError(try DialogueVoiceAssetInstaller.managedRelativePaths(
+                kind: .voxcpm2ReferenceAudio,
+                destinationToken: invalidToken,
+                fileExtension: "wav"
+            ))
+        }
+        for invalidExtension in ["WAV", "pth", "../wav", ""] {
+            XCTAssertThrowsError(try DialogueVoiceAssetInstaller.managedRelativePaths(
+                kind: .voxcpm2ReferenceAudio,
+                destinationToken: token,
+                fileExtension: invalidExtension
+            ))
+        }
+    }
+
+    func testManagedVoiceAssetInstallUsesSuppliedTokenAndCleansZeroByteReservations() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("managed-asset-token-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let source = root.appendingPathComponent("source.wav")
+        try pcmWAV().write(to: source)
+        let token = "87654321-4321-4321-4321-cba987654321"
+        let paths = try DialogueVoiceAssetInstaller.managedRelativePaths(
+            kind: .voxcpm2ReferenceAudio,
+            destinationToken: token,
+            fileExtension: "wav"
+        )
+        let installed = try DialogueVoiceAssetInstaller(applicationSupportRoot: root).install(
+            sourceURL: source,
+            kind: .voxcpm2ReferenceAudio,
+            destinationToken: token
+        )
+        XCTAssertEqual(installed.relativePath, paths.destination)
+        XCTAssertEqual(
+            try Data(contentsOf: root.appendingPathComponent(paths.destination)),
+            pcmWAV()
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent(paths.staging).path))
+
+        let zeroBytePaths = try DialogueVoiceAssetInstaller.managedRelativePaths(
+            kind: .voxcpm2ReferenceAudio,
+            destinationToken: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            fileExtension: "wav"
+        )
+        for relativePath in [zeroBytePaths.staging, zeroBytePaths.destination] {
+            let url = root.appendingPathComponent(relativePath)
+            XCTAssertTrue(FileManager.default.createFile(atPath: url.path, contents: Data()))
+            XCTAssertTrue(try DialogueVoiceAssetInstaller.removeManagedFile(
+                relativePath: relativePath,
+                root: root,
+                maximumBytes: DialogueVoiceAssetKind.voxcpm2ReferenceAudio.maximumBytes
+            ))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        }
+    }
+
     func testReferenceAudioMustDecodeAndManagedIdentityDetectsMutation() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("dialogue-audio-tests-\(UUID().uuidString)", isDirectory: true)
@@ -2134,33 +2212,28 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
     }
 
     private func makeVoxFixture(root: URL) throws -> VoxFixture {
-        let snapshot = root.appendingPathComponent("VoxCPM2-Sakamata-ZeroShot-Handover", isDirectory: true)
-        let model = snapshot.appendingPathComponent("model", isDirectory: true)
+        let sourceSnapshot = root.appendingPathComponent("VoxCPM2-Sakamata-ZeroShot-Handover", isDirectory: true)
         let referenceRelativePath = "voice/assets/voxcpm2-reference/reference.wav"
         let reference = root.appendingPathComponent(referenceRelativePath)
         let python = root.appendingPathComponent("runtime/python3")
         let helper = root.appendingPathComponent("voxcpm2-helper.py")
-        try FileManager.default.createDirectory(at: model, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(
             at: reference.deletingLastPathComponent(), withIntermediateDirectories: true
         )
         try FileManager.default.createDirectory(
             at: python.deletingLastPathComponent(), withIntermediateDirectories: true
         )
-        for (name, data) in [
-            ("model.safetensors", Data("weights".utf8)),
-            ("audiovae.pth", Data("vae".utf8)),
-            ("config.json", Data("{}".utf8)),
-            ("tokenizer.json", Data("{}".utf8)),
-        ] {
-            try data.write(to: model.appendingPathComponent(name))
-        }
+        try makeSyntheticVoxSnapshot(at: sourceSnapshot)
         try pcmWAV().write(to: reference)
         try Data("python".utf8).write(to: python)
         try Data("helper".utf8).write(to: helper)
         XCTAssertEqual(chmod(python.path, 0o700), 0)
 
-        let treeDigest = try VoxCPM2ProfileValidator.computeSnapshotTreeSHA256(snapshotRoot: snapshot)
+        let imported = try VoxCPM2SnapshotInstaller(applicationSupportRoot: root).install(
+            sourceURL: sourceSnapshot,
+            destinationToken: "12345678-1234-1234-1234-123456789abc"
+        )
+        let snapshot = root.appendingPathComponent(imported.snapshotRootRelativePath, isDirectory: true)
         let pythonIdentity = try Qwen3TTSProfileValidator.validatePythonExecutable(at: python)
         let referenceDigest = try DialogueVoiceAssetInstaller.sha256ManagedFile(
             relativePath: referenceRelativePath,
@@ -2168,8 +2241,8 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             maximumBytes: DialogueVoiceAssetKind.voxcpm2ReferenceAudio.maximumBytes
         )
         let provisional = try VoxCPM2VoiceProfile(
-            name: "Vox fixture", snapshotPath: snapshot.path,
-            snapshotTreeSHA256: treeDigest,
+            name: "Vox fixture", snapshotPath: imported.snapshotRootRelativePath,
+            snapshotTreeSHA256: imported.treeSHA256,
             pythonExecutablePath: python.path,
             pythonExecutableSHA256: pythonIdentity.finalTargetSHA256,
             referenceAudioRelativePath: referenceRelativePath,
@@ -2192,7 +2265,38 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
                 components: provisional.inputFingerprintComponents
             )
         )
-        return VoxFixture(profile: profile, snapshot: snapshot, python: python, helper: helper)
+        return VoxFixture(
+            profile: profile,
+            snapshot: snapshot,
+            sourceSnapshot: sourceSnapshot,
+            python: python,
+            helper: helper
+        )
+    }
+
+    private func makeSyntheticVoxSnapshot(at root: URL) throws {
+        let model = root.appendingPathComponent("model", isDirectory: true)
+        try FileManager.default.createDirectory(at: model, withIntermediateDirectories: true)
+        for (name, data) in [
+            ("model.safetensors", Data("weights".utf8)),
+            ("audiovae.pth", Data("vae".utf8)),
+            ("config.json", Data("{}".utf8)),
+            ("tokenizer.json", Data("{}".utf8)),
+        ] {
+            try data.write(to: model.appendingPathComponent(name))
+        }
+    }
+
+    private func makeSyntheticRootVoxSnapshot(at root: URL) throws {
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        for (name, data) in [
+            ("model.safetensors", Data("weights".utf8)),
+            ("audiovae.pth", Data("vae".utf8)),
+            ("config.json", Data("{}".utf8)),
+            ("tokenizer.json", Data("{}".utf8)),
+        ] {
+            try data.write(to: root.appendingPathComponent(name))
+        }
     }
 
     private func makeSyntheticQwenHandover(at root: URL) throws {
@@ -2255,6 +2359,303 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             at: root.appendingPathComponent("unsafe"), withDestinationURL: root.appendingPathComponent("config.json")
         )
         XCTAssertThrowsError(try VoxCPM2ProfileValidator.computeSnapshotTreeSHA256(snapshotRoot: root))
+    }
+
+    func testVoxCPM2SnapshotRequiresOneCoherentRootOrNestedModelLayout() throws {
+        let container = FileManager.default.temporaryDirectory
+            .appendingPathComponent("voxcpm2-layout-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: container) }
+        let rootLayout = container.appendingPathComponent("root-layout", isDirectory: true)
+        let nestedLayout = container.appendingPathComponent("nested-layout", isDirectory: true)
+        let mixedLayout = container.appendingPathComponent("mixed-layout", isDirectory: true)
+        let duplicateLayout = container.appendingPathComponent("duplicate-layout", isDirectory: true)
+        try makeSyntheticRootVoxSnapshot(at: rootLayout)
+        try makeSyntheticVoxSnapshot(at: nestedLayout)
+        try FileManager.default.createDirectory(
+            at: mixedLayout.appendingPathComponent("model", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try Data("weights".utf8).write(to: mixedLayout.appendingPathComponent("model.safetensors"))
+        for (name, value) in [
+            ("audiovae.pth", "vae"),
+            ("config.json", "{}"),
+            ("tokenizer.json", "{}"),
+        ] {
+            try Data(value.utf8).write(
+                to: mixedLayout.appendingPathComponent("model/\(name)")
+            )
+        }
+        try makeSyntheticRootVoxSnapshot(at: duplicateLayout)
+        try makeSyntheticVoxSnapshot(at: duplicateLayout)
+
+        XCTAssertNoThrow(
+            try VoxCPM2ProfileValidator.computeSnapshotTreeSHA256(snapshotRoot: rootLayout)
+        )
+        XCTAssertNoThrow(
+            try VoxCPM2ProfileValidator.computeSnapshotTreeSHA256(snapshotRoot: nestedLayout)
+        )
+        XCTAssertThrowsError(
+            try VoxCPM2ProfileValidator.computeSnapshotTreeSHA256(snapshotRoot: mixedLayout)
+        ) {
+            XCTAssertEqual($0 as? DialogueVoiceRuntimeError, .profileRejected)
+        }
+        XCTAssertThrowsError(
+            try VoxCPM2ProfileValidator.computeSnapshotTreeSHA256(snapshotRoot: duplicateLayout)
+        ) {
+            XCTAssertEqual($0 as? DialogueVoiceRuntimeError, .profileRejected)
+        }
+
+        let support = container.appendingPathComponent("support", isDirectory: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        let installer = VoxCPM2SnapshotInstaller(applicationSupportRoot: support)
+        let importedRoot = try installer.install(
+            sourceURL: rootLayout,
+            destinationToken: "11111111-1111-1111-1111-111111111111"
+        )
+        let importedNested = try installer.install(
+            sourceURL: nestedLayout,
+            destinationToken: "22222222-2222-2222-2222-222222222222"
+        )
+        XCTAssertNoThrow(try VoxCPM2ProfileValidator.computeSnapshotTreeSHA256(
+            snapshotRoot: support.appendingPathComponent(importedRoot.snapshotRootRelativePath)
+        ))
+        XCTAssertNoThrow(try VoxCPM2ProfileValidator.computeSnapshotTreeSHA256(
+            snapshotRoot: support.appendingPathComponent(importedNested.snapshotRootRelativePath)
+        ))
+        XCTAssertThrowsError(try installer.install(
+            sourceURL: mixedLayout,
+            destinationToken: "33333333-3333-3333-3333-333333333333"
+        )) {
+            XCTAssertEqual($0 as? DialogueVoiceRuntimeError, .profileRejected)
+        }
+    }
+
+    func testVoxCPM2SnapshotInstallerPublishesPrivateCopyIndependentOfSource() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("voxcpm2-import-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try makeVoxFixture(root: root)
+
+        XCTAssertTrue(fixture.profile.snapshotPath.hasPrefix("voice/packages/voxcpm2/"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.snapshot.path))
+        XCTAssertEqual(
+            fixture.profile.snapshotTreeSHA256,
+            try VoxCPM2ProfileValidator.computeSnapshotTreeSHA256(snapshotRoot: fixture.snapshot)
+        )
+
+        try Data("untrusted replacement".utf8).write(
+            to: fixture.sourceSnapshot.appendingPathComponent("model/model.safetensors")
+        )
+        try FileManager.default.removeItem(at: fixture.sourceSnapshot)
+        let validated = try VoxCPM2ProfileValidator.validate(
+            profile: fixture.profile,
+            applicationSupportRoot: root
+        )
+        XCTAssertEqual(validated.snapshotRoot, fixture.snapshot)
+        XCTAssertEqual(
+            try Data(contentsOf: fixture.snapshot.appendingPathComponent("model/model.safetensors")),
+            Data("weights".utf8)
+        )
+    }
+
+    func testVoxCPM2SnapshotInstallerObservesCancellationAndRemovesOnlyManagedVoxPackages() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("voxcpm2-cancel-import-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("source", isDirectory: true)
+        try makeSyntheticVoxSnapshot(at: source)
+        let installer = VoxCPM2SnapshotInstaller(applicationSupportRoot: root)
+
+        let cancelled = Task.detached {
+            await Task.yield()
+            return try installer.install(sourceURL: source)
+        }
+        cancelled.cancel()
+        do {
+            _ = try await cancelled.value
+            XCTFail("cancelled VoxCPM2 snapshot import completed")
+        } catch is CancellationError {
+            // Expected: cancellation is checked before enumeration and each copy chunk.
+        }
+
+        let imported = try installer.install(
+            sourceURL: source,
+            destinationToken: "87654321-4321-4321-4321-cba987654321"
+        )
+        let managed = root.appendingPathComponent(imported.snapshotRootRelativePath)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: managed.path))
+        try installer.removeManagedPackage(relativePath: imported.snapshotRootRelativePath)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: managed.path))
+
+        let unrelated = root.appendingPathComponent("voice/packages/qwen/keep", isDirectory: true)
+        try FileManager.default.createDirectory(at: unrelated, withIntermediateDirectories: true)
+        XCTAssertThrowsError(
+            try installer.removeManagedPackage(relativePath: "voice/packages/qwen/keep")
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: unrelated.path))
+    }
+
+    func testVoxCPM2SnapshotInstallerRejectsSymlinkedManagedStorageComponents() throws {
+        for redirectedComponent in 0..<3 {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent(
+                    "voxcpm2-storage-symlink-\(redirectedComponent)-\(UUID().uuidString)",
+                    isDirectory: true
+                )
+            defer { try? FileManager.default.removeItem(at: root) }
+            let source = root.appendingPathComponent("source", isDirectory: true)
+            let external = root.appendingPathComponent("external", isDirectory: true)
+            try makeSyntheticVoxSnapshot(at: source)
+            try FileManager.default.createDirectory(at: external, withIntermediateDirectories: true)
+
+            let componentPaths = [
+                root.appendingPathComponent("voice", isDirectory: true),
+                root.appendingPathComponent("voice/packages", isDirectory: true),
+                root.appendingPathComponent("voice/packages/voxcpm2", isDirectory: true),
+            ]
+            if redirectedComponent > 0 {
+                try FileManager.default.createDirectory(
+                    at: componentPaths[redirectedComponent].deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+            }
+            try FileManager.default.createSymbolicLink(
+                at: componentPaths[redirectedComponent],
+                withDestinationURL: external
+            )
+
+            XCTAssertThrowsError(
+                try VoxCPM2SnapshotInstaller(applicationSupportRoot: root)
+                    .install(sourceURL: source)
+            )
+            XCTAssertEqual(
+                try FileManager.default.contentsOfDirectory(atPath: external.path),
+                []
+            )
+        }
+    }
+
+    func testVoxCPM2RuntimeRejectsManagedStorageRedirectBeforeSwapRestoreRunner() async throws {
+        let fixtureRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("voxcpm2-redirect-fixture-\(UUID().uuidString)", isDirectory: true)
+        let attackedRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("voxcpm2-redirect-root-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: attackedRoot)
+            try? FileManager.default.removeItem(at: fixtureRoot)
+        }
+        let fixture = try makeVoxFixture(root: fixtureRoot)
+        try FileManager.default.createDirectory(at: attackedRoot, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: attackedRoot.appendingPathComponent("voice"),
+            withDestinationURL: fixtureRoot.appendingPathComponent("voice")
+        )
+        let invocation = LockedQwenInvocation()
+        let client = VoxCPM2Client(
+            helperExecutableURL: fixture.helper,
+            probeExecutableURL: fixture.helper
+        ) { processInvocation in
+            invocation.set(processInvocation)
+            let model = fixture.snapshot.appendingPathComponent("model/model.safetensors")
+            let trusted = try Data(contentsOf: model)
+            try Data("unverified external bytes".utf8).write(to: model)
+            defer { try? trusted.write(to: model) }
+            try Data(#"{"schema":1,"device":"cpu","sample_rate":48000}"#.utf8)
+                .write(to: processInvocation.outputURL)
+        }
+
+        do {
+            _ = try await client.validateProfile(
+                fixture.profile,
+                applicationSupportRoot: attackedRoot
+            )
+            XCTFail("executed a VoxCPM2 snapshot through a redirected managed root")
+        } catch let error as DialogueVoiceRuntimeError {
+            XCTAssertEqual(error, .invalidManagedPath)
+        }
+        XCTAssertNil(invocation.value)
+        XCTAssertEqual(
+            try Data(contentsOf: fixture.snapshot.appendingPathComponent("model/model.safetensors")),
+            Data("weights".utf8)
+        )
+    }
+
+    func testVoxCPM2SnapshotInstallerCleansPublishedDestinationAfterPostRenameFailure() throws {
+        enum InjectedFailure: Error { case afterPublish }
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("voxcpm2-post-rename-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("source", isDirectory: true)
+        try makeSyntheticVoxSnapshot(at: source)
+        let token = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        let paths = try VoxCPM2SnapshotInstaller.managedRelativePaths(destinationToken: token)
+        let installer = VoxCPM2SnapshotInstaller(
+            applicationSupportRoot: root,
+            afterPublish: { throw InjectedFailure.afterPublish }
+        )
+
+        XCTAssertThrowsError(try installer.install(sourceURL: source, destinationToken: token)) {
+            XCTAssertTrue($0 is InjectedFailure)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent(paths.destination).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent(paths.staging).path))
+    }
+
+    func testVoxCPM2SnapshotTraversalEnforcesEntryAndDepthLimits() throws {
+        XCTAssertEqual(
+            try VoxCPM2SnapshotTree.checkedEntryCount(VoxCPM2SnapshotTree.maximumEntryCount),
+            VoxCPM2SnapshotTree.maximumEntryCount
+        )
+        XCTAssertThrowsError(
+            try VoxCPM2SnapshotTree.checkedEntryCount(VoxCPM2SnapshotTree.maximumEntryCount + 1)
+        )
+        XCTAssertEqual(
+            try VoxCPM2SnapshotTree.checkedDepth(VoxCPM2SnapshotTree.maximumDepth),
+            VoxCPM2SnapshotTree.maximumDepth
+        )
+        XCTAssertThrowsError(
+            try VoxCPM2SnapshotTree.checkedDepth(VoxCPM2SnapshotTree.maximumDepth + 1)
+        )
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("voxcpm2-depth-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try makeSyntheticVoxSnapshot(at: root)
+        var nested = root
+        for index in 0...VoxCPM2SnapshotTree.maximumDepth {
+            nested.appendPathComponent("d\(index)", isDirectory: true)
+            try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: false)
+        }
+        XCTAssertThrowsError(
+            try VoxCPM2ProfileValidator.computeSnapshotTreeSHA256(snapshotRoot: root)
+        )
+    }
+
+    func testVoxCPM2SnapshotHashCancellationIsCheckedBetweenChunks() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("voxcpm2-hash-cancel-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try makeSyntheticVoxSnapshot(at: root)
+        let started = expectation(description: "snapshot hashing reached a file chunk")
+        let release = DispatchSemaphore(value: 0)
+        let task = Task.detached {
+            try VoxCPM2ProfileValidator.computeSnapshotTreeSHA256(
+                snapshotRoot: root,
+                hashChunkObserver: {
+                    started.fulfill()
+                    release.wait()
+                }
+            )
+        }
+        await fulfillment(of: [started], timeout: 2)
+        task.cancel()
+        release.signal()
+        do {
+            _ = try await task.value
+            XCTFail("cancelled VoxCPM2 snapshot hashing completed")
+        } catch is CancellationError {
+            // Expected: the next file/chunk iteration observes cancellation.
+        }
     }
 
     func testVoxCPM2OutputValidationRequires48kMonoPCM16() {
@@ -2350,6 +2751,52 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
                 XCTAssertEqual(error, .inferenceUnavailable)
             }
         }
+    }
+
+    func testVoxCPM2ProbeRejectsOversizedAndSymlinkMarkersWithoutReadingTarget() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("voxcpm2-probe-marker-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try makeVoxFixture(root: root)
+
+        let oversized = VoxCPM2Client(
+            helperExecutableURL: fixture.helper,
+            probeExecutableURL: fixture.helper
+        ) { invocation in
+            try Data(repeating: 0x61, count: 4_097).write(to: invocation.outputURL)
+        }
+        do {
+            _ = try await oversized.validateProfile(
+                fixture.profile,
+                applicationSupportRoot: root
+            )
+            XCTFail("accepted an oversized VoxCPM2 probe marker")
+        } catch let error as DialogueVoiceRuntimeError {
+            XCTAssertEqual(error, .inferenceUnavailable)
+        }
+
+        let externalMarker = root.appendingPathComponent("external-probe.json")
+        let externalData = Data(#"{"schema":1,"device":"cpu","sample_rate":48000}"#.utf8)
+        try externalData.write(to: externalMarker)
+        let symlinked = VoxCPM2Client(
+            helperExecutableURL: fixture.helper,
+            probeExecutableURL: fixture.helper
+        ) { invocation in
+            try FileManager.default.createSymbolicLink(
+                at: invocation.outputURL,
+                withDestinationURL: externalMarker
+            )
+        }
+        do {
+            _ = try await symlinked.validateProfile(
+                fixture.profile,
+                applicationSupportRoot: root
+            )
+            XCTFail("followed a symlinked VoxCPM2 probe marker")
+        } catch let error as DialogueVoiceRuntimeError {
+            XCTAssertEqual(error, .inferenceUnavailable)
+        }
+        XCTAssertEqual(try Data(contentsOf: externalMarker), externalData)
     }
 
     func testVoxCPM2SynthesisRejectsSnapshotDriftAndHonorsCancellation() async throws {

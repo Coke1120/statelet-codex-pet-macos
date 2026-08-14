@@ -4,6 +4,39 @@ import XCTest
 @testable import Statelet
 
 final class PetPlayerPlaybackHeadlessTests: XCTestCase {
+    func testConversionRecoveryRoutePolicyAcceptsOnlyCharacterScopedSameStateRoutes() {
+        XCTAssertTrue(ConversionRecoveryRoutePolicy.accepts(
+            state: PetState.running.rawValue,
+            transitionFrom: PetState.idle.rawValue,
+            transitionTo: PetState.running.rawValue,
+            transitionScope: .global
+        ))
+        XCTAssertTrue(ConversionRecoveryRoutePolicy.accepts(
+            state: PetState.running.rawValue,
+            transitionFrom: PetState.running.rawValue,
+            transitionTo: PetState.running.rawValue,
+            transitionScope: .character
+        ))
+        XCTAssertFalse(ConversionRecoveryRoutePolicy.accepts(
+            state: PetState.running.rawValue,
+            transitionFrom: PetState.running.rawValue,
+            transitionTo: PetState.running.rawValue,
+            transitionScope: .global
+        ))
+        XCTAssertFalse(ConversionRecoveryRoutePolicy.accepts(
+            state: PetState.running.rawValue,
+            transitionFrom: PetState.running.rawValue,
+            transitionTo: PetState.running.rawValue,
+            transitionScope: nil
+        ))
+        XCTAssertFalse(ConversionRecoveryRoutePolicy.accepts(
+            state: PetState.idle.rawValue,
+            transitionFrom: PetState.running.rawValue,
+            transitionTo: PetState.running.rawValue,
+            transitionScope: .character
+        ))
+    }
+
     func testInStateTransitionPolicyOnlyAllowsAutomaticContinuousClipEnd() {
         XCTAssertTrue(InStateTransitionPolicy.shouldTrigger(
             trigger: .playlistRotation,

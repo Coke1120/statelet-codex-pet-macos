@@ -67,6 +67,17 @@ media/
 *.hevc
 *.prores*
 
+# Private local voice models and reference/generated audio
+*.safetensors
+*.ckpt
+*.pth
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.aac
+*.ogg
+
 # Local configuration, credentials, and signing material
 .env
 .env.*

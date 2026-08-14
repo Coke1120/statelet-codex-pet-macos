@@ -10,11 +10,12 @@
   profile passes that WAV as both `prompt_wav_path` and `reference_wav_path`.
 - Choose the Python executable from the prepared environment that provides
   `voxcpm` and its PyTorch dependencies. Statelet pins its executable identity,
-  the complete external tree digest, the managed reference digest, transcript,
+  the complete managed tree digest, the managed reference digest, transcript,
   language, seed, CFG, timestep, and policy settings.
-- Statelet copies only the reference WAV into private Application Support. It
-  never commits, bundles, uploads, logs, or automatically downloads the
-  snapshot, reference, transcript, dialogue, or generated WAV.
+- Statelet copies the complete snapshot and reference WAV into private
+  Application Support through descriptor-bound staging. It never commits,
+  bundles, uploads, logs, or automatically downloads the snapshot, reference,
+  transcript, dialogue, or generated WAV.
 
 ## Probe and generation
 
@@ -40,13 +41,15 @@ audio locally.
 
 - If validation becomes `Invalid`, re-import the complete unchanged handover,
   matching reference WAV/transcript, and the Python executable from its working
-  environment. Do not edit the external snapshot in place.
+  environment. Statelet executes only its private managed copy; changes to the
+  selected source folder after import do not change the active snapshot.
 - If validation is `Local service unavailable`, confirm the runtime can import
   `voxcpm` offline and that the bounded probe can load the model within its
   timeout. Restore the prepared environment before retrying.
 - If generation times out or is cancelled, Statelet kills the contained child
   process and retains the previous ready WAV. Retry only after the profile is
   `Ready`.
-- Remove the VoxCPM2 profile to delete only Statelet's managed reference and
-  generated speech. The external snapshot remains untouched; dialogue text and
-  other configured providers remain available. Deferred cleanup is retried.
+- Remove the VoxCPM2 profile to delete Statelet's managed snapshot, reference,
+  and generated speech. The selected source folder remains untouched; dialogue
+  text and other configured providers remain available. Deferred cleanup is
+  retried.

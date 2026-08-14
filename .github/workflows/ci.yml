@@ -52,7 +52,7 @@ jobs:
 
       - name: Reject excluded public-release content
         run: |
-          if git ls-files | grep -E '^(private-assets|private-media|prompts|esp32-p4|vendor)/|\.(mp4|mov|m4v|webm|mkv|avi)$'; then
+          if git ls-files | grep -Ei '^(private-assets|private-media|prompts|esp32-p4|vendor)/|\.(mp4|mov|m4v|webm|mkv|avi|gif|hevc|prores[^/]*|safetensors|ckpt|pth|wav|flac|mp3|m4a|aac|ogg)$'; then
             echo "Excluded private, hardware, or media content is tracked." >&2
             exit 1
           fi
@@ -61,6 +61,13 @@ jobs:
         run: >-
           swift test -c release --package-path mac/CodexPetMac
           --skip PetPlayerPlaybackIntegrationTests
+
+      - name: Run same-state AVPlayer integration
+        env:
+          STATELET_RUN_AVPLAYER_INTEGRATION: "1"
+        run: >-
+          swift test -c release --package-path mac/CodexPetMac
+          --filter PetPlayerPlaybackIntegrationTests/testSameStateLifecycleHandoffRetainsOutgoingThenPromotesNextClip
 
       - name: Run Swift core self-test
         run: swift run --package-path mac/CodexPetMac -c release codex-pet-core-self-test

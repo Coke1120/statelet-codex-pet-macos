@@ -47,6 +47,8 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         cls.identity = read(MAC_SOURCES / "StateletIdentity.swift")
         cls.diagnostics = read(MAC_SOURCES / "PetDiagnostics.swift")
         cls.build_script = read(ROOT / "mac" / "CodexPetMac" / "scripts" / "build_app.sh")
+        cls.gitignore = read(ROOT / ".gitignore")
+        cls.ci = read(ROOT / ".github" / "workflows" / "ci.yml")
 
     def test_voice_is_the_seventh_accessible_settings_pane(self) -> None:
         tab_match = re.search(
@@ -228,16 +230,24 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
 
     def test_unavailable_stale_retry_uses_profile_activation_without_retrying_queued_state(self) -> None:
         retry = method_body(self.coordinator, "    func retryLine")
+        activation_call = "Self.activateValidatedProfileRetainingVoxReplacementOutputs(&$0)"
         self.assertIn("let selectedWasStale", retry)
-        self.assertIn("$0.activateValidatedProfile()", retry)
+        self.assertIn(activation_call, retry)
         self.assertIn("if selectedWasStale", retry)
         self.assertIn("activatedLine.status == .queued", retry)
         self.assertIn("line = try $0.retryLine(id: id)", retry)
         self.assertLess(
-            retry.index("$0.activateValidatedProfile()"),
+            retry.index(activation_call),
             retry.index("if selectedWasStale"),
         )
         self.assertIn("previousOutputPaths.subtracting(retainedOutputPaths).sorted()", retry)
+        activation = method_body(
+            self.coordinator,
+            "    private static func activateValidatedProfileRetainingVoxReplacementOutputs",
+        )
+        self.assertIn("return try library.activateValidatedProfile()", activation)
+        self.assertIn("let activatedCount = try library.activateValidatedProfile()", activation)
+        self.assertIn("outputRelativePath: previous.outputRelativePath", activation)
 
     def test_background_refresh_preserves_dirty_settings_editors(self) -> None:
         update = method_body(self.voice_view, "    func update")
@@ -669,6 +679,15 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         self.assertIn('voxcpm2Profile', self.core)
         self.assertIn('voxcpm2_generate.py', self.build_script)
         self.assertIn('voxcpm2_probe.py', self.build_script)
+        self.assertIn("VoxCPM2SnapshotInstaller(applicationSupportRoot: root)", self.coordinator)
+        self.assertIn("voxSnapshotInstall(snapshotURL, root, snapshotToken)", self.coordinator)
+        self.assertIn("voxReferenceInstall(", self.coordinator)
+        self.assertIn("referenceToken", self.coordinator)
+        self.assertIn("destinationToken: token", self.coordinator)
+        self.assertIn("snapshot.snapshotRootRelativePath", self.coordinator)
+        self.assertIn("DialogueVoiceValidation.voxCPM2SnapshotPath", self.core)
+        self.assertIn("VoxCPM2ManagedStorage.withOpenSnapshot", self.runtime)
+        self.assertIn("O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC", self.runtime)
 
     def test_profile_state_fingerprint_and_secure_cleanup_are_persisted(self) -> None:
         for status in ("notConfigured", "validating", "ready", "invalid", "unavailable"):
@@ -702,8 +721,16 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         self.assertIn("guard !library.referencedManagedPaths.contains(path)", retry_cleanup)
         self.assertLess(
             retry_cleanup.index("guard !library.referencedManagedPaths.contains(path)"),
-            retry_cleanup.index("removeManagedFile"),
+            retry_cleanup.index("removeManagedCleanupPath(path)"),
         )
+        cleanup_dispatch = method_body(
+            self.coordinator,
+            "    private func removeManagedCleanupPath",
+        )
+        self.assertIn('path.hasPrefix("voice/packages/qwen/")', cleanup_dispatch)
+        self.assertIn('path.hasPrefix("voice/packages/voxcpm2/")', cleanup_dispatch)
+        self.assertIn("removeManagedPackage(relativePath: path)", cleanup_dispatch)
+        self.assertIn("managedFileRemove", cleanup_dispatch)
         self.assertIn("metadataPersistenceFailed", self.coordinator)
         self.assertIn("outcome.remainingCount == 0", self.coordinator)
         late_import = method_body(self.coordinator, "    func importAsset")
@@ -721,14 +748,16 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
             accept_import.index("importedAssets.gptWeightRelativePath = asset.relativePath"),
         )
         self.assertIn("retryPendingCleanup(preserving: cleanupPreservationPaths)", accept_import)
-        self.assertIn("stagedImportedPaths.union(inFlightQwenPackagePaths)", accept_import)
+        self.assertIn(".union(inFlightQwenPackagePaths)", accept_import)
+        self.assertIn(".union(voxcpm2ReplacementCleanupPaths)", accept_import)
 
         shutdown = method_body(self.coordinator, "    func shutdown")
         self.assertIn(
-            "retryPendingCleanup(preserving: inFlightQwenPackagePaths)",
+            "preserving: inFlightQwenPackagePaths.union(inFlightVoxImportPaths)",
             shutdown,
         )
         self.assertIn("inFlightQwenPackagePaths", self.coordinator)
+        self.assertIn("inFlightVoxImportPaths", self.coordinator)
 
         remove_profile = method_body(
             self.coordinator,
@@ -804,11 +833,53 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
             capture_output=True,
             text=True,
         ).stdout.splitlines()
-        private_extensions = {".ckpt", ".pth", ".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg"}
-        leaked = [path for path in tracked if Path(path).suffix.lower() in private_extensions]
-        self.assertEqual(leaked, [], f"Tracked voice assets must not ship: {leaked}")
+        private_extensions = {
+            ".mp4",
+            ".mov",
+            ".m4v",
+            ".webm",
+            ".mkv",
+            ".avi",
+            ".gif",
+            ".hevc",
+            ".safetensors",
+            ".ckpt",
+            ".pth",
+            ".wav",
+            ".flac",
+            ".mp3",
+            ".m4a",
+            ".aac",
+            ".ogg",
+        }
+        leaked = [
+            path
+            for path in tracked
+            if Path(path).suffix.lower() in private_extensions
+            or Path(path).suffix.lower().startswith(".prores")
+        ]
+        self.assertEqual(leaked, [], f"Tracked private assets must not ship: {leaked}")
         for extension in ("*.ckpt", "*.pth", "*.wav"):
             self.assertNotIn(extension, self.build_script)
+        for extension in (
+            "*.safetensors",
+            "*.ckpt",
+            "*.pth",
+            "*.wav",
+            "*.flac",
+            "*.mp3",
+            "*.m4a",
+            "*.aac",
+            "*.ogg",
+            "*.gif",
+            "*.hevc",
+            "*.prores*",
+        ):
+            self.assertIn(extension, self.gitignore)
+        self.assertRegex(
+            self.ci,
+            r"grep -Ei [^\n]+\\\.\(mp4\|mov\|m4v\|webm\|mkv\|avi\|gif\|hevc\|prores\[\^/\]\*\|safetensors\|ckpt\|pth\|wav\|flac\|mp3\|m4a\|aac\|ogg\)\$",
+        )
 
         self.assertNotRegex(self.diagnostics, r"Dialogue(Line|Voice)|referenceText|gptWeight|sovitsWeight")
         log_calls = "\n".join(

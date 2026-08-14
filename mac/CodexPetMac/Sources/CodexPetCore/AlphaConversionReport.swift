@@ -962,7 +962,8 @@ public extension MediaMap {
             defaultFormat: defaultFormat,
             window: window,
             states: updatedStates,
-            transitions: transitions
+            transitions: transitions,
+            inStateTransitions: inStateTransitions
         )
     }
 
@@ -972,7 +973,8 @@ public extension MediaMap {
             defaultFormat: defaultFormat,
             window: replacement,
             states: states,
-            transitions: transitions
+            transitions: transitions,
+            inStateTransitions: inStateTransitions
         )
     }
 }
