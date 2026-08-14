@@ -233,15 +233,16 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     var onDeleteCharacter: ((String) -> Void)?
     var onImportCharacterBundle: (() -> Void)?
     var onExportCharacterBundle: ((String) -> Void)?
-    var onImportTransitionMP4: ((TransitionLibraryScope, PetState, PetState) -> Void)?
-    var onUseTransitionMovie: ((TransitionLibraryScope, PetState, PetState) -> Void)?
-    var onReplaceTransitionMP4: ((TransitionLibraryScope, PetState, PetState, String) -> Void)?
-    var onReplaceTransitionMovie: ((TransitionLibraryScope, PetState, PetState, String) -> Void)?
-    var onPreviewTransition: ((TransitionLibraryScope, PetState, PetState, String) -> Void)?
-    var onRemoveTransition: ((TransitionLibraryScope, PetState, PetState, String) -> Void)?
-    var onMoveTransition: ((TransitionLibraryScope, PetState, PetState, String, Int) -> Void)?
-    var onTransitionModeChange: ((TransitionLibraryScope, PetState, PetState, MediaPlaybackMode) -> Void)?
-    var onSetFixedTransition: ((TransitionLibraryScope, PetState, PetState, String) -> Void)?
+    var onMigrateGlobalTransitionLegacy: (() -> Void)?
+    var onImportTransitionMP4: ((TransitionLibraryScope, SettingsTransitionRoute) -> Void)?
+    var onUseTransitionMovie: ((TransitionLibraryScope, SettingsTransitionRoute) -> Void)?
+    var onReplaceTransitionMP4: ((TransitionLibraryScope, SettingsTransitionRoute, String) -> Void)?
+    var onReplaceTransitionMovie: ((TransitionLibraryScope, SettingsTransitionRoute, String) -> Void)?
+    var onPreviewTransition: ((TransitionLibraryScope, SettingsTransitionRoute, String) -> Void)?
+    var onRemoveTransition: ((TransitionLibraryScope, SettingsTransitionRoute, String) -> Void)?
+    var onMoveTransition: ((TransitionLibraryScope, SettingsTransitionRoute, String, Int) -> Void)?
+    var onTransitionModeChange: ((TransitionLibraryScope, SettingsTransitionRoute, MediaPlaybackMode) -> Void)?
+    var onSetFixedTransition: ((TransitionLibraryScope, SettingsTransitionRoute, String) -> Void)?
 
     private let tabs = NSSegmentedControl(labels: ["Animations", "Voice", "Appearance", "General", "Diagnostics", "Help", "Prompts", "Recommendation"], trackingMode: .selectOne, target: nil, action: nil)
     private let paneHost = NSView()
@@ -681,45 +682,48 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             guard let self else { return }
             self.confirmClipRemoval(state: self.selectedAnimationState, path: entry.path)
         }
-        transitionLibrary.onImportMP4 = { [weak self] source, destination in
+        transitionLibrary.onImportMP4 = { [weak self] route in
             guard let self else { return }
-            self.onImportTransitionMP4?(self.selectedTransitionScope, source, destination)
+            self.onImportTransitionMP4?(self.selectedTransitionScope, route)
         }
-        transitionLibrary.onUseMovie = { [weak self] source, destination in
-            guard let self else { return }
-            self.onUseTransitionMovie?(self.selectedTransitionScope, source, destination)
+        transitionLibrary.onMigrateLegacy = { [weak self] in
+            self?.onMigrateGlobalTransitionLegacy?()
         }
-        transitionLibrary.onReplaceMP4 = { [weak self] source, destination, path in
+        transitionLibrary.onUseMovie = { [weak self] route in
             guard let self else { return }
-            self.onReplaceTransitionMP4?(self.selectedTransitionScope, source, destination, path)
+            self.onUseTransitionMovie?(self.selectedTransitionScope, route)
         }
-        transitionLibrary.onReplaceMovie = { [weak self] source, destination, path in
+        transitionLibrary.onReplaceMP4 = { [weak self] route, path in
             guard let self else { return }
-            self.onReplaceTransitionMovie?(self.selectedTransitionScope, source, destination, path)
+            self.onReplaceTransitionMP4?(self.selectedTransitionScope, route, path)
+        }
+        transitionLibrary.onReplaceMovie = { [weak self] route, path in
+            guard let self else { return }
+            self.onReplaceTransitionMovie?(self.selectedTransitionScope, route, path)
         }
         transitionLibrary.onPreviewOrStop = { [weak self] clip, shouldStop in
             if shouldStop {
                 self?.onStopPreview?()
             } else {
                 guard let self else { return }
-                self.onPreviewTransition?(self.selectedTransitionScope, clip.source, clip.destination, clip.path)
+                self.onPreviewTransition?(self.selectedTransitionScope, clip.route, clip.path)
             }
         }
         transitionLibrary.onRemove = { [weak self] clip in
             guard let self else { return }
-            self.onRemoveTransition?(self.selectedTransitionScope, clip.source, clip.destination, clip.path)
+            self.onRemoveTransition?(self.selectedTransitionScope, clip.route, clip.path)
         }
-        transitionLibrary.onMove = { [weak self] source, destination, path, index in
+        transitionLibrary.onMove = { [weak self] route, path, index in
             guard let self else { return }
-            self.onMoveTransition?(self.selectedTransitionScope, source, destination, path, index)
+            self.onMoveTransition?(self.selectedTransitionScope, route, path, index)
         }
-        transitionLibrary.onModeChange = { [weak self] source, destination, mode in
+        transitionLibrary.onModeChange = { [weak self] route, mode in
             guard let self else { return }
-            self.onTransitionModeChange?(self.selectedTransitionScope, source, destination, mode)
+            self.onTransitionModeChange?(self.selectedTransitionScope, route, mode)
         }
-        transitionLibrary.onSetFixed = { [weak self] source, destination, path in
+        transitionLibrary.onSetFixed = { [weak self] route, path in
             guard let self else { return }
-            self.onSetFixedTransition?(self.selectedTransitionScope, source, destination, path)
+            self.onSetFixedTransition?(self.selectedTransitionScope, route, path)
         }
         transitionLibrary.onScopeChange = { [weak self] scope in
             self?.selectedTransitionScope = scope
@@ -1559,44 +1563,71 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             importEnabled: toolchainState.isReady,
             characterName: activeCharacterName
         )
-        let transitionPlaylists: [StateTransitionKey: StateMediaPlaylist]
-        let resolveTransitionURL: (MediaEntry) -> URL
+        var transitionClips: [SettingsTransitionClip]
+        let globalFallbackRoutes: Set<StateTransitionKey>
+        let globalLegacyRouteCount: Int
         switch selectedTransitionScope {
         case .character:
-            transitionPlaylists = snapshot.mediaMap.transitions
-            resolveTransitionURL = { entry in
-                snapshot.mediaMap.resolvedURL(for: entry, relativeTo: snapshot.mediaMapURL)
+            transitionClips = snapshot.mediaMap.transitions.flatMap { key, playlist in
+                playlist.entries.enumerated().map { index, entry in
+                    SettingsTransitionClip(
+                        route: .directional(source: key.from, destination: key.to),
+                        path: entry.path,
+                        exists: FileManager.default.isReadableFile(
+                            atPath: snapshot.mediaMap.resolvedURL(for: entry, relativeTo: snapshot.mediaMapURL).path
+                        ),
+                        position: index,
+                        count: playlist.entries.count,
+                        mode: playlist.mode,
+                        isFixed: entry.path == playlist.fixedPath
+                    )
+                }
             }
+            globalLegacyRouteCount = 0
         case .global:
-            transitionPlaylists = snapshot.globalTransitionLibrary.transitions
-            resolveTransitionURL = { entry in
-                snapshot.globalTransitionLibrary.resolvedURL(
-                    for: entry,
-                    relativeTo: snapshot.globalTransitionLibraryURL
-                )
+            if let playlist = snapshot.globalTransitionLibrary.universalPlaylist {
+                transitionClips = playlist.entries.enumerated().map { index, entry in
+                    SettingsTransitionClip(
+                        route: .global,
+                        path: entry.path,
+                        exists: FileManager.default.isReadableFile(
+                            atPath: snapshot.globalTransitionLibrary.resolvedURL(
+                                for: entry,
+                                relativeTo: snapshot.globalTransitionLibraryURL
+                            ).path
+                        ),
+                        position: index,
+                        count: playlist.entries.count,
+                        mode: playlist.mode,
+                        isFixed: entry.path == playlist.fixedPath
+                    )
+                }
+            } else {
+                // Conflicting legacy route-keyed data is retained by the
+                // model and shown as a migration notice, never flattened by
+                // silently choosing one route.
+                transitionClips = []
             }
+            globalLegacyRouteCount = snapshot.globalTransitionLibrary.requiresLegacyMigration
+                ? snapshot.globalTransitionLibrary.transitions.count
+                : 0
         }
-        var transitionClips = transitionPlaylists.flatMap { key, playlist in
-            playlist.entries.enumerated().map { index, entry in
-                SettingsTransitionClip(
-                    source: key.from,
-                    destination: key.to,
-                    path: entry.path,
-                    exists: FileManager.default.isReadableFile(
-                        atPath: resolveTransitionURL(entry).path
-                    ),
-                    position: index,
-                    count: playlist.entries.count,
-                    mode: playlist.mode,
-                    isFixed: entry.path == playlist.fixedPath
-                )
-            }
+        if snapshot.globalTransitionLibrary.universalPlaylist != nil {
+            globalFallbackRoutes = Set(
+                PetState.allCases.flatMap { source in
+                    PetState.allCases.compactMap { destination in
+                        guard source != destination else { return nil }
+                        return try? StateTransitionKey(from: source, to: destination)
+                    }
+                }
+            )
+        } else {
+            globalFallbackRoutes = Set(snapshot.globalTransitionLibrary.transitions.keys)
         }
         if selectedTransitionScope == .character {
             transitionClips += snapshot.mediaMap.inStateTransitions.map { state, entry in
                 SettingsTransitionClip(
-                    source: state,
-                    destination: state,
+                    route: .directional(source: state, destination: state),
                     path: entry.path,
                     exists: FileManager.default.isReadableFile(atPath: snapshot.mediaMap.resolvedURL(for: entry, relativeTo: snapshot.mediaMapURL).path),
                     position: 0,
@@ -1608,7 +1639,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         }
         transitionLibrary.update(
             clips: transitionClips,
-            globalFallbackRoutes: Set(snapshot.globalTransitionLibrary.transitions.keys),
+            globalFallbackRoutes: globalFallbackRoutes,
+            globalLegacyRouteCount: globalLegacyRouteCount,
             previewPath: snapshot.preview?.path,
             reduceMotion: snapshot.reduceMotion,
             busy: globallyBusy,

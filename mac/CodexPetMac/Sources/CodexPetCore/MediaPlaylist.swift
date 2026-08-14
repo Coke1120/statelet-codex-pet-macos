@@ -461,11 +461,17 @@ public struct TransitionSelectionRequest: Equatable, Sendable {
     public private(set) var triedPaths: Set<String>
     public private(set) var selectedPath: String?
     public private(set) var isCommitted: Bool
+    private let cursorKey: TransitionSelectionCursorKey
     private let candidates: [MediaEntry]
 
-    fileprivate init(route: StateTransitionKey, candidates: [MediaEntry]) {
+    fileprivate init(
+        route: StateTransitionKey,
+        candidates: [MediaEntry],
+        cursorKey: TransitionSelectionCursorKey = .route
+    ) {
         self.route = route
         self.candidates = candidates
+        self.cursorKey = cursorKey
         triedPaths = []
         selectedPath = nil
         isCommitted = false
@@ -491,17 +497,27 @@ public struct TransitionSelectionRequest: Equatable, Sendable {
     @discardableResult
     public mutating func commit(to cursor: inout TransitionSelectionCursor) -> Bool {
         guard !isCommitted, let selectedPath else { return false }
-        cursor.commit(path: selectedPath, for: route)
+        cursor.commit(path: selectedPath, for: cursorKey, route: route)
         isCommitted = true
         return true
     }
 }
 
+private enum TransitionSelectionCursorKey: Equatable, Sendable {
+    case route
+    case global
+}
+
 public struct TransitionSelectionCursor: Equatable, Sendable {
     public private(set) var selectedPaths: [StateTransitionKey: String]
+    public private(set) var globalSelectedPath: String?
 
-    public init(selectedPaths: [StateTransitionKey: String] = [:]) {
+    public init(
+        selectedPaths: [StateTransitionKey: String] = [:],
+        globalSelectedPath: String? = nil
+    ) {
         self.selectedPaths = selectedPaths
+        self.globalSelectedPath = globalSelectedPath
     }
 
     public func selectedPath(for route: StateTransitionKey) -> String? {
@@ -523,9 +539,51 @@ public struct TransitionSelectionCursor: Equatable, Sendable {
         randomIndex: (Int) -> Int = { Int.random(in: 0..<$0) }
     ) throws -> TransitionSelectionRequest {
         let route = try StateTransitionKey(from: from, to: to)
+        return try request(
+            route: route,
+            playlist: playlist,
+            cursorKey: .route,
+            isEligible: isEligible,
+            randomIndex: randomIndex
+        )
+    }
+
+    /// Proposes a selection from the one shared Global playlist. The selected
+    /// path is committed to one Global cursor, independent of the lifecycle
+    /// route that triggered it.
+    public func requestGlobal(
+        from: PetState,
+        to: PetState,
+        playlist: StateMediaPlaylist,
+        isEligible: (MediaEntry) -> Bool = { _ in true },
+        randomIndex: (Int) -> Int = { Int.random(in: 0..<$0) }
+    ) throws -> TransitionSelectionRequest {
+        let route = try StateTransitionKey(from: from, to: to)
+        return try request(
+            route: route,
+            playlist: playlist,
+            cursorKey: .global,
+            isEligible: isEligible,
+            randomIndex: randomIndex
+        )
+    }
+
+    private func request(
+        route: StateTransitionKey,
+        playlist: StateMediaPlaylist,
+        cursorKey: TransitionSelectionCursorKey,
+        isEligible: (MediaEntry) -> Bool,
+        randomIndex: (Int) -> Int
+    ) throws -> TransitionSelectionRequest {
         let eligible = playlist.entries.filter(isEligible)
-        guard !eligible.isEmpty else { return TransitionSelectionRequest(route: route, candidates: []) }
-        let previousPath = selectedPaths[route]
+        guard !eligible.isEmpty else {
+            return TransitionSelectionRequest(
+                route: route,
+                candidates: [],
+                cursorKey: cursorKey
+            )
+        }
+        let previousPath = cursorKey == .global ? globalSelectedPath : selectedPaths[route]
         let ordered: [MediaEntry]
         switch playlist.mode {
         case .fixed:
@@ -569,15 +627,37 @@ public struct TransitionSelectionCursor: Equatable, Sendable {
             }
             ordered = randomized
         }
-        return TransitionSelectionRequest(route: route, candidates: ordered)
+        return TransitionSelectionRequest(
+            route: route,
+            candidates: ordered,
+            cursorKey: cursorKey
+        )
     }
 
     public mutating func reset(route: StateTransitionKey? = nil) {
-        if let route { selectedPaths[route] = nil } else { selectedPaths.removeAll() }
+        if let route {
+            selectedPaths[route] = nil
+        } else {
+            selectedPaths.removeAll()
+            globalSelectedPath = nil
+        }
     }
 
-    fileprivate mutating func commit(path: String, for route: StateTransitionKey) {
-        selectedPaths[route] = path
+    public mutating func resetGlobal() {
+        globalSelectedPath = nil
+    }
+
+    fileprivate mutating func commit(
+        path: String,
+        for cursorKey: TransitionSelectionCursorKey,
+        route: StateTransitionKey
+    ) {
+        switch cursorKey {
+        case .route:
+            selectedPaths[route] = path
+        case .global:
+            globalSelectedPath = path
+        }
     }
 }
 

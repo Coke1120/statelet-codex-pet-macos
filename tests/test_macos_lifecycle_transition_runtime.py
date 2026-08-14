@@ -126,7 +126,8 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         transition_source = self.app[transition:transition_end]
         self.assertIn("transitionSelectionCursor(", transition_source)
         self.assertIn("for: resolvedTransition.scope", transition_source)
-        self.assertIn(").request(", transition_source)
+        self.assertIn("selectionRequest = try? selectionCursor.request", transition_source)
+        self.assertIn("selectionCursor.requestGlobal(", transition_source)
         self.assertIn("selectionRequest.next()", transition_source)
         self.assertIn("destinationEntry: destinationEntry", transition_source)
         self.assertLess(
@@ -368,6 +369,12 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         self.assertIn("globalTransitionLibrarySHA256:", journal_source)
         self.assertNotIn("if scope == .character", source[:conversion])
 
+    def test_conflicting_global_legacy_data_has_an_explicit_migration_action(self):
+        self.assertIn("onMigrateGlobalTransitionLegacy", self.app)
+        self.assertIn("migrateGlobalTransitionLegacy()", self.app)
+        self.assertIn("migratingLegacyToUniversal(using: route)", self.app)
+        self.assertIn("All legacy route-specific playlists and their media remain", self.app)
+
     def test_recovery_publishes_transition_to_recorded_scope_with_digest_barrier(self):
         start = self.app.index("private func recoverInterruptedConversionIfPresent")
         end = self.app.index("private func recoveryOwner(for journal:", start)
@@ -462,7 +469,7 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         self.assertIn("catalogSnapshot?.library == self.characterLibrary", source[callback:mutation])
         self.assertIn("catalogSnapshot?.encodedData == self.characterLibraryEncodedData", source[callback:mutation])
         self.assertIn(
-            "self.mediaMap.transitionPlaylist(from: source, to: destination)?.entry(path: path) != nil",
+            "self.characterRouteContains(route, path: path)",
             source[callback:mutation],
         )
         self.assertLess(mutation, publish)

@@ -20,9 +20,81 @@ final class GlobalTransitionLibraryTests: XCTestCase {
 
         let data = try JSONEncoder().encode(library)
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        XCTAssertEqual(object["schema_version"] as? Int, 1)
+        XCTAssertEqual(object["schema_version"] as? Int, 2)
         XCTAssertNotNil((object["transitions"] as? [String: Any])?["idle_to_running"])
         XCTAssertEqual(try JSONDecoder().decode(GlobalTransitionLibrary.self, from: data), library)
+    }
+
+    func testUniversalPlaylistAppliesToEveryDistinctRouteAndRoundTrips() throws {
+        let first = try MediaEntry(path: "global-one.mov", loop: false)
+        let second = try MediaEntry(path: "global-two.mov", loop: false)
+        let playlist = try StateMediaPlaylist(
+            mode: .sequential,
+            entries: [first, second]
+        )
+        let library = try GlobalTransitionLibrary(universalPlaylist: playlist)
+
+        XCTAssertEqual(library.universalPlaylist, playlist)
+        XCTAssertEqual(library.transitionPlaylist(from: .idle, to: .running), playlist)
+        XCTAssertEqual(library.transitionPlaylist(from: .waiting, to: .review), playlist)
+        XCTAssertNil(library.transitionPlaylist(from: .idle, to: .idle))
+        XCTAssertNil(TransitionLibraryResolver.resolve(
+            from: .idle,
+            to: .idle,
+            character: try MediaMap(),
+            global: library
+        ))
+        XCTAssertTrue(library.transitions.isEmpty)
+
+        let data = try JSONEncoder().encode(library)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertNotNil(object["universal_playlist"])
+        XCTAssertEqual(try JSONDecoder().decode(GlobalTransitionLibrary.self, from: data), library)
+    }
+
+    func testLegacySchemaMigratesIdenticalRoutesAndPreservesConflicts() throws {
+        let first = try MediaEntry(path: "legacy.mov", loop: false)
+        let playlist = try StateMediaPlaylist(entries: [first])
+        let idleRunning = try StateTransitionKey(from: .idle, to: .running)
+        let runningWaiting = try StateTransitionKey(from: .running, to: .waiting)
+        let playlistJSON = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(playlist)
+        )
+        let identicalData = try JSONSerialization.data(withJSONObject: [
+            "schema_version": 1,
+            "transitions": [
+                idleRunning.storageKey: playlistJSON,
+                runningWaiting.storageKey: playlistJSON,
+            ],
+        ])
+        let identical = try JSONDecoder().decode(GlobalTransitionLibrary.self, from: identicalData)
+        XCTAssertEqual(identical.universalPlaylist, playlist)
+        XCTAssertTrue(identical.transitions.isEmpty)
+        XCTAssertFalse(identical.requiresLegacyMigration)
+
+        let other = try StateMediaPlaylist(entries: [MediaEntry(path: "other.mov")])
+        let otherJSON = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(other)
+        )
+        let conflictingData = try JSONSerialization.data(withJSONObject: [
+            "schema_version": 1,
+            "transitions": [
+                idleRunning.storageKey: playlistJSON,
+                runningWaiting.storageKey: otherJSON,
+            ],
+        ])
+        let conflicting = try JSONDecoder().decode(GlobalTransitionLibrary.self, from: conflictingData)
+        XCTAssertNil(conflicting.universalPlaylist)
+        XCTAssertEqual(conflicting.transitions.count, 2)
+        XCTAssertTrue(conflicting.requiresLegacyMigration)
+
+        let migrated = try conflicting.migratingLegacyToUniversal(using: idleRunning)
+        XCTAssertEqual(migrated.universalPlaylist, playlist)
+        XCTAssertEqual(migrated.transitions, conflicting.transitions)
+        XCTAssertFalse(migrated.requiresLegacyMigration)
+        XCTAssertThrowsError(
+            try conflicting.settingUniversalTransition(MediaEntry(path: "replacement.mov"))
+        )
     }
 
     func testMutationOperationsMatchMediaMapTransitionSemantics() throws {
