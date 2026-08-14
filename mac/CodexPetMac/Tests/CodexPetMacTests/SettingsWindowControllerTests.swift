@@ -95,11 +95,15 @@ final class SettingsWindowControllerTests: XCTestCase {
             tabs.selectedSegment = section
             NSApp.sendAction(tabs.action!, to: tabs.target, from: tabs)
             Self.pumpMainRunLoop(for: 0.05)
-            XCTAssertNotNil(
+            let scrollView = try XCTUnwrap(
                 Self.descendants(of: window.contentView).compactMap { $0 as? NSScrollView }.first {
                     $0.accessibilityLabel() == "Settings pane scroll area"
                 },
                 "section \(section)"
+            )
+            XCTAssertTrue(
+                try XCTUnwrap(scrollView.documentView, "section \(section)").isFlipped,
+                "section \(section) should open at the top of its scrollable content"
             )
         }
     }

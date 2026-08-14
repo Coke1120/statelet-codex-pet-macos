@@ -1,6 +1,10 @@
 import AppKit
 import CodexPetCore
 
+private final class TopAlignedSettingsDocumentView: NSView {
+    override var isFlipped: Bool { true }
+}
+
 private final class SettingsAnimationsPaneView: NSView {
     weak var statusView: NSView?
     weak var modeView: NSView?
@@ -1258,7 +1262,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         scroll.drawsBackground = false
         scroll.setAccessibilityLabel("Settings pane scroll area")
 
-        let document = NSView()
+        let document = TopAlignedSettingsDocumentView()
         document.translatesAutoresizingMaskIntoConstraints = false
         scroll.documentView = document
         pane.addSubview(scroll)
