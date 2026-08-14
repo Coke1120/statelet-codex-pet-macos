@@ -28,7 +28,6 @@ try:
         VALID_STATES,
         aggregate_state_with_source,
         default_state_dir,
-        read_active_states,
         read_session_snapshot,
     )
 except ModuleNotFoundError as error:
@@ -44,7 +43,6 @@ except ModuleNotFoundError as error:
         VALID_STATES,
         aggregate_state_with_source,
         default_state_dir,
-        read_active_states,
         read_session_snapshot,
     )
 
@@ -604,7 +602,9 @@ def resolve_state_snapshot(
             else force_source_updated_at
         )
         return (forced_state, source_updated_at, 0)
-    active = read_active_states(state_dir, now=wall_time, active_ttl=active_ttl)
+    active = read_session_snapshot(
+        state_dir, now=wall_time, active_ttl=active_ttl
+    )["active"]
     lifecycle, source_updated_at = aggregate_state_with_source(active)
     return (lifecycle, source_updated_at, len(active))
 
@@ -625,12 +625,14 @@ def resolve_state_snapshot_with_expiry(
             force_source_updated_at,
         )
         return (state, source_updated_at, active_sessions, None)
-    active = read_active_states(state_dir, now=wall_time, active_ttl=active_ttl)
+    snapshot = read_session_snapshot(
+        state_dir, now=wall_time, active_ttl=active_ttl
+    )
+    active = snapshot["active"]
     lifecycle, source_updated_at = aggregate_state_with_source(active)
     next_expiry = (
-        min(updated_at + active_ttl for _, updated_at in active)
-        + TTL_DEADLINE_EPSILON
-        if active
+        snapshot["next_expiry"] + TTL_DEADLINE_EPSILON
+        if snapshot["next_expiry"] is not None
         else None
     )
     return (lifecycle, source_updated_at, len(active), next_expiry)
@@ -651,8 +653,8 @@ def resolve_diagnostic_snapshot(
     active = snapshot["active"]
     lifecycle, source_updated_at = aggregate_state_with_source(active)
     next_expiry = (
-        min(updated_at + active_ttl for _, updated_at in active) + TTL_DEADLINE_EPSILON
-        if active
+        snapshot["next_expiry"] + TTL_DEADLINE_EPSILON
+        if snapshot["next_expiry"] is not None
         else None
     )
     reasons = snapshot["rejections"]

@@ -106,6 +106,7 @@ public struct CurrentStateRejectionDiagnostics: Codable, Equatable, Sendable {
         "future_event",
         "invalid_record",
         "invalid_timestamp",
+        "quiescent_expired",
         "stale_event",
     ]
 

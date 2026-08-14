@@ -70,9 +70,12 @@ waiting > review > running > idle
 
 `Stop` and `SessionEnd` terminalize only their own session. Each other valid
 session record remains active for 900 seconds after its authoritative event
-time. Records that are malformed, non-finite, expired, or more than 60 seconds
-in the future are rejected or pruned. A delayed callback cannot replace a newer
-event for the same session. Equal-priority records use the newest timestamp.
+time, except a `PostToolUse` record, which has a 30-second quiescent grace
+period when Desktop fails to provide a terminal callback. A later hook event
+refreshes the normal 900-second lease. Records that are malformed, non-finite,
+expired, or more than 60 seconds in the future are rejected or pruned. A
+delayed callback cannot replace a newer event for the same session.
+Equal-priority records use the newest timestamp.
 
 The aggregator normally uses macOS `kqueue` directory events, so changed
 session records wake it immediately. It also wakes at session TTL,
