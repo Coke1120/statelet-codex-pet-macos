@@ -1,6 +1,10 @@
 import AppKit
 import CodexPetCore
 
+private final class TopAlignedSettingsDocumentView: NSView {
+    override var isFlipped: Bool { true }
+}
+
 private final class SettingsAnimationsPaneView: NSView {
     weak var statusView: NSView?
     weak var modeView: NSView?
@@ -129,6 +133,45 @@ struct WindowSettingsUpdate {
     let appearance: PetAppearanceConfiguration
 }
 
+enum SettingsWindowSizeStore {
+    static let defaultsKey = "Statelet.settingsWindowContentSize.v1"
+
+    private static let widthKey = "width"
+    private static let heightKey = "height"
+    private static let maximumDimension: Double = 10_000
+
+    static func restored(from defaults: UserDefaults) -> NSSize? {
+        guard let values = defaults.dictionary(forKey: defaultsKey),
+              let width = (values[widthKey] as? NSNumber)?.doubleValue,
+              let height = (values[heightKey] as? NSNumber)?.doubleValue,
+              isValid(width: width),
+              isValid(height: height) else { return nil }
+        return NSSize(width: width, height: height)
+    }
+
+    static func persist(_ size: NSSize, to defaults: UserDefaults) {
+        let width = Double(size.width)
+        let height = Double(size.height)
+        guard isValid(width: width), isValid(height: height) else { return }
+        defaults.set([
+            widthKey: width,
+            heightKey: height,
+        ], forKey: defaultsKey)
+    }
+
+    static func reset(in defaults: UserDefaults) {
+        defaults.removeObject(forKey: defaultsKey)
+    }
+
+    private static func isValid(width: Double) -> Bool {
+        width.isFinite && width > 0 && width <= maximumDimension
+    }
+
+    private static func isValid(height: Double) -> Bool {
+        height.isFinite && height > 0 && height <= maximumDimension
+    }
+}
+
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private static let defaultStateLabelCustomColor = "#007AFF"
     private static let preferredContentSize = NSSize(width: 760, height: 650)
@@ -239,6 +282,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let stateLabelColorWell = NSColorWell()
     private let stateLabelPositionPopup = NSPopUpButton()
     private let stateLabelSizePopup = NSPopUpButton()
+    private let resetSettingsWindowSizeButton = NSButton(title: "Reset Window Size", target: nil, action: nil)
     private let fpsEnabledCheckbox = NSButton(checkboxWithTitle: "Show video FPS", target: nil, action: nil)
     private let fpsColorWell = NSColorWell()
     private let fpsSizePopup = NSPopUpButton()
@@ -271,13 +315,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private var minimumPaneWidthConstraint: NSLayoutConstraint?
     private var minimumPaneHeightConstraint: NSLayoutConstraint?
     private var hasShownWindow = false
+    private let defaults: UserDefaults
+    private var usePreferredSizeOnFirstShow = true
     private var aspectRatio = 1.5
     private let stateLabelPositions: [StateLabelPosition] = [.topLeft, .topRight, .bottomLeft, .bottomRight]
     private let stateLabelSizes: [StateLabelSize] = [.small, .regular, .large]
 
-    init() {
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        let restoredSize = SettingsWindowSizeStore.restored(from: defaults)
+        usePreferredSizeOnFirstShow = restoredSize == nil
         let window = NSWindow(
-            contentRect: NSRect(origin: .zero, size: Self.preferredContentSize),
+            contentRect: NSRect(origin: .zero, size: restoredSize ?? Self.preferredContentSize),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
@@ -289,11 +338,33 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         super.init(window: window)
         window.delegate = self
         buildInterface()
-        fitWindowToVisibleScreen(usePreferredSize: true)
+        configureWindowActions()
+        fitWindowToVisibleScreen(usePreferredSize: false)
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    private func configureWindowActions() {
+        resetSettingsWindowSizeButton.target = self
+        resetSettingsWindowSizeButton.action = #selector(resetSettingsWindowSize)
+        resetSettingsWindowSizeButton.controlSize = .small
+        resetSettingsWindowSizeButton.bezelStyle = .texturedRounded
+        resetSettingsWindowSizeButton.setAccessibilityLabel("Reset Settings Window Size")
+        resetSettingsWindowSizeButton.setAccessibilityHelp(
+            "Restore the default Settings window size without changing the pet window."
+        )
+        resetSettingsWindowSizeButton.toolTip = "Restore the default Settings window size"
+
+        let accessory = NSTitlebarAccessoryViewController()
+        accessory.layoutAttribute = .right
+        let accessoryView = NSView(frame: NSRect(x: 0, y: 0, width: 132, height: 22))
+        resetSettingsWindowSizeButton.frame = accessoryView.bounds
+        resetSettingsWindowSizeButton.autoresizingMask = [.width, .height]
+        accessoryView.addSubview(resetSettingsWindowSizeButton)
+        accessory.view = accessoryView
+        window?.addTitlebarAccessoryViewController(accessory)
+    }
 
     func show() {
         NSApp.activate(ignoringOtherApps: true)
@@ -302,8 +373,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         startLibraryRevisionTimer()
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
-        fitWindowToVisibleScreen(usePreferredSize: !hasShownWindow)
-        let shouldUsePreferredSize = !hasShownWindow
+        let shouldUsePreferredSize = !hasShownWindow && usePreferredSizeOnFirstShow
+        fitWindowToVisibleScreen(usePreferredSize: shouldUsePreferredSize)
         DispatchQueue.main.async { [weak self] in
             self?.fitWindowToVisibleScreen(usePreferredSize: shouldUsePreferredSize)
         }
@@ -885,14 +956,15 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 12
-        appearancePane.addSubview(stack)
+        let (_, documentView) = makeScrollablePane(for: appearancePane)
+        documentView.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: appearancePane.topAnchor),
-            stack.leadingAnchor.constraint(equalTo: appearancePane.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: appearancePane.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: documentView.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor),
             surfaceRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
             overlayRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: appearancePane.bottomAnchor),
+            stack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor),
         ])
     }
 
@@ -964,14 +1036,16 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 14
-        generalPane.addSubview(stack)
+        let (_, documentView) = makeScrollablePane(for: generalPane)
+        documentView.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: generalPane.topAnchor),
-            stack.leadingAnchor.constraint(equalTo: generalPane.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: generalPane.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: documentView.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor),
             petWindowBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
             motionBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
             localBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            stack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor),
         ])
     }
 
@@ -1146,16 +1220,17 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 14
-        recommendationPane.addSubview(stack)
+        let (_, documentView) = makeScrollablePane(for: recommendationPane)
+        documentView.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: recommendationPane.topAnchor, constant: 4),
-            stack.leadingAnchor.constraint(equalTo: recommendationPane.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: recommendationPane.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: documentView.topAnchor, constant: 4),
+            stack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor),
             loopBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
             backgroundBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
             framingBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
             toolsBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: recommendationPane.bottomAnchor),
+            stack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor),
         ])
     }
 
@@ -1175,6 +1250,34 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             ])
         }
         return box
+    }
+
+    private func makeScrollablePane(for pane: NSView) -> (scroll: NSScrollView, document: NSView) {
+        let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.borderType = .noBorder
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+        scroll.setAccessibilityLabel("Settings pane scroll area")
+
+        let document = TopAlignedSettingsDocumentView()
+        document.translatesAutoresizingMaskIntoConstraints = false
+        scroll.documentView = document
+        pane.addSubview(scroll)
+        NSLayoutConstraint.activate([
+            scroll.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: pane.topAnchor),
+            scroll.bottomAnchor.constraint(equalTo: pane.bottomAnchor),
+            document.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            document.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
+            document.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            document.heightAnchor.constraint(greaterThanOrEqualTo: scroll.contentView.heightAnchor),
+        ])
+        return (scroll, document)
     }
 
     private func makeAppearanceRow(title: String, control: NSView, value: NSTextField? = nil) -> NSStackView {
@@ -1500,8 +1603,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        persistSettingsWindowSize()
         libraryRevisionTimer?.invalidate()
         libraryRevisionTimer = nil
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        persistSettingsWindowSize()
     }
 
     func windowDidChangeScreen(_ notification: Notification) {
@@ -1554,6 +1662,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         minimumPaneWidthConstraint?.constant = max(0, effectiveMinimumSize.width - 40)
         minimumPaneHeightConstraint?.constant = max(0, effectiveMinimumSize.height - 72)
         window.contentMinSize = effectiveMinimumSize
+        window.contentMaxSize = maximumContentSize
 
         let currentSize = window.contentLayoutRect.size
         let requestedSize = usePreferredSize ? Self.preferredContentSize : currentSize
@@ -1569,6 +1678,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         window.setFrame(frame, display: false)
         window.contentView?.layoutSubtreeIfNeeded()
         window.displayIfNeeded()
+        persistSettingsWindowSize()
+    }
+
+    @objc private func resetSettingsWindowSize() {
+        SettingsWindowSizeStore.reset(in: defaults)
+        usePreferredSizeOnFirstShow = false
+        fitWindowToVisibleScreen(usePreferredSize: true)
+    }
+
+    private func persistSettingsWindowSize() {
+        guard let window else { return }
+        SettingsWindowSizeStore.persist(window.contentLayoutRect.size, to: defaults)
     }
 
     @objc private func helpStateChanged() { updateHelpPrompt() }
