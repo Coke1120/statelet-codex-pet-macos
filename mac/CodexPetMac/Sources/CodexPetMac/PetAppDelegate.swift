@@ -524,6 +524,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var activeOneShotPreview: ActiveOneShotPreview?
     private var settingsController: SettingsWindowController?
     private var updateCoordinator: StateletUpdateCoordinator?
+    private var updateRecoveryBlocked = false
     private var dialogueVoiceCoordinator: DialogueVoiceCoordinator!
     private let toolchainDiscovery = AlphaToolchainDiscovery()
     private var toolchainState: AlphaToolchainState = .checking
@@ -571,7 +572,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 applyDeferredCharacterLibraryReloadIfNeeded()
                 applyDeferredGlobalTransitionLibraryReloadIfNeeded()
                 processPendingCharacterBundleOpenIfPossible()
-                updateCoordinator?.retryAutomaticInstallIfNeeded()
             }
         }
     }
@@ -587,22 +587,21 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         do {
             try StateletUpdateInstaller.reconcilePendingTransaction()
         } catch {
+            updateRecoveryBlocked = true
             logger.error("event=update_transaction_recovery_failed action=retain_journal")
         }
-        let updater = StateletUpdateCoordinator(
-            installer: { downloaded, _ in
-                try StateletUpdateInstaller.install(downloaded)
-            },
-            isSafeToInstall: { [weak self] in
-                guard let self else { return false }
-                return self.isSafeForUpdateInstall
+        if !updateRecoveryBlocked {
+            let updater = StateletUpdateCoordinator(
+                installer: { downloaded, _ in
+                    try StateletUpdateInstaller.install(downloaded)
+                }
+            )
+            updater.onSnapshot = { [weak self] snapshot in
+                self?.settingsController?.update(update: snapshot)
             }
-        )
-        updater.onSnapshot = { [weak self] snapshot in
-            self?.settingsController?.update(update: snapshot)
+            updateCoordinator = updater
+            updater.startAutomaticChecks()
         }
-        updateCoordinator = updater
-        updater.startAutomaticChecks()
         configuredMediaMapURL = options.mediaMapURL
         configureCharacterLibrary()
         loadMediaMap()
@@ -757,8 +756,23 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         positionSaveGeneration &+= 1
         positionSaveWorkItem?.cancel()
         positionSaveWorkItem = nil
-        _ = conversionCoordinator.terminateAndWait()
-        dialogueVoiceCoordinator?.shutdown()
+        let playerQuiescent = player?.shutdownForTermination() ?? true
+        let conversionQuiescent = conversionCoordinator.terminateAndWait()
+        let voiceQuiescent = dialogueVoiceCoordinator?.shutdownAndWaitForQuiescence() ?? true
+        let updaterWorkQuiescent = playerQuiescent && conversionQuiescent && voiceQuiescent
+        do {
+            if let candidate = try updateCoordinator?.commitScheduledUpdateAtTermination(
+                ifQuiescent: updaterWorkQuiescent
+            ) {
+                logger.info("event=update_committed_at_termination version=\(candidate.version.description, privacy: .public)")
+            } else if !updaterWorkQuiescent,
+                      updateCoordinator?.snapshot.isScheduledForRestart == true {
+                logger.error("event=update_commit_skipped reason=work_not_quiescent action=retain_current_app")
+            }
+        } catch {
+            logger.error("event=update_commit_failed action=retain_current_or_recover_on_launch")
+        }
+        updateCoordinator?.discardPreparedUpdateAtTermination()
         savePanelFrame()
         NotificationCenter.default.removeObserver(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
@@ -2443,16 +2457,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         options?.alwaysOnTopOverride ?? mediaMap.window.alwaysOnTop
     }
 
-    private var isSafeForUpdateInstall: Bool {
-        !mediaMutationInProgress
-            && activeMP4BatchID == nil
-            && activeTransitionConversionID == nil
-            && activeLifecycleTransition == nil
-            && pendingLifecycleTransitionAttestation == nil
-            && activeOneShotPreview == nil
-            && dialogueVoiceCoordinator?.isBusyForUpdateInstall != true
-    }
-
     @objc private func showSettings() {
         if settingsController == nil {
             settingsController = makeSettingsController()
@@ -2460,7 +2464,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
         refreshDiagnosticsSnapshot()
         refreshSettings()
-        updateCoordinator?.retryAutomaticInstallIfNeeded()
         if let snapshot = updateCoordinator?.snapshot {
             settingsController?.update(update: snapshot)
         }
@@ -2591,6 +2594,21 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         controller.update(dialogueVoice: dialogueVoiceCoordinator.snapshot)
         if let snapshot = updateCoordinator?.snapshot {
             controller.update(update: snapshot)
+        } else if updateRecoveryBlocked {
+            controller.update(
+                update: StateletUpdateSnapshot(
+                    status: StateletUpdaterError.transactionRecoveryRequired.safeStatus,
+                    installedVersion: StateletVersion.current().description,
+                    candidateVersion: nil,
+                    releaseNotes: nil,
+                    progress: nil,
+                    isChecking: false,
+                    isReadyToInstall: false,
+                    isScheduledForRestart: false,
+                    isBlocked: true,
+                    automaticInstallEnabled: false
+                )
+            )
         }
         if let pendingRecoveryNotice {
             controller.update(activity: .failed(pendingRecoveryNotice.0, pendingRecoveryNotice.1))

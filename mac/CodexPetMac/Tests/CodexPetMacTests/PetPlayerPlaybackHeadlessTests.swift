@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import CodexPetCore
 import XCTest
 @testable import Statelet
@@ -369,5 +370,21 @@ final class PetPlayerPlaybackHeadlessTests: XCTestCase {
         XCTAssertEqual(runningItem.action, #selector(PetPlayerView.selectTemporaryState(_:)))
         XCTAssertTrue(NSApplication.shared.sendAction(runningItem.action!, to: runningItem.target, from: runningItem))
         XCTAssertEqual(selectedState, .running)
+    }
+
+    @MainActor
+    func testTerminationShutdownDetachesEveryPlaybackSurface() {
+        let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
+        let controller = PetPlayerController(view: view)
+        view.destinationPlayerLayer.player = AVPlayer()
+        view.lifecycleTransitionPlayerLayer.player = AVPlayer()
+
+        XCTAssertNotNil(view.playerLayer.player)
+        XCTAssertTrue(controller.shutdownForTermination())
+        XCTAssertTrue(controller.isQuiescentForTerminationForTesting)
+        XCTAssertNil(view.playerLayer.player)
+        XCTAssertNil(view.destinationPlayerLayer.player)
+        XCTAssertNil(view.lifecycleTransitionPlayerLayer.player)
+        XCTAssertTrue(controller.shutdownForTermination(), "shutdown must remain idempotent")
     }
 }

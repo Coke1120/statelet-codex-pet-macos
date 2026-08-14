@@ -1114,6 +1114,60 @@ final class PetPlayerController {
         removeLifecycleNotificationObservers()
     }
 
+    /// Synchronously detaches every playback surface before the updater may
+    /// exchange the application bundle at process termination.
+    @discardableResult
+    func shutdownForTermination() -> Bool {
+        cancelLifecycleHandoff(notifyFailure: false)
+        cancelDirectReplacement()
+        invalidateActiveTransition()
+        currentItemObservation = nil
+        displayReadyObservation = nil
+        stopQueuePlayback()
+        view.playerLayer.player = nil
+        view.cancelLifecycleHandoffLayers()
+        view.hideFPSBadge()
+        currentURL = nil
+        currentPresentationIsOneShot = false
+        presentationStatus = .awaiting
+
+        if let failedToEndObserver {
+            NotificationCenter.default.removeObserver(failedToEndObserver)
+            self.failedToEndObserver = nil
+        }
+        if let didPlayToEndObserver {
+            NotificationCenter.default.removeObserver(didPlayToEndObserver)
+            self.didPlayToEndObserver = nil
+        }
+        removeLifecycleNotificationObservers()
+
+        onPresentationEvent = nil
+        onOneShotEnded = nil
+        onPlaylistClipEnded = nil
+        onLifecycleTransitionEnded = nil
+        onLifecycleTransitionFailed = nil
+        return isQuiescentForTermination
+    }
+
+    var isQuiescentForTerminationForTesting: Bool {
+        isQuiescentForTermination
+    }
+
+    private var isQuiescentForTermination: Bool {
+        activeTransition == nil
+            && activeLifecycleHandoff == nil
+            && activeDirectReplacement == nil
+            && queuePlayer.items().isEmpty
+            && view.playerLayer.player == nil
+            && view.destinationPlayerLayer.player == nil
+            && view.lifecycleTransitionPlayerLayer.player == nil
+            && readinessTimeoutWorkItem == nil
+            && lifecycleReadinessTimeoutWorkItem == nil
+            && lifecyclePlaybackStallTimeoutWorkItem == nil
+            && directTimeoutWorkItem == nil
+            && fpsLoadingTask == nil
+    }
+
     /// Atomically replaces the visible asset after both the queued item and
     /// standby AVPlayerLayer pass their readiness gates. Reduce Motion uses a
     /// decoded static presentation without clearing the existing content first.

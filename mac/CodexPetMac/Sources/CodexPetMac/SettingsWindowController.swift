@@ -300,7 +300,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let updateProgress = NSProgressIndicator()
     private let checkForUpdatesButton = NSButton(title: "Check Now", target: nil, action: nil)
     private let cancelUpdateButton = NSButton(title: "Cancel", target: nil, action: nil)
-    private let installUpdateButton = NSButton(title: "Install Update", target: nil, action: nil)
+    private let installUpdateButton = NSButton(title: "Install at Restart", target: nil, action: nil)
     private let automaticInstallCheckbox = NSButton(checkboxWithTitle: "Automatically install verified updates at the next safe restart", target: nil, action: nil)
     private let diagnosticsTextView = NSTextView()
     private let launchAtLoginCheckbox = NSButton(checkboxWithTitle: "Start Statelet when I log in", target: nil, action: nil)
@@ -465,9 +465,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         }
         updateStatusLabel.stringValue = snapshot.status
         let status = snapshot.status.lowercased()
-        updateStatusLabel.textColor = status.contains("unable") || status.contains("could not") || status.contains("failed")
+        updateStatusLabel.textColor = status.contains("unable")
+            || status.contains("could not")
+            || status.contains("failed")
+            || status.contains("recovery")
             ? .systemRed
-            : (snapshot.isReadyToInstall ? .systemGreen : .secondaryLabelColor)
+            : (snapshot.isReadyToInstall || snapshot.isScheduledForRestart ? .systemGreen : .secondaryLabelColor)
         updateNotesLabel.stringValue = snapshot.releaseNotes ?? ""
         updateNotesLabel.isHidden = snapshot.releaseNotes == nil
         updateProgress.isHidden = snapshot.progress == nil
@@ -475,10 +478,17 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             updateProgress.doubleValue = min(max(progress, 0), 1) * 100
         }
         checkForUpdatesButton.isEnabled = !snapshot.isChecking
-        cancelUpdateButton.isEnabled = snapshot.isChecking
-        installUpdateButton.isEnabled = snapshot.isReadyToInstall && !snapshot.isChecking
+            && !snapshot.isReadyToInstall
+            && !snapshot.isScheduledForRestart
+            && !snapshot.isBlocked
+        cancelUpdateButton.isEnabled = snapshot.isChecking && !snapshot.isBlocked
+        installUpdateButton.isEnabled = snapshot.isReadyToInstall
+            && !snapshot.isChecking
+            && !snapshot.isBlocked
         automaticInstallCheckbox.state = snapshot.automaticInstallEnabled ? .on : .off
         automaticInstallCheckbox.isEnabled = !snapshot.isChecking
+            && !snapshot.isScheduledForRestart
+            && !snapshot.isBlocked
     }
 
     func update(
@@ -1180,7 +1190,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         )
         let media = makeSection(
             title: "Animation and voice",
-            content: NSTextField(wrappingLabelWithString: "Animation imports run through HEVC-with-alpha and playback validation. Use the Animations pane for playlists, transitions and Reduce Motion posters. Voice providers run locally; model files, reference audio, dialogue and generated speech stay in private Application Support and are never bundled in releases.")
+            content: NSTextField(wrappingLabelWithString: "Animation imports run through HEVC-with-alpha and playback validation. Use the Animations pane for playlists, transitions and Reduce Motion posters. GPT-SoVITS, Qwen3-TTS and VoxCPM2 run locally; model files, reference audio, dialogue and generated speech stay in private Application Support and are never bundled in releases.")
+        )
+        let accessibility = makeSection(
+            title: "Interaction and accessibility",
+            content: NSTextField(wrappingLabelWithString: "Settings supports keyboard navigation and VoiceOver labels. Reduce Motion replaces transition motion with verified posters when available. If click-through prevents pointer access to the pet, use the Statelet menu-bar icon to reopen Settings or turn click-through off.")
         )
         let recovery = makeSection(
             title: "Recovery and diagnostics",
@@ -1218,7 +1232,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         installUpdateButton.action = #selector(installUpdate)
         installUpdateButton.bezelStyle = .rounded
         installUpdateButton.isEnabled = false
-        installUpdateButton.setAccessibilityLabel("Install verified Statelet update")
+        installUpdateButton.setAccessibilityLabel("Install verified Statelet update at restart")
         automaticInstallCheckbox.target = self
         automaticInstallCheckbox.action = #selector(automaticInstallChanged)
         automaticInstallCheckbox.setAccessibilityLabel("Automatically install verified updates")
@@ -1239,38 +1253,28 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         updateStack.spacing = 8
         let updateBox = makeSection(title: "Updates", content: updateStack)
 
-        let stack = NSStackView(views: [title, introduction, quickStart, lifecycle, media, recovery, links, updateBox])
+        let stack = NSStackView(views: [
+            title,
+            introduction,
+            quickStart,
+            lifecycle,
+            media,
+            accessibility,
+            recovery,
+            links,
+            updateBox,
+        ])
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 14
-        for view in [quickStart, lifecycle, media, recovery, updateBox] {
+        for view in [quickStart, lifecycle, media, accessibility, recovery, updateBox] {
             view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
 
-        let scroll = NSScrollView()
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        scroll.borderType = .noBorder
-        scroll.hasVerticalScroller = true
-        scroll.hasHorizontalScroller = false
-        scroll.autohidesScrollers = true
-        scroll.drawsBackground = false
-        scroll.setAccessibilityLabel("Settings pane scroll area")
-        let document = NSView()
-        document.translatesAutoresizingMaskIntoConstraints = false
-        scroll.documentView = document
+        let (_, document) = makeScrollablePane(for: helpPane)
         document.addSubview(stack)
-        helpPane.addSubview(scroll)
         NSLayoutConstraint.activate([
-            scroll.leadingAnchor.constraint(equalTo: helpPane.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: helpPane.trailingAnchor),
-            scroll.topAnchor.constraint(equalTo: helpPane.topAnchor),
-            scroll.bottomAnchor.constraint(equalTo: helpPane.bottomAnchor),
-            document.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
-            document.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
-            document.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
-            document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
-            document.heightAnchor.constraint(greaterThanOrEqualTo: scroll.contentView.heightAnchor),
             stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 4),
             stack.leadingAnchor.constraint(equalTo: document.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: document.trailingAnchor),

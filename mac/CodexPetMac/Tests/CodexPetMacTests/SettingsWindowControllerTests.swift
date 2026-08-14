@@ -91,7 +91,7 @@ final class SettingsWindowControllerTests: XCTestCase {
                 $0.accessibilityLabel() == "Settings section"
             }
         )
-        for section in [2, 3, 6] {
+        for section in [2, 3, 5, 6] {
             tabs.selectedSegment = section
             NSApp.sendAction(tabs.action!, to: tabs.target, from: tabs)
             Self.pumpMainRunLoop(for: 0.05)
@@ -101,10 +101,18 @@ final class SettingsWindowControllerTests: XCTestCase {
                 },
                 "section \(section)"
             )
+            let documentView = try XCTUnwrap(scrollView.documentView, "section \(section)")
             XCTAssertTrue(
-                try XCTUnwrap(scrollView.documentView, "section \(section)").isFlipped,
+                documentView.isFlipped,
                 "section \(section) should open at the top of its scrollable content"
             )
+            if section == 5 {
+                XCTAssertGreaterThan(
+                    documentView.frame.height,
+                    scrollView.contentView.bounds.height,
+                    "Help should retain scrollable overflow at the supported compact size"
+                )
+            }
         }
     }
 
@@ -150,6 +158,34 @@ final class SettingsWindowControllerTests: XCTestCase {
                 $0.accessibilityLabel() == "Cancel Statelet update"
             }
         )
+
+        controller.update(
+            update: StateletUpdateSnapshot(
+                status: StateletUpdaterError.transactionRecoveryRequired.safeStatus,
+                installedVersion: "1.7.1 (13)",
+                candidateVersion: nil,
+                releaseNotes: nil,
+                progress: nil,
+                isChecking: false,
+                isReadyToInstall: false,
+                isScheduledForRestart: false,
+                isBlocked: true,
+                automaticInstallEnabled: false
+            )
+        )
+        Self.pumpMainRunLoop(for: 0.05)
+        let updateControls = Self.descendants(of: window.contentView)
+            .compactMap { $0 as? NSButton }
+            .filter {
+                [
+                    "Check for Statelet updates",
+                    "Cancel Statelet update",
+                    "Install verified Statelet update at restart",
+                    "Automatically install verified updates",
+                ].contains($0.accessibilityLabel() ?? "")
+            }
+        XCTAssertEqual(updateControls.count, 4)
+        XCTAssertTrue(updateControls.allSatisfy { !$0.isEnabled })
 
         tabs.selectedSegment = 6
         NSApp.sendAction(tabs.action!, to: tabs.target, from: tabs)

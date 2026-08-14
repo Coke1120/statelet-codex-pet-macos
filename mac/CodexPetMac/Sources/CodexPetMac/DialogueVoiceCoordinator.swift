@@ -36,6 +36,38 @@ struct DialogueVoiceCoordinatorSnapshot {
 }
 
 final class DialogueVoiceCoordinator: @unchecked Sendable {
+    private final class DetachedActivityTracker: @unchecked Sendable {
+        private let condition = NSCondition()
+        private var activeCount = 0
+
+        func begin() {
+            condition.lock()
+            activeCount += 1
+            condition.unlock()
+        }
+
+        func finish() {
+            condition.lock()
+            activeCount -= 1
+            if activeCount == 0 {
+                condition.broadcast()
+            }
+            condition.unlock()
+        }
+
+        func waitForQuiescence(timeout: TimeInterval) -> Bool {
+            let deadline = Date(timeIntervalSinceNow: max(0, timeout))
+            condition.lock()
+            defer { condition.unlock() }
+            while activeCount > 0 {
+                if !condition.wait(until: deadline), activeCount > 0 {
+                    return false
+                }
+            }
+            return true
+        }
+    }
+
     private enum GenerationResult: Sendable {
         case success(String, ValidatedProviderIdentity)
         case failure(String)
@@ -133,6 +165,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     private let managedFileRemove: ManagedFileRemove
     private let voxSnapshotInstall: VoxSnapshotInstall
     private let voxReferenceInstall: VoxReferenceInstall
+    private let detachedActivities = DetachedActivityTracker()
 
     private(set) var library: DialogueVoiceLibrary
     private(set) var draft: DialogueVoiceProfileDraft
@@ -169,21 +202,6 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         guard audioPlayer.isPlaying,
               case .automatic = activeVoicePlayback else { return false }
         return true
-    }
-
-    /// Update installation must wait for voice imports, validation, generation,
-    /// and playback to finish. The activity text is intentionally treated as a
-    /// conservative busy signal because several operations span async tasks.
-    var isBusyForUpdateInstall: Bool {
-        if activeGenerationTask != nil || activeImportTask != nil || profileValidationTask != nil {
-            return true
-        }
-        if audioPlayer.isPlaying || automaticPlaybackTask != nil {
-            return true
-        }
-        let busyPrefixes = ["importing ", "validating ", "generating ", "refreshing ", "playing "]
-        guard let activity = activityMessage?.lowercased() else { return false }
-        return busyPrefixes.contains { activity.hasPrefix($0) }
     }
 
     init(
@@ -371,6 +389,18 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         }
     }
 
+    /// Cancels voice work and waits until detached import, validation, and
+    /// generation operations have stopped touching updater-sensitive files and
+    /// processes. This is intentionally synchronous for the app termination
+    /// boundary; detached operations signal completion before dispatching their
+    /// final state update back to the main actor.
+    @discardableResult
+    func shutdownAndWaitForQuiescence(timeout: TimeInterval = 5) -> Bool {
+        assertMainThread()
+        shutdown()
+        return detachedActivities.waitForQuiescence(timeout: timeout)
+    }
+
     func importAsset(sourceURL: URL, kind: DialogueVoiceAssetKind, preserving draft: DialogueVoiceProfileDraft) {
         assertMainThread()
         guard !persistenceBlocked else { return }
@@ -381,6 +411,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         activityMessage = "Importing \(assetDisplayName(kind))…"
         notify()
         let installer = installer
+        detachedActivities.begin()
+        let detachedActivities = detachedActivities
         activeImportTask = Task.detached(priority: .userInitiated) { [self] in
             let result: Result<DialogueVoiceInstalledAsset, DialogueVoiceRuntimeError>
             do {
@@ -392,6 +424,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             } catch {
                 result = .failure(.copyFailed)
             }
+            detachedActivities.finish()
             await MainActor.run {
                 guard sequence == self.importSequence else {
                     if case let .success(asset) = result {
@@ -468,6 +501,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
 
         let root = applicationSupportRoot
         let qwenPackageInstall = qwenPackageInstall
+        detachedActivities.begin()
+        let detachedActivities = detachedActivities
         activeImportTask = Task.detached(priority: .userInitiated) {
             let result: Result<
                 (Qwen3TTSImportedPackage, Qwen3TTSPythonRuntimeIdentity),
@@ -487,6 +522,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             } catch {
                 result = .failure(.profileRejected)
             }
+            detachedActivities.finish()
             await MainActor.run {
                 self.inFlightQwenPackagePaths.subtract(reservedPaths)
                 guard sequence == self.importSequence else {
@@ -619,6 +655,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         notify()
         let voxSnapshotInstall = voxSnapshotInstall
         let voxReferenceInstall = voxReferenceInstall
+        detachedActivities.begin()
+        let detachedActivities = detachedActivities
         activeImportTask = Task.detached(priority: .userInitiated) {
             let result: VoxCPM2ProfileImportResult
             do {
@@ -682,6 +720,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             } catch {
                 result = .failure(.profileRejected, installedPaths: [])
             }
+            detachedActivities.finish()
             await MainActor.run {
                 self.inFlightVoxImportPaths.subtract(reservedPaths)
                 guard sequence == self.importSequence else {
@@ -1490,6 +1529,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                 outputRelativePath: outputRelativePath
             )
         }
+        detachedActivities.begin()
+        let detachedActivities = detachedActivities
         profileValidationTask = Task.detached(priority: .utility) { [self] in
             let result: ProfileValidationResult
             do {
@@ -1533,6 +1574,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             } catch {
                 result = .invalid
             }
+            detachedActivities.finish()
             await MainActor.run {
                 guard sequence == self.profileValidationSequence,
                       self.library.activeProviderKind == .gptSovits,
@@ -1577,6 +1619,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             )
         }
         let qwenClient = qwenClient
+        detachedActivities.begin()
+        let detachedActivities = detachedActivities
         profileValidationTask = Task.detached(priority: .utility) { [self] in
             let result: ProfileValidationResult
             do {
@@ -1607,6 +1651,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             } catch {
                 result = .invalid
             }
+            detachedActivities.finish()
             await MainActor.run {
                 guard sequence == self.profileValidationSequence,
                       self.library.activeProviderKind == .qwen3TTS,
@@ -1633,6 +1678,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                 outputRelativePath: outputRelativePath
             )
         }
+        detachedActivities.begin()
+        let detachedActivities = detachedActivities
         profileValidationTask = Task.detached(priority: .utility) {
             let result: ProfileValidationResult
             var probeSummary: String?
@@ -1659,6 +1706,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             } catch { result = .invalid }
             let validationResult = result
             let validationSummary = probeSummary
+            detachedActivities.finish()
             await MainActor.run {
                 guard sequence == self.profileValidationSequence,
                       self.library.activeProviderKind == .voxcpm2,
@@ -1853,6 +1901,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             let qwenProfile = library.qwenProfile
             let voxProfile = library.voxcpm2Profile
             let voxcpm2Client = voxcpm2Client
+            detachedActivities.begin()
+            let detachedActivities = detachedActivities
             activeGenerationTask = Task.detached(priority: .userInitiated) { [self] in
                 let result: GenerationResult
                 do {
@@ -1940,6 +1990,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                 } catch {
                     result = .failure(DialogueVoiceRuntimeError.inferenceUnavailable.safeCode)
                 }
+                detachedActivities.finish()
                 await MainActor.run {
                     self.finishGeneration(ticket: ticket, result: result)
                 }

@@ -137,6 +137,33 @@ final class StateletUpdaterTests: XCTestCase {
         ) { XCTAssertEqual($0 as? StateletUpdaterError, .artifactHashMismatch) }
     }
 
+    func testArtifactVerificationPreservesCancellation() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let artifact = directory.appendingPathComponent("Statelet.zip")
+        let payload = Data("cancelled verification".utf8)
+        try payload.write(to: artifact)
+        let digest = SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()
+        let gate = AsyncTestGate()
+        let verification = Task {
+            await gate.wait()
+            try StateletArtifactVerifier.verifyFile(
+                at: artifact,
+                expectedSize: Int64(payload.count),
+                expectedSHA256: digest
+            )
+        }
+
+        verification.cancel()
+        await gate.open()
+        do {
+            try await verification.value
+            XCTFail("cancelled verification must not succeed")
+        } catch is CancellationError {
+            // Expected: cancellation is not rewritten as an artifact failure.
+        }
+    }
+
     func testManagedBundleValidationChecksCanonicalIdentityAndExecutable() throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -155,6 +182,32 @@ final class StateletUpdaterTests: XCTestCase {
         XCTAssertThrowsError(try StateletBundleValidator.validate(at: bundle)) {
             XCTAssertEqual($0 as? StateletUpdaterError, .untrustedSignature)
         }
+
+        let missingCompatibility = try makeBundle(
+            in: directory,
+            name: "MissingCompatibility.app",
+            identifier: StateletIdentity.bundleIdentifier,
+            minimumSystemVersion: nil
+        )
+        XCTAssertThrowsError(
+            try StateletBundleValidator.validate(
+                at: missingCompatibility,
+                requireTrustedSignature: false
+            )
+        ) { XCTAssertEqual($0 as? StateletUpdaterError, .unsupportedSystem) }
+
+        let malformedCompatibility = try makeBundle(
+            in: directory,
+            name: "MalformedCompatibility.app",
+            identifier: StateletIdentity.bundleIdentifier,
+            minimumSystemVersion: "14.foo"
+        )
+        XCTAssertThrowsError(
+            try StateletBundleValidator.validate(
+                at: malformedCompatibility,
+                requireTrustedSignature: false
+            )
+        ) { XCTAssertEqual($0 as? StateletUpdaterError, .unsupportedSystem) }
     }
 
     func testTransactionalInstallerRetainsJournalUntilNextLaunchReconciles() throws {
@@ -164,36 +217,32 @@ final class StateletUpdaterTests: XCTestCase {
         let staging = root.appendingPathComponent("staging", isDirectory: true)
         try FileManager.default.createDirectory(at: applications, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
-        let target = try makeBundle(in: applications, identifier: StateletIdentity.bundleIdentifier)
-        let candidate = try makeBundle(in: staging, identifier: StateletIdentity.bundleIdentifier)
-        try Data("candidate".utf8).write(to: candidate.appendingPathComponent("candidate.marker"))
-        let oldVersion = try XCTUnwrap(StateletVersion(version: "1.0.0", build: "1"))
-        let newVersion = try XCTUnwrap(StateletVersion(version: "2.0.0", build: "20"))
-        let downloaded = StateletDownloadedUpdate(artifactURL: staging.appendingPathComponent("update.zip"), bundleURL: candidate)
-        let validate: StateletUpdateInstaller.BundleValidation = { _, trusted in
-            StateletBundleMetadata(version: trusted ? newVersion : oldVersion, minimumSystemVersion: nil)
-        }
+        let target = try makeInstallerBundle(in: applications, marker: "old", version: "1.0.0", build: "1")
+        let candidate = try makeInstallerBundle(in: staging, marker: "candidate", version: "2.0.0", build: "20")
+        let validate = try installerValidation()
+        let downloaded = StateletDownloadedUpdate(
+            artifactURL: staging.appendingPathComponent("update.zip"),
+            bundleURL: candidate
+        )
 
         try StateletUpdateInstaller.install(
             downloaded,
             targetURL: target,
             validateBundle: validate
         )
-        XCTAssertEqual(try String(contentsOf: target.appendingPathComponent("candidate.marker")), "candidate")
-        XCTAssertTrue(
-            try FileManager.default.contentsOfDirectory(at: applications, includingPropertiesForKeys: nil)
-                .contains { $0.lastPathComponent.hasPrefix(".statelet-update-") }
-        )
+        XCTAssertEqual(try installerMarker(at: target), "candidate")
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: applications.appendingPathComponent(".statelet-update-active").path
+        ))
 
         try StateletUpdateInstaller.reconcilePendingTransaction(
             targetURL: target,
             validateBundle: validate
         )
-        XCTAssertFalse(
-            try FileManager.default.contentsOfDirectory(at: applications, includingPropertiesForKeys: nil)
-                .contains { $0.lastPathComponent.hasPrefix(".statelet-update-") }
-        )
-        XCTAssertEqual(try String(contentsOf: target.appendingPathComponent("candidate.marker")), "candidate")
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: applications.appendingPathComponent(".statelet-update-active").path
+        ))
+        XCTAssertEqual(try installerMarker(at: target), "candidate")
     }
 
     func testTransactionalInstallerRestoresPreviousBundleWhenPostPublishValidationFails() throws {
@@ -203,19 +252,13 @@ final class StateletUpdaterTests: XCTestCase {
         let staging = root.appendingPathComponent("staging", isDirectory: true)
         try FileManager.default.createDirectory(at: applications, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
-        let target = try makeBundle(in: applications, identifier: StateletIdentity.bundleIdentifier)
-        let candidate = try makeBundle(in: staging, identifier: StateletIdentity.bundleIdentifier)
-        try Data("old".utf8).write(to: target.appendingPathComponent("version.marker"))
-        try Data("candidate".utf8).write(to: candidate.appendingPathComponent("version.marker"))
-        let oldVersion = try XCTUnwrap(StateletVersion(version: "1.0.0", build: "1"))
-        let newVersion = try XCTUnwrap(StateletVersion(version: "2.0.0", build: "20"))
-        let downloaded = StateletDownloadedUpdate(artifactURL: staging.appendingPathComponent("update.zip"), bundleURL: candidate)
-        var validationCount = 0
-        let validate: StateletUpdateInstaller.BundleValidation = { _, trusted in
-            validationCount += 1
-            if trusted, validationCount == 3 { throw StateletUpdaterError.untrustedSignature }
-            return StateletBundleMetadata(version: trusted ? newVersion : oldVersion, minimumSystemVersion: nil)
-        }
+        let target = try makeInstallerBundle(in: applications, marker: "old", version: "1.0.0", build: "1")
+        let candidate = try makeInstallerBundle(in: staging, marker: "candidate", version: "2.0.0", build: "20")
+        let validate = try installerValidation(rejectTrustedCandidateAt: target)
+        let downloaded = StateletDownloadedUpdate(
+            artifactURL: staging.appendingPathComponent("update.zip"),
+            bundleURL: candidate
+        )
 
         XCTAssertThrowsError(
             try StateletUpdateInstaller.install(
@@ -224,11 +267,183 @@ final class StateletUpdaterTests: XCTestCase {
                 validateBundle: validate
             )
         ) { XCTAssertEqual($0 as? StateletUpdaterError, .untrustedSignature) }
-        XCTAssertEqual(try String(contentsOf: target.appendingPathComponent("version.marker")), "old")
-        XCTAssertFalse(
-            try FileManager.default.contentsOfDirectory(at: applications, includingPropertiesForKeys: nil)
-                .contains { $0.lastPathComponent.hasPrefix(".statelet-update-") }
+        XCTAssertEqual(try installerMarker(at: target), "old")
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: applications.appendingPathComponent(".statelet-update-active").path
+        ))
+    }
+
+    func testTransactionalInstallerKeepsTargetRunnableAcrossEveryCrashCheckpoint() throws {
+        for checkpoint in StateletUpdateInstaller.InstallCheckpoint.allCases {
+            let root = try makeTemporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let applications = root.appendingPathComponent("Applications", isDirectory: true)
+            let staging = root.appendingPathComponent("staging", isDirectory: true)
+            try FileManager.default.createDirectory(at: applications, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+            let target = try makeInstallerBundle(
+                in: applications,
+                marker: "old",
+                version: "1.0.0",
+                build: "1"
+            )
+            let candidate = try makeInstallerBundle(
+                in: staging,
+                marker: "candidate",
+                version: "2.0.0",
+                build: "20"
+            )
+            let validate = try installerValidation()
+            let downloaded = StateletDownloadedUpdate(
+                artifactURL: staging.appendingPathComponent("update.zip"),
+                bundleURL: candidate
+            )
+
+            XCTAssertThrowsError(
+                try StateletUpdateInstaller.install(
+                    downloaded,
+                    targetURL: target,
+                    validateBundle: validate,
+                    checkpoint: { observed in
+                        if observed == checkpoint {
+                            throw StateletUpdateInstaller.SimulatedCrash()
+                        }
+                    }
+                ),
+                "checkpoint: \(checkpoint)"
+            ) { XCTAssertTrue($0 is StateletUpdateInstaller.SimulatedCrash) }
+            XCTAssertTrue(
+                FileManager.default.fileExists(atPath: target.path),
+                "target missing after checkpoint: \(checkpoint)"
+            )
+
+            try StateletUpdateInstaller.reconcilePendingTransaction(
+                targetURL: target,
+                validateBundle: validate
+            )
+            let candidateWasPublished: Bool
+            switch checkpoint {
+            case .bundlesSwapped, .published, .validated:
+                candidateWasPublished = true
+            case .transactionJournaled, .candidateStaged, .swapPrepared:
+                candidateWasPublished = false
+            }
+            XCTAssertEqual(
+                try installerMarker(at: target),
+                candidateWasPublished ? "candidate" : "old",
+                "checkpoint: \(checkpoint)"
+            )
+        }
+    }
+
+    func testTransactionalInstallerRejectsMalformedPendingJournal() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let applications = root.appendingPathComponent("Applications", isDirectory: true)
+        try FileManager.default.createDirectory(at: applications, withIntermediateDirectories: true)
+        let target = try makeBundle(in: applications, identifier: StateletIdentity.bundleIdentifier)
+        let transaction = applications.appendingPathComponent(".statelet-update-active", isDirectory: true)
+        try FileManager.default.createDirectory(at: transaction, withIntermediateDirectories: false)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: transaction.path)
+        let journal = transaction.appendingPathComponent("journal.json")
+        try Data("{not-json".utf8).write(to: journal)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: journal.path)
+
+        XCTAssertThrowsError(
+            try StateletUpdateInstaller.reconcilePendingTransaction(targetURL: target)
+        ) { XCTAssertEqual($0 as? StateletUpdaterError, .transactionRecoveryRequired) }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: transaction.path))
+    }
+
+    func testTransactionalInstallerRejectsMultipleOrUnexpectedPendingJournals() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let applications = root.appendingPathComponent("Applications", isDirectory: true)
+        try FileManager.default.createDirectory(at: applications, withIntermediateDirectories: true)
+        let target = try makeBundle(in: applications, identifier: StateletIdentity.bundleIdentifier)
+        let first = try writeTransactionJournal(parent: applications, target: target, phase: "staged")
+        let second = try writeTransactionJournal(
+            parent: applications,
+            target: target,
+            phase: "staged",
+            transactionName: ".statelet-update-unexpected"
         )
+
+        XCTAssertThrowsError(
+            try StateletUpdateInstaller.reconcilePendingTransaction(targetURL: target)
+        ) { XCTAssertEqual($0 as? StateletUpdaterError, .transactionRecoveryRequired) }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: first.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: second.path))
+    }
+
+    func testTransactionalInstallerRefusesNewInstallWhileJournalIsPending() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let applications = root.appendingPathComponent("Applications", isDirectory: true)
+        let staging = root.appendingPathComponent("staging", isDirectory: true)
+        try FileManager.default.createDirectory(at: applications, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        let target = try makeInstallerBundle(in: applications, marker: "old", version: "1.0.0", build: "1")
+        let pending = try writeTransactionJournal(parent: applications, target: target, phase: "staged")
+        let candidate = try makeInstallerBundle(in: staging, marker: "candidate", version: "2.0.0", build: "20")
+        let downloaded = StateletDownloadedUpdate(
+            artifactURL: staging.appendingPathComponent("update.zip"),
+            bundleURL: candidate
+        )
+
+        XCTAssertThrowsError(
+            try StateletUpdateInstaller.install(
+                downloaded,
+                targetURL: target,
+                validateBundle: try installerValidation()
+            )
+        ) { XCTAssertEqual($0 as? StateletUpdaterError, .transactionRecoveryRequired) }
+        XCTAssertEqual(try installerMarker(at: target), "old")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: pending.path))
+    }
+
+    func testTransactionalInstallerRejectsJournalPathsOutsideTransaction() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let applications = root.appendingPathComponent("Applications", isDirectory: true)
+        try FileManager.default.createDirectory(at: applications, withIntermediateDirectories: true)
+        let target = try makeBundle(in: applications, identifier: StateletIdentity.bundleIdentifier)
+        let externalSwap = root.appendingPathComponent("must-not-touch-swap.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: externalSwap, withIntermediateDirectories: true)
+        let transaction = try writeTransactionJournal(
+            parent: applications,
+            target: target,
+            phase: "staged",
+            swapPath: externalSwap.path
+        )
+
+        XCTAssertThrowsError(
+            try StateletUpdateInstaller.reconcilePendingTransaction(targetURL: target)
+        ) { XCTAssertEqual($0 as? StateletUpdaterError, .transactionRecoveryRequired) }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: externalSwap.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: transaction.path))
+    }
+
+    func testTransactionalInstallerRejectsNonPrivateJournalPermissions() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let applications = root.appendingPathComponent("Applications", isDirectory: true)
+        try FileManager.default.createDirectory(at: applications, withIntermediateDirectories: true)
+        let target = try makeBundle(in: applications, identifier: StateletIdentity.bundleIdentifier)
+        let transaction = try writeTransactionJournal(
+            parent: applications,
+            target: target,
+            phase: "staged"
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o644],
+            ofItemAtPath: transaction.appendingPathComponent("journal.json").path
+        )
+
+        XCTAssertThrowsError(
+            try StateletUpdateInstaller.reconcilePendingTransaction(targetURL: target)
+        ) { XCTAssertEqual($0 as? StateletUpdaterError, .transactionRecoveryRequired) }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: transaction.path))
     }
 
     func testAutomaticCheckPolicyUsesLaunchAndTwentyFourHourBoundary() {
@@ -306,7 +521,71 @@ final class StateletUpdaterTests: XCTestCase {
     }
 
     @MainActor
-    func testCoordinatorVerifiesStagesAndRequiresSafeInstallBoundary() async throws {
+    func testCancellationDuringTrustValidationNeverPublishesReadyAndCleansStaging() async throws {
+        let directory = try makeOwnedStagingDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let artifact = directory.appendingPathComponent("Statelet-update.zip")
+        let payload = Data("cancel-during-validation".utf8)
+        try payload.write(to: artifact)
+        let digest = SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()
+        let bundle = try makeBundle(in: directory, identifier: StateletIdentity.bundleIdentifier)
+        let suite = "StateletUpdaterTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let validationStarted = expectation(description: "validation started")
+        let cancelled = expectation(description: "cancelled")
+        let validationGate = AsyncTestGate()
+        let candidateVersion = try XCTUnwrap(StateletVersion(version: "2.0.0", build: "20"))
+        let coordinator = StateletUpdateCoordinator(
+            installedVersion: try XCTUnwrap(StateletVersion(version: "1.0.0", build: "1")),
+            defaults: defaults,
+            fetchReleases: { self.releaseFeedJSON(size: payload.count, digest: digest) },
+            fetchAssetData: { _ in Data() },
+            download: { _, _ in
+                StateletDownloadedUpdate(
+                    artifactURL: artifact,
+                    bundleURL: bundle,
+                    cleanupRootURL: directory
+                )
+            },
+            installer: { _, _ in XCTFail("cancelled update must not install") },
+            validateBundle: { _ in
+                validationStarted.fulfill()
+                await validationGate.wait()
+                return StateletBundleMetadata(
+                    version: candidateVersion,
+                    minimumSystemVersion: OperatingSystemVersion(
+                        majorVersion: 13,
+                        minorVersion: 0,
+                        patchVersion: 0
+                    )
+                )
+            }
+        )
+        coordinator.onSnapshot = { snapshot in
+            if snapshot.status == StateletUpdaterError.cancelled.safeStatus {
+                cancelled.fulfill()
+            }
+        }
+
+        coordinator.checkNow()
+        await fulfillment(of: [validationStarted], timeout: 2)
+        coordinator.cancel()
+        await Task.yield()
+        await validationGate.open()
+        await fulfillment(of: [cancelled], timeout: 2)
+
+        XCTAssertFalse(coordinator.snapshot.isReadyToInstall)
+        XCTAssertFalse(coordinator.snapshot.isScheduledForRestart)
+        let cleanupDeadline = Date().addingTimeInterval(2)
+        while FileManager.default.fileExists(atPath: directory.path), Date() < cleanupDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    @MainActor
+    func testCoordinatorVerifiesStagesAndCommitsOnlyAtTerminationBoundary() async throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let artifact = directory.appendingPathComponent("Statelet.zip")
@@ -319,12 +598,11 @@ final class StateletUpdaterTests: XCTestCase {
         let suite = "StateletUpdaterTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
+        let downloadProgress = expectation(description: "download progress")
         let ready = expectation(description: "ready")
-        let safeBoundary = expectation(description: "safe boundary retained")
-        let installed = expectation(description: "installed at safe boundary")
+        let scheduled = expectation(description: "scheduled for restart")
+        let installed = expectation(description: "installed at termination boundary")
         var installCount = 0
-        var safeToInstall = false
-        var safeBoundaryFulfilled = false
         let candidateVersion = try XCTUnwrap(StateletVersion(version: "2.0.0", build: "20"))
         let coordinator = StateletUpdateCoordinator(
             installedVersion: try XCTUnwrap(StateletVersion(version: "1.0.0", build: "1")),
@@ -339,38 +617,129 @@ final class StateletUpdaterTests: XCTestCase {
                 installCount += 1
                 installed.fulfill()
             },
-            isSafeToInstall: { safeToInstall },
             validateBundle: { _ in
                 StateletBundleMetadata(version: candidateVersion, minimumSystemVersion: nil)
             }
         )
         coordinator.onSnapshot = { snapshot in
+            if snapshot.status == "Downloading update…", snapshot.progress == 0.5 {
+                downloadProgress.fulfill()
+            }
             if snapshot.status == "Update verified and ready to install." { ready.fulfill() }
-            if snapshot.status.contains("safe restart"), !safeBoundaryFulfilled {
-                safeBoundaryFulfilled = true
-                safeBoundary.fulfill()
+            if snapshot.isScheduledForRestart {
+                scheduled.fulfill()
             }
         }
 
         coordinator.checkNow()
-        await fulfillment(of: [ready], timeout: 2)
+        await fulfillment(of: [downloadProgress, ready], timeout: 2)
         XCTAssertTrue(coordinator.snapshot.isReadyToInstall)
         XCTAssertEqual(coordinator.snapshot.progress, 1)
         coordinator.installReadyUpdate()
-        await fulfillment(of: [safeBoundary], timeout: 2)
+        await fulfillment(of: [scheduled], timeout: 2)
         XCTAssertEqual(installCount, 0)
-        XCTAssertTrue(coordinator.snapshot.isReadyToInstall)
-        coordinator.setAutomaticInstall(true)
-        await Task.yield()
-        safeToInstall = true
-        coordinator.retryAutomaticInstallIfNeeded()
+        XCTAssertFalse(coordinator.snapshot.isReadyToInstall)
+        XCTAssertTrue(coordinator.snapshot.isScheduledForRestart)
+
+        let skipped = try coordinator.commitScheduledUpdateAtTermination(ifQuiescent: false)
+        XCTAssertNil(skipped)
+        XCTAssertEqual(installCount, 0)
+        XCTAssertTrue(coordinator.snapshot.isScheduledForRestart)
+
+        let committed = try coordinator.commitScheduledUpdateAtTermination(ifQuiescent: true)
         await fulfillment(of: [installed], timeout: 2)
         XCTAssertEqual(installCount, 1)
+        XCTAssertEqual(committed?.version, candidateVersion)
+        XCTAssertFalse(coordinator.snapshot.isScheduledForRestart)
+    }
+
+    @MainActor
+    func testUnsafeTerminationPersistsRetryIntentAndForcesNextLaunchCheck() async throws {
+        let suite = "StateletUpdaterTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let candidateVersion = try XCTUnwrap(StateletVersion(version: "2.0.0", build: "20"))
+
+        let firstDirectory = try makeOwnedStagingDirectory()
+        defer { try? FileManager.default.removeItem(at: firstDirectory) }
+        let firstArtifact = firstDirectory.appendingPathComponent("Statelet.zip")
+        let firstPayload = Data("first scheduled archive".utf8)
+        try firstPayload.write(to: firstArtifact)
+        let firstDigest = SHA256.hash(data: firstPayload).map { String(format: "%02x", $0) }.joined()
+        let firstBundle = firstDirectory.appendingPathComponent("Statelet.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: firstBundle, withIntermediateDirectories: true)
+        let firstReady = expectation(description: "first update ready")
+        let firstScheduled = expectation(description: "first update scheduled")
+        let firstCoordinator = StateletUpdateCoordinator(
+            installedVersion: try XCTUnwrap(StateletVersion(version: "1.0.0", build: "1")),
+            defaults: defaults,
+            fetchReleases: { self.releaseFeedJSON(size: firstPayload.count, digest: firstDigest) },
+            fetchAssetData: { _ in Data() },
+            download: { _, _ in
+                StateletDownloadedUpdate(
+                    artifactURL: firstArtifact,
+                    bundleURL: firstBundle,
+                    cleanupRootURL: firstDirectory
+                )
+            },
+            installer: { _, _ in XCTFail("unsafe termination must not install") },
+            validateBundle: { _ in
+                StateletBundleMetadata(version: candidateVersion, minimumSystemVersion: nil)
+            }
+        )
+        firstCoordinator.onSnapshot = { snapshot in
+            if snapshot.isReadyToInstall { firstReady.fulfill() }
+            if snapshot.isScheduledForRestart { firstScheduled.fulfill() }
+        }
+        firstCoordinator.checkNow()
+        await fulfillment(of: [firstReady], timeout: 2)
+        firstCoordinator.installReadyUpdate()
+        await fulfillment(of: [firstScheduled], timeout: 2)
+        XCTAssertNil(try firstCoordinator.commitScheduledUpdateAtTermination(ifQuiescent: false))
+        XCTAssertTrue(defaults.bool(forKey: "StateletUpdater.pendingInstallRetry.v1"))
+        firstCoordinator.discardPreparedUpdateAtTermination()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: firstDirectory.path))
+
+        let retryDirectory = try makeOwnedStagingDirectory()
+        defer { try? FileManager.default.removeItem(at: retryDirectory) }
+        let retryArtifact = retryDirectory.appendingPathComponent("Statelet.zip")
+        let retryPayload = Data("retried scheduled archive".utf8)
+        try retryPayload.write(to: retryArtifact)
+        let retryDigest = SHA256.hash(data: retryPayload).map { String(format: "%02x", $0) }.joined()
+        let retryBundle = retryDirectory.appendingPathComponent("Statelet.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: retryBundle, withIntermediateDirectories: true)
+        let retryScheduled = expectation(description: "pending install retried despite recent check")
+        let retryCoordinator = StateletUpdateCoordinator(
+            installedVersion: try XCTUnwrap(StateletVersion(version: "1.0.0", build: "1")),
+            defaults: defaults,
+            fetchReleases: { self.releaseFeedJSON(size: retryPayload.count, digest: retryDigest) },
+            fetchAssetData: { _ in Data() },
+            download: { _, _ in
+                StateletDownloadedUpdate(
+                    artifactURL: retryArtifact,
+                    bundleURL: retryBundle,
+                    cleanupRootURL: retryDirectory
+                )
+            },
+            installer: { _, _ in },
+            validateBundle: { _ in
+                StateletBundleMetadata(version: candidateVersion, minimumSystemVersion: nil)
+            }
+        )
+        retryCoordinator.onSnapshot = { snapshot in
+            if snapshot.isScheduledForRestart { retryScheduled.fulfill() }
+        }
+
+        retryCoordinator.startAutomaticChecks()
+        await fulfillment(of: [retryScheduled], timeout: 2)
+        XCTAssertTrue(retryCoordinator.snapshot.isScheduledForRestart)
+        _ = try retryCoordinator.commitScheduledUpdateAtTermination(ifQuiescent: true)
+        XCTAssertFalse(defaults.bool(forKey: "StateletUpdater.pendingInstallRetry.v1"))
     }
 
     @MainActor
     func testAutomaticInstallIsPersistedOptIn() async throws {
-        let directory = try makeTemporaryDirectory()
+        let directory = try makeOwnedStagingDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let artifact = directory.appendingPathComponent("Statelet.zip")
         let payload = Data("auto-install-archive".utf8)
@@ -381,25 +750,45 @@ final class StateletUpdaterTests: XCTestCase {
         let suite = "StateletUpdaterTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
-        let installed = expectation(description: "installed")
+        let scheduled = expectation(description: "scheduled")
+        let installed = expectation(description: "installed at termination")
+        var installCount = 0
         let candidateVersion = try XCTUnwrap(StateletVersion(version: "2.0.0", build: "20"))
         let coordinator = StateletUpdateCoordinator(
             installedVersion: try XCTUnwrap(StateletVersion(version: "1.0.0", build: "1")),
             defaults: defaults,
             fetchReleases: { self.releaseFeedJSON(size: payload.count, digest: digest) },
             fetchAssetData: { _ in Data() },
-            download: { _, _ in StateletDownloadedUpdate(artifactURL: artifact, bundleURL: bundle) },
-            installer: { _, _ in installed.fulfill() },
-            isSafeToInstall: { true },
+            download: { _, _ in
+                StateletDownloadedUpdate(
+                    artifactURL: artifact,
+                    bundleURL: bundle,
+                    cleanupRootURL: directory
+                )
+            },
+            installer: { _, _ in
+                installCount += 1
+                installed.fulfill()
+            },
             validateBundle: { _ in
                 StateletBundleMetadata(version: candidateVersion, minimumSystemVersion: nil)
             }
         )
+        coordinator.onSnapshot = { snapshot in
+            if snapshot.isScheduledForRestart { scheduled.fulfill() }
+        }
         coordinator.setAutomaticInstall(true)
         XCTAssertTrue(defaults.bool(forKey: "StateletUpdater.automaticInstall.v1"))
         coordinator.checkNow()
+        await fulfillment(of: [scheduled], timeout: 2)
+        XCTAssertEqual(installCount, 0)
+        XCTAssertTrue(coordinator.snapshot.isScheduledForRestart)
+
+        _ = try coordinator.commitScheduledUpdateAtTermination(ifQuiescent: true)
         await fulfillment(of: [installed], timeout: 2)
-        XCTAssertEqual(coordinator.snapshot.status, "Update installed. Restart Statelet to finish.")
+        XCTAssertEqual(installCount, 1)
+        XCTAssertEqual(coordinator.snapshot.status, "Update installed. Reopen Statelet to use the new version.")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
     }
 
     private func releaseAsset(name: String, size: Int64, digest: String?) throws -> StateletReleaseAsset {
@@ -436,10 +825,22 @@ final class StateletUpdaterTests: XCTestCase {
         return url
     }
 
+    private func makeOwnedStagingDirectory() throws -> URL {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StateletUpdates", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let url = base.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
+        return url
+    }
+
     private func makeBundle(
         in directory: URL,
         name: String = "Statelet.app",
-        identifier: String
+        identifier: String,
+        minimumSystemVersion: String? = "13.0",
+        version: String = "2.0.0",
+        build: String = "20"
     ) throws -> URL {
         let bundle = directory.appendingPathComponent(name, isDirectory: true)
         let macOS = bundle.appendingPathComponent("Contents/MacOS", isDirectory: true)
@@ -447,14 +848,16 @@ final class StateletUpdaterTests: XCTestCase {
         let executable = macOS.appendingPathComponent(StateletIdentity.executableName)
         try Data("#!/bin/sh\nexit 0\n".utf8).write(to: executable)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
-        let info: [String: Any] = [
+        var info: [String: Any] = [
             "CFBundleIdentifier": identifier,
             "CFBundleExecutable": StateletIdentity.executableName,
-            "CFBundleShortVersionString": "2.0.0",
-            "CFBundleVersion": "20",
-            "LSMinimumSystemVersion": "13.0",
+            "CFBundleShortVersionString": version,
+            "CFBundleVersion": build,
             StateletIdentity.appManagedPlistKey: StateletIdentity.managedMarker,
         ]
+        if let minimumSystemVersion {
+            info["LSMinimumSystemVersion"] = minimumSystemVersion
+        }
         let plist = try PropertyListSerialization.data(
             fromPropertyList: info,
             format: .xml,
@@ -463,6 +866,80 @@ final class StateletUpdaterTests: XCTestCase {
         try plist.write(to: bundle.appendingPathComponent("Contents/Info.plist"))
         return bundle
     }
+
+    private func makeInstallerBundle(
+        in directory: URL,
+        marker: String,
+        version: String,
+        build: String
+    ) throws -> URL {
+        let bundle = try makeBundle(
+            in: directory,
+            identifier: StateletIdentity.bundleIdentifier,
+            version: version,
+            build: build
+        )
+        try Data(marker.utf8).write(to: bundle.appendingPathComponent("version.marker"))
+        return bundle
+    }
+
+    private func installerMarker(at bundle: URL) throws -> String {
+        try String(contentsOf: bundle.appendingPathComponent("version.marker"), encoding: .utf8)
+    }
+
+    private func installerValidation(
+        rejectTrustedCandidateAt rejectedTarget: URL? = nil
+    ) throws -> StateletUpdateInstaller.BundleValidation {
+        let oldVersion = try XCTUnwrap(StateletVersion(version: "1.0.0", build: "1"))
+        let candidateVersion = try XCTUnwrap(StateletVersion(version: "2.0.0", build: "20"))
+        return { url, requireTrustedSignature in
+            let marker = try self.installerMarker(at: url)
+            if requireTrustedSignature,
+               marker == "candidate",
+               let rejectedTarget,
+               url.standardizedFileURL.path == rejectedTarget.standardizedFileURL.path {
+                throw StateletUpdaterError.untrustedSignature
+            }
+            let version: StateletVersion
+            switch marker {
+            case "old":
+                version = oldVersion
+            case "candidate":
+                version = candidateVersion
+            default:
+                throw StateletUpdaterError.invalidArtifact
+            }
+            return StateletBundleMetadata(version: version, minimumSystemVersion: nil)
+        }
+    }
+
+    private func writeTransactionJournal(
+        parent: URL,
+        target: URL,
+        phase: String,
+        swapPath: String? = nil,
+        transactionName: String = ".statelet-update-active"
+    ) throws -> URL {
+        let transaction = parent.appendingPathComponent(
+            transactionName,
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: transaction, withIntermediateDirectories: false)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: transaction.path)
+        let journal: [String: Any] = [
+            "targetPath": target.path,
+            "swapPath": swapPath ?? transaction.appendingPathComponent("swap.app").path,
+            "transactionPath": transaction.path,
+            "candidateVersion": "2.0.0",
+            "candidateBuild": 20,
+            "phase": phase,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: journal, options: [.sortedKeys])
+        let journalURL = transaction.appendingPathComponent("journal.json")
+        try data.write(to: journalURL)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: journalURL.path)
+        return transaction
+    }
 }
 
 private actor FetchCounter {
@@ -470,5 +947,21 @@ private actor FetchCounter {
 
     func increment() {
         value += 1
+    }
+}
+
+private actor AsyncTestGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var isOpen = false
+
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func open() {
+        isOpen = true
+        continuation?.resume()
+        continuation = nil
     }
 }

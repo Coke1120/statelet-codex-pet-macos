@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 import Security
 
@@ -345,6 +346,7 @@ enum StateletArtifactVerifier {
     }
 
     static func verifyFile(at url: URL, expectedSize: Int64, expectedSHA256: String) throws {
+        try Task.checkCancellation()
         guard url.isFileURL,
               expectedSize > 0,
               StateletReleaseAsset.isSHA256(expectedSHA256.lowercased()) else {
@@ -366,8 +368,11 @@ enum StateletArtifactVerifier {
         var hasher = SHA256()
         do {
             while let chunk = try handle.read(upToCount: 1024 * 1024), !chunk.isEmpty {
+                try Task.checkCancellation()
                 hasher.update(data: chunk)
             }
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw StateletUpdaterError.invalidArtifact
         }
@@ -421,10 +426,11 @@ enum StateletBundleValidator {
         }
         if requireTrustedSignature { try validateSignature(at: bundleURL) }
 
-        let minimumVersion = (info["LSMinimumSystemVersion"] as? String)
-            .flatMap(parseOperatingSystemVersion)
-        if let minimumVersion,
-           !ProcessInfo.processInfo.isOperatingSystemAtLeast(minimumVersion) {
+        guard let minimumVersionText = info["LSMinimumSystemVersion"] as? String,
+              let minimumVersion = parseOperatingSystemVersion(minimumVersionText) else {
+            throw StateletUpdaterError.unsupportedSystem
+        }
+        if !ProcessInfo.processInfo.isOperatingSystemAtLeast(minimumVersion) {
             throw StateletUpdaterError.unsupportedSystem
         }
         return StateletBundleMetadata(version: version, minimumSystemVersion: minimumVersion)
@@ -514,8 +520,22 @@ enum StateletBundleValidator {
     }
 
     private static func parseOperatingSystemVersion(_ value: String) -> OperatingSystemVersion? {
-        let components = value.split(separator: ".").compactMap { Int($0) }
-        guard !components.isEmpty, components.count <= 3 else { return nil }
+        let rawComponents = value.split(
+            separator: ".",
+            omittingEmptySubsequences: false
+        )
+        guard (1 ... 3).contains(rawComponents.count) else { return nil }
+        var components = [Int]()
+        for component in rawComponents {
+            guard !component.isEmpty,
+                  component.allSatisfy(\.isNumber),
+                  let number = Int(component),
+                  number >= 0 else {
+                return nil
+            }
+            components.append(number)
+        }
+        guard components[0] > 0 else { return nil }
         return OperatingSystemVersion(
             majorVersion: components[0],
             minorVersion: components.count > 1 ? components[1] : 0,
@@ -527,6 +547,33 @@ enum StateletBundleValidator {
 struct StateletDownloadedUpdate {
     let artifactURL: URL
     let bundleURL: URL
+    let cleanupRootURL: URL?
+
+    init(artifactURL: URL, bundleURL: URL, cleanupRootURL: URL? = nil) {
+        self.artifactURL = artifactURL
+        self.bundleURL = bundleURL
+        self.cleanupRootURL = cleanupRootURL
+    }
+
+    func removeOwnedStaging(fileManager: FileManager = .default) {
+        guard let cleanupRootURL else { return }
+        let base = fileManager.temporaryDirectory
+            .appendingPathComponent("StateletUpdates", isDirectory: true)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        let root = cleanupRootURL.resolvingSymlinksInPath().standardizedFileURL
+        let artifact = artifactURL.resolvingSymlinksInPath().standardizedFileURL
+        let bundle = bundleURL.resolvingSymlinksInPath().standardizedFileURL
+        let rootPrefix = root.path.hasSuffix("/") ? root.path : "\(root.path)/"
+        guard root.deletingLastPathComponent().path == base.path,
+              !root.lastPathComponent.isEmpty,
+              artifact.path.hasPrefix(rootPrefix),
+              bundle.path.hasPrefix(rootPrefix),
+              fileManager.fileExists(atPath: root.path) else {
+            return
+        }
+        try? fileManager.removeItem(at: root)
+    }
 }
 
 struct StateletUpdateSnapshot: Equatable {
@@ -537,6 +584,8 @@ struct StateletUpdateSnapshot: Equatable {
     let progress: Double?
     let isChecking: Bool
     let isReadyToInstall: Bool
+    let isScheduledForRestart: Bool
+    let isBlocked: Bool
     let automaticInstallEnabled: Bool
 }
 
@@ -594,9 +643,8 @@ final class StateletUpdateCoordinator {
         @escaping (Double) -> Void
     ) async throws -> StateletDownloadedUpdate
     typealias DownloadPreparation = (StateletDownloadedUpdate) async throws -> StateletDownloadedUpdate
-    typealias Installer = (StateletDownloadedUpdate, StateletUpdateCandidate) async throws -> Void
-    typealias SafeInstallCheck = () async -> Bool
-    typealias BundleValidation = (URL) throws -> StateletBundleMetadata
+    typealias Installer = (StateletDownloadedUpdate, StateletUpdateCandidate) throws -> Void
+    typealias BundleValidation = (URL) async throws -> StateletBundleMetadata
 
     var onSnapshot: ((StateletUpdateSnapshot) -> Void)? {
         didSet { onSnapshot?(snapshot) }
@@ -607,22 +655,22 @@ final class StateletUpdateCoordinator {
     private let defaults: UserDefaults
     private let lastCheckKey: String
     private let automaticInstallKey: String
+    private let pendingInstallRetryKey: String
     private let now: () -> Date
     private let fetchReleases: ReleaseFetcher
     private let fetchAssetData: AssetDataFetcher
     private let download: Downloader
     private let prepareDownloadedUpdate: DownloadPreparation
     private let installer: Installer
-    private let isSafeToInstall: SafeInstallCheck
     private let validateBundle: BundleValidation
     private var operation: Task<Void, Never>?
     private var readyUpdate: (StateletDownloadedUpdate, StateletUpdateCandidate)?
+    private var downloadProgressToken: UUID?
 
     convenience init(
         defaults: UserDefaults = .standard,
         bundle: Bundle = .main,
-        installer: Installer? = nil,
-        isSafeToInstall: @escaping SafeInstallCheck = { false }
+        installer: Installer? = nil
     ) {
         let resolvedInstaller = installer ?? { _, _ in
             // Installation must be supplied by the transactional installer boundary.
@@ -651,7 +699,9 @@ final class StateletUpdateCoordinator {
                 try await Self.expandDownloadedUpdate(downloaded)
             },
             installer: resolvedInstaller,
-            isSafeToInstall: isSafeToInstall
+            validateBundle: { url in
+                try await Self.validateBundleOffMain(url)
+            }
         )
     }
 
@@ -660,28 +710,28 @@ final class StateletUpdateCoordinator {
         defaults: UserDefaults = .standard,
         lastCheckKey: String = "StateletUpdater.lastCheckDate.v1",
         automaticInstallKey: String = "StateletUpdater.automaticInstall.v1",
+        pendingInstallRetryKey: String = "StateletUpdater.pendingInstallRetry.v1",
         now: @escaping () -> Date = Date.init,
         fetchReleases: @escaping ReleaseFetcher,
         fetchAssetData: @escaping AssetDataFetcher,
         download: @escaping Downloader,
         prepareDownloadedUpdate: @escaping DownloadPreparation = { $0 },
         installer: @escaping Installer,
-        isSafeToInstall: @escaping SafeInstallCheck = { false },
-        validateBundle: @escaping BundleValidation = {
-            try StateletBundleValidator.validate(at: $0)
+        validateBundle: @escaping BundleValidation = { url in
+            try await StateletUpdateCoordinator.validateBundleOffMain(url)
         }
     ) {
         self.installedVersion = installedVersion
         self.defaults = defaults
         self.lastCheckKey = lastCheckKey
         self.automaticInstallKey = automaticInstallKey
+        self.pendingInstallRetryKey = pendingInstallRetryKey
         self.now = now
         self.fetchReleases = fetchReleases
         self.fetchAssetData = fetchAssetData
         self.download = download
         self.prepareDownloadedUpdate = prepareDownloadedUpdate
         self.installer = installer
-        self.isSafeToInstall = isSafeToInstall
         self.validateBundle = validateBundle
         let automaticInstall = defaults.bool(forKey: automaticInstallKey)
         snapshot = StateletUpdateSnapshot(
@@ -692,13 +742,17 @@ final class StateletUpdateCoordinator {
             progress: nil,
             isChecking: false,
             isReadyToInstall: false,
+            isScheduledForRestart: false,
+            isBlocked: false,
             automaticInstallEnabled: automaticInstall
         )
     }
 
     func startAutomaticChecks() {
         let lastCheck = defaults.object(forKey: lastCheckKey) as? Date
-        guard StateletUpdatePolicy.shouldCheckAutomatically(now: now(), lastCheck: lastCheck) else { return }
+        let retryPendingInstall = defaults.bool(forKey: pendingInstallRetryKey)
+        guard retryPendingInstall
+            || StateletUpdatePolicy.shouldCheckAutomatically(now: now(), lastCheck: lastCheck) else { return }
         Task { @MainActor [weak self] in self?.beginCheck() }
     }
 
@@ -715,42 +769,74 @@ final class StateletUpdateCoordinator {
                 candidate: self.readyUpdate?.1,
                 progress: self.snapshot.progress,
                 isChecking: self.snapshot.isChecking,
-                isReady: self.snapshot.isReadyToInstall
+                isReady: self.snapshot.isReadyToInstall,
+                isScheduled: self.snapshot.isScheduledForRestart
             )
-            if enabled, self.readyUpdate != nil { self.beginReadyInstall() }
+            if self.defaults.bool(forKey: self.automaticInstallKey), self.readyUpdate != nil {
+                self.scheduleReadyInstall()
+            }
         }
     }
 
     func installReadyUpdate() {
-        Task { @MainActor [weak self] in self?.beginReadyInstall() }
-    }
-
-    func retryAutomaticInstallIfNeeded() {
-        Task { @MainActor [weak self] in
-            guard let self,
-                  self.snapshot.automaticInstallEnabled,
-                  self.readyUpdate != nil else { return }
-            self.beginReadyInstall()
-        }
+        Task { @MainActor [weak self] in self?.scheduleReadyInstall() }
     }
 
     @MainActor
-    private func beginReadyInstall() {
-        guard operation == nil, let readyUpdate else { return }
-        operation = Task { [weak self] in
-            guard let self else { return }
-            await self.install(update: readyUpdate)
-            self.operation = nil
+    private func scheduleReadyInstall() {
+        guard let readyUpdate else { return }
+        publish(
+            status: "Update scheduled for the next Statelet restart.",
+            candidate: readyUpdate.1,
+            progress: 1,
+            isScheduled: true
+        )
+    }
+
+    @MainActor
+    func commitScheduledUpdateAtTermination(
+        ifQuiescent isQuiescent: Bool
+    ) throws -> StateletUpdateCandidate? {
+        guard snapshot.isScheduledForRestart,
+              let readyUpdate else { return nil }
+        guard isQuiescent else {
+            defaults.set(true, forKey: pendingInstallRetryKey)
+            return nil
         }
+        defer { readyUpdate.0.removeOwnedStaging() }
+        do {
+            try installer(readyUpdate.0, readyUpdate.1)
+        } catch {
+            defaults.set(true, forKey: pendingInstallRetryKey)
+            throw error
+        }
+        self.readyUpdate = nil
+        defaults.removeObject(forKey: pendingInstallRetryKey)
+        publish(
+            status: "Update installed. Reopen Statelet to use the new version.",
+            candidate: readyUpdate.1,
+            progress: 1
+        )
+        return readyUpdate.1
+    }
+
+    @MainActor
+    func discardPreparedUpdateAtTermination() {
+        readyUpdate?.0.removeOwnedStaging()
+        readyUpdate = nil
     }
 
     func cancel() {
+        defaults.removeObject(forKey: pendingInstallRetryKey)
         Task { @MainActor [weak self] in self?.operation?.cancel() }
     }
 
     @MainActor
     private func beginCheck() {
-        guard operation == nil else { return }
+        guard operation == nil,
+              readyUpdate == nil,
+              !snapshot.isScheduledForRestart,
+              !snapshot.isBlocked else { return }
         defaults.set(now(), forKey: lastCheckKey)
         operation = Task { [weak self] in
             guard let self else { return }
@@ -761,6 +847,8 @@ final class StateletUpdateCoordinator {
 
     @MainActor
     private func performCheck() async {
+        var stagingToCleanup: StateletDownloadedUpdate?
+        let retryPendingInstall = defaults.bool(forKey: pendingInstallRetryKey)
         publish(status: "Checking for updates…", isChecking: true)
         do {
             let data = try await fetchReleases()
@@ -771,6 +859,7 @@ final class StateletUpdateCoordinator {
                 newerThan: installedVersion
             ) else {
                 readyUpdate = nil
+                defaults.removeObject(forKey: pendingInstallRetryKey)
                 publish(status: "Statelet is up to date.")
                 return
             }
@@ -791,9 +880,13 @@ final class StateletUpdateCoordinator {
                 for: candidate.packageAsset,
                 checksumData: checksumData
             )
+            let progressToken = UUID()
+            downloadProgressToken = progressToken
             let downloaded = try await download(candidate.packageAsset) { [weak self] progress in
                 Task { @MainActor in
-                    guard let self, self.operation != nil else { return }
+                    guard let self,
+                          self.operation != nil,
+                          self.downloadProgressToken == progressToken else { return }
                     self.publish(
                         status: "Downloading update…",
                         candidate: candidate,
@@ -802,75 +895,55 @@ final class StateletUpdateCoordinator {
                     )
                 }
             }
+            await Task.yield()
+            downloadProgressToken = nil
+            stagingToCleanup = downloaded
             try Task.checkCancellation()
-            try StateletArtifactVerifier.verifyFile(
-                at: downloaded.artifactURL,
+            try await Self.verifyArtifactOffMain(
+                downloaded.artifactURL,
                 expectedSize: candidate.packageAsset.size,
                 expectedSHA256: expectedHash
             )
             let preparedUpdate = try await prepareDownloadedUpdate(downloaded)
+            stagingToCleanup = preparedUpdate
             try Task.checkCancellation()
-            let metadata = try validateBundle(preparedUpdate.bundleURL)
+            let metadata = try await validateBundle(preparedUpdate.bundleURL)
+            try Task.checkCancellation()
             guard metadata.version > installedVersion,
                   metadata.version.semantic == candidate.version.semantic,
                   candidate.version.build == 0 || metadata.version.build == candidate.version.build else {
                 throw StateletUpdaterError.versionMismatch
             }
             readyUpdate = (preparedUpdate, candidate)
+            stagingToCleanup = nil
             publish(
                 status: "Update verified and ready to install.",
                 candidate: candidate,
                 progress: 1,
                 isReady: true
             )
-            if snapshot.automaticInstallEnabled {
-                await install(update: (preparedUpdate, candidate))
+            if snapshot.automaticInstallEnabled || retryPendingInstall {
+                scheduleReadyInstall()
             }
         } catch is CancellationError {
+            downloadProgressToken = nil
             readyUpdate = nil
             publish(status: StateletUpdaterError.cancelled.safeStatus)
         } catch let error as StateletUpdaterError {
+            downloadProgressToken = nil
             readyUpdate = nil
             publish(status: error.safeStatus)
         } catch is URLError {
+            downloadProgressToken = nil
             readyUpdate = nil
             publish(status: StateletUpdaterError.offline.safeStatus)
         } catch {
+            downloadProgressToken = nil
             readyUpdate = nil
             publish(status: "Unable to check for updates. Statelet will keep running normally.")
         }
-    }
-
-    @MainActor
-    private func install(update: (StateletDownloadedUpdate, StateletUpdateCandidate)) async {
-        guard await isSafeToInstall() else {
-            publish(
-                status: StateletUpdaterError.unsafeInstallBoundary.safeStatus,
-                candidate: update.1,
-                progress: 1,
-                isReady: true
-            )
-            return
-        }
-        publish(status: "Installing update…", candidate: update.1, progress: 1)
-        do {
-            try await installer(update.0, update.1)
-            readyUpdate = nil
-            publish(status: "Update installed. Restart Statelet to finish.", candidate: update.1)
-        } catch is CancellationError {
-            publish(
-                status: StateletUpdaterError.cancelled.safeStatus,
-                candidate: update.1,
-                progress: 1,
-                isReady: true
-            )
-        } catch {
-            publish(
-                status: "The update could not be installed. The current app was not changed.",
-                candidate: update.1,
-                progress: 1,
-                isReady: true
-            )
+        if let stagingToCleanup {
+            await Self.removeOwnedStagingOffMain(stagingToCleanup)
         }
     }
 
@@ -880,7 +953,9 @@ final class StateletUpdateCoordinator {
         candidate: StateletUpdateCandidate? = nil,
         progress: Double? = nil,
         isChecking: Bool = false,
-        isReady: Bool = false
+        isReady: Bool = false,
+        isScheduled: Bool = false,
+        isBlocked: Bool = false
     ) {
         snapshot = StateletUpdateSnapshot(
             status: status,
@@ -890,6 +965,8 @@ final class StateletUpdateCoordinator {
             progress: progress,
             isChecking: isChecking,
             isReadyToInstall: isReady,
+            isScheduledForRestart: isScheduled,
+            isBlocked: isBlocked,
             automaticInstallEnabled: defaults.bool(forKey: automaticInstallKey)
         )
         onSnapshot?(snapshot)
@@ -914,6 +991,45 @@ final class StateletUpdateCoordinator {
         return data
     }
 
+    private static func verifyArtifactOffMain(
+        _ url: URL,
+        expectedSize: Int64,
+        expectedSHA256: String
+    ) async throws {
+        let verification = Task.detached(priority: .utility) {
+            try StateletArtifactVerifier.verifyFile(
+                at: url,
+                expectedSize: expectedSize,
+                expectedSHA256: expectedSHA256
+            )
+        }
+        try await withTaskCancellationHandler {
+            try await verification.value
+        } onCancel: {
+            verification.cancel()
+        }
+    }
+
+    private static func validateBundleOffMain(_ url: URL) async throws -> StateletBundleMetadata {
+        let validation = Task.detached(priority: .utility) {
+            try Task.checkCancellation()
+            let metadata = try StateletBundleValidator.validate(at: url)
+            try Task.checkCancellation()
+            return metadata
+        }
+        return try await withTaskCancellationHandler {
+            try await validation.value
+        } onCancel: {
+            validation.cancel()
+        }
+    }
+
+    private static func removeOwnedStagingOffMain(_ update: StateletDownloadedUpdate) async {
+        await Task.detached(priority: .utility) {
+            update.removeOwnedStaging()
+        }.value
+    }
+
     private static func downloadArtifact(
         asset: StateletReleaseAsset,
         progress: @escaping (Double) -> Void
@@ -927,7 +1043,14 @@ final class StateletUpdateCoordinator {
         request.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
         request.setValue("Statelet-Updater", forHTTPHeaderField: "User-Agent")
         progress(0)
-        let (temporaryURL, response) = try await URLSession.shared.download(for: request)
+        let progressDelegate = StateletUpdateDownloadProgressDelegate(
+            declaredSize: asset.size,
+            progress: progress
+        )
+        let (temporaryURL, response) = try await URLSession.shared.download(
+            for: request,
+            delegate: progressDelegate
+        )
         try Task.checkCancellation()
         guard let http = response as? HTTPURLResponse,
               (200 ..< 300).contains(http.statusCode),
@@ -946,7 +1069,11 @@ final class StateletUpdateCoordinator {
             do {
                 let artifact = staging.appendingPathComponent("Statelet-update.zip")
                 try manager.moveItem(at: temporaryURL, to: artifact)
-                return StateletDownloadedUpdate(artifactURL: artifact, bundleURL: artifact)
+                return StateletDownloadedUpdate(
+                    artifactURL: artifact,
+                    bundleURL: artifact,
+                    cleanupRootURL: staging
+                )
             } catch {
                 try? manager.removeItem(at: staging)
                 throw error
@@ -959,7 +1086,8 @@ final class StateletUpdateCoordinator {
     private static func expandDownloadedUpdate(
         _ downloaded: StateletDownloadedUpdate
     ) async throws -> StateletDownloadedUpdate {
-        try await Task.detached(priority: .utility) {
+        let expansion = Task.detached(priority: .utility) {
+            try Task.checkCancellation()
             let manager = FileManager.default
             let staging = downloaded.artifactURL.deletingLastPathComponent()
             let expanded = staging.appendingPathComponent("Expanded", isDirectory: true)
@@ -971,7 +1099,15 @@ final class StateletUpdateCoordinator {
             process.standardError = FileHandle.nullDevice
             do {
                 try process.run()
-                process.waitUntilExit()
+                while process.isRunning {
+                    if Task.isCancelled {
+                        process.terminate()
+                        process.waitUntilExit()
+                        throw CancellationError()
+                    }
+                    Darwin.usleep(50_000)
+                }
+                try Task.checkCancellation()
                 guard process.terminationReason == .exit,
                       process.terminationStatus == 0 else {
                     throw StateletUpdaterError.invalidArtifact
@@ -991,12 +1127,60 @@ final class StateletUpdateCoordinator {
                 }
                 return StateletDownloadedUpdate(
                     artifactURL: downloaded.artifactURL,
-                    bundleURL: bundle
+                    bundleURL: bundle,
+                    cleanupRootURL: downloaded.cleanupRootURL
                 )
             } catch {
                 try? manager.removeItem(at: expanded)
                 throw error
             }
-        }.value
+        }
+        return try await withTaskCancellationHandler {
+            try await expansion.value
+        } onCancel: {
+            expansion.cancel()
+        }
+    }
+}
+
+private final class StateletUpdateDownloadProgressDelegate: NSObject,
+    URLSessionDownloadDelegate,
+    @unchecked Sendable {
+    private let declaredSize: Int64
+    private let progress: (Double) -> Void
+    private let lock = NSLock()
+    private var lastReportedProgress = 0.0
+
+    init(declaredSize: Int64, progress: @escaping (Double) -> Void) {
+        self.declaredSize = declaredSize
+        self.progress = progress
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didFinishDownloadingTo location: URL
+    ) {}
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didWriteData bytesWritten: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        let expected = totalBytesExpectedToWrite > 0
+            ? totalBytesExpectedToWrite
+            : declaredSize
+        guard expected > 0 else { return }
+        let fraction = min(max(Double(totalBytesWritten) / Double(expected), 0), 1)
+        lock.lock()
+        guard fraction > lastReportedProgress else {
+            lock.unlock()
+            return
+        }
+        lastReportedProgress = fraction
+        lock.unlock()
+        progress(fraction)
     }
 }
