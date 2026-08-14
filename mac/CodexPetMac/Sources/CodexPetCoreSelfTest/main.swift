@@ -1083,6 +1083,17 @@ private func runSelfTest() throws {
         MediaMapChangeImpact.decide(previous: mediaMap, incoming: updatedMap) == .playback,
         "media entry change did not request playback refresh"
     )
+    let sameStateMap = try MediaMap(
+        defaultFormat: mediaMap.defaultFormat,
+        window: mediaMap.window,
+        states: mediaMap.states,
+        transitions: mediaMap.transitions,
+        inStateTransitions: [.idle: MediaEntry(path: "idle-handoff.mov", loop: false)]
+    )
+    try require(
+        MediaMapChangeImpact.decide(previous: mediaMap, incoming: sameStateMap) == .playback,
+        "same-state transition change did not request playback refresh"
+    )
 
     let idleOne = try MediaEntry(path: "idle/one.mov")
     let idleTwo = try MediaEntry(path: "idle/two.mov")

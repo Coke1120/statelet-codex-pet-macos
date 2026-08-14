@@ -494,6 +494,155 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
     }
 
     @MainActor
+    func testReplacingActiveVoxCPM2ProfileRevalidatesAndCleansPreviousAssets() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = try makeVoxProfile(root: root)
+        var library = try DialogueVoiceLibrary(
+            voxcpm2Profile: profile,
+            activeProviderKind: .voxcpm2
+        )
+        let line = try library.addLine(text: "前の参照音声", language: "japanese")
+        let ticket = try library.beginGeneration(for: line.id)
+        let oldOutputPath = "voice/generated/old-vox.wav"
+        let oldOutputURL = root.appendingPathComponent(oldOutputPath)
+        try FileManager.default.createDirectory(
+            at: oldOutputURL.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try Self.voxWAV(frames: 480).write(to: oldOutputURL)
+        _ = try library.completeGeneration(ticket: ticket, outputPath: oldOutputPath)
+        try save(library, root: root)
+
+        let probeCalls = RequestCounter()
+        let synthesisCalls = RequestCounter()
+        let coordinator = DialogueVoiceCoordinator(
+            applicationSupportRoot: root,
+            voxcpm2Client: makeVoxClient(
+                root: root, probeCalls: probeCalls, synthesisCalls: synthesisCalls
+            )
+        )
+        defer { coordinator.shutdown() }
+        coordinator.start()
+        try await waitUntil(timeout: 5) {
+            coordinator.library.profileStatus == .ready && probeCalls.value >= 1
+        }
+
+        let newReferenceURL = root.deletingLastPathComponent()
+            .appendingPathComponent("new-vox-reference-\(UUID().uuidString).wav")
+        defer { try? FileManager.default.removeItem(at: newReferenceURL) }
+        try Self.pcmWAV(sampleRate: 32_000, frames: 3_200).write(to: newReferenceURL)
+        coordinator.configureVoxCPM2Profile(
+            snapshotURL: URL(fileURLWithPath: profile.snapshotPath),
+            referenceAudioURL: newReferenceURL,
+            referenceText: "新しい参照音声です。",
+            pythonExecutableURL: URL(fileURLWithPath: "/bin/sh")
+        )
+
+        try await waitUntil(timeout: 5) {
+            coordinator.library.voxcpm2Profile?.revision == 2
+                && coordinator.library.profileStatus == .ready
+                && coordinator.library.lines.first?.status == .ready
+                && synthesisCalls.value >= 1
+        }
+        let updatedProfile = try XCTUnwrap(coordinator.library.voxcpm2Profile)
+        XCTAssertEqual(coordinator.library.activeProviderKind, .voxcpm2)
+        XCTAssertEqual(updatedProfile.revision, 2)
+        XCTAssertNotEqual(updatedProfile.referenceAudioRelativePath, profile.referenceAudioRelativePath)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent(profile.referenceAudioRelativePath).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: oldOutputURL.path))
+        XCTAssertNotEqual(coordinator.library.lines.first?.outputRelativePath, oldOutputPath)
+        XCTAssertGreaterThanOrEqual(probeCalls.value, 2)
+    }
+
+    @MainActor
+    func testReplacingConfiguredVoxCPM2ProfileCleansPreviousReferenceWithoutSwitchingProvider() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gptProfile = try makeGPTProfile(root: root)
+        let oldVoxProfile = try makeVoxProfile(root: root)
+        let library = try DialogueVoiceLibrary(
+            profile: gptProfile,
+            voxcpm2Profile: oldVoxProfile,
+            activeProviderKind: .gptSovits
+        )
+        try save(library, root: root)
+
+        let coordinator = DialogueVoiceCoordinator(applicationSupportRoot: root)
+        defer { coordinator.shutdown() }
+        coordinator.start()
+        let newReferenceURL = root.deletingLastPathComponent()
+            .appendingPathComponent("configured-vox-reference-\(UUID().uuidString).wav")
+        defer { try? FileManager.default.removeItem(at: newReferenceURL) }
+        try Self.pcmWAV(sampleRate: 32_000, frames: 3_200).write(to: newReferenceURL)
+        coordinator.configureVoxCPM2Profile(
+            snapshotURL: URL(fileURLWithPath: oldVoxProfile.snapshotPath),
+            referenceAudioURL: newReferenceURL,
+            referenceText: "設定済み参照音声です。",
+            pythonExecutableURL: URL(fileURLWithPath: "/bin/sh")
+        )
+
+        try await waitUntil(timeout: 5) {
+            coordinator.library.voxcpm2Profile?.revision == 2
+                && coordinator.library.activeProviderKind == .gptSovits
+        }
+        let updatedProfile = try XCTUnwrap(coordinator.library.voxcpm2Profile)
+        XCTAssertNotEqual(updatedProfile.referenceAudioRelativePath, oldVoxProfile.referenceAudioRelativePath)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent(oldVoxProfile.referenceAudioRelativePath).path
+        ))
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent(updatedProfile.referenceAudioRelativePath).path
+        ))
+        XCTAssertTrue(coordinator.library.pendingCleanupPaths.isEmpty)
+    }
+
+    @MainActor
+    func testPersistedVoxCPM2InvalidReadyOutputIsRegenerated() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = try makeVoxProfile(root: root)
+        var library = try DialogueVoiceLibrary(
+            voxcpm2Profile: profile,
+            activeProviderKind: .voxcpm2
+        )
+        let line = try library.addLine(text: "壊れた出力を更新", language: "japanese")
+        let ticket = try library.beginGeneration(for: line.id)
+        let invalidOutputPath = "voice/generated/invalid-vox.wav"
+        let invalidOutputURL = root.appendingPathComponent(invalidOutputPath)
+        try FileManager.default.createDirectory(
+            at: invalidOutputURL.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try Data("not a wav".utf8).write(to: invalidOutputURL)
+        _ = try library.completeGeneration(ticket: ticket, outputPath: invalidOutputPath)
+        try save(library, root: root)
+
+        let probeCalls = RequestCounter()
+        let synthesisCalls = RequestCounter()
+        let coordinator = DialogueVoiceCoordinator(
+            applicationSupportRoot: root,
+            voxcpm2Client: makeVoxClient(
+                root: root, probeCalls: probeCalls, synthesisCalls: synthesisCalls
+            )
+        )
+        defer { coordinator.shutdown() }
+        coordinator.start()
+
+        try await waitUntil(timeout: 5) {
+            guard let current = coordinator.library.lines.first else { return false }
+            return current.status == .ready
+                && current.outputRelativePath != invalidOutputPath
+                && probeCalls.value >= 1
+                && synthesisCalls.value >= 1
+        }
+        let current = try XCTUnwrap(coordinator.library.lines.first)
+        XCTAssertEqual(current.status, .ready)
+        XCTAssertNotEqual(current.outputRelativePath, invalidOutputPath)
+        let currentOutputPath = try XCTUnwrap(current.outputRelativePath)
+        let currentOutput = try Data(contentsOf: root.appendingPathComponent(currentOutputPath))
+        XCTAssertTrue(VoxCPM2Client.isValidOutputWAV(currentOutput))
+    }
+
+    @MainActor
     func testQwenProviderRoundTripDiscardsCancellationInsensitiveStaleAttempt() async throws {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -675,6 +824,7 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
         try FileManager.default.createDirectory(
             at: reference.deletingLastPathComponent(), withIntermediateDirectories: true
         )
+        try Data("helper".utf8).write(to: helperURL(root))
         for (name, data) in [
             ("model.safetensors", Data("weights".utf8)),
             ("audiovae.pth", Data("vae".utf8)),
@@ -714,6 +864,27 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
         )
     }
 
+    private func makeVoxClient(
+        root: URL,
+        probeCalls: RequestCounter,
+        synthesisCalls: RequestCounter
+    ) -> VoxCPM2Client {
+        VoxCPM2Client(
+            helperExecutableURL: helperURL(root),
+            probeExecutableURL: helperURL(root)
+        ) { invocation in
+            let body = try JSONSerialization.jsonObject(with: invocation.standardInput) as? [String: Any]
+            if body?["probe_output"] != nil {
+                probeCalls.increment()
+                try Data(#"{"schema":1,"device":"cpu","sample_rate":48000}"#.utf8)
+                    .write(to: invocation.outputURL)
+            } else {
+                synthesisCalls.increment()
+                try Self.voxWAV(frames: 480).write(to: invocation.outputURL)
+            }
+        }
+    }
+
     private func sha(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
     private func fingerprint(_ fields: [String]) -> String {
         var hasher = SHA256()
@@ -733,6 +904,9 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
         append(sampleRate, to: &data); append(sampleRate * 2, to: &data); append(UInt16(2), to: &data); append(UInt16(16), to: &data)
         data.append(Data("data".utf8)); append(UInt32(byteCount), to: &data); data.append(Data(repeating: 0, count: byteCount))
         return data
+    }
+    private static func voxWAV(frames: Int) -> Data {
+        pcmWAV(sampleRate: 48_000, frames: frames)
     }
     private static func append<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
         var little = value.littleEndian

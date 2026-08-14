@@ -971,6 +971,14 @@ final class CodexPetCoreTests: XCTestCase {
             entry: try MediaEntry(path: "idle-running.mov", loop: false)
         )
         XCTAssertEqual(MediaMapChangeImpact.decide(previous: original, incoming: withTransition), .playback)
+        let withInStateTransition = try MediaMap(
+            defaultFormat: original.defaultFormat,
+            window: original.window,
+            states: original.states,
+            transitions: original.transitions,
+            inStateTransitions: [.idle: try MediaEntry(path: "idle-handoff.mov", loop: false)]
+        )
+        XCTAssertEqual(MediaMapChangeImpact.decide(previous: original, incoming: withInStateTransition), .playback)
         XCTAssertEqual(try withTransition.replacingWindow(appearanceWindow).transitions, withTransition.transitions)
         XCTAssertEqual(
             try withTransition.replacingEntry(for: .idle, with: try MediaEntry(path: "replacement.mov")).transitions,

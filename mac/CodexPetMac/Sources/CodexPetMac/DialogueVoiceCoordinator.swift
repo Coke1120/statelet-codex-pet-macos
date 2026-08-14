@@ -535,26 +535,101 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             } catch let error as DialogueVoiceRuntimeError { result = .failure(error) }
               catch { result = .failure(.profileRejected) }
             await MainActor.run {
-                guard sequence == self.importSequence else { return }
+                guard sequence == self.importSequence else {
+                    if case let .success(profile) = result {
+                        let cleanup = self.deferCleanup(paths: [profile.referenceAudioRelativePath])
+                        if cleanup.requiresNotice {
+                            self.activityMessage = self.cleanupAwareMessage(
+                                "An outdated VoxCPM2 profile import was discarded.",
+                                outcome: cleanup
+                            )
+                            self.notify()
+                        }
+                    }
+                    return
+                }
                 self.activeImportTask = nil
                 switch result {
                 case let .failure(error): self.activityMessage = error.localizedDescription
                 case let .success(profile):
                     do {
-                        let activates = self.library.activeProviderKind == nil
-                        var updated = self.library
-                        if activates { try updated.replaceActiveProfile(profile); try updated.setProfileStatus(.validating) }
-                        else { try updated.replaceConfiguredProfile(profile) }
-                        try self.store.save(updated); self.library = updated
-                        self.activityMessage = activates
-                            ? "VoxCPM2 profile saved. Revalidating its offline inputs and runtime…"
-                            : "VoxCPM2 profile saved. Use VoxCPM2 to switch providers."
-                        if activates { self.validatePersistedProfile(profile) }
-                    } catch { self.activityMessage = "The VoxCPM2 profile could not be saved." }
+                        try self.activateImportedVoxCPM2Profile(profile)
+                    } catch {
+                        let persistedLibrary: DialogueVoiceLibrary?
+                        do {
+                            persistedLibrary = try self.store.load()
+                        } catch {
+                            persistedLibrary = nil
+                        }
+                        let wasCommitted = persistedLibrary?.voxcpm2Profile?.id == profile.id
+                            && persistedLibrary?.voxcpm2Profile?.inputFingerprint == profile.inputFingerprint
+                        if let persistedLibrary, wasCommitted {
+                            self.library = persistedLibrary
+                            self.activityMessage = "The VoxCPM2 profile was saved, but storage durability could not be confirmed. Restart Statelet before editing voice settings again."
+                        } else if persistedLibrary != nil {
+                            let cleanup = self.deferCleanup(paths: [profile.referenceAudioRelativePath])
+                            self.activityMessage = self.cleanupAwareMessage(
+                                "The VoxCPM2 profile was validated but could not be saved.",
+                                outcome: cleanup
+                            )
+                        } else {
+                            self.persistenceBlocked = true
+                            self.activityMessage = "VoxCPM2 profile storage is unreadable, so the imported reference audio was preserved to avoid data loss. Restore the voice library before editing settings again."
+                        }
+                        self.logger.error("event=voxcpm2_profile_save_failed code=STORE_FAILURE")
+                    }
                 }
                 self.notify()
             }
         }
+    }
+
+    private func activateImportedVoxCPM2Profile(_ profile: VoxCPM2VoiceProfile) throws {
+        let previous = library.voxcpm2Profile
+        let activatesVox = library.activeProviderKind == nil || library.activeProviderKind == .voxcpm2
+        let priorOutputs = activatesVox ? library.lines.compactMap(\.outputRelativePath) : []
+        let replacedReference: [String] = if let previousReference = previous?.referenceAudioRelativePath,
+                                             previousReference != profile.referenceAudioRelativePath {
+            [previousReference]
+        } else {
+            []
+        }
+
+        var updated = library
+        if activatesVox {
+            profileValidationTask?.cancel()
+            profileValidationSequence &+= 1
+            profileValidationTask = nil
+            validatedProviderIdentity = nil
+            voxcpm2ProbeSummary = nil
+            activeGenerationTask?.cancel()
+            activeGenerationTask = nil
+            activeTicket = nil
+            cancelAutomaticPlayback()
+            voicePlaybackSequence &+= 1
+            activeVoicePlayback = nil
+            audioPlayer.stop()
+            try updated.replaceActiveProfile(profile)
+            for line in updated.lines where line.status == .stale {
+                _ = try updated.retryLine(id: line.id)
+            }
+            try updated.setProfileStatus(.validating)
+        } else {
+            try updated.replaceConfiguredProfile(profile)
+        }
+        try updated.enqueueCleanup(paths: priorOutputs + replacedReference)
+        try store.save(updated)
+        library = updated
+        let cleanup = retryPendingCleanup()
+        activityMessage = cleanupAwareMessage(
+            activatesVox
+                ? "VoxCPM2 profile saved. Revalidating its offline inputs and runtime…"
+                : "VoxCPM2 profile saved. Use VoxCPM2 to switch providers.",
+            outcome: cleanup
+        )
+        logger.info("event=profile_saved provider=voxcpm2 revision=\(profile.revision, privacy: .public)")
+        notify()
+        if activatesVox { validatePersistedProfile(profile) }
     }
 
     func saveProfile(_ draft: DialogueVoiceProfileDraft) throws {
@@ -1371,6 +1446,14 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         let sequence = profileValidationSequence
         let root = applicationSupportRoot
         let client = voxcpm2Client
+        let readyOutputs = library.lines.compactMap { line -> ReadyOutputValidationTicket? in
+            guard line.status == .ready, let outputRelativePath = line.outputRelativePath else { return nil }
+            return ReadyOutputValidationTicket(
+                lineID: line.id,
+                lineRevision: line.revision,
+                outputRelativePath: outputRelativePath
+            )
+        }
         profileValidationTask = Task.detached(priority: .utility) {
             let result: ProfileValidationResult
             var probeSummary: String?
@@ -1378,13 +1461,21 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                 let validated = try VoxCPM2ProfileValidator.validate(
                     profile: profile, applicationSupportRoot: root
                 )
+                let invalidOutputs = readyOutputs.filter { output in
+                    guard let data = try? DialogueVoiceAssetInstaller.readManagedFile(
+                        relativePath: output.outputRelativePath,
+                        root: root,
+                        maximumBytes: 67_108_864
+                    ) else { return true }
+                    return !VoxCPM2Client.isValidOutputWAV(data)
+                }
                 do {
                     let probe = try await client.validateProfile(profile, applicationSupportRoot: root)
                     probeSummary = probe.sanitizedSummary
-                    result = .valid(.voxcpm2(validated.identityTokens), [])
+                    result = .valid(.voxcpm2(validated.identityTokens), invalidOutputs)
                 } catch let error as DialogueVoiceRuntimeError
                     where error == .inferenceUnavailable || error == .cancelled {
-                    result = .unavailable(.voxcpm2(validated.identityTokens), [])
+                    result = .unavailable(.voxcpm2(validated.identityTokens), invalidOutputs)
                 } catch { result = .invalid }
             } catch { result = .invalid }
             let validationResult = result

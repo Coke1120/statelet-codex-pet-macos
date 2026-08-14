@@ -846,7 +846,8 @@ public enum MediaMapChangeImpact: String, Equatable, Sendable {
         if previous.version != incoming.version
             || previous.defaultFormat != incoming.defaultFormat
             || previous.states != incoming.states
-            || previous.transitions != incoming.transitions {
+            || previous.transitions != incoming.transitions
+            || previous.inStateTransitions != incoming.inStateTransitions {
             return .playback
         }
         return .windowOnly
