@@ -23,6 +23,21 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
     }
 
     @MainActor
+    func testTerminationShutdownDetachesEveryPlaybackSurface() {
+        let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
+        let controller = PetPlayerController(view: view)
+        view.destinationPlayerLayer.player = AVPlayer()
+        view.lifecycleTransitionPlayerLayer.player = AVPlayer()
+
+        XCTAssertNotNil(view.playerLayer.player)
+        XCTAssertTrue(controller.shutdownForTermination())
+        XCTAssertTrue(controller.isQuiescentForTerminationForTesting)
+        XCTAssertNil(view.playerLayer.player)
+        XCTAssertNil(view.destinationPlayerLayer.player)
+        XCTAssertNil(view.lifecycleTransitionPlayerLayer.player)
+    }
+
+    @MainActor
     func testLifecycleTransitionRetainsOutgoingThenPrerollsAndPromotesDestination() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("statelet-transition-test-\(UUID().uuidString)", isDirectory: true)

@@ -1,5 +1,4 @@
 import AppKit
-import AVFoundation
 import CodexPetCore
 import XCTest
 @testable import Statelet
@@ -373,11 +372,9 @@ final class PetPlayerPlaybackHeadlessTests: XCTestCase {
     }
 
     @MainActor
-    func testTerminationShutdownDetachesEveryPlaybackSurface() {
+    func testTerminationShutdownDetachesBasePlaybackSurface() {
         let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         let controller = PetPlayerController(view: view)
-        view.destinationPlayerLayer.player = AVPlayer()
-        view.lifecycleTransitionPlayerLayer.player = AVPlayer()
 
         XCTAssertNotNil(view.playerLayer.player)
         XCTAssertTrue(controller.shutdownForTermination())
