@@ -47,6 +47,19 @@ verification. A Command Line Tools-only Mac can still build the app and run
 `swift run -c release codex-pet-core-self-test`, but Apple does not include the
 XCTest module in that smaller toolchain.
 
+## Local voice providers
+
+Voice Setup supports GPT-SoVITS, Qwen3-TTS, and VoxCPM2 while keeping only one
+provider active. VoxCPM2 imports the complete source handover directory, one
+WAV reference with its exact transcript, and a trusted Python runtime. Statelet
+descriptor-copies and fingerprints both the snapshot and reference in private
+Application Support, then executes only the managed snapshot. Its bounded
+probe loads the snapshot offline, confirms a sanitized `mps`, `cuda`, or `cpu`
+device category and a 48 kHz model rate, and its helper runs under an OS
+network-denied child-process policy. MPS uses the upstream float32 stability
+path and may be slow on Apple Silicon. See [Using Statelet](../../docs/USAGE.md#voxcpm2-setup-and-recovery)
+and the project-local [VoxCPM2 voice reference](../../.agents/skills/operate-statelet-local-voice/references/voxcpm2.md).
+
 An ad-hoc signature is appropriate for personal local execution. It is not a
 Developer ID signature and is not notarized. Distribution to other people
 requires an authorized Apple Developer identity, hardened-runtime review,
@@ -97,9 +110,14 @@ Review as separate clip libraries:
   mode.
 - `advance_on` defaults to `state_entry`. For Random or Sequential libraries
   with at least two entries, **Continue with another clip when this clip ends**
-  selects `clip_end`: the player hard-cuts to the next eligible clip while the
+  selects `clip_end`: the player switches to the next eligible clip while the
   lifecycle state stays active. In Fixed mode or a one-entry library,
   `clip_end` is ineffective and the entry's normal `loop` behavior applies.
+  The active character can optionally configure one same-state transition for
+  each lifecycle state. It is used only for automatic effective `clip_end`
+  rotation, reuses the transparent layered handoff, and falls back to the next
+  ready clip on validation, readiness, playback, or timeout failure. Reduce
+  Motion and all manual or refresh paths bypass it.
 - The native clip table aligns filename, readiness, fixed/poster status, and
   row actions for quick comparison. **Preview** plays that exact clip once
   without changing the live Codex state,

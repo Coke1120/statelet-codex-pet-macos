@@ -153,8 +153,26 @@ private enum DialogueVoiceValidation {
             "voice/assets/sovits/",
             "voice/assets/reference/",
             "voice/packages/qwen/",
+            "voice/packages/voxcpm2/",
+            "voice/assets/voxcpm2-reference/",
             "voice/generated/",
         ].contains(where: { path.hasPrefix($0) }) else {
+            throw DialogueVoiceError.invalidManagedPath
+        }
+        return path
+    }
+
+    static func voxCPM2SnapshotPath(_ value: String) throws -> String {
+        let path = try managedPath(value)
+        let components = path.split(separator: "/", omittingEmptySubsequences: false)
+        guard components.count == 4,
+              components[0] == "voice",
+              components[1] == "packages",
+              components[2] == "voxcpm2" else {
+            throw DialogueVoiceError.invalidManagedPath
+        }
+        let token = String(components[3])
+        guard UUID(uuidString: token) != nil, token == token.lowercased() else {
             throw DialogueVoiceError.invalidManagedPath
         }
         return path
@@ -194,6 +212,108 @@ private enum DialogueVoiceValidation {
 public enum DialogueVoiceProviderKind: String, Codable, CaseIterable, Sendable {
     case gptSovits = "gpt_sovits"
     case qwen3TTS = "qwen3_tts"
+    case voxcpm2
+}
+
+public struct VoxCPM2SynthesisParameters: Codable, Equatable, Sendable {
+    public static let verifiedDefaults = try! VoxCPM2SynthesisParameters()
+    public let cfgValue: Double
+    public let inferenceTimesteps: Int
+    public let seed: Int
+    public let loadDenoiser: Bool
+    public let optimize: Bool
+
+    public init(cfgValue: Double = 2, inferenceTimesteps: Int = 10, seed: Int = 1_112,
+                loadDenoiser: Bool = false, optimize: Bool = false) throws {
+        guard cfgValue.isFinite, (0...10).contains(cfgValue),
+              (1...100).contains(inferenceTimesteps), seed >= 0,
+              !loadDenoiser, !optimize else { throw DialogueVoiceError.invalidProfile }
+        self.cfgValue = cfgValue
+        self.inferenceTimesteps = inferenceTimesteps
+        self.seed = seed
+        self.loadDenoiser = loadDenoiser
+        self.optimize = optimize
+    }
+}
+
+/// A pinned, local-only VoxCPM2 zero-shot profile. `snapshotPath` retains its
+/// persisted field name for schema compatibility, but stores only a managed
+/// Application Support-relative package path.
+public struct VoxCPM2VoiceProfile: Codable, Equatable, Sendable {
+    public let id: UUID
+    public let revision: Int
+    public let name: String
+    public let snapshotPath: String
+    public let snapshotTreeSHA256: String
+    public let pythonExecutablePath: String
+    public let pythonExecutableSHA256: String
+    public let referenceAudioRelativePath: String
+    public let referenceAudioSHA256: String
+    public let referenceText: String
+    public let defaultTextLanguage: String
+    public let parameters: VoxCPM2SynthesisParameters
+    public let inputFingerprint: String
+
+    public init(id: UUID = UUID(), revision: Int = 1, name: String,
+                snapshotPath: String, snapshotTreeSHA256: String,
+                pythonExecutablePath: String, pythonExecutableSHA256: String,
+                referenceAudioRelativePath: String, referenceAudioSHA256: String,
+                referenceText: String, defaultTextLanguage: String = "japanese",
+                parameters: VoxCPM2SynthesisParameters = .verifiedDefaults,
+                inputFingerprint: String) throws {
+        guard revision > 0 else { throw DialogueVoiceError.invalidProfile }
+        self.id = id; self.revision = revision
+        self.name = try DialogueVoiceValidation.nonBlank(name, maximum: DialogueVoiceValidation.maximumLabelLength, error: .invalidProfile)
+        self.snapshotPath = try DialogueVoiceValidation.voxCPM2SnapshotPath(snapshotPath)
+        self.snapshotTreeSHA256 = try DialogueVoiceValidation.sha256(snapshotTreeSHA256)
+        self.pythonExecutablePath = try DialogueVoiceValidation.absoluteExecutablePath(pythonExecutablePath)
+        self.pythonExecutableSHA256 = try DialogueVoiceValidation.sha256(pythonExecutableSHA256)
+        let reference = try DialogueVoiceValidation.managedPath(referenceAudioRelativePath)
+        guard reference.hasPrefix("voice/assets/voxcpm2-reference/") else { throw DialogueVoiceError.invalidManagedPath }
+        self.referenceAudioRelativePath = reference
+        self.referenceAudioSHA256 = try DialogueVoiceValidation.sha256(referenceAudioSHA256)
+        self.referenceText = try DialogueVoiceValidation.nonBlank(referenceText, maximum: DialogueVoiceValidation.maximumReferenceTextLength, error: .invalidText)
+        self.defaultTextLanguage = try DialogueVoiceValidation.language(defaultTextLanguage)
+        self.parameters = parameters
+        self.inputFingerprint = try DialogueVoiceValidation.sha256(inputFingerprint)
+    }
+
+    public var inputFingerprintComponents: [String] {
+        ["statelet-voxcpm2-profile-v2", snapshotPath, snapshotTreeSHA256,
+         pythonExecutablePath, pythonExecutableSHA256, referenceAudioRelativePath,
+         referenceAudioSHA256, referenceText, defaultTextLanguage,
+         String(parameters.cfgValue), String(parameters.inferenceTimesteps),
+         String(parameters.seed), String(parameters.loadDenoiser), String(parameters.optimize)]
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, revision, name, snapshotPath, snapshotTreeSHA256
+        case pythonExecutablePath, pythonExecutableSHA256
+        case referenceAudioRelativePath, referenceAudioSHA256, referenceText
+        case defaultTextLanguage, parameters, inputFingerprint
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            id: container.decode(UUID.self, forKey: .id),
+            revision: container.decode(Int.self, forKey: .revision),
+            name: container.decode(String.self, forKey: .name),
+            snapshotPath: container.decode(String.self, forKey: .snapshotPath),
+            snapshotTreeSHA256: container.decode(String.self, forKey: .snapshotTreeSHA256),
+            pythonExecutablePath: container.decode(String.self, forKey: .pythonExecutablePath),
+            pythonExecutableSHA256: container.decode(String.self, forKey: .pythonExecutableSHA256),
+            referenceAudioRelativePath: container.decode(
+                String.self,
+                forKey: .referenceAudioRelativePath
+            ),
+            referenceAudioSHA256: container.decode(String.self, forKey: .referenceAudioSHA256),
+            referenceText: container.decode(String.self, forKey: .referenceText),
+            defaultTextLanguage: container.decode(String.self, forKey: .defaultTextLanguage),
+            parameters: container.decode(VoxCPM2SynthesisParameters.self, forKey: .parameters),
+            inputFingerprint: container.decode(String.self, forKey: .inputFingerprint)
+        )
+    }
 }
 
 public struct GPTSoVITSVoiceProfile: Codable, Equatable, Sendable {
@@ -774,19 +894,21 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
     public private(set) var activeProviderKind: DialogueVoiceProviderKind?
     public private(set) var profile: GPTSoVITSVoiceProfile?
     public private(set) var qwenProfile: Qwen3TTSVoiceProfile?
+    public private(set) var voxcpm2Profile: VoxCPM2VoiceProfile?
     public private(set) var profileStatus: DialogueVoiceProfileStatus
     public private(set) var lines: [DialogueLine]
     public private(set) var pendingCleanupPaths: [String]
     public private(set) var playbackSettings: DialogueVoicePlaybackSettings
 
     public var referencedManagedPaths: Set<String> {
-        Self.referencedPaths(profile: profile, qwenProfile: qwenProfile, lines: lines)
+        Self.referencedPaths(profile: profile, qwenProfile: qwenProfile, voxcpm2Profile: voxcpm2Profile, lines: lines)
     }
 
     public var activeProfileID: UUID? {
         switch activeProviderKind {
         case .gptSovits: profile?.id
         case .qwen3TTS: qwenProfile?.id
+        case .voxcpm2: voxcpm2Profile?.id
         case nil: nil
         }
     }
@@ -795,6 +917,7 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
         switch activeProviderKind {
         case .gptSovits: profile?.revision
         case .qwen3TTS: qwenProfile?.revision
+        case .voxcpm2: voxcpm2Profile?.revision
         case nil: nil
         }
     }
@@ -803,6 +926,7 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
         switch activeProviderKind {
         case .gptSovits: profile?.inputFingerprint
         case .qwen3TTS: qwenProfile?.inputFingerprint
+        case .voxcpm2: voxcpm2Profile?.inputFingerprint
         case nil: nil
         }
     }
@@ -811,6 +935,7 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
         switch activeProviderKind {
         case .gptSovits: profile?.defaultTextLanguage
         case .qwen3TTS: qwenProfile?.defaultTextLanguage
+        case .voxcpm2: voxcpm2Profile?.defaultTextLanguage
         case nil: nil
         }
     }
@@ -823,6 +948,7 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
         version: Int = Self.schemaVersion,
         profile: GPTSoVITSVoiceProfile? = nil,
         qwenProfile: Qwen3TTSVoiceProfile? = nil,
+        voxcpm2Profile: VoxCPM2VoiceProfile? = nil,
         activeProviderKind: DialogueVoiceProviderKind? = nil,
         profileStatus: DialogueVoiceProfileStatus? = nil,
         lines: [DialogueLine] = [],
@@ -838,15 +964,16 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
             throw DialogueVoiceError.invalidState
         }
         guard Set(validatedCleanupPaths).isDisjoint(
-            with: Self.referencedPaths(profile: profile, qwenProfile: qwenProfile, lines: lines)
+            with: Self.referencedPaths(profile: profile, qwenProfile: qwenProfile, voxcpm2Profile: voxcpm2Profile, lines: lines)
         ) else {
             throw DialogueVoiceError.invalidState
         }
         self.version = version
         self.profile = profile
         self.qwenProfile = qwenProfile
+        self.voxcpm2Profile = voxcpm2Profile
         self.activeProviderKind = activeProviderKind
-            ?? (profile != nil ? .gptSovits : (qwenProfile != nil ? .qwen3TTS : nil))
+            ?? (profile != nil ? .gptSovits : (qwenProfile != nil ? .qwen3TTS : (voxcpm2Profile != nil ? .voxcpm2 : nil)))
         self.profileStatus = profileStatus ?? (self.activeProviderKind == nil ? .notConfigured : .ready)
         self.lines = lines
         self.pendingCleanupPaths = validatedCleanupPaths
@@ -881,9 +1008,20 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
         self = candidate
     }
 
+    public mutating func replaceActiveProfile(_ profile: VoxCPM2VoiceProfile) throws {
+        var candidate = self; candidate.voxcpm2Profile = profile
+        try candidate.selectActiveProvider(.voxcpm2); self = candidate
+    }
+
+    public mutating func replaceConfiguredProfile(_ profile: VoxCPM2VoiceProfile) throws {
+        var candidate = self; candidate.voxcpm2Profile = profile
+        try candidate.validateProfileRelationships(); self = candidate
+    }
+
     public mutating func selectActiveProvider(_ provider: DialogueVoiceProviderKind) throws {
         guard (provider == .gptSovits && profile != nil)
-                || (provider == .qwen3TTS && qwenProfile != nil) else {
+                || (provider == .qwen3TTS && qwenProfile != nil)
+                || (provider == .voxcpm2 && voxcpm2Profile != nil) else {
             throw DialogueVoiceError.profileNotConfigured
         }
         let updatedLines = try lines.map { line in
@@ -907,7 +1045,7 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
             }
         }
         guard Set(pendingCleanupPaths).isDisjoint(
-            with: Self.referencedPaths(profile: profile, qwenProfile: qwenProfile, lines: updatedLines)
+            with: Self.referencedPaths(profile: profile, qwenProfile: qwenProfile, voxcpm2Profile: voxcpm2Profile, lines: updatedLines)
         ) else {
             throw DialogueVoiceError.invalidState
         }
@@ -1091,7 +1229,7 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
         var updatedLines = lines
         updatedLines[index] = line
         guard Set(pendingCleanupPaths).isDisjoint(
-            with: Self.referencedPaths(profile: profile, qwenProfile: qwenProfile, lines: updatedLines)
+            with: Self.referencedPaths(profile: profile, qwenProfile: qwenProfile, voxcpm2Profile: voxcpm2Profile, lines: updatedLines)
         ) else {
             throw DialogueVoiceError.invalidState
         }
@@ -1289,6 +1427,7 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
     private static func referencedPaths(
         profile: GPTSoVITSVoiceProfile?,
         qwenProfile: Qwen3TTSVoiceProfile?,
+        voxcpm2Profile: VoxCPM2VoiceProfile?,
         lines: [DialogueLine]
     ) -> Set<String> {
         var paths = Set(lines.compactMap(\.outputRelativePath))
@@ -1300,11 +1439,15 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
         if let qwenProfile {
             paths.insert(qwenProfile.packageRootRelativePath)
         }
+        if let voxcpm2Profile {
+            paths.insert(voxcpm2Profile.snapshotPath)
+            paths.insert(voxcpm2Profile.referenceAudioRelativePath)
+        }
         return paths
     }
 
     private func validateProfileRelationships() throws {
-        let configuredProfileCount = (profile == nil ? 0 : 1) + (qwenProfile == nil ? 0 : 1)
+        let configuredProfileCount = (profile == nil ? 0 : 1) + (qwenProfile == nil ? 0 : 1) + (voxcpm2Profile == nil ? 0 : 1)
         if configuredProfileCount == 0 {
             guard profileStatus == .notConfigured,
                   activeProviderKind == nil,
@@ -1316,12 +1459,15 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
         guard configuredProfileCount > 0,
               (activeProviderKind != .gptSovits || profile != nil),
               (activeProviderKind != .qwen3TTS || qwenProfile != nil),
+              (activeProviderKind != .voxcpm2 || voxcpm2Profile != nil),
               activeProviderKind != nil else {
             throw DialogueVoiceError.invalidState
         }
         if let profile, let qwenProfile, profile.id == qwenProfile.id {
             throw DialogueVoiceError.invalidState
         }
+        let ids = [profile?.id, qwenProfile?.id, voxcpm2Profile?.id].compactMap { $0 }
+        guard Set(ids).count == ids.count else { throw DialogueVoiceError.invalidState }
         guard profileStatus != .notConfigured else { throw DialogueVoiceError.invalidState }
         for line in lines {
             if line.status == .ready,
@@ -1336,6 +1482,7 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
         case activeProviderKind = "active_provider"
         case profile
         case qwenProfile = "qwen_profile"
+        case voxcpm2Profile = "voxcpm2_profile"
         case profileStatus = "profile_status"
         case lines
         case pendingCleanupPaths = "pending_cleanup_paths"
@@ -1346,15 +1493,17 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let profile = try container.decodeIfPresent(GPTSoVITSVoiceProfile.self, forKey: .profile)
         let qwenProfile = try container.decodeIfPresent(Qwen3TTSVoiceProfile.self, forKey: .qwenProfile)
+        let voxcpm2Profile = try container.decodeIfPresent(VoxCPM2VoiceProfile.self, forKey: .voxcpm2Profile)
         let activeProviderKind = try container.decodeIfPresent(
             DialogueVoiceProviderKind.self,
             forKey: .activeProviderKind
         )
-            ?? (profile == nil ? (qwenProfile == nil ? nil : .qwen3TTS) : .gptSovits)
+            ?? (profile == nil ? (qwenProfile == nil ? (voxcpm2Profile == nil ? nil : .voxcpm2) : .qwen3TTS) : .gptSovits)
         try self.init(
             version: container.decode(Int.self, forKey: .version),
             profile: profile,
             qwenProfile: qwenProfile,
+            voxcpm2Profile: voxcpm2Profile,
             activeProviderKind: activeProviderKind,
             profileStatus: container.decodeIfPresent(DialogueVoiceProfileStatus.self, forKey: .profileStatus)
                 ?? (activeProviderKind == nil ? .notConfigured : .ready),

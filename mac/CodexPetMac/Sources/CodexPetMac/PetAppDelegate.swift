@@ -234,6 +234,23 @@ private struct ActiveConversionJournal: Codable {
     }
 }
 
+enum ConversionRecoveryRoutePolicy {
+    static func accepts(
+        state: String,
+        transitionFrom: String?,
+        transitionTo: String?,
+        transitionScope: TransitionLibraryScope?
+    ) -> Bool {
+        if transitionFrom == nil, transitionTo == nil { return true }
+        guard let rawFrom = transitionFrom,
+              let rawTo = transitionTo,
+              let from = PetState(rawValue: rawFrom),
+              let to = PetState(rawValue: rawTo),
+              state == to.rawValue else { return false }
+        return from != to || transitionScope == .character
+    }
+}
+
 private struct RecoveryOwner {
     let entry: CharacterLibraryEntry
     let map: MediaMap
@@ -272,7 +289,9 @@ private struct ActiveLifecycleTransition {
     let destinationEntry: MediaEntry
     let destinationURL: URL
     let transitionScope: TransitionLibraryScope
-    var selectionRequest: TransitionSelectionRequest
+    var transitionSelectionRequest: TransitionSelectionRequest?
+    var destinationSelectionRequest: MediaSelectionRequest?
+    let isInState: Bool
 }
 
 private struct PendingLifecycleTransitionAttestation {
@@ -284,7 +303,20 @@ private struct PendingLifecycleTransitionAttestation {
     let destinationEntry: MediaEntry
     let destinationURL: URL
     let transitionScope: TransitionLibraryScope
-    var selectionRequest: TransitionSelectionRequest
+    var transitionSelectionRequest: TransitionSelectionRequest?
+    var destinationSelectionRequest: MediaSelectionRequest?
+    let isInState: Bool
+}
+
+private struct PendingMediaSelectionCommit {
+    let transitionID: UInt64
+    var request: MediaSelectionRequest
+    let target: MediaSelectionCommitTarget
+}
+
+private enum MediaSelectionCommitTarget {
+    case lifecycle
+    case manualPreview
 }
 
 enum LifecycleTransitionCompletionDecision: Equatable {
@@ -345,6 +377,20 @@ struct LifecycleTransitionPolicy {
               let lastCommittedState,
               lastCommittedState != incomingState else { return nil }
         return lastCommittedState
+    }
+}
+
+enum InStateTransitionPolicy {
+    static func shouldTrigger(
+        trigger: LifecyclePresentationTrigger,
+        reduceMotion: Bool,
+        continuousRotation: Bool,
+        temporaryPreviewActive: Bool
+    ) -> Bool {
+        trigger == .playlistRotation
+            && !reduceMotion
+            && continuousRotation
+            && !temporaryPreviewActive
     }
 }
 
@@ -464,6 +510,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         Result<CharacterTransitionRuntimeAttestation, Error>, Never
     >?
     private var activeLifecycleTransition: ActiveLifecycleTransition?
+    private var pendingMediaSelectionCommit: PendingMediaSelectionCommit?
     private var stateDialoguePresentation: StateDialoguePresentation?
     private var publisherHealth: PublisherHealth = .unknown
     private var mapReadFailureReported = false
@@ -982,6 +1029,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                     guard let loaded = try? storage.loadMediaMap(for: entry) else { return 0 }
                     return loaded.map.states.values.reduce(0) { $0 + $1.entries.count }
                         + loaded.map.allTransitionEntries.count
+                        + loaded.map.allInStateTransitionEntries.count
                 }
             }
             DispatchQueue.main.async { [weak self] in
@@ -1340,7 +1388,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             destinationEntry: destinationEntry,
             destinationURL: destinationURL,
             transitionScope: resolvedTransition.scope,
-            selectionRequest: selectionRequest
+            transitionSelectionRequest: selectionRequest,
+            destinationSelectionRequest: nil,
+            isInState: false
         )
         pendingLifecycleTransitionAttestation = request
         pendingPresentationState = destination
@@ -1386,7 +1436,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 destinationEntry: request.destinationEntry,
                 destinationURL: request.destinationURL,
                 transitionScope: request.transitionScope,
-                selectionRequest: request.selectionRequest
+                transitionSelectionRequest: request.transitionSelectionRequest,
+                destinationSelectionRequest: request.destinationSelectionRequest,
+                isInState: request.isInState
             )
             let continuousRotation = mediaMap.playlist(for: request.destination)?.isContinuousRotationEffective == true
             let playback = player.showLifecycleTransition(
@@ -1420,15 +1472,16 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
               currentState == request.destination,
               temporaryStatePreviewPolicy.previewState == nil,
               activeOneShotPreview == nil else { return }
-        var selectionRequest = request.selectionRequest
-        guard let transitionEntry = selectionRequest.next() else {
+        guard var selectionRequest = request.transitionSelectionRequest,
+              let transitionEntry = selectionRequest.next() else {
             pendingPresentationState = nil
             logger.error("event=lifecycle_transition_variants_exhausted transition_id=\(request.id, privacy: .public) from=\(request.source.rawValue, privacy: .public) to=\(request.destination.rawValue, privacy: .public) reason=\(reason, privacy: .public)")
             startLifecyclePresentation(
                 state: request.destination,
                 advanceSelection: false,
                 refreshReason: "layered_handoff_variants_exhausted",
-                preselectedEntry: request.destinationEntry
+                preselectedEntry: request.destinationEntry,
+                selectionRequest: request.destinationSelectionRequest
             )
             return
         }
@@ -1447,7 +1500,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             destinationEntry: request.destinationEntry,
             destinationURL: request.destinationURL,
             transitionScope: request.transitionScope,
-            selectionRequest: selectionRequest
+            transitionSelectionRequest: selectionRequest,
+            destinationSelectionRequest: request.destinationSelectionRequest,
+            isInState: false
         )
         pendingLifecycleTransitionAttestation = retry
         pendingPresentationState = request.destination
@@ -1466,7 +1521,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func finishLifecycleTransition(transitionID: UInt64, outcome: String) {
-        guard var active = activeLifecycleTransition,
+        guard let active = activeLifecycleTransition,
               LifecycleTransitionCompletionDecision.decide(
                   callbackID: transitionID,
                   currentSequence: transitionSequence,
@@ -1479,13 +1534,28 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         pendingPresentationState = nil
         logger.info("event=lifecycle_transition_finished transition_id=\(transitionID, privacy: .public) from=\(active.source.rawValue, privacy: .public) to=\(active.destination.rawValue, privacy: .public) outcome=\(outcome, privacy: .public)")
         if outcome == "completed" {
-            var cursor = transitionSelectionCursor(for: active.transitionScope)
-            _ = active.selectionRequest.commit(to: &cursor)
-            setTransitionSelectionCursor(cursor, for: active.transitionScope)
+            if var selectionRequest = active.transitionSelectionRequest {
+                var cursor = transitionSelectionCursor(for: active.transitionScope)
+                _ = selectionRequest.commit(to: &cursor)
+                setTransitionSelectionCursor(cursor, for: active.transitionScope)
+            }
+            if var selectionRequest = active.destinationSelectionRequest {
+                _ = selectionRequest.commit(to: &mediaSelectionCursor)
+            }
             lastPresentedState = active.destination
             lastCommittedLifecycleState = active.destination
-            presentStateOwnedDialogueIfNeeded(for: active.destination)
+            if !active.isInState { presentStateOwnedDialogueIfNeeded(for: active.destination) }
         } else {
+            if active.isInState {
+                startLifecyclePresentation(
+                    state: active.destination,
+                    advanceSelection: false,
+                    refreshReason: "in_state_handoff_failed",
+                    preselectedEntry: active.destinationEntry,
+                    selectionRequest: active.destinationSelectionRequest
+                )
+                return
+            }
             retryLifecycleTransition(
                 request: PendingLifecycleTransitionAttestation(
                     id: active.id,
@@ -1496,7 +1566,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                     destinationEntry: active.destinationEntry,
                     destinationURL: active.destinationURL,
                     transitionScope: active.transitionScope,
-                    selectionRequest: active.selectionRequest
+                    transitionSelectionRequest: active.transitionSelectionRequest,
+                    destinationSelectionRequest: active.destinationSelectionRequest,
+                    isInState: false
                 ),
                 reason: "playback_failed"
             )
@@ -1559,8 +1631,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         refreshReason: String,
         useManualPreviewCursor: Bool = false,
         explicitUserAdvance: Bool = false,
-        preselectedEntry: MediaEntry? = nil
+        preselectedEntry: MediaEntry? = nil,
+        selectionRequest: MediaSelectionRequest? = nil,
+        selectionCommitTarget: MediaSelectionCommitTarget = .lifecycle
     ) {
+        pendingMediaSelectionCommit = nil
         if stateDialoguePresentation?.state != state {
             let keepSpokenMessage = dialogueVoiceCoordinator.isAutomaticPlaybackActive
             dialogueVoiceCoordinator.cancelAutomaticPlayback()
@@ -1592,6 +1667,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         ) ?? .failed
         switch startResult {
         case .presented:
+            if var selectionRequest {
+                commitMediaSelectionRequest(
+                    &selectionRequest,
+                    target: selectionCommitTarget
+                )
+            }
             lastPresentedState = state
             if temporaryStatePreviewPolicy.previewState == nil, activeOneShotPreview == nil {
                 lastCommittedLifecycleState = state
@@ -1599,6 +1680,13 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             pendingPresentationState = nil
             presentStateOwnedDialogueIfNeeded(for: state)
         case .preparing:
+            if let selectionRequest {
+                pendingMediaSelectionCommit = PendingMediaSelectionCommit(
+                    transitionID: transitionID,
+                    request: selectionRequest,
+                    target: selectionCommitTarget
+                )
+            }
             lastPresentedState = nil
             pendingPresentationState = state
         case .failed:
@@ -1618,12 +1706,112 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
               mediaMap.playlist(for: state)?.isContinuousRotationEffective == true else { return }
         pendingPresentationState = nil
         logger.info("event=playlist_advance_triggered transition_id=\(transitionID, privacy: .public) state=\(state.rawValue, privacy: .public) reason=clip_end")
+        if InStateTransitionPolicy.shouldTrigger(
+            trigger: .playlistRotation,
+            reduceMotion: reduceMotion,
+            continuousRotation: true,
+            temporaryPreviewActive: temporaryStatePreviewPolicy.previewState != nil
+        ),
+           beginInStateTransition(state: state) {
+            return
+        }
+        let useManualPreviewCursor = temporaryStatePreviewPolicy.previewState != nil
+        guard let selectionRequest = mediaSelectionRequest(
+            for: state,
+            advance: true,
+            useManualPreviewCursor: useManualPreviewCursor
+        ) else { return }
         startLifecyclePresentation(
             state: state,
-            advanceSelection: true,
+            advanceSelection: false,
             refreshReason: "clip_end",
-            useManualPreviewCursor: temporaryStatePreviewPolicy.previewState != nil
+            useManualPreviewCursor: useManualPreviewCursor,
+            preselectedEntry: selectionRequest.entry,
+            selectionRequest: selectionRequest,
+            selectionCommitTarget: useManualPreviewCursor ? .manualPreview : .lifecycle
         )
+    }
+
+    private func beginInStateTransition(state: PetState) -> Bool {
+        guard !reduceMotion,
+              activeOneShotPreview == nil,
+              let mediaMapURL,
+              let transitionEntry = mediaMap.inStateTransition(for: state) else { return false }
+        let transitionURL = mediaMap.resolvedURL(for: transitionEntry, relativeTo: mediaMapURL)
+        guard FileManager.default.isReadableFile(atPath: transitionURL.path) else { return false }
+        guard let destinationSelectionRequest = mediaSelectionRequest(
+            for: state,
+            advance: true,
+            useManualPreviewCursor: false
+        ) else { return false }
+        let destinationEntry = destinationSelectionRequest.entry
+        let destinationURL = mediaMap.resolvedURL(for: destinationEntry, relativeTo: mediaMapURL)
+        guard FileManager.default.isReadableFile(atPath: destinationURL.path) else { return false }
+        cancelActiveLifecycleTransition(reason: "superseded_in_state")
+        transitionSequence &+= 1
+        let transitionID = transitionSequence
+        let request = PendingLifecycleTransitionAttestation(
+            id: transitionID,
+            source: state,
+            destination: state,
+            transitionEntry: transitionEntry,
+            transitionURL: transitionURL,
+            destinationEntry: destinationEntry,
+            destinationURL: destinationURL,
+            transitionScope: .character,
+            transitionSelectionRequest: nil,
+            destinationSelectionRequest: destinationSelectionRequest,
+            isInState: true
+        )
+        pendingLifecycleTransitionAttestation = request
+        pendingPresentationState = state
+        let verifier = Task.detached(priority: .userInitiated) {
+            await Self.attestRuntimeTransition(
+                movieURL: transitionURL,
+                timeoutSeconds: Self.transitionAttestationTimeoutSeconds
+            )
+        }
+        pendingLifecycleTransitionAttestationTask = verifier
+        Task { @MainActor [weak self] in
+            let result = await verifier.value
+            self?.finishLifecycleTransitionAttestation(request: request, result: result)
+        }
+        logger.info("event=in_state_transition_attestation_started transition_id=\(transitionID, privacy: .public) state=\(state.rawValue, privacy: .public)")
+        return true
+    }
+
+    private func mediaSelectionRequest(
+        for state: PetState,
+        advance: Bool,
+        useManualPreviewCursor: Bool
+    ) -> MediaSelectionRequest? {
+        guard let mediaMapURL,
+              let playlist = mediaMap.playlist(for: state) else { return nil }
+        let cursor = useManualPreviewCursor
+            ? manualPreviewSelectionCursor
+            : mediaSelectionCursor
+        return cursor.request(
+            for: state,
+            from: playlist,
+            advance: advance,
+            isEligible: { [mediaMap, mediaMapURL] entry in
+                FileManager.default.isReadableFile(
+                    atPath: mediaMap.resolvedURL(for: entry, relativeTo: mediaMapURL).path
+                )
+            }
+        )
+    }
+
+    private func commitMediaSelectionRequest(
+        _ request: inout MediaSelectionRequest,
+        target: MediaSelectionCommitTarget
+    ) {
+        switch target {
+        case .lifecycle:
+            _ = request.commit(to: &mediaSelectionCursor)
+        case .manualPreview:
+            _ = request.commit(to: &manualPreviewSelectionCursor)
+        }
     }
 
     private func handlePresentationEvent(
@@ -1648,6 +1836,14 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
         switch event {
         case .ready:
+            if var pending = pendingMediaSelectionCommit,
+               pending.transitionID == transitionID {
+                commitMediaSelectionRequest(
+                    &pending.request,
+                    target: pending.target
+                )
+                pendingMediaSelectionCommit = nil
+            }
             lastPresentedState = state
             if temporaryStatePreviewPolicy.previewState == nil, activeOneShotPreview == nil {
                 lastCommittedLifecycleState = state
@@ -1655,6 +1851,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             presentStateOwnedDialogueIfNeeded(for: state)
             logger.info("event=presentation_committed transition_id=\(transitionID, privacy: .public) state=\(state.rawValue, privacy: .public)")
         case .failed:
+            if pendingMediaSelectionCommit?.transitionID == transitionID {
+                pendingMediaSelectionCommit = nil
+            }
             lastPresentedState = nil
             logger.error("event=presentation_revoked transition_id=\(transitionID, privacy: .public) state=\(state.rawValue, privacy: .public)")
         }
@@ -2316,6 +2515,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         controller.onRemoveQwenProfile = { [weak self] profile in
             self?.confirmQwenVoiceProfileRemoval(profile)
         }
+        controller.onConfigureVoxCPM2Profile = { [weak self] transcript in
+            self?.chooseVoxCPM2Snapshot(referenceText: transcript)
+        }
+        controller.onRemoveVoxCPM2Profile = { [weak self] profile in
+            self?.confirmVoxCPM2ProfileRemoval(profile)
+        }
         controller.onDialogueVoicePlaybackSettingsChange = { [weak self] settings in
             self?.updateDialogueVoicePlaybackSettings(settings)
         }
@@ -2790,6 +2995,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             panel.message = "Choose reference audio that you own or are authorized to use. Statelet keeps a private local copy."
             panel.prompt = "Import Reference Audio"
             panel.allowedContentTypes = [.audio]
+        case .voxcpm2ReferenceAudio:
+            panel.title = "Import VoxCPM2 Reference Audio"
+            panel.message = "Choose a trusted WAV that you own or are authorized to use."
+            panel.prompt = "Import Reference Audio"
+            panel.allowedContentTypes = [.wav]
         }
         panel.beginSheetModal(for: settingsWindow) { [weak self] response in
             guard response == .OK, let sourceURL = panel.url else { return }
@@ -2879,6 +3089,60 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 sourceURL: packageURL,
                 pythonExecutableURL: pythonURL
             )
+        }
+    }
+
+    private func chooseVoxCPM2Snapshot(referenceText: String) {
+        guard let window = settingsController?.window else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Choose VoxCPM2 Snapshot"
+        panel.message = "Choose a trusted complete openbmb/VoxCPM2 snapshot. Statelet copies and fingerprints it in private managed storage and never uploads or bundles it."
+        panel.prompt = "Use Snapshot"; panel.canChooseFiles = false; panel.canChooseDirectories = true
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let snapshot = panel.url else { return }
+            self?.chooseVoxCPM2Reference(snapshotURL: snapshot, referenceText: referenceText)
+        }
+    }
+
+    private func chooseVoxCPM2Reference(snapshotURL: URL, referenceText: String) {
+        guard let window = settingsController?.window else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Choose VoxCPM2 Reference WAV"
+        panel.message = "Choose one trusted reference WAV that you own or may use. Statelet keeps a private managed copy."
+        panel.prompt = "Use Reference"; panel.allowedContentTypes = [.wav]
+        panel.canChooseFiles = true; panel.canChooseDirectories = false
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let reference = panel.url else { return }
+            self?.chooseVoxCPM2Python(snapshotURL: snapshotURL, referenceURL: reference, referenceText: referenceText)
+        }
+    }
+
+    private func chooseVoxCPM2Python(snapshotURL: URL, referenceURL: URL, referenceText: String) {
+        guard let window = settingsController?.window else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Choose VoxCPM2 Python Runtime"
+        panel.message = "Choose a trusted Python executable whose environment provides voxcpm, PyTorch, and soundfile."
+        panel.prompt = "Use Runtime"; panel.canChooseFiles = true; panel.canChooseDirectories = false
+        panel.resolvesAliases = false
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let python = panel.url else { return }
+            self?.dialogueVoiceCoordinator.configureVoxCPM2Profile(
+                snapshotURL: snapshotURL, referenceAudioURL: referenceURL,
+                referenceText: referenceText, pythonExecutableURL: python
+            )
+        }
+    }
+
+    private func confirmVoxCPM2ProfileRemoval(_ profile: VoxCPM2VoiceProfile) {
+        guard let window = settingsController?.window else { return }
+        let alert = NSAlert(); alert.alertStyle = .warning
+        alert.messageText = "Remove \(profile.name)?"
+        alert.informativeText = "Statelet removes its managed snapshot, reference, and generated speech. The selected source folder, dialogue text, and other providers remain untouched."
+        alert.addButton(withTitle: "Remove VoxCPM2 Profile"); alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            do { try self?.dialogueVoiceCoordinator.removeProfile(provider: .voxcpm2) }
+            catch { self?.presentSettingsError(error.localizedDescription) }
         }
     }
 
@@ -3021,7 +3285,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         openPanel.title = "Import \(source.rawValue.capitalized) → \(destination.rawValue.capitalized) Transition MP4"
         openPanel.prompt = "Import Transition"
         openPanel.allowedContentTypes = [.mpeg4Movie]
-        openPanel.allowsMultipleSelection = replacingPath == nil
+        openPanel.allowsMultipleSelection = replacingPath == nil && source != destination
         openPanel.canChooseDirectories = false
         openPanel.beginSheetModal(for: settingsWindow) { [weak self] response in
             guard response == .OK, !openPanel.urls.isEmpty else { return }
@@ -3040,7 +3304,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         openPanel.title = "Choose \(source.rawValue.capitalized) → \(destination.rawValue.capitalized) Transition"
         openPanel.prompt = "Import Transition"
         openPanel.allowedContentTypes = [.quickTimeMovie]
-        openPanel.allowsMultipleSelection = replacingPath == nil
+        openPanel.allowsMultipleSelection = replacingPath == nil && source != destination
         openPanel.canChooseDirectories = false
         openPanel.beginSheetModal(for: settingsWindow) { [weak self] response in
             guard response == .OK, !openPanel.urls.isEmpty else { return }
@@ -3136,14 +3400,20 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     ) throws {
         switch scope {
         case .character:
-            let updated = try replacingPath.map {
-                try mediaMap.replacingTransitionEntry(
-                    from: source, to: destination, path: $0, with: entry
-                )
-            } ?? mediaMap.appendingTransitionEntry(entry, from: source, to: destination)
+            let updated: MediaMap
+            if source == destination {
+                updated = try mediaMap.settingInStateTransition(for: source, entry: entry)
+            } else {
+                updated = try replacingPath.map {
+                    try mediaMap.replacingTransitionEntry(
+                        from: source, to: destination, path: $0, with: entry
+                    )
+                } ?? mediaMap.appendingTransitionEntry(entry, from: source, to: destination)
+            }
             try publishMediaMap(updated)
             applyPublishedMediaMap(updated)
         case .global:
+            guard source != destination else { throw PetContractError.invalidValue("same-state transitions are character-scoped") }
             let updated = try replacingPath.map {
                 try globalTransitionLibrary.replacingTransitionEntry(
                     from: source, to: destination, path: $0, with: entry
@@ -3161,7 +3431,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         to destination: PetState,
         replacingPath: String?
     ) {
-        let orderedURLs = replacingPath == nil ? sourceURLs : Array(sourceURLs.prefix(1))
+        let orderedURLs = replacingPath == nil && source != destination ? sourceURLs : Array(sourceURLs.prefix(1))
         guard let first = orderedURLs.first else { return }
         importTransitionMP4(first, scope: scope, from: source, to: destination, replacingPath: replacingPath) { [weak self] _ in
             guard replacingPath == nil else { return }
@@ -3374,7 +3644,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         let libraryURL: URL
         switch scope {
         case .character:
-            entry = mediaMap.transitionPlaylist(from: source, to: destination)?.entry(path: path)
+            entry = source == destination
+                ? mediaMap.inStateTransition(for: source)
+                : mediaMap.transitionPlaylist(from: source, to: destination)?.entry(path: path)
             libraryURL = mediaMapURL
         case .global:
             entry = globalTransitionLibrary.transitionPlaylist(from: source, to: destination)?.entry(path: path)
@@ -3427,7 +3699,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         let entryExists: Bool
         switch scope {
         case .character:
-            entryExists = mediaMap.transitionPlaylist(from: source, to: destination)?.entry(path: path) != nil
+            entryExists = source == destination
+                ? mediaMap.inStateTransition(for: source)?.path == path
+                : mediaMap.transitionPlaylist(from: source, to: destination)?.entry(path: path) != nil
         case .global:
             entryExists = globalTransitionLibrary.transitionPlaylist(from: source, to: destination)?.entry(path: path) != nil
         }
@@ -3474,7 +3748,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                   self.characterLibrary.activeCharacterID == requestedCharacterID,
                   self.mediaMapURL.standardizedFileURL == requestedMapURL,
                   self.mediaMapEncodedData == requestedMapData,
-                  self.mediaMap.transitionPlaylist(from: source, to: destination)?.entry(path: path) != nil else {
+                  (source == destination
+                    ? self.mediaMap.inStateTransition(for: source)?.path == path
+                    : self.mediaMap.transitionPlaylist(from: source, to: destination)?.entry(path: path) != nil) else {
                 self.settingsController?.update(
                     activity: .failed(destination, "The character or transition changed before removal. Nothing was removed.")
                 )
@@ -3489,14 +3765,21 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 let updated: MediaMap
                 if response == .alertFirstButtonReturn {
                     let originalMap = self.mediaMap
-                    let plan = try ManagedMediaRemovalPlanner.plan(
-                        mediaMap: self.mediaMap,
-                        mapURL: self.mediaMapURL,
-                        transitionFrom: source,
-                        transitionTo: destination,
-                        path: path,
-                        canonicalRoot: self.canonicalManagedMediaRoot
-                    )
+                    let plan = try source == destination
+                        ? ManagedMediaRemovalPlanner.plan(
+                            mediaMap: self.mediaMap,
+                            mapURL: self.mediaMapURL,
+                            inStateTransition: source,
+                            canonicalRoot: self.canonicalManagedMediaRoot
+                        )
+                        : ManagedMediaRemovalPlanner.plan(
+                            mediaMap: self.mediaMap,
+                            mapURL: self.mediaMapURL,
+                            transitionFrom: source,
+                            transitionTo: destination,
+                            path: path,
+                            canonicalRoot: self.canonicalManagedMediaRoot
+                        )
                     let libraryMaps = try self.allCharacterMediaMaps()
                     guard !plan.trashURLs.contains(where: { target in
                         self.globalTransitionLibraryReferences(target)
@@ -3548,7 +3831,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                         return
                     }
                 } else {
-                    updated = try self.mediaMap.removingTransitionEntry(from: source, to: destination, path: path)
+                    updated = try source == destination
+                        ? self.mediaMap.removingInStateTransition(for: source)
+                        : self.mediaMap.removingTransitionEntry(from: source, to: destination, path: path)
                     try self.publishMediaMap(updated)
                     self.applyPublishedMediaMap(updated)
                 }
@@ -4245,7 +4530,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                             switch owner {
                             case let .character(characterOwner):
                                 var updated = characterOwner.map
-                                if updated.transitionPlaylist(from: from, to: to)?
+                                if from == to {
+                                    updated = try updated.settingInStateTransition(for: from, entry: entry)
+                                } else if updated.transitionPlaylist(from: from, to: to)?
                                     .entry(path: journal.outputBasename) == nil {
                                     updated = try updated.appendingTransitionEntry(entry, from: from, to: to)
                                 }
@@ -4267,6 +4554,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                                     self.characterClipCounts[characterOwner.entry.id] = self.totalClipCount(in: updated)
                                 }
                             case let .global(globalOwner):
+                                guard from != to else {
+                                    throw PetContractError.invalidValue("same-state transitions are character-scoped")
+                                }
                                 var updated = globalOwner.library
                                 if updated.transitionPlaylist(from: from, to: to)?
                                     .entry(path: journal.outputBasename) == nil {
@@ -4399,12 +4689,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private static func isValidRecoveryRoute(_ journal: ActiveConversionJournal) -> Bool {
-        if journal.transitionFrom == nil, journal.transitionTo == nil { return true }
-        guard let rawFrom = journal.transitionFrom,
-              let rawTo = journal.transitionTo,
-              let from = PetState(rawValue: rawFrom),
-              let to = PetState(rawValue: rawTo) else { return false }
-        return from != to && journal.state == to.rawValue
+        ConversionRecoveryRoutePolicy.accepts(
+            state: journal.state,
+            transitionFrom: journal.transitionFrom,
+            transitionTo: journal.transitionTo,
+            transitionScope: journal.transitionScope
+        )
     }
 
     private static func recoveryArtifactStem(

@@ -1,6 +1,6 @@
 ---
 name: operate-statelet-local-voice
-description: Configure, migrate, generate, and verify private GPT-SoVITS or Qwen3-TTS dialogue for Statelet. Use when importing GPT `.ckpt`, SoVITS `.pth`, reference audio, or a self-contained Qwen handover; selecting a validated local Python and MLX Audio runtime; configuring a loopback API v2 service; adding Idle, Running, Waiting, or Review state-owned messages; diagnosing silent or fragmented WAV output; validating synthesis-policy migration; or installing and testing local voice after a Statelet upgrade.
+description: Configure, migrate, generate, and verify private GPT-SoVITS, Qwen3-TTS, or VoxCPM2 dialogue for Statelet. Use when importing GPT `.ckpt`, SoVITS `.pth`, reference audio, a self-contained Qwen handover, or a complete VoxCPM2 handover; selecting a validated local Python runtime; configuring a loopback API v2 service; adding Idle, Running, Waiting, or Review state-owned messages; diagnosing silent or fragmented WAV output; validating synthesis-policy migration; or installing and testing local voice after a Statelet upgrade.
 ---
 
 # Operate Statelet local voice
@@ -22,6 +22,13 @@ in private local storage. Never commit, bundle, diagnose-upload, or log them.
      local Python executable whose environment provides MLX Audio. The current
      Statelet profile is Japanese-only and accepts at most 500 characters per
      line. Read [references/qwen3-tts-mlx.md](references/qwen3-tts-mlx.md).
+   - For VoxCPM2, require the complete source snapshot folder, one trusted
+     WAV reference and exact transcript, and a trusted Python executable. The
+     snapshot is copied into Statelet's private managed storage through a
+     descriptor-bound staged import and fingerprinted as a complete
+     regular-file tree. The bounded probe must load only that managed copy
+     offline, report `mps`, `cuda`, or `cpu`, and confirm a 48 kHz model output rate. Read
+     [references/voxcpm2.md](references/voxcpm2.md).
 3. Import through **Settings → Voice → Voice Setup** so Statelet copies and
    fingerprints private inputs below Application Support. Select the provider
    page first. GPT-SoVITS imports three assets separately; Qwen3-TTS imports the
@@ -36,7 +43,8 @@ in private local storage. Never commit, bundle, diagnose-upload, or log them.
    Same-state heartbeats and clip rotation must not replay delivered speech.
 6. Read the provider reference before changing request fields, persistence,
    migration, or playback behavior: [GPT-SoVITS v2](references/gpt-sovits-v2.md)
-   or [Qwen3-TTS with MLX Audio](references/qwen3-tts-mlx.md).
+   or [Qwen3-TTS with MLX Audio](references/qwen3-tts-mlx.md), or
+   [VoxCPM2](references/voxcpm2.md).
 7. For GPT-SoVITS, run
    `python3 .agents/skills/operate-statelet-local-voice/scripts/verify_statelet_voice.py --support-root "$HOME/Library/Application Support/Statelet"`
    to verify state coverage, managed paths, WAV geometry, synthesis-policy
@@ -45,6 +53,11 @@ in private local storage. Never commit, bundle, diagnose-upload, or log them.
    `Ready` provider, a Japanese line of 500 characters or fewer that reaches
    `Ready`, successful **Preview**, and the runtime-enforced 24 kHz mono PCM16
    WAV contract.
+   For VoxCPM2, require a `Ready` provider, a Japanese line of 1,000
+   characters or fewer that reaches `Ready`, successful **Preview**, and the
+   runtime-enforced 48 kHz mono PCM16 WAV contract. Do not claim audible
+   quality from the probe; generation remains asynchronous and MPS float32
+   can be slow.
 8. Verify the installed app separately: full-Xcode CI, signed release build,
    installed-binary hash equality, live animation, message display, and audible
    state transitions. Preserve existing media and voice data during upgrades.
@@ -68,6 +81,13 @@ in private local storage. Never commit, bundle, diagnose-upload, or log them.
   the saved line to 500 characters or fewer, and retry only after the provider
   returns to `Ready`. Do not enable downloads or replace the pinned package at
   runtime; Statelet deliberately runs Qwen with offline model-loading flags.
+- VoxCPM2 import is rejected before generation: confirm that the selected
+  folder contains the full snapshot (including `model.safetensors`,
+  `audiovae.pth`, config, tokenizer assets, and tokenization code), contains no
+  symbolic links or special files, fits the 8 GiB aggregate limit, and can be
+  copied into private Application Support with adequate free space. Re-import
+  the complete handover if the managed copy fails its stored tree digest or the probe
+  reports an incompatible device or sample rate.
 - Keep Statelet's per-job GPT and SoVITS activation as an integrity reassertion.
   Configure the local service to make repeated activation of the same absolute,
   canonical weight path a no-op; reloading identical weights has empirically
@@ -88,11 +108,13 @@ in private local storage. Never commit, bundle, diagnose-upload, or log them.
 - Legacy generated output: version the synthesis policy independently from the
   input fingerprint. Retain the old WAV until replacement succeeds, then clean
   it atomically.
-- Provider changes: GPT-SoVITS and Qwen3-TTS profiles may coexist, but only one
+- Provider changes: GPT-SoVITS, Qwen3-TTS, and VoxCPM2 profiles may coexist, but only one
   is active. Use the provider's **Use** button and wait for revalidation and
   regeneration before judging playback. Removing Qwen deletes Statelet's
   managed package and generated speech while preserving dialogue text and a
-  separately configured GPT-SoVITS profile.
+  separately configured GPT-SoVITS profile. VoxCPM2 removal preserves the
+  selected source folder and removes Statelet's managed snapshot, reference,
+  and speech.
 - `swift test` cannot import XCTest under Command Line Tools: use local builds
   and source checks for iteration, then require the repository full-Xcode CI
   before merge.

@@ -35,6 +35,19 @@ private func validAlphaReportJSON() -> String {
 }
 
 final class CodexPetCoreTests: XCTestCase {
+    func testInStateTransitionRoundTripIsIndependentAndOneShot() throws {
+        let transition = try MediaEntry(path: "media/idle-handoff.mov", loop: true)
+        let map = try MediaMap(
+            states: [.idle: try MediaEntry(path: "media/idle.mov")],
+            inStateTransitions: [.idle: transition]
+        )
+
+        XCTAssertFalse(try XCTUnwrap(map.inStateTransition(for: .idle)).loop)
+        XCTAssertNil(map.transitionPlaylist(from: .idle, to: .idle))
+        XCTAssertEqual(try JSONDecoder().decode(MediaMap.self, from: JSONEncoder().encode(map)), map)
+        XCTAssertNil(try map.removingInStateTransition(for: .idle).inStateTransition(for: .idle))
+    }
+
     func testLayeredLifecycleHandoffKeepsAVisibleThenPrerollsBUnderTransition() {
         var handoff = LayeredLifecycleHandoff(id: 7, source: .idle, destination: .running)
         XCTAssertEqual(handoff.lowerLayer, .outgoing(.idle))
@@ -75,6 +88,82 @@ final class CodexPetCoreTests: XCTestCase {
         XCTAssertEqual(handoff.transitionFailed(id: 12), .fallBack(.review))
         XCTAssertFalse(handoff.transitionVisible)
         XCTAssertTrue(handoff.preservesVisibleContent)
+    }
+
+    func testLayeredSameStateHandoffPrerollsAndFallsBackWithoutClearingVisibleLayer() {
+        var handoff = LayeredLifecycleHandoff(id: 41, source: .running, destination: .running)
+        XCTAssertEqual(handoff.lowerLayer, .outgoing(.running))
+        XCTAssertEqual(handoff.transitionBecameReady(id: 41), .revealTransition)
+        XCTAssertEqual(handoff.destinationPrerollCueReached(id: 41), .startDestinationPreroll(.running))
+        XCTAssertEqual(handoff.destinationBecameReady(id: 41), .revealDestination(.running))
+        XCTAssertEqual(handoff.lowerLayer, .destination(.running))
+        XCTAssertEqual(handoff.transitionFinished(id: 41), .finish(.running))
+
+        var failed = LayeredLifecycleHandoff(id: 42, source: .running, destination: .running)
+        XCTAssertEqual(failed.transitionBecameReady(id: 42), .revealTransition)
+        XCTAssertEqual(failed.destinationPrerollCueReached(id: 42), .startDestinationPreroll(.running))
+        XCTAssertEqual(failed.transitionFailed(id: 42), .fallBack(.running))
+        XCTAssertEqual(failed.lowerLayer, .outgoing(.running))
+        XCTAssertTrue(failed.preservesVisibleContent)
+        XCTAssertEqual(failed.destinationBecameReady(id: 41), .none)
+    }
+
+    func testSameStateFallbackReusesSelectedPlaylistEntryWithoutDoubleAdvancingCursor() throws {
+        let first = try MediaEntry(path: "running-first.mov")
+        let second = try MediaEntry(path: "running-second.mov")
+        let playlist = try StateMediaPlaylist(mode: .sequential, entries: [first, second])
+        var cursor = MediaSelectionCursor()
+
+        XCTAssertEqual(cursor.select(for: .running, from: playlist)?.path, first.path)
+        let selectedDestination = cursor.select(for: .running, from: playlist)?.path
+        XCTAssertEqual(selectedDestination, second.path)
+        XCTAssertEqual(
+            cursor.select(for: .running, from: playlist, advance: false)?.path,
+            selectedDestination
+        )
+        XCTAssertEqual(cursor.select(for: .running, from: playlist)?.path, first.path)
+    }
+
+    func testMediaSelectionRequestCancellationAndDirectFailureDoNotSkipAndSuccessCommitsOnce() throws {
+        let first = try MediaEntry(path: "running-first.mov")
+        let second = try MediaEntry(path: "running-second.mov")
+        let playlist = try StateMediaPlaylist(mode: .sequential, entries: [first, second])
+        var cursor = MediaSelectionCursor(selectedPaths: [.running: first.path])
+
+        let cancelled = try XCTUnwrap(cursor.request(for: .running, from: playlist))
+        XCTAssertEqual(cancelled.entry, second)
+        XCTAssertEqual(cursor.selectedPath(for: .running), first.path)
+
+        let directFailure = try XCTUnwrap(cursor.request(for: .running, from: playlist))
+        XCTAssertEqual(directFailure.entry, second)
+        XCTAssertEqual(cursor.selectedPath(for: .running), first.path)
+
+        var accepted = try XCTUnwrap(cursor.request(for: .running, from: playlist))
+        XCTAssertEqual(accepted.entry, second)
+        XCTAssertTrue(accepted.commit(to: &cursor))
+        XCTAssertFalse(accepted.commit(to: &cursor))
+        XCTAssertEqual(cursor.selectedPath(for: .running), second.path)
+        XCTAssertEqual(cursor.request(for: .running, from: playlist)?.entry, first)
+    }
+
+    func testMediaSelectionRequestAttestationAndBindingFallbackCommitOnlyWhenAccepted() throws {
+        let first = try MediaEntry(path: "running-first.mov")
+        let second = try MediaEntry(path: "running-second.mov")
+        let playlist = try StateMediaPlaylist(mode: .sequential, entries: [first, second])
+        var cursor = MediaSelectionCursor(selectedPaths: [.running: first.path])
+
+        let attestationFailure = try XCTUnwrap(cursor.request(for: .running, from: playlist))
+        XCTAssertEqual(attestationFailure.entry, second)
+        XCTAssertEqual(cursor.selectedPath(for: .running), first.path)
+
+        let bindingFailure = try XCTUnwrap(cursor.request(for: .running, from: playlist))
+        XCTAssertEqual(bindingFailure.entry, second)
+        XCTAssertEqual(cursor.selectedPath(for: .running), first.path)
+
+        var acceptedFallback = try XCTUnwrap(cursor.request(for: .running, from: playlist))
+        XCTAssertTrue(acceptedFallback.commit(to: &cursor))
+        XCTAssertFalse(acceptedFallback.commit(to: &cursor))
+        XCTAssertEqual(cursor.selectedPath(for: .running), second.path)
     }
 
     func testLayeredLifecycleHandoffUsesDeterministicBoundedOverlap() {
@@ -846,10 +935,12 @@ final class CodexPetCoreTests: XCTestCase {
         )
         let idle = try MediaEntry(path: "idle.mov", posterPath: "idle.png")
         let running = try MediaEntry(path: "running.mov", playbackRate: 1.25)
+        let idleHandoff = try MediaEntry(path: "idle-handoff.mov", loop: false)
         let original = try MediaMap(
             defaultFormat: "mov",
             window: originalWindow,
-            states: [.idle: idle, .running: running]
+            states: [.idle: idle, .running: running],
+            inStateTransitions: [.idle: idleHandoff]
         )
         let imported = try MediaEntry(path: "imports/idle-v2.mov", loop: true)
         let withImport = try original.replacingEntry(for: .idle, with: imported)
@@ -857,6 +948,7 @@ final class CodexPetCoreTests: XCTestCase {
         XCTAssertEqual(withImport.entry(for: .running), running)
         XCTAssertEqual(withImport.window, originalWindow)
         XCTAssertEqual(withImport.defaultFormat, original.defaultFormat)
+        XCTAssertEqual(withImport.inStateTransition(for: .idle), idleHandoff)
         XCTAssertEqual(original.entry(for: .idle), idle)
 
         let replacementWindow = try originalWindow.replacing(width: 400, clickThrough: true)
@@ -910,6 +1002,7 @@ final class CodexPetCoreTests: XCTestCase {
         XCTAssertEqual(withWindow.window, appearanceWindow)
         XCTAssertEqual(withWindow.defaultFormat, original.defaultFormat)
         XCTAssertEqual(withWindow.states, original.states)
+        XCTAssertEqual(withWindow.inStateTransition(for: .idle), idleHandoff)
         XCTAssertEqual(original.window, originalWindow)
 
         XCTAssertEqual(MediaMapChangeImpact.decide(previous: original, incoming: original), .unchanged)
@@ -924,6 +1017,14 @@ final class CodexPetCoreTests: XCTestCase {
             entry: try MediaEntry(path: "idle-running.mov", loop: false)
         )
         XCTAssertEqual(MediaMapChangeImpact.decide(previous: original, incoming: withTransition), .playback)
+        let withInStateTransition = try MediaMap(
+            defaultFormat: original.defaultFormat,
+            window: original.window,
+            states: original.states,
+            transitions: original.transitions,
+            inStateTransitions: [.idle: try MediaEntry(path: "idle-handoff-v2.mov", loop: false)]
+        )
+        XCTAssertEqual(MediaMapChangeImpact.decide(previous: original, incoming: withInStateTransition), .playback)
         XCTAssertEqual(try withTransition.replacingWindow(appearanceWindow).transitions, withTransition.transitions)
         XCTAssertEqual(
             try withTransition.replacingEntry(for: .idle, with: try MediaEntry(path: "replacement.mov")).transitions,
@@ -1124,6 +1225,39 @@ final class CodexPetCoreTests: XCTestCase {
                 CharacterBundleAsset(role: .poster, path: transition.posterPath!, size: 1, sha256: hash),
                 CharacterBundleAsset(role: .poster, path: alternate.posterPath!, size: 1, sha256: hash),
             ]
+        ))
+    }
+
+    func testCharacterBundleSameStateTransitionRewriteRequiresAndPreservesAssets() throws {
+        let hash = String(repeating: "b", count: 64)
+        let handoff = try MediaEntry(
+            path: "movies/idle-handoff.mov",
+            posterPath: "posters/idle-handoff.png",
+            loop: true
+        )
+        let map = try MediaMap(
+            states: [.idle: try MediaEntry(path: "movies/idle.mov")],
+            inStateTransitions: [.idle: handoff]
+        )
+        let manifest = try CharacterBundleManifest(
+            characterID: "same-state-character",
+            characterName: "Same State Character",
+            mediaMap: map,
+            assets: [
+                CharacterBundleAsset(role: .movie, path: "movies/idle.mov", size: 1, sha256: hash),
+                CharacterBundleAsset(role: .movie, path: handoff.path, size: 1, sha256: hash),
+                CharacterBundleAsset(role: .poster, path: handoff.posterPath!, size: 1, sha256: hash),
+            ]
+        )
+        let rewritten = try manifest.mediaMap(rewritingPaths: { "installed/\($0)" })
+        XCTAssertEqual(rewritten.inStateTransition(for: .idle)?.path, "installed/movies/idle-handoff.mov")
+        XCTAssertEqual(rewritten.inStateTransition(for: .idle)?.posterPath, "installed/posters/idle-handoff.png")
+        XCTAssertFalse(try XCTUnwrap(rewritten.inStateTransition(for: .idle)).loop)
+        XCTAssertThrowsError(try CharacterBundleManifest(
+            characterID: "same-state-character",
+            characterName: "Same State Character",
+            mediaMap: map,
+            assets: [CharacterBundleAsset(role: .movie, path: "movies/idle.mov", size: 1, sha256: hash)]
         ))
     }
 

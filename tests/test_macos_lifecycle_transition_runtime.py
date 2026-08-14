@@ -45,25 +45,81 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         finish_source = self.app[finish:finish_end]
         self.assertNotIn("player.clearTransientPresentation()", finish_source)
         self.assertIn('reason: "playback_failed"', finish_source)
-        self.assertIn("selectionRequest: active.selectionRequest", finish_source)
-        self.assertIn("active.selectionRequest.commit(to: &cursor)", finish_source)
+        self.assertIn(
+            "var selectionRequest = active.transitionSelectionRequest",
+            finish_source,
+        )
+        self.assertIn("selectionRequest.commit(to: &cursor)", finish_source)
         self.assertIn("setTransitionSelectionCursor(cursor, for: active.transitionScope)", finish_source)
 
         retry = self.app.index("private func retryLifecycleTransition(")
         retry_end = self.app.index("private func finishLifecycleTransition(", retry)
         retry_source = self.app[retry:retry_end]
-        self.assertIn("var selectionRequest = request.selectionRequest", retry_source)
+        self.assertIn("var selectionRequest = request.transitionSelectionRequest", retry_source)
         self.assertIn("selectionRequest.next()", retry_source)
         self.assertIn('refreshReason: "layered_handoff_variants_exhausted"', retry_source)
         self.assertIn("preselectedEntry: request.destinationEntry", retry_source)
         self.assertIn("advanceSelection: false", retry_source)
-        self.assertIn("selectionRequest: selectionRequest", retry_source)
+        self.assertIn("selectionRequest: request.destinationSelectionRequest", retry_source)
+        self.assertIn("transitionSelectionRequest: selectionRequest", retry_source)
+
+    def test_same_state_clip_end_uses_layered_handoff_and_direct_fallback(self):
+        advance = self.app.index("private func advancePlaylistAfterClipEnd")
+        begin = self.app.index("private func beginInStateTransition", advance)
+        advance_source = self.app[advance:begin]
+        self.assertIn("InStateTransitionPolicy.shouldTrigger", advance_source)
+        self.assertIn("beginInStateTransition(state: state)", advance_source)
+        self.assertIn('refreshReason: "clip_end"', advance_source)
+        self.assertIn("mediaSelectionRequest(", advance_source)
+        self.assertIn("useManualPreviewCursor: useManualPreviewCursor", advance_source)
+        self.assertIn("preselectedEntry: selectionRequest.entry", advance_source)
+        self.assertIn("selectionRequest: selectionRequest", advance_source)
+        self.assertLess(
+            advance_source.index("mediaSelectionRequest("),
+            advance_source.index("startLifecyclePresentation("),
+        )
+
+        begin_end = self.app.index("private func handlePresentationEvent", begin)
+        begin_source = self.app[begin:begin_end]
+        self.assertIn("destination: state", begin_source)
+        self.assertIn("mediaSelectionRequest(", begin_source)
+        self.assertIn("destinationSelectionRequest: destinationSelectionRequest", begin_source)
+        self.assertNotIn("selectedEntry(", begin_source)
+        self.assertIn("attestRuntimeTransition", begin_source)
+        request_helper = begin_source.index("private func mediaSelectionRequest(")
+        helper_source = begin_source[request_helper:]
+        self.assertIn("return cursor.request(", helper_source)
+        self.assertIn("request.commit(to: &mediaSelectionCursor)", helper_source)
+        self.assertIn("request.commit(to: &manualPreviewSelectionCursor)", helper_source)
+
+        cancel = self.app.index("private func cancelActiveLifecycleTransition")
+        cancel_end = self.app.index("private func startLifecyclePresentation", cancel)
+        cancel_source = self.app[cancel:cancel_end]
+        self.assertIn("pendingLifecycleTransitionAttestation = nil", cancel_source)
+        self.assertNotIn("destinationSelectionRequest.commit", cancel_source)
+
+        finish = self.app.index("private func finishLifecycleTransition")
+        finish_end = self.app.index("private static func attestRuntimeTransition", finish)
+        finish_source = self.app[finish:finish_end]
+        self.assertIn("if active.isInState", finish_source)
+        self.assertIn('refreshReason: "in_state_handoff_failed"', finish_source)
+        self.assertIn("preselectedEntry: active.destinationEntry", finish_source)
+        self.assertIn("advanceSelection: false", finish_source)
+        self.assertIn("selectionRequest: active.destinationSelectionRequest", finish_source)
+        self.assertIn("selectionRequest.commit(to: &mediaSelectionCursor)", finish_source)
+
+        presentation = self.app.index("private func startLifecyclePresentation(")
+        presentation_end = self.app.index("private func advancePlaylistAfterClipEnd", presentation)
+        presentation_source = self.app[presentation:presentation_end]
+        self.assertIn("pendingMediaSelectionCommit", presentation_source)
+        self.assertIn("commitMediaSelectionRequest(", presentation_source)
 
         active = self.app.index("private struct ActiveLifecycleTransition")
         active_end = self.app.index("enum LifecycleTransitionCompletionDecision", active)
         active_source = self.app[active:active_end]
         self.assertIn("let destinationEntry: MediaEntry", active_source)
-        self.assertIn("var selectionRequest: TransitionSelectionRequest", active_source)
+        self.assertIn("var transitionSelectionRequest: TransitionSelectionRequest?", active_source)
+        self.assertIn("var destinationSelectionRequest: MediaSelectionRequest?", active_source)
 
         transition = self.app.index("private func beginLifecycleTransition(")
         transition_end = self.app.index("private func finishLifecycleTransitionAttestation", transition)
@@ -97,9 +153,6 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
             self.app[attestation_finish:attestation_finish_end],
         )
 
-        presentation = self.app.index("private func startLifecyclePresentation(")
-        presentation_end = self.app.index("private func advancePlaylistAfterClipEnd", presentation)
-        presentation_source = self.app[presentation:presentation_end]
         self.assertIn("let entry = preselectedEntry ?? selectedEntry(", presentation_source)
 
     def test_dialogue_only_starts_from_destination_presentation_commit(self):
@@ -222,7 +275,8 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         finish = self.app.index("private func finishLifecycleTransition(")
         finish_end = self.app.index("private static func attestRuntimeTransition", finish)
         finish_source = self.app[finish:finish_end]
-        self.assertIn("active.selectionRequest.commit", finish_source)
+        self.assertIn("active.transitionSelectionRequest", finish_source)
+        self.assertIn("selectionRequest.commit(to: &cursor)", finish_source)
         self.assertIn("setTransitionSelectionCursor(", finish_source)
         self.assertIn("for: active.transitionScope", finish_source)
 

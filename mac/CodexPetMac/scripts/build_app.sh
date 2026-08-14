@@ -138,6 +138,11 @@ install -m 0644 "$repo_root/mac/requirements-alpha.txt" \
   "$stage/Contents/Resources/AlphaTools/requirements-alpha.txt"
 install -m 0644 "$package_dir/Resources/QwenTTS/qwen3_tts_generate.py" \
   "$stage/Contents/Resources/QwenTTS/qwen3_tts_generate.py"
+install -d -m 0755 "$stage/Contents/Resources/VoxCPM2"
+install -m 0644 "$package_dir/Resources/VoxCPM2/voxcpm2_generate.py" \
+  "$stage/Contents/Resources/VoxCPM2/voxcpm2_generate.py"
+install -m 0644 "$package_dir/Resources/VoxCPM2/voxcpm2_probe.py" \
+  "$stage/Contents/Resources/VoxCPM2/voxcpm2_probe.py"
 install -m 0644 "$package_dir/Resources/QwenTTS/qwen3_tts_probe.py" \
   "$stage/Contents/Resources/QwenTTS/qwen3_tts_probe.py"
 

@@ -162,6 +162,14 @@ public struct CharacterBundleManifest: Codable, Equatable, Sendable {
                 }
             }
         }
+        for entry in mediaMap.inStateTransitions.values {
+            try Self.requireAsset(path: entry.path, role: .movie, assetsByPath: assetsByPath)
+            referencedMoviePaths.insert(entry.path)
+            if let posterPath = entry.posterPath {
+                try Self.requireAsset(path: posterPath, role: .poster, assetsByPath: assetsByPath)
+                referencedPosterPaths.insert(posterPath)
+            }
+        }
         var reportedMovies = Set<String>()
         for report in assets where report.role == .report {
             try Self.requireAsset(path: report.moviePath!, role: .movie, assetsByPath: assetsByPath)
@@ -229,12 +237,21 @@ public struct CharacterBundleManifest: Codable, Equatable, Sendable {
                 )
             )
         })
+        let rewrittenInStateTransitions = try Dictionary(uniqueKeysWithValues: mediaMap.inStateTransitions.map { state, entry in
+            (state, try MediaEntry(
+                path: transform(entry.path),
+                posterPath: try entry.posterPath.map(transform),
+                loop: false,
+                playbackRate: entry.playbackRate.value
+            ))
+        })
         return try MediaMap(
             version: mediaMap.version,
             defaultFormat: mediaMap.defaultFormat,
             window: mediaMap.window,
             states: rewrittenStates,
-            transitions: rewrittenTransitions
+            transitions: rewrittenTransitions,
+            inStateTransitions: rewrittenInStateTransitions
         )
     }
 

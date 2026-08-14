@@ -410,13 +410,26 @@ public extension MediaMap {
         return try replacingTransitions(updated)
     }
 
+    func settingInStateTransition(for state: PetState, entry: MediaEntry) throws -> MediaMap {
+        var updated = inStateTransitions
+        updated[state] = entry
+        return try replacingInStateTransitions(updated)
+    }
+
+    func removingInStateTransition(for state: PetState) throws -> MediaMap {
+        var updated = inStateTransitions
+        updated[state] = nil
+        return try replacingInStateTransitions(updated)
+    }
+
     private func replacingStates(_ states: [PetState: StateMediaPlaylist]) throws -> MediaMap {
         try MediaMap(
             version: version,
             defaultFormat: defaultFormat,
             window: window,
             states: states,
-            transitions: transitions
+            transitions: transitions,
+            inStateTransitions: inStateTransitions
         )
     }
 
@@ -426,7 +439,19 @@ public extension MediaMap {
             defaultFormat: defaultFormat,
             window: window,
             states: states,
-            transitions: transitions
+            transitions: transitions,
+            inStateTransitions: inStateTransitions
+        )
+    }
+
+    private func replacingInStateTransitions(_ routes: [PetState: MediaEntry]) throws -> MediaMap {
+        try MediaMap(
+            version: version,
+            defaultFormat: defaultFormat,
+            window: window,
+            states: states,
+            transitions: transitions,
+            inStateTransitions: routes
         )
     }
 }
@@ -488,6 +513,8 @@ public struct TransitionSelectionCursor: Equatable, Sendable {
         return selectedPath(for: route)
     }
 
+    /// Proposes a selection without changing this cursor. Commit the returned
+    /// request only after the selected entry is accepted for presentation.
     public func request(
         from: PetState,
         to: PetState,
@@ -574,6 +601,26 @@ public struct MediaSelectionCursor: Equatable, Sendable {
         return playlist.entries.contains { entry in
             isEligible(entry) && !StateMediaPlaylist.pathsEqual(entry.path, baselinePath)
         }
+    }
+
+    /// Proposes a selection without changing this cursor. Commit the returned
+    /// request only after the selected entry is accepted for presentation.
+    public func request(
+        for state: PetState,
+        from playlist: StateMediaPlaylist,
+        advance: Bool = true,
+        isEligible: (MediaEntry) -> Bool = { _ in true },
+        randomIndex: (Int) -> Int = { Int.random(in: 0..<$0) }
+    ) -> MediaSelectionRequest? {
+        var proposedCursor = self
+        guard let entry = proposedCursor.select(
+            for: state,
+            from: playlist,
+            advance: advance,
+            isEligible: isEligible,
+            randomIndex: randomIndex
+        ) else { return nil }
+        return MediaSelectionRequest(state: state, entry: entry)
     }
 
     public mutating func select(
@@ -680,6 +727,10 @@ public struct MediaSelectionCursor: Equatable, Sendable {
         }
     }
 
+    fileprivate mutating func commit(path: String, for state: PetState) {
+        selectedPaths[state] = path
+    }
+
     private static func nextEligible(
         after index: Int,
         entries: [MediaEntry],
@@ -690,6 +741,26 @@ public struct MediaSelectionCursor: Equatable, Sendable {
             if isEligible(candidate) { return candidate }
         }
         return nil
+    }
+}
+
+public struct MediaSelectionRequest: Equatable, Sendable {
+    public let state: PetState
+    public let entry: MediaEntry
+    public private(set) var isCommitted: Bool
+
+    fileprivate init(state: PetState, entry: MediaEntry) {
+        self.state = state
+        self.entry = entry
+        isCommitted = false
+    }
+
+    @discardableResult
+    public mutating func commit(to cursor: inout MediaSelectionCursor) -> Bool {
+        guard !isCommitted else { return false }
+        cursor.commit(path: entry.path, for: state)
+        isCommitted = true
+        return true
     }
 }
 

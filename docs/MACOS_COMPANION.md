@@ -131,8 +131,12 @@ manual migration is required.
 ## Playback and preview contract
 
 Normal Statelet playback uses one AVFoundation decoder. Natural completion can
-hard-cut to another clip when effective `clip_end` rotation is enabled. Normal
-playlist playback has no cross-fade, warmed decoder, or weighted selection.
+switch to another clip when effective `clip_end` rotation is enabled. A
+character-scoped optional `in_state_transitions` entry for the current state can
+decorate only that automatic handoff with the transparent layered transition
+contract and a pre-rolled lower destination. These entries are independent of
+distinct-state routes and their cursors. Reduce Motion and manual or refresh
+paths use the direct switch.
 
 An optional `transitions` map can bind a distinct ordered state pair such as
 `idle_to_running` to an ordered playlist. Character maps keep character-local

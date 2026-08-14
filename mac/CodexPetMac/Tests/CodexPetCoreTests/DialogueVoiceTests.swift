@@ -51,6 +51,23 @@ final class DialogueVoiceTests: XCTestCase {
         )
     }
 
+    private func voxProfile(revision: Int = 1) throws -> VoxCPM2VoiceProfile {
+        try VoxCPM2VoiceProfile(
+            id: UUID(uuidString: "CCCCCCCC-DDDD-EEEE-FFFF-000000000000")!,
+            revision: revision,
+            name: "VoxCPM2 Test Voice",
+            snapshotPath: "voice/packages/voxcpm2/12345678-1234-1234-1234-123456789abc",
+            snapshotTreeSHA256: String(repeating: "7", count: 64),
+            pythonExecutablePath: "/opt/statelet/venv/bin/python",
+            pythonExecutableSHA256: String(repeating: "8", count: 64),
+            referenceAudioRelativePath: "voice/assets/voxcpm2-reference/reference.wav",
+            referenceAudioSHA256: String(repeating: "9", count: 64),
+            referenceText: "Reference text",
+            defaultTextLanguage: "japanese",
+            inputFingerprint: String(repeating: "a", count: 64)
+        )
+    }
+
     private func libraryWithQueuedLine(state: PetState = .idle) throws -> DialogueVoiceLibrary {
         var library = try DialogueVoiceLibrary(profile: profile())
         try library.addLine(text: "你好", state: state, id: lineID)
@@ -232,10 +249,13 @@ final class DialogueVoiceTests: XCTestCase {
     }
 
     func testProviderProfilesCoexistAndOnlySelectedProviderDrivesTickets() throws {
-        var library = try DialogueVoiceLibrary(profile: profile(), qwenProfile: qwenProfile())
+        var library = try DialogueVoiceLibrary(
+            profile: profile(), qwenProfile: qwenProfile(), voxcpm2Profile: voxProfile()
+        )
         XCTAssertEqual(library.activeProviderKind, .gptSovits)
         XCTAssertNotNil(library.profile)
         XCTAssertNotNil(library.qwenProfile)
+        XCTAssertNotNil(library.voxcpm2Profile)
         _ = try library.addLine(text: "Hello", id: lineID)
 
         try library.selectActiveProvider(.qwen3TTS)
@@ -251,6 +271,13 @@ final class DialogueVoiceTests: XCTestCase {
         XCTAssertEqual(ticket.profileRevision, library.qwenProfile?.revision)
 
         try library.failGeneration(ticket: ticket, failureCode: "TEST_FAILURE")
+        try library.retryLine(id: lineID)
+        try library.selectActiveProvider(.voxcpm2)
+        XCTAssertEqual(library.activeProviderKind, .voxcpm2)
+        let voxTicket = try library.beginGeneration(for: lineID)
+        XCTAssertEqual(voxTicket.profileID, library.voxcpm2Profile?.id)
+        XCTAssertEqual(voxTicket.profileRevision, library.voxcpm2Profile?.revision)
+        try library.failGeneration(ticket: voxTicket, failureCode: "TEST_FAILURE")
         try library.retryLine(id: lineID)
         try library.selectActiveProvider(.gptSovits)
         let gptTicket = try library.beginGeneration(for: lineID)
@@ -919,5 +946,62 @@ final class DialogueVoiceTests: XCTestCase {
             try library.outputURL(for: lineID, relativeTo: root).path,
             "/managed/root/audio/ready.wav"
         )
+    }
+
+    func testVoxCPM2ProviderPersistsCompletePinnedProfile() throws {
+        let provisional = try VoxCPM2VoiceProfile(
+            name: "VoxCPM2 Voice",
+            snapshotPath: "voice/packages/voxcpm2/12345678-1234-1234-1234-123456789abc",
+            snapshotTreeSHA256: String(repeating: "a", count: 64),
+            pythonExecutablePath: "/private/venv/bin/python",
+            pythonExecutableSHA256: String(repeating: "b", count: 64),
+            referenceAudioRelativePath: "voice/assets/voxcpm2-reference/ref.wav",
+            referenceAudioSHA256: String(repeating: "c", count: 64),
+            referenceText: "正確な文字起こし。", inputFingerprint: String(repeating: "d", count: 64)
+        )
+        let library = try DialogueVoiceLibrary(voxcpm2Profile: provisional, activeProviderKind: .voxcpm2)
+        let decoded = try JSONDecoder().decode(
+            DialogueVoiceLibrary.self, from: JSONEncoder().encode(library)
+        )
+        XCTAssertEqual(decoded.activeProviderKind, .voxcpm2)
+        XCTAssertEqual(decoded.voxcpm2Profile, provisional)
+        XCTAssertTrue(decoded.referencedManagedPaths.contains(provisional.snapshotPath))
+        XCTAssertTrue(decoded.referencedManagedPaths.contains(provisional.referenceAudioRelativePath))
+        XCTAssertEqual(provisional.parameters, .verifiedDefaults)
+
+        var legacyObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(provisional))
+                as? [String: Any]
+        )
+        legacyObject["snapshotPath"] = "/private/models/VoxCPM2"
+        let legacyData = try JSONSerialization.data(withJSONObject: legacyObject)
+        XCTAssertThrowsError(try JSONDecoder().decode(VoxCPM2VoiceProfile.self, from: legacyData)) {
+            XCTAssertEqual($0 as? DialogueVoiceError, .invalidManagedPath)
+        }
+    }
+
+    func testVoxCPM2RejectsExternalReferenceAndUnsafeRuntimePaths() throws {
+        XCTAssertThrowsError(try VoxCPM2VoiceProfile(
+            name: "Vox", snapshotPath: "/models/VoxCPM2",
+            snapshotTreeSHA256: String(repeating: "a", count: 64),
+            pythonExecutablePath: "relative/python",
+            pythonExecutableSHA256: String(repeating: "b", count: 64),
+            referenceAudioRelativePath: "voice/assets/reference/ref.wav",
+            referenceAudioSHA256: String(repeating: "c", count: 64),
+            referenceText: "reference", inputFingerprint: String(repeating: "d", count: 64)
+        ))
+        XCTAssertThrowsError(try VoxCPM2VoiceProfile(
+            name: "Vox",
+            snapshotPath: "voice/packages/voxcpm2/not-a-uuid",
+            snapshotTreeSHA256: String(repeating: "a", count: 64),
+            pythonExecutablePath: "/models/python",
+            pythonExecutableSHA256: String(repeating: "b", count: 64),
+            referenceAudioRelativePath: "voice/assets/voxcpm2-reference/ref.wav",
+            referenceAudioSHA256: String(repeating: "c", count: 64),
+            referenceText: "reference",
+            inputFingerprint: String(repeating: "d", count: 64)
+        ))
+        XCTAssertThrowsError(try VoxCPM2SynthesisParameters(loadDenoiser: true))
+        XCTAssertThrowsError(try VoxCPM2SynthesisParameters(optimize: true))
     }
 }

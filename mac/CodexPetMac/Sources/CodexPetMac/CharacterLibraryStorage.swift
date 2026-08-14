@@ -505,6 +505,10 @@ final class CharacterLibraryStorage {
                 if let poster = transition.posterPath { _ = try register(poster, role: .poster) }
             }
         }
+        for transition in loaded.map.inStateTransitions.values {
+            _ = try register(transition.path, role: .movie)
+            if let poster = transition.posterPath { _ = try register(poster, role: .poster) }
+        }
 
         var reports: [(source: URL, path: String, moviePath: String)] = []
         for item in sourceByBundlePath where item.role == .movie {
@@ -530,7 +534,9 @@ final class CharacterLibraryStorage {
             }
             return bundled
         }
-        let transitionMoviePaths = Set(rewrittenMap.allTransitionEntries.map(\.path))
+        let transitionMoviePaths = Set(
+            (rewrittenMap.allTransitionEntries + rewrittenMap.allInStateTransitionEntries).map(\.path)
+        )
 
         var expectedAggregate: UInt64 = 0
         for item in sourceByBundlePath {
@@ -753,7 +759,9 @@ final class CharacterLibraryStorage {
                 }
                 return report
             }
-        let transitionMoviePaths = Set(manifest.mediaMap.allTransitionEntries.map(\.path))
+        let transitionMoviePaths = Set(
+            (manifest.mediaMap.allTransitionEntries + manifest.mediaMap.allInStateTransitionEntries).map(\.path)
+        )
         for movie in manifest.assets where movie.role == .movie {
             guard let movieURL = installedByBundlePath[movie.path] else {
                 throw CharacterLibraryStorageError.invalidFile
@@ -972,12 +980,24 @@ private extension MediaMap {
                 )
             )
         })
+        let inStateTransitions = try Dictionary(uniqueKeysWithValues: self.inStateTransitions.map { state, entry in
+            (
+                state,
+                try MediaEntry(
+                    path: transform(entry.path),
+                    posterPath: try entry.posterPath.map(transform),
+                    loop: false,
+                    playbackRate: entry.playbackRate.value
+                )
+            )
+        })
         return try MediaMap(
             version: version,
             defaultFormat: defaultFormat,
             window: window,
             states: states,
-            transitions: transitions
+            transitions: transitions,
+            inStateTransitions: inStateTransitions
         )
     }
 }

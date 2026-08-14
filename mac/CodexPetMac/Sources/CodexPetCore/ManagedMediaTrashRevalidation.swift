@@ -357,6 +357,18 @@ public enum ManagedMediaTrashRevalidator {
                 }
             }
         }
+        for entry in map.inStateTransitions.values {
+            let movie = map.resolvedURL(for: entry, relativeTo: mapURL)
+                .resolvingSymlinksInPath().standardizedFileURL
+            let report = movie.deletingPathExtension().appendingPathExtension("report.json")
+            let poster = map.resolvedPosterURL(for: entry, relativeTo: mapURL)?
+                .resolvingSymlinksInPath().standardizedFileURL
+            if targetPaths.contains(movie.path)
+                || targetPaths.contains(report.path)
+                || poster.map({ targetPaths.contains($0.path) }) == true {
+                throw ManagedMediaTrashRevalidationError.stillReferenced
+            }
+        }
 
         for expected in snapshot.targets {
             let current: ManagedMediaTrashTarget
@@ -951,6 +963,18 @@ public enum ManagedMediaTrashRevalidator {
                     || poster.map({ targetPaths.contains($0.path) }) == true {
                     throw ManagedMediaTrashRevalidationError.stillReferenced
                 }
+            }
+        }
+        for entry in map.inStateTransitions.values {
+            let movie = map.resolvedURL(for: entry, relativeTo: mapURL)
+                .resolvingSymlinksInPath().standardizedFileURL
+            let report = movie.deletingPathExtension().appendingPathExtension("report.json")
+            let poster = map.resolvedPosterURL(for: entry, relativeTo: mapURL)?
+                .resolvingSymlinksInPath().standardizedFileURL
+            if targetPaths.contains(movie.path)
+                || targetPaths.contains(report.path)
+                || poster.map({ targetPaths.contains($0.path) }) == true {
+                throw ManagedMediaTrashRevalidationError.stillReferenced
             }
         }
     }

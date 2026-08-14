@@ -170,6 +170,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     var onConfigureQwenProfile: (() -> Void)?
     var onSelectVoiceProvider: ((DialogueVoiceProviderKind) -> Void)?
     var onRemoveQwenProfile: ((Qwen3TTSVoiceProfile) -> Void)?
+    var onConfigureVoxCPM2Profile: ((String) -> Void)?
+    var onRemoveVoxCPM2Profile: ((VoxCPM2VoiceProfile) -> Void)?
     var onAddDialogueLine: ((String, String, PetState) -> Void)?
     var onUpdateDialogueLine: ((DialogueLine, String, String, PetState) -> Void)?
     var onDeleteDialogueLine: ((DialogueLine) -> Void)?
@@ -712,6 +714,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         }
         dialogueVoiceView.onRemoveQwenProfile = { [weak self] profile in
             self?.onRemoveQwenProfile?(profile)
+        }
+        dialogueVoiceView.onConfigureVoxCPM2Profile = { [weak self] transcript in
+            self?.onConfigureVoxCPM2Profile?(transcript)
+        }
+        dialogueVoiceView.onRemoveVoxCPM2Profile = { [weak self] profile in
+            self?.onRemoveVoxCPM2Profile?(profile)
         }
         dialogueVoiceView.onAddLine = { [weak self] text, language, state in
             self?.onAddDialogueLine?(text, language, state)
@@ -1306,7 +1314,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                 )
             }
         }
-        let transitionClips = transitionPlaylists.flatMap { key, playlist in
+        var transitionClips = transitionPlaylists.flatMap { key, playlist in
             playlist.entries.enumerated().map { index, entry in
                 SettingsTransitionClip(
                     source: key.from,
@@ -1319,6 +1327,20 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                     count: playlist.entries.count,
                     mode: playlist.mode,
                     isFixed: entry.path == playlist.fixedPath
+                )
+            }
+        }
+        if selectedTransitionScope == .character {
+            transitionClips += snapshot.mediaMap.inStateTransitions.map { state, entry in
+                SettingsTransitionClip(
+                    source: state,
+                    destination: state,
+                    path: entry.path,
+                    exists: FileManager.default.isReadableFile(atPath: snapshot.mediaMap.resolvedURL(for: entry, relativeTo: snapshot.mediaMapURL).path),
+                    position: 0,
+                    count: 1,
+                    mode: .fixed,
+                    isFixed: true
                 )
             }
         }

@@ -203,6 +203,17 @@ private func runDialogueVoiceSelfTest() throws {
 
 private func runSelfTest() throws {
     try runDialogueVoiceSelfTest()
+    let sameStateTransition = try MediaEntry(path: "media/idle-handoff.mov", loop: true)
+    let map = try MediaMap(
+        states: [.idle: try MediaEntry(path: "media/idle.mov")],
+        inStateTransitions: [.idle: sameStateTransition]
+    )
+    try require(map.inStateTransition(for: .idle)?.loop == false, "same-state transition was not normalized to one-shot")
+    try require(map.transitionPlaylist(from: .idle, to: .idle) == nil, "same-state route leaked into lifecycle transitions")
+    let mapRoundTrip = try JSONDecoder().decode(MediaMap.self, from: JSONEncoder().encode(map))
+    try require(mapRoundTrip == map, "same-state transition did not round-trip")
+    let removed = try map.removingInStateTransition(for: .idle)
+    try require(removed.inStateTransition(for: .idle) == nil, "same-state transition removal failed")
     var handoff = LayeredLifecycleHandoff(id: 17, source: .idle, destination: .running)
     try require(handoff.lowerLayer == .outgoing(.idle), "layered handoff hid the outgoing state")
     try require(handoff.transitionBecameReady(id: 17) == .revealTransition, "transition did not become foreground")
@@ -1071,6 +1082,17 @@ private func runSelfTest() throws {
     try require(
         MediaMapChangeImpact.decide(previous: mediaMap, incoming: updatedMap) == .playback,
         "media entry change did not request playback refresh"
+    )
+    let sameStateMap = try MediaMap(
+        defaultFormat: mediaMap.defaultFormat,
+        window: mediaMap.window,
+        states: mediaMap.states,
+        transitions: mediaMap.transitions,
+        inStateTransitions: [.idle: MediaEntry(path: "idle-handoff.mov", loop: false)]
+    )
+    try require(
+        MediaMapChangeImpact.decide(previous: mediaMap, incoming: sameStateMap) == .playback,
+        "same-state transition change did not request playback refresh"
     )
 
     let idleOne = try MediaEntry(path: "idle/one.mov")
