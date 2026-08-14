@@ -181,6 +181,48 @@ class LifecycleStateTests(unittest.TestCase):
                 ("waiting", 160.0, 2),
             )
 
+    def test_post_tool_use_quiescent_fallback_expires_before_generic_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            record = record_path(directory, "a")
+            write_v2_record(record, "running", "PostToolUse", 99.0)
+
+            snapshot = state.read_session_snapshot(
+                directory,
+                now=99.0 + state.DEFAULT_QUIESCENT_TTL + 0.01,
+                active_ttl=state.DEFAULT_ACTIVE_TTL,
+            )
+
+            self.assertEqual(snapshot["active"], [])
+            self.assertEqual(snapshot["next_expiry"], None)
+            self.assertEqual(snapshot["rejections"], {"quiescent_expired": 1})
+            self.assertFalse(record.exists())
+
+            self.assertEqual(
+                aggregator.resolve_state_snapshot(
+                    directory,
+                    active_ttl=state.DEFAULT_ACTIVE_TTL,
+                    wall_time=99.0 + state.DEFAULT_QUIESCENT_TTL + 0.01,
+                ),
+                ("idle", None, 0),
+            )
+
+    def test_post_tool_use_remains_active_during_quiescent_grace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            write_v2_record(record_path(directory, "a"), "running", "PostToolUse", 99.0)
+
+            snapshot = state.read_session_snapshot(
+                directory,
+                now=99.0 + state.DEFAULT_QUIESCENT_TTL - 0.01,
+                active_ttl=state.DEFAULT_ACTIVE_TTL,
+            )
+
+        self.assertEqual(snapshot["active"], [("running", 99.0)])
+        self.assertEqual(
+            snapshot["next_expiry"], 99.0 + state.DEFAULT_QUIESCENT_TTL
+        )
+
     def test_terminal_session_is_excluded_and_diagnostics_are_privacy_safe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -572,6 +614,45 @@ class PublisherTests(unittest.TestCase):
             )
 
             self.assertAlmostEqual(waiter.timeouts[0], 1.001, places=6)
+            self.assertEqual(json.loads(output.read_text())["state"], "idle")
+            self.assertFalse(record_path(sessions, "a").exists())
+
+    def test_deadline_wakes_for_quiescent_tool_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            sessions.mkdir()
+            output = root / "current_state.json"
+            clock = FakeClock()
+            write_v2_record(
+                record_path(sessions, "a"),
+                "running",
+                "PostToolUse",
+                99.0,
+            )
+            waiter = ScriptedWaiter(clock)
+
+            aggregator.run(
+                sessions,
+                output,
+                poll=0.25,
+                heartbeat=60.0,
+                active_ttl=state.DEFAULT_ACTIVE_TTL,
+                once=False,
+                print_state=False,
+                forced_state=None,
+                force_seconds=30.0,
+                should_stop=lambda: waiter.wait_count >= 2,
+                waiter=waiter,
+                wall_clock=clock.wall,
+                monotonic_clock=clock.monotonic,
+            )
+
+            self.assertAlmostEqual(
+                waiter.timeouts[0],
+                state.DEFAULT_QUIESCENT_TTL - 1.0 + aggregator.TTL_DEADLINE_EPSILON,
+                places=6,
+            )
             self.assertEqual(json.loads(output.read_text())["state"], "idle")
             self.assertFalse(record_path(sessions, "a").exists())
 

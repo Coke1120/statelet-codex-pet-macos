@@ -366,6 +366,13 @@ final class CodexPetCoreTests: XCTestCase {
             "unknown"
         )
 
+        let quiescentExpiry = #"{"version":1,"state":"idle","emitted_at":12,"publication_revision":9,"rejection_diagnostics":{"count":1,"reasons":{"quiescent_expired":1}}}"#.data(using: .utf8)!
+        XCTAssertEqual(
+            try JSONDecoder.codexPet.decode(CurrentState.self, from: quiescentExpiry)
+                .rejectionDiagnostics.reasons,
+            ["quiescent_expired": 1]
+        )
+
         XCTAssertThrowsError(try CurrentState(state: .idle, emittedAt: 1, publicationRevision: 0))
         XCTAssertThrowsError(try CurrentState(state: .idle, emittedAt: 1, latestEventAt: .infinity))
         XCTAssertThrowsError(try CurrentStateRejectionDiagnostics(count: -1))

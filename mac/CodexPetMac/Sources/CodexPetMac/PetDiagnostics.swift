@@ -273,7 +273,8 @@ struct PetDiagnostics {
 
     private func rejectionCategories(_ reasons: [String: Int]) -> String {
         let allowed = Set([
-            "expired", "future_event", "invalid_record", "invalid_timestamp", "stale_event",
+            "expired", "future_event", "invalid_record", "invalid_timestamp",
+            "quiescent_expired", "stale_event",
             "equal_revision_conflict", "equal_revision_duplicate", "legacy_timestamp_duplicate",
             "legacy_timestamp_rollback", "lower_revision", "revisionless_rollback",
         ])

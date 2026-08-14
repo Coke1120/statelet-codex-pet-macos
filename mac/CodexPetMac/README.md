@@ -502,10 +502,13 @@ test, lint, typecheck, or review work and Running otherwise. `SessionStart`,
 `SessionEnd`, and `Stop` map only that session to Idle; SessionEnd and Stop also
 terminalize that record.
 
-Nonterminal session records remain active for 900 seconds. Malformed records,
-non-finite timestamps, records more than 60 seconds in the future, and expired
-records are rejected or pruned. A delayed or conflicting callback cannot
-replace a newer event for its session. The aggregator chooses the greatest
+Nonterminal session records remain active for 900 seconds, except a
+`PostToolUse` record, which has a 30-second quiescent grace period when Desktop
+fails to provide a terminal callback. A later hook event refreshes the normal
+900-second lease. Malformed records, non-finite timestamps, records more than
+60 seconds in the future, and expired records are rejected or pruned. A
+delayed or conflicting callback cannot replace a newer event for its session.
+The aggregator chooses the greatest
 tuple of lifecycle priority and event time:
 `waiting > review > running > idle`, with the newest
 timestamp breaking a same-priority tie. An older Waiting session therefore

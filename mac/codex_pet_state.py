@@ -34,11 +34,25 @@ HOOK_RECORD_V2_KEYS = frozenset(
     ("version", "state", "event", "event_at", "updated_at", "terminal", "rejections", "causal")
 )
 VALID_REJECTION_REASONS = frozenset(
-    ("invalid_record", "invalid_timestamp", "expired", "future_event", "stale_event")
+    (
+        "invalid_record",
+        "invalid_timestamp",
+        "expired",
+        "future_event",
+        "quiescent_expired",
+        "stale_event",
+    )
 )
 MAX_REJECTION_REASONS = 8
 MAX_REJECTION_COUNT = 1_000_000
 DEFAULT_ACTIVE_TTL = 900.0
+# A completed tool is evidence that the session is no longer actively using a
+# tool.  If Desktop fails to emit its terminal callback after that point, a
+# short grace period prevents the generic 15-minute session lease from making
+# the pet appear busy indefinitely.  Subsequent hook events refresh the record
+# and continue to use the normal active lease.
+DEFAULT_QUIESCENT_TTL = 30.0
+QUIESCENT_EVENTS = frozenset(("PostToolUse",))
 MAX_FUTURE_SKEW = 60.0
 CAUSAL_HASH = re.compile(r"^[0-9a-f]{24}$")
 CAUSAL_KEYS = frozenset(
@@ -81,6 +95,13 @@ def read_active_states(
 ) -> List[Tuple[str, float]]:
     """Return validated, live lifecycle records and prune expired candidates."""
     return read_session_snapshot(state_dir, now, active_ttl)["active"]
+
+
+def active_ttl_for_event(event: str, active_ttl: float) -> float:
+    """Return the bounded lease for a nonterminal hook event."""
+    if event in QUIESCENT_EVENTS:
+        return min(active_ttl, DEFAULT_QUIESCENT_TTL)
+    return active_ttl
 
 
 def _add_rejection(rejections: Dict[str, int], reason: str, count: int = 1) -> None:
@@ -134,6 +155,7 @@ def read_session_snapshot(
     """Read active sessions plus bounded, identifier-free event diagnostics."""
     current = time.time() if now is None else now
     active: List[Tuple[str, float]] = []
+    active_expiries: List[float] = []
     latest_event: Optional[str] = None
     latest_event_at: Optional[float] = None
     rejections: Dict[str, int] = {}
@@ -143,6 +165,7 @@ def read_session_snapshot(
             "latest_event": latest_event,
             "latest_event_at": latest_event_at,
             "rejections": rejections,
+            "next_expiry": None,
         }
     for path in sorted(state_dir.glob("*.json"), key=lambda candidate: candidate.name):
         if HOOK_RECORD_NAME.fullmatch(path.name) is None:
@@ -202,9 +225,19 @@ def read_session_snapshot(
                 and 0 < count <= MAX_REJECTION_COUNT
             ):
                 _add_rejection(rejections, reason, count)
+        event_ttl = active_ttl_for_event(event, active_ttl)
         age = current - event_at
-        if age < -MAX_FUTURE_SKEW or age > active_ttl:
-            _add_rejection(rejections, "future_event" if age < 0 else "expired")
+        if age < -MAX_FUTURE_SKEW or age > event_ttl:
+            reason = (
+                "future_event"
+                if age < 0
+                else (
+                    "quiescent_expired"
+                    if event in QUIESCENT_EVENTS
+                    else "expired"
+                )
+            )
+            _add_rejection(rejections, reason)
             _prune_if_unchanged(path, identity)
             continue
         if latest_event_at is None or (event_at, event) > (
@@ -215,11 +248,13 @@ def read_session_snapshot(
             latest_event_at = event_at
         if not terminal:
             active.append((state, event_at))
+            active_expiries.append(event_at + event_ttl)
     return {
         "active": active,
         "latest_event": latest_event,
         "latest_event_at": latest_event_at,
         "rejections": rejections,
+        "next_expiry": min(active_expiries) if active_expiries else None,
     }
 
 
