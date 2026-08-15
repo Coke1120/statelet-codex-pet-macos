@@ -929,6 +929,7 @@ def build_ffmpeg_decode_command(
     ffmpeg: str = "ffmpeg",
     stream_index: int = 0,
     resize_mode: str = "fill",
+    frame_sync_mode: str = "fps_mode",
 ) -> list[str]:
     """Build an aspect-filled raw RGB stream; no runtime key is involved.
 
@@ -971,8 +972,17 @@ def build_ffmpeg_decode_command(
                 video_filter,
             ]
         )
-    command.extend(["-vsync", "0", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+    command.extend(_ffmpeg_passthrough_arguments(frame_sync_mode))
+    command.extend(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
     return command
+
+
+def _ffmpeg_passthrough_arguments(frame_sync_mode: str) -> list[str]:
+    if frame_sync_mode == "fps_mode":
+        return ["-fps_mode", "passthrough"]
+    if frame_sync_mode == "vsync":
+        return ["-vsync", "0"]
+    raise AlphaConversionError("unsupported ffmpeg frame synchronization mode")
 
 
 def build_ffmpeg_rgba_decode_command(
@@ -981,6 +991,7 @@ def build_ffmpeg_rgba_decode_command(
     width: int,
     height: int,
     ffmpeg: str = "ffmpeg",
+    frame_sync_mode: str = "fps_mode",
 ) -> list[str]:
     """Build the independent RGBA decoder used for Apple alpha proof.
 
@@ -1003,7 +1014,8 @@ def build_ffmpeg_rgba_decode_command(
     ]
     if width > 0 and height > 0:
         command.extend(["-vf", f"scale={width}:{height}:flags=lanczos"])
-    command.extend(["-vsync", "0", "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+    command.extend(_ffmpeg_passthrough_arguments(frame_sync_mode))
+    command.extend(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
     return command
 
 

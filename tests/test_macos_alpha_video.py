@@ -205,7 +205,8 @@ class MacOSAlphaCommandTests(unittest.TestCase):
         self.assertEqual(decode[0], "ffmpeg-custom")
         self.assertIn("-map", decode)
         self.assertEqual(decode[decode.index("-pix_fmt") + 1], "rgb24")
-        self.assertEqual(decode[decode.index("-vsync") + 1], "0")
+        self.assertEqual(decode[decode.index("-fps_mode") + 1], "passthrough")
+        self.assertNotIn("-vsync", decode)
         self.assertNotIn("-r", decode)
         self.assertEqual(
             decode[decode.index("-vf") + 1],
@@ -217,6 +218,19 @@ class MacOSAlphaCommandTests(unittest.TestCase):
             "/tmp/roundtrip.mov", width=640, height=360
         )
         self.assertEqual(roundtrip_decode[roundtrip_decode.index("-pix_fmt") + 1], "rgba")
+        self.assertEqual(
+            roundtrip_decode[roundtrip_decode.index("-fps_mode") + 1],
+            "passthrough",
+        )
+        self.assertNotIn("-vsync", roundtrip_decode)
+        legacy_decode = alpha.build_ffmpeg_decode_command(
+            "/private/source.mp4",
+            width=640,
+            height=360,
+            frame_sync_mode="vsync",
+        )
+        self.assertEqual(legacy_decode[legacy_decode.index("-vsync") + 1], "0")
+        self.assertNotIn("-fps_mode", legacy_decode)
         self.assertNotIn("alphaextract", roundtrip_decode)
         self.assertEqual(
             roundtrip_decode[roundtrip_decode.index("-vf") + 1],
@@ -2564,6 +2578,9 @@ class MacOSAlphaCommandTests(unittest.TestCase):
                 ("ffmpeg", ("-hide_banner", "-filters")): (
                     " .. scale V->V\n .. crop V->V\n .. pad V->V\n"
                 ),
+                ("ffmpeg", ("-hide_banner", "-h", "full")): (
+                    " -fps_mode[:stream_specifier] set framerate mode\n"
+                ),
                 ("avconvert", ("--help",)): (
                     f"{converter.DEFAULT_PRESET}\n{converter.ROUNDTRIP_PRESET}\n"
                 ),
@@ -2576,6 +2593,7 @@ class MacOSAlphaCommandTests(unittest.TestCase):
                 ("scale", ("ffmpeg", ("-hide_banner", "-filters")), " .. crop V->V\n .. pad V->V\n", "scale filter"),
                 ("crop", ("ffmpeg", ("-hide_banner", "-filters")), " .. scale V->V\n .. pad V->V\n", "crop filter"),
                 ("pad", ("ffmpeg", ("-hide_banner", "-filters")), " .. scale V->V\n .. crop V->V\n", "pad filter"),
+                ("frame sync", ("ffmpeg", ("-hide_banner", "-h", "full")), "", "frame synchronization"),
                 ("delivery preset", ("avconvert", ("--help",)), converter.ROUNDTRIP_PRESET, converter.DEFAULT_PRESET),
                 ("roundtrip preset", ("avconvert", ("--help",)), converter.DEFAULT_PRESET, converter.ROUNDTRIP_PRESET),
             )
@@ -2606,6 +2624,9 @@ class MacOSAlphaCommandTests(unittest.TestCase):
         outputs = {
             ("ffmpeg", ("-hide_banner", "-encoders")): " VFS... prores_ks encoder\n",
             ("ffmpeg", ("-hide_banner", "-filters")): " .. scale V->V\n .. crop V->V\n .. pad V->V\n",
+            ("ffmpeg", ("-hide_banner", "-h", "full")): (
+                " -fps_mode[:stream_specifier] set framerate mode\n"
+            ),
             ("avconvert", ("--help",)): f"avconvert help\n{converter.DEFAULT_PRESET}\n{converter.ROUNDTRIP_PRESET}\n",
             ("ffmpeg", ("-version",)): "ffmpeg version test\n",
             ("ffprobe", ("-version",)): "ffprobe version test\n",
@@ -2634,6 +2655,8 @@ class MacOSAlphaCommandTests(unittest.TestCase):
                     return " VFS... prores_ks encoder\n"
                 if arguments == ("-hide_banner", "-filters"):
                     return " .. scale V->V\n .. crop V->V\n .. pad V->V\n"
+                if arguments == ("-hide_banner", "-h", "full"):
+                    return " -fps_mode[:stream_specifier] set framerate mode\n"
                 if arguments == ("--help",):
                     return f"help\n{converter.DEFAULT_PRESET}\n{converter.ROUNDTRIP_PRESET}\n"
                 if executable == "/usr/bin/sw_vers":
@@ -2670,6 +2693,34 @@ class MacOSAlphaCommandTests(unittest.TestCase):
             self.assertEqual(first["toolchain"]["avconvert_version"], "sha256-" + "a" * 64)
             self.assertEqual(first["toolchain"]["macos_build"], "23G93")
             self.assertNotIn(tempfile.gettempdir(), json.dumps(first["toolchain"]))
+
+    def test_tool_capability_preflight_falls_back_to_legacy_vsync(self):
+        outputs = {
+            ("ffmpeg", ("-hide_banner", "-encoders")): " VFS... prores_ks encoder\n",
+            ("ffmpeg", ("-hide_banner", "-filters")): (
+                " .. scale V->V\n .. crop V->V\n .. pad V->V\n"
+            ),
+            ("ffmpeg", ("-hide_banner", "-h", "full")): (
+                " -vsync parameter set video sync method globally\n"
+            ),
+            ("avconvert", ("--help",)): (
+                f"{converter.DEFAULT_PRESET}\n{converter.ROUNDTRIP_PRESET}\n"
+            ),
+            ("ffmpeg", ("-version",)): "ffmpeg version 5.0\n",
+            ("ffprobe", ("-version",)): "ffprobe version 5.0\n",
+            ("/usr/bin/sw_vers", ("-buildVersion",)): "23G93\n",
+        }
+        with mock.patch.object(
+            converter,
+            "_bounded_tool_output",
+            side_effect=lambda executable, arguments, **_kwargs: outputs[
+                (executable, arguments)
+            ],
+        ):
+            result = converter._preflight_tool_capabilities(
+                ffmpeg="ffmpeg", ffprobe="ffprobe", avconvert="avconvert"
+            )
+        self.assertEqual(result["capabilities"]["ffmpeg_frame_sync"], "vsync")
 
     def test_converter_composite_gate_aborts_before_publication(self):
         if alpha.np is None:

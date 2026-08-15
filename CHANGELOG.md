@@ -5,6 +5,55 @@ versioning for the public source release.
 
 ## Unreleased
 
+## [1.8.0] - 2026-08-15
+
+### Added
+
+- Settings now includes a dedicated Help pane with privacy-safe release status,
+  manual and daily update checks, cancellable download progress, and opt-in
+  installation at a safe restart boundary.
+- A session activity rail beside the pet shows active sessions and completed,
+  unread work from a bounded owner-only sidecar without changing the
+  authoritative lifecycle animation state.
+- VoxCPM2 is available as a third private, offline dialogue provider using an
+  explicitly imported local handover and reference WAV.
+- Character playlists can use same-state clip-end transitions while retaining
+  the outgoing layer until the next clip is ready.
+- Settings window size is persisted, screen-clamped, resettable, and usable
+  through scrollable compact layouts.
+
+### Changed
+
+- Global transitions now use one universal playlist for every distinct-state
+  lifecycle change that has no character-specific directional override.
+- The updater stages privately, verifies release metadata and artifacts, waits
+  for playback, conversion, and voice work to quiesce, and publishes through a
+  crash-recoverable atomic transaction journal.
+- Qwen virtual-environment launchers may use relative or chained interpreter
+  symlinks while retaining their environment-specific invocation path.
+
+### Fixed
+
+- Statelet returns to Idle after a quiescent final Desktop tool callback even
+  when Codex does not deliver a terminal Stop or SessionEnd event.
+- Alpha conversion uses FFmpeg's current per-stream passthrough mode so frame
+  decoding remains compatible with FFmpeg 9 without synthesizing timestamps.
+- Universal Global migration preserves unresolved legacy routes, keeps archived
+  routes from silently reactivating, and recovers interrupted conversions as a
+  visible conflict.
+- Session activity publication, decoding, acknowledgement retention, window
+  placement, and terminal callback handling now fail closed across stale data,
+  symlinks, path replacement, malformed records, and constrained displays.
+
+### Distribution notes
+
+- No character, animation, voice model, reference audio, session record, or
+  other private runtime data is bundled.
+- This release remains source-only. The local builder produces an
+  ad-hoc-signed app for personal local use; a public updater package still
+  requires Developer ID signing, notarization, stapling, a pinned team
+  identifier, and clean-Mac Gatekeeper verification.
+
 ## [1.7.1] - 2026-08-14
 
 ### Added
@@ -110,6 +159,7 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
+[1.8.0]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.0
 [1.7.1]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.7.1
 [1.7.0]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.7.0
 [1.6.0]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.6.0

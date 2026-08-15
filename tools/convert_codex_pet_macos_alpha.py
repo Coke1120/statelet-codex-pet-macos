@@ -519,6 +519,17 @@ def _preflight_tool_capabilities(
     for name in ("scale", "crop", "pad"):
         if not re.search(rf"(?m)^\s*\.{{2,3}}\s+{name}\s", filters):
             raise AlphaConversionError(f"ffmpeg does not provide the required {name} filter")
+    full_help = _bounded_tool_output(
+        ffmpeg, ("-hide_banner", "-h", "full"), cache=cache
+    )
+    if re.search(r"(?m)^\s*-fps_mode(?:\[|:|\s)", full_help):
+        frame_sync_mode = "fps_mode"
+    elif re.search(r"(?m)^\s*-vsync(?:\s|$)", full_help):
+        frame_sync_mode = "vsync"
+    else:
+        raise AlphaConversionError(
+            "ffmpeg does not provide a supported frame synchronization mode"
+        )
     avconvert_help = _bounded_tool_output(avconvert, ("--help",), cache=cache)
     for preset in (DEFAULT_PRESET, ROUNDTRIP_PRESET):
         if preset not in avconvert_help:
@@ -546,6 +557,7 @@ def _preflight_tool_capabilities(
         "capabilities": {
             "ffmpeg_encoder": "prores_ks",
             "ffmpeg_filters": ["scale", "crop", "pad"],
+            "ffmpeg_frame_sync": frame_sync_mode,
             "avconvert_presets": [DEFAULT_PRESET, ROUNDTRIP_PRESET],
             "passed": True,
         },
@@ -1962,6 +1974,7 @@ def _start_rgba_decoder_pair(
     width: int,
     height: int,
     ffmpeg: str,
+    frame_sync_mode: str = "fps_mode",
 ) -> tuple[Any, Any]:
     """Start both RGBA decoders and close the first if the second fails."""
 
@@ -1970,13 +1983,21 @@ def _start_rgba_decoder_pair(
     try:
         reference_decoder = _start_process(
             build_ffmpeg_rgba_decode_command(
-                reference_video, width=width, height=height, ffmpeg=ffmpeg
+                reference_video,
+                width=width,
+                height=height,
+                ffmpeg=ffmpeg,
+                frame_sync_mode=frame_sync_mode,
             ),
             stdout=subprocess.PIPE,
         )
         delivery_decoder = _start_process(
             build_ffmpeg_rgba_decode_command(
-                roundtrip_video, width=width, height=height, ffmpeg=ffmpeg
+                roundtrip_video,
+                width=width,
+                height=height,
+                ffmpeg=ffmpeg,
+                frame_sync_mode=frame_sync_mode,
             ),
             stdout=subprocess.PIPE,
         )
@@ -2053,6 +2074,7 @@ def _verify_source_background(
     ffmpeg: str,
     timeout_seconds: float,
     progress: _ProgressReporter | None = None,
+    frame_sync_mode: str = "fps_mode",
 ) -> dict[str, Any]:
     """Attest green evidence on every untransformed source frame."""
 
@@ -2062,6 +2084,7 @@ def _verify_source_background(
         height=0,
         ffmpeg=ffmpeg,
         stream_index=info.stream_index,
+        frame_sync_mode=frame_sync_mode,
     )
     decoder = _start_process(command, stdout=subprocess.PIPE)
     frames_checked = 0
@@ -2202,6 +2225,7 @@ def _stream_matte_to_prores(
     timeout_seconds: float = DEFAULT_PROCESS_TIMEOUT_SECONDS,
     resize_mode: str = "fill",
     progress: _ProgressReporter | None = None,
+    frame_sync_mode: str = "fps_mode",
 ) -> dict[str, Any]:
     decode_command = build_ffmpeg_decode_command(
         source,
@@ -2210,6 +2234,7 @@ def _stream_matte_to_prores(
         ffmpeg=ffmpeg,
         stream_index=info.stream_index,
         resize_mode=resize_mode,
+        frame_sync_mode=frame_sync_mode,
     )
     encode_command = build_ffmpeg_prores_command(
         intermediate, width=width, height=height, fps=info.fps, ffmpeg=ffmpeg
@@ -2571,6 +2596,7 @@ def _verify_alpha_roundtrip(
     require_foreground: bool = True,
     progress: _ProgressReporter | None = None,
     timeout_seconds: float = DEFAULT_PROCESS_TIMEOUT_SECONDS,
+    frame_sync_mode: str = "fps_mode",
 ) -> dict[str, Any]:
     """Prove HEVC alpha and visual fidelity through lockstep Apple round-trips."""
 
@@ -2656,6 +2682,7 @@ def _verify_alpha_roundtrip(
             width=expected.width,
             height=expected.height,
             ffmpeg=ffmpeg,
+            frame_sync_mode=frame_sync_mode,
         )
         frames_verified = 0
         max_border = 0
@@ -2900,6 +2927,9 @@ def convert_video(
     tool_preflight = _preflight_tool_capabilities(
         ffmpeg=ffmpeg, ffprobe=ffprobe, avconvert=avconvert
     )
+    frame_sync_mode = str(
+        tool_preflight["capabilities"].get("ffmpeg_frame_sync", "fps_mode")
+    )
     _preflight_source_size(source, max_source_bytes=args.max_source_bytes)
     # Bind the source before ffprobe and any decoder process starts.  The
     # digest is carried through the report and checked again immediately
@@ -2953,6 +2983,7 @@ def convert_video(
             ffmpeg=ffmpeg,
             stream_index=info.stream_index,
             resize_mode=args.resize_mode,
+            frame_sync_mode=frame_sync_mode,
         )
         prores_command = build_ffmpeg_prores_command(
             Path("intermediate.prores4444.mov"),
@@ -3050,6 +3081,7 @@ def convert_video(
             ffmpeg=ffmpeg,
             timeout_seconds=args.process_timeout_seconds,
             progress=progress,
+            frame_sync_mode=frame_sync_mode,
         )
         progress.emit(
             10,
@@ -3082,6 +3114,7 @@ def convert_video(
             timeout_seconds=args.process_timeout_seconds,
             resize_mode=args.resize_mode,
             progress=progress,
+            frame_sync_mode=frame_sync_mode,
         )
         quality["source_cadence"] = cadence
         quality["source_background"] = source_background
@@ -3161,6 +3194,7 @@ def convert_video(
             require_foreground=not args.allow_empty_frame,
             progress=progress,
             timeout_seconds=args.process_timeout_seconds,
+            frame_sync_mode=frame_sync_mode,
         )
 
         delivery_sha256 = _sha256_file(temp_output)

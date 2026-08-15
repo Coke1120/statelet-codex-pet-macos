@@ -1,7 +1,7 @@
 # Statelet lifecycle and media reference
 
-This reference documents the internal contracts behind Statelet 1.7.1 (build
-13), the native Codex lifecycle companion for macOS. Start with
+This reference documents the internal contracts behind Statelet 1.8.0 (build
+14), the native Codex lifecycle companion for macOS. Start with
 [Deployment](DEPLOYMENT.md) for installation or [Using Statelet](USAGE.md) for
 daily operation.
 
