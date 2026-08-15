@@ -82,8 +82,9 @@ class MacAnimationLibraryUISourceTests(unittest.TestCase):
 
     def test_transition_editor_lists_ordered_distinct_direction_pairs(self) -> None:
         self.assertIn("final class TransitionLibraryView", self.source)
-        self.assertIn("PetState.allCases.flatMap { source in", self.source)
-        self.assertIn("source == destination ? nil", self.source)
+        self.assertIn("routes = PetState.allCases.flatMap { source in", self.source)
+        self.assertIn("SettingsTransitionRoute.directional(source: source, destination: destination)", self.source)
+        self.assertIn("routes = [.global]", self.source)
         self.assertIn('labelWithString: "LIFECYCLE TRANSITIONS"', self.source)
         self.assertIn('labels: ["State Animations", "Transitions"]', self.controller)
 
@@ -120,12 +121,15 @@ class MacAnimationLibraryUISourceTests(unittest.TestCase):
                 self.controller,
                 rf"var {callback}: \(\(TransitionLibraryScope,",
             )
-        self.assertIn("self.selectedTransitionScope, source, destination", self.controller)
+        self.assertIn("self.selectedTransitionScope, route", self.controller)
 
     def test_transition_guidance_and_accessibility_identify_scope(self) -> None:
         self.assertIn("scope: TransitionLibraryScope", self.source)
         self.assertIn('scope == .character ? "Character" : "Global"', self.source)
-        self.assertIn('"Global directional lifecycle transitions"', self.source)
+        self.assertIn('"Global lifecycle transition"', self.source)
+        self.assertIn('One optional transition for every lifecycle state change', self.source)
+        self.assertIn('title: "Resolve Legacy…"', self.source)
+        self.assertIn("onMigrateLegacy", self.source)
 
     def test_empty_character_route_reports_global_fallback(self) -> None:
         self.assertIn("let usesGlobalFallback: Bool", self.source)
@@ -133,7 +137,7 @@ class MacAnimationLibraryUISourceTests(unittest.TestCase):
         self.assertIn("scope == .character && key.map(globalFallbackRoutes.contains) == true", self.source)
         self.assertIn('"Using Global fallback"', self.source)
         self.assertIn(
-            "globalFallbackRoutes: Set(snapshot.globalTransitionLibrary.transitions.keys)",
+            "globalFallbackRoutes = Set(snapshot.globalTransitionLibrary.transitions.keys)",
             self.controller,
         )
 
@@ -158,8 +162,8 @@ class MacAnimationLibraryUISourceTests(unittest.TestCase):
 
     def test_transition_editor_flattens_every_variant_and_keeps_empty_routes(self) -> None:
         self.assertIn("private struct SettingsTransitionRowModel", self.source)
-        self.assertIn("let grouped = Dictionary(grouping: clips)", self.source)
-        self.assertIn("let routeClips = (grouped[pair] ?? []).sorted", self.source)
+        self.assertIn("let grouped = Dictionary(grouping: clips, by: \\.route)", self.source)
+        self.assertIn("let routeClips = (grouped[route] ?? []).sorted", self.source)
         self.assertIn("guard !routeClips.isEmpty else", self.source)
         self.assertIn("usesGlobalFallback: scope == .character", self.source)
         self.assertIn("playlist.entries.enumerated().map", self.controller)
@@ -170,8 +174,8 @@ class MacAnimationLibraryUISourceTests(unittest.TestCase):
         self.assertIn('title: "Selection"', self.source)
         self.assertIn('title: "Default"', self.source)
         self.assertIn('title: "Order"', self.source)
-        self.assertIn("cell.button.isEnabled = model.clip != nil && !busy", self.source)
-        self.assertIn('"Choose Fixed, Random, or Sequential selection for this route."', self.source)
+        self.assertIn("cell.button.isEnabled = model.clip != nil && !busy && canEditCurrentScope", self.source)
+        self.assertIn('"Choose Fixed, Random, or Sequential selection for this transition."', self.source)
         self.assertIn('"Set as default"', self.source)
         self.assertIn('("Move Up", model.position - 1)', self.source)
         self.assertIn('("Move Down", model.position + 1)', self.source)
@@ -194,7 +198,7 @@ class MacAnimationLibraryUISourceTests(unittest.TestCase):
         self.assertIn("clip?.exists == false ? .systemRed", self.source)
         self.assertIn('"The transition movie file is missing. Replace or remove it."', self.source)
         self.assertIn("FileManager.default.isReadableFile(", self.controller)
-        self.assertIn("resolveTransitionURL(entry).path", self.controller)
+        self.assertIn("snapshot.globalTransitionLibrary.resolvedURL(", self.controller)
 
     def test_transition_editor_documents_duration_and_destination_commit(self) -> None:
         self.assertIn("Maximum duration: 4 seconds.", self.source)

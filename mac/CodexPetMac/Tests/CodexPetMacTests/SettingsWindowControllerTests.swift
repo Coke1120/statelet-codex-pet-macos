@@ -1,4 +1,5 @@
 import AppKit
+import CodexPetCore
 import XCTest
 @testable import Statelet
 
@@ -261,6 +262,112 @@ final class SettingsWindowControllerTests: XCTestCase {
                 XCTAssertTrue(visibleFrame.contains(window.frame), "section \(section)")
             }
         }
+    }
+
+    func testGlobalTransitionScopeShowsOneEditorAndDisablesEditsDuringLegacyResolution() throws {
+        let route = try StateTransitionKey(from: .idle, to: .running)
+        let universal = try StateMediaPlaylist(entries: [
+            MediaEntry(path: "global.mov", loop: false),
+        ])
+        let conflict = try GlobalTransitionLibrary(universalPlaylist: universal)
+            .recoveringLegacyTransitionEntry(
+                MediaEntry(path: "recovered.mov", loop: false),
+                from: route.from,
+                to: route.to
+            )
+        let controller = SettingsWindowController()
+        let window = try XCTUnwrap(controller.window)
+        controller.update(snapshot: SettingsSnapshot(
+            mediaMap: try MediaMap(),
+            mediaMapURL: URL(fileURLWithPath: "/tmp/media-map.json"),
+            globalTransitionLibrary: conflict,
+            globalTransitionLibraryURL: URL(fileURLWithPath: "/tmp/global-transitions.json"),
+            publisherSummary: "Test",
+            reduceMotion: false
+        ))
+        controller.show()
+        Self.pumpMainRunLoop(for: 0.1)
+        defer {
+            window.close()
+            Self.pumpMainRunLoop(for: 0.05)
+        }
+
+        let animationModes = try XCTUnwrap(
+            Self.descendants(of: window.contentView).compactMap { $0 as? NSSegmentedControl }.first {
+                $0.accessibilityLabel() == "Animation library mode"
+            }
+        )
+        animationModes.selectedSegment = 1
+        NSApp.sendAction(animationModes.action!, to: animationModes.target, from: animationModes)
+        Self.pumpMainRunLoop(for: 0.05)
+        let transitionScope = try XCTUnwrap(
+            Self.descendants(of: window.contentView).compactMap { $0 as? NSSegmentedControl }.first {
+                $0.accessibilityLabel() == "Transition library scope"
+            }
+        )
+        transitionScope.selectedSegment = 1
+        NSApp.sendAction(transitionScope.action!, to: transitionScope.target, from: transitionScope)
+        Self.pumpMainRunLoop(for: 0.05)
+
+        let globalEditors = Self.descendants(of: window.contentView).compactMap { $0 as? NSTableView }.filter {
+            $0.accessibilityLabel() == "Global lifecycle transition"
+        }
+        let globalEditor = try XCTUnwrap(globalEditors.first)
+        XCTAssertEqual(globalEditors.count, 1)
+        XCTAssertEqual(globalEditor.numberOfRows, 1)
+
+        let resolveButton = try XCTUnwrap(
+            Self.descendants(of: window.contentView).compactMap { $0 as? NSButton }.first {
+                $0.accessibilityLabel() == "Resolve legacy Global transitions"
+            }
+        )
+        XCTAssertFalse(resolveButton.isHidden)
+        XCTAssertTrue(resolveButton.isEnabled)
+
+        let addColumn = try XCTUnwrap(globalEditor.tableColumns.firstIndex { $0.title == "Add" })
+        let addCell = try XCTUnwrap(
+            globalEditor.view(atColumn: addColumn, row: 0, makeIfNecessary: true)
+        )
+        let addButton = try XCTUnwrap(
+            Self.descendants(of: addCell).compactMap { $0 as? NSButton }.first
+        )
+        XCTAssertFalse(addButton.isEnabled)
+
+        let previewColumn = try XCTUnwrap(globalEditor.tableColumns.firstIndex { $0.title == "Preview" })
+        let previewCell = try XCTUnwrap(
+            globalEditor.view(atColumn: previewColumn, row: 0, makeIfNecessary: true)
+        )
+        let previewButton = try XCTUnwrap(
+            Self.descendants(of: previewCell).compactMap { $0 as? NSButton }.first
+        )
+        XCTAssertEqual(previewButton.title, "Preview")
+        XCTAssertFalse(previewButton.isEnabled)
+        XCTAssertTrue(
+            Self.descendants(of: window.contentView).compactMap { $0 as? NSTextField }.contains {
+                $0.stringValue.contains("Resolve the migration before editing")
+            }
+        )
+
+        let archivedOnly = try conflict
+            .migratingLegacyToUniversal(using: route)
+            .removingUniversalTransition()
+        controller.update(snapshot: SettingsSnapshot(
+            mediaMap: try MediaMap(),
+            mediaMapURL: URL(fileURLWithPath: "/tmp/media-map.json"),
+            globalTransitionLibrary: archivedOnly,
+            globalTransitionLibraryURL: URL(fileURLWithPath: "/tmp/global-transitions.json"),
+            publisherSummary: "Test",
+            reduceMotion: false
+        ))
+        transitionScope.selectedSegment = 0
+        NSApp.sendAction(transitionScope.action!, to: transitionScope.target, from: transitionScope)
+        Self.pumpMainRunLoop(for: 0.05)
+
+        XCTAssertFalse(
+            Self.descendants(of: window.contentView).compactMap { $0 as? NSTextField }.contains {
+                $0.stringValue.contains("Using Global fallback")
+            }
+        )
     }
 
     private static func descendants(of root: NSView?) -> [NSView] {

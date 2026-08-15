@@ -1176,6 +1176,25 @@ final class CodexPetCoreTests: XCTestCase {
         XCTAssertEqual(forward.next()?.path, "three.mov")
     }
 
+    func testUniversalTransitionSelectionSharesCursorAcrossLifecycleRoutes() throws {
+        let one = try MediaEntry(path: "global-one.mov", loop: false)
+        let two = try MediaEntry(path: "global-two.mov", loop: false)
+        let playlist = try StateMediaPlaylist(mode: .sequential, entries: [one, two])
+        var cursor = TransitionSelectionCursor()
+
+        var first = try cursor.requestGlobal(from: .idle, to: .running, playlist: playlist)
+        XCTAssertEqual(first.next()?.path, "global-one.mov")
+        XCTAssertTrue(first.commit(to: &cursor))
+        XCTAssertEqual(cursor.globalSelectedPath, "global-one.mov")
+
+        var second = try cursor.requestGlobal(from: .waiting, to: .review, playlist: playlist)
+        XCTAssertEqual(second.next()?.path, "global-two.mov")
+        XCTAssertTrue(second.commit(to: &cursor))
+
+        var third = try cursor.requestGlobal(from: .review, to: .idle, playlist: playlist)
+        XCTAssertEqual(third.next()?.path, "global-one.mov")
+    }
+
     func testCharacterBundleTransitionsRewriteAndRequireReferencedAssets() throws {
         let hash = String(repeating: "a", count: 64)
         let transition = try MediaEntry(

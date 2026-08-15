@@ -8,8 +8,7 @@ private enum AnimationLibraryLayout {
 }
 
 struct SettingsTransitionClip: Equatable {
-    let source: PetState
-    let destination: PetState
+    let route: SettingsTransitionRoute
     let path: String
     let exists: Bool
     let position: Int
@@ -18,9 +17,44 @@ struct SettingsTransitionClip: Equatable {
     let isFixed: Bool
 }
 
-private struct SettingsTransitionPair: Hashable {
-    let source: PetState
-    let destination: PetState
+enum SettingsTransitionRoute: Hashable, Sendable {
+    case directional(source: PetState, destination: PetState)
+    case global
+
+    var source: PetState? {
+        guard case let .directional(source, _) = self else { return nil }
+        return source
+    }
+
+    var destination: PetState? {
+        guard case let .directional(_, destination) = self else { return nil }
+        return destination
+    }
+
+    var isSameState: Bool {
+        guard case let .directional(source, destination) = self else { return false }
+        return source == destination
+    }
+
+    var displayName: String {
+        switch self {
+        case let .directional(source, destination):
+            return source == destination
+                ? "\(source.displayName) clip end"
+                : "\(source.displayName) → \(destination.displayName)"
+        case .global:
+            return "All lifecycle transitions"
+        }
+    }
+
+    var accessibilityName: String {
+        switch self {
+        case let .directional(source, destination):
+            return "\(source.displayName) to \(destination.displayName)"
+        case .global:
+            return "all lifecycle transitions"
+        }
+    }
 }
 
 private enum TransitionColumn {
@@ -36,7 +70,7 @@ private enum TransitionColumn {
 }
 
 private struct SettingsTransitionRowModel {
-    let pair: SettingsTransitionPair
+    let route: SettingsTransitionRoute
     let clip: SettingsTransitionClip?
     let position: Int
     let count: Int
@@ -993,15 +1027,16 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
 
 final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDelegate {
     var onScopeChange: ((TransitionLibraryScope) -> Void)?
-    var onImportMP4: ((PetState, PetState) -> Void)?
-    var onUseMovie: ((PetState, PetState) -> Void)?
-    var onReplaceMP4: ((PetState, PetState, String) -> Void)?
-    var onReplaceMovie: ((PetState, PetState, String) -> Void)?
+    var onMigrateLegacy: (() -> Void)?
+    var onImportMP4: ((SettingsTransitionRoute) -> Void)?
+    var onUseMovie: ((SettingsTransitionRoute) -> Void)?
+    var onReplaceMP4: ((SettingsTransitionRoute, String) -> Void)?
+    var onReplaceMovie: ((SettingsTransitionRoute, String) -> Void)?
     var onPreviewOrStop: ((SettingsTransitionClip, Bool) -> Void)?
     var onRemove: ((SettingsTransitionClip) -> Void)?
-    var onMove: ((PetState, PetState, String, Int) -> Void)?
-    var onModeChange: ((PetState, PetState, MediaPlaybackMode) -> Void)?
-    var onSetFixed: ((PetState, PetState, String) -> Void)?
+    var onMove: ((SettingsTransitionRoute, String, Int) -> Void)?
+    var onModeChange: ((SettingsTransitionRoute, MediaPlaybackMode) -> Void)?
+    var onSetFixed: ((SettingsTransitionRoute, String) -> Void)?
 
     private let tableView = NSTableView()
     private let scrollView = NSScrollView()
@@ -1011,6 +1046,7 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
         target: nil,
         action: nil
     )
+    private let migrateButton = NSButton(title: "Resolve Legacy…", target: nil, action: nil)
     private let guidance = NSTextField(
         wrappingLabelWithString: "Optional directional clips play once before the destination animation. Maximum duration: 4 seconds."
     )
@@ -1019,6 +1055,7 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
     private var reduceMotion = false
     private var busy = false
     private var scope: TransitionLibraryScope = .character
+    private var globalLegacyRouteCount = 0
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1042,7 +1079,14 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
         scopeControl.action = #selector(changeScope)
         scopeControl.setAccessibilityLabel("Transition library scope")
         scopeControl.setAccessibilityHelp("Choose whether to edit transitions for the active character or the global transition library.")
-        let header = NSStackView(views: [title, scopeControl])
+        migrateButton.controlSize = .small
+        migrateButton.target = self
+        migrateButton.action = #selector(migrateLegacy)
+        migrateButton.isHidden = true
+        migrateButton.setAccessibilityLabel("Resolve legacy Global transitions")
+        migrateButton.setAccessibilityHelp("Choose which preserved legacy route becomes the one universal Global transition. Other legacy routes remain recoverable.")
+        migrateButton.toolTip = "Choose which preserved legacy route becomes the universal Global transition."
+        let header = NSStackView(views: [title, scopeControl, migrateButton])
         header.orientation = .horizontal
         header.alignment = .centerY
         header.distribution = .fill
@@ -1110,33 +1154,36 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
     func update(
         clips: [SettingsTransitionClip],
         globalFallbackRoutes: Set<StateTransitionKey>,
+        globalLegacyRouteCount: Int,
         previewPath: String?,
         reduceMotion: Bool,
         busy: Bool,
         characterName: String,
         scope: TransitionLibraryScope
     ) {
-        let pairs = PetState.allCases.flatMap { source in
-            PetState.allCases.compactMap { destination in
-                // Legacy distinct-route contract: source == destination ? nil.
-                // Same-state rows are character-scoped clip-end routes; keep
-                // the legacy distinct-pair expression visible for source
-                // compatibility contracts.
-                if source == destination {
-                    return scope == .character ? SettingsTransitionPair(source: source, destination: destination) : nil
+        let routes: [SettingsTransitionRoute]
+        switch scope {
+        case .character:
+            routes = PetState.allCases.flatMap { source in
+                PetState.allCases.map { destination in
+                    SettingsTransitionRoute.directional(source: source, destination: destination)
                 }
-                return SettingsTransitionPair(source: source, destination: destination)
             }
+        case .global:
+            routes = [.global]
         }
-        let grouped = Dictionary(grouping: clips) {
-            SettingsTransitionPair(source: $0.source, destination: $0.destination)
-        }
-        rows = pairs.flatMap { pair -> [SettingsTransitionRowModel] in
-            let routeClips = (grouped[pair] ?? []).sorted { $0.position < $1.position }
+        let grouped = Dictionary(grouping: clips, by: \.route)
+        rows = routes.flatMap { route -> [SettingsTransitionRowModel] in
+            let routeClips = (grouped[route] ?? []).sorted { $0.position < $1.position }
             guard !routeClips.isEmpty else {
-                let key = try? StateTransitionKey(from: pair.source, to: pair.destination)
+                let key: StateTransitionKey?
+                if case let .directional(source, destination) = route {
+                    key = try? StateTransitionKey(from: source, to: destination)
+                } else {
+                    key = nil
+                }
                 return [SettingsTransitionRowModel(
-                    pair: pair,
+                    route: route,
                     clip: nil,
                     position: 0,
                     count: 0,
@@ -1146,7 +1193,7 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
             }
             return routeClips.map {
                 SettingsTransitionRowModel(
-                    pair: pair,
+                    route: route,
                     clip: $0,
                     position: $0.position,
                     count: $0.count,
@@ -1159,17 +1206,30 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
         self.reduceMotion = reduceMotion
         self.busy = busy
         self.scope = scope
+        self.globalLegacyRouteCount = globalLegacyRouteCount
         scopeControl.selectedSegment = TransitionLibraryScope.allCases.firstIndex(of: scope) ?? 0
         scopeControl.setAccessibilityValue(scope == .character ? "Character" : "Global")
+        migrateButton.isHidden = scope != .global || globalLegacyRouteCount == 0
+        migrateButton.isEnabled = !busy
         let libraryName = scope == .character ? characterName : "Global"
-        guidance.stringValue = reduceMotion
-            ? "Reduce Motion is on for \(libraryName) transitions. Video preview and playback are skipped; the destination fallback is presented."
-            : "Optional directional and same-state clip-end handoffs for \(libraryName). Maximum duration: 4 seconds."
+        if scope == .global, globalLegacyRouteCount > 0 {
+            guidance.stringValue = "Global has \(globalLegacyRouteCount) legacy route-specific playlists. Resolve the migration before editing one universal transition."
+        } else {
+            guidance.stringValue = reduceMotion
+                ? "Reduce Motion is on for \(libraryName) transitions. Video preview and playback are skipped; the destination fallback is presented."
+                : scope == .global
+                    ? "One optional transition for every lifecycle state change without a character override. Maximum duration: 4 seconds."
+                    : "Optional directional and same-state clip-end handoffs for \(libraryName). Maximum duration: 4 seconds."
+        }
         guidance.setAccessibilityHelp(guidance.stringValue)
         tableView.setAccessibilityLabel(scope == .character
             ? "\(characterName) directional lifecycle transitions"
-            : "Global directional lifecycle transitions")
+            : "Global lifecycle transition")
         tableView.reloadData()
+    }
+
+    private var canEditCurrentScope: Bool {
+        scope != .global || globalLegacyRouteCount == 0
     }
 
     @objc private func changeScope() {
@@ -1181,12 +1241,17 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
         onScopeChange?(selected)
     }
 
+    @objc private func migrateLegacy() {
+        guard scope == .global, globalLegacyRouteCount > 0, !busy else { return }
+        onMigrateLegacy?()
+    }
+
     func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard row >= 0, row < rows.count, let tableColumn else { return nil }
         let model = rows[row]
-        let pair = model.pair
+        let route = model.route
         let clip = model.clip
         let filename = clip.map { URL(fileURLWithPath: $0.path).lastPathComponent } ?? "Not configured"
         switch tableColumn.identifier {
@@ -1194,12 +1259,10 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
             let configurationStatus = clip.map { $0.exists ? "\($0.count) variants" : "Variant \($0.position + 1) missing" } ?? "No variants"
             return textCell(
                 identifier: TransitionColumn.route,
-                primary: pair.source == pair.destination
-                    ? "\(pair.source.displayName) clip end"
-                    : "\(pair.source.displayName) → \(pair.destination.displayName)",
+                primary: route.displayName,
                 secondary: configurationStatus,
                 secondaryColor: clip?.exists == false ? .systemRed : .secondaryLabelColor,
-                accessibilityLabel: "\(pair.source.displayName) to \(pair.destination.displayName), \(configurationStatus.lowercased())"
+                accessibilityLabel: "\(route.accessibilityName), \(configurationStatus.lowercased())"
             )
         case TransitionColumn.clip:
             let clipStatus: String
@@ -1222,23 +1285,23 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
             )
         case TransitionColumn.mode:
             let cell = actionCell(identifier: TransitionColumn.mode, title: model.mode.rawValue.capitalized, action: #selector(changeMode(_:)))
-            cell.button.isEnabled = model.clip != nil && !busy
-            if pair.source == pair.destination { cell.button.isEnabled = false }
-            cell.button.setAccessibilityLabel("Selection mode for \(pair.source.displayName) to \(pair.destination.displayName): \(model.mode.rawValue)")
+            cell.button.isEnabled = model.clip != nil && !busy && canEditCurrentScope
+            if route.isSameState { cell.button.isEnabled = false }
+            cell.button.setAccessibilityLabel("Selection mode for \(route.accessibilityName): \(model.mode.rawValue)")
             cell.button.toolTip = model.clip == nil
                 ? "Add a transition variant before choosing a selection mode."
-                : "Choose Fixed, Random, or Sequential selection for this route."
+                : "Choose Fixed, Random, or Sequential selection for this transition."
             return cell
         case TransitionColumn.fixed:
             let cell = actionCell(identifier: TransitionColumn.fixed, title: clip?.isFixed == true ? "Default" : "Set", action: #selector(setFixed(_:)))
-            cell.button.isEnabled = clip != nil && pair.source != pair.destination && clip?.isFixed == false && !busy
-            cell.button.setAccessibilityLabel("\(clip?.isFixed == true ? "Default variant" : "Set as default") for \(pair.source.displayName) to \(pair.destination.displayName)")
+            cell.button.isEnabled = clip != nil && !route.isSameState && clip?.isFixed == false && !busy && canEditCurrentScope
+            cell.button.setAccessibilityLabel("\(clip?.isFixed == true ? "Default variant" : "Set as default") for \(route.accessibilityName)")
             return cell
         case TransitionColumn.preview:
             let cell = actionCell(identifier: TransitionColumn.preview, title: "Preview", action: #selector(previewTransition(_:)))
-            let isPreviewing = clip?.path == previewPath
+            let isPreviewing = clip.map { $0.path == previewPath } ?? false
             cell.button.title = isPreviewing ? "Stop" : "Preview"
-            cell.button.isEnabled = isPreviewing || (clip?.exists == true && !reduceMotion && !busy)
+            cell.button.isEnabled = canEditCurrentScope && (isPreviewing || (clip?.exists == true && !reduceMotion && !busy))
             let disabledReason: String?
             if reduceMotion {
                 disabledReason = "Preview is unavailable while Reduce Motion is on."
@@ -1251,29 +1314,29 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
             }
             cell.button.toolTip = disabledReason
             cell.button.setAccessibilityHelp(disabledReason)
-            cell.button.setAccessibilityLabel("\(isPreviewing ? "Stop preview" : "Preview") \(pair.source.displayName) to \(pair.destination.displayName) transition")
+            cell.button.setAccessibilityLabel("\(isPreviewing ? "Stop preview" : "Preview") \(route.accessibilityName) transition")
             return cell
         case TransitionColumn.add:
             let cell = actionCell(identifier: TransitionColumn.add, title: "Add…", action: #selector(addVariants(_:)))
-            cell.button.isEnabled = !busy
-            cell.button.setAccessibilityLabel("Add variants for \(pair.source.displayName) to \(pair.destination.displayName)")
+            cell.button.isEnabled = !busy && canEditCurrentScope
+            cell.button.setAccessibilityLabel("Add variants for \(route.accessibilityName)")
             cell.button.toolTip = "Import one or multiple MP4s, or add verified transparent MOVs."
             return cell
         case TransitionColumn.replace:
             let cell = actionCell(identifier: TransitionColumn.replace, title: "Replace…", action: #selector(replaceVariant(_:)))
-            cell.button.isEnabled = clip != nil && !busy
-            cell.button.setAccessibilityLabel("Replace variant \((clip?.position ?? 0) + 1) for \(pair.source.displayName) to \(pair.destination.displayName)")
+            cell.button.isEnabled = clip != nil && !busy && canEditCurrentScope
+            cell.button.setAccessibilityLabel("Replace variant \((clip?.position ?? 0) + 1) for \(route.accessibilityName)")
             cell.button.toolTip = "Replace only this transition variant."
             return cell
         case TransitionColumn.reorder:
             let cell = actionCell(identifier: TransitionColumn.reorder, title: "Up / Down", action: #selector(showReorder(_:)))
-            cell.button.isEnabled = clip != nil && pair.source != pair.destination && model.count > 1 && !busy
-            cell.button.setAccessibilityLabel("Move variant \(model.position + 1) for \(pair.source.displayName) to \(pair.destination.displayName)")
+            cell.button.isEnabled = clip != nil && !route.isSameState && model.count > 1 && !busy && canEditCurrentScope
+            cell.button.setAccessibilityLabel("Move variant \(model.position + 1) for \(route.accessibilityName)")
             return cell
         case TransitionColumn.remove:
             let cell = actionCell(identifier: TransitionColumn.remove, title: "Remove…", action: #selector(removeTransition(_:)))
-            cell.button.isEnabled = clip != nil && !busy
-            cell.button.setAccessibilityLabel("Remove \(pair.source.displayName) to \(pair.destination.displayName) transition")
+            cell.button.isEnabled = clip != nil && !busy && canEditCurrentScope
+            cell.button.setAccessibilityLabel("Remove \(route.accessibilityName) transition")
             return cell
         default:
             return nil
@@ -1357,18 +1420,18 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
     @objc private func importTransitionMP4(_ sender: NSMenuItem) {
         guard let model = representedRow(sender) else { return }
         if sender.title.hasPrefix("Replace"), let clip = model.clip {
-            onReplaceMP4?(model.pair.source, model.pair.destination, clip.path)
+            onReplaceMP4?(model.route, clip.path)
         } else {
-            onImportMP4?(model.pair.source, model.pair.destination)
+            onImportMP4?(model.route)
         }
     }
 
     @objc private func useTransitionMovie(_ sender: NSMenuItem) {
         guard let model = representedRow(sender) else { return }
         if sender.title.hasPrefix("Replace"), let clip = model.clip {
-            onReplaceMovie?(model.pair.source, model.pair.destination, clip.path)
+            onReplaceMovie?(model.route, clip.path)
         } else {
-            onUseMovie?(model.pair.source, model.pair.destination)
+            onUseMovie?(model.route)
         }
     }
 
@@ -1394,13 +1457,13 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
         guard let values = sender.representedObject as? [Int], values.count == 2,
               values[0] >= 0, values[0] < rows.count,
               values[1] >= 0, values[1] < MediaPlaybackMode.allCases.count else { return }
-        let pair = rows[values[0]].pair
-        onModeChange?(pair.source, pair.destination, MediaPlaybackMode.allCases[values[1]])
+        let route = rows[values[0]].route
+        onModeChange?(route, MediaPlaybackMode.allCases[values[1]])
     }
 
     @objc private func setFixed(_ sender: NSButton) {
         guard let clip = rowModel(for: sender)?.clip else { return }
-        onSetFixed?(clip.source, clip.destination, clip.path)
+        onSetFixed?(clip.route, clip.path)
     }
 
     @objc private func showReorder(_ sender: NSButton) {
@@ -1420,6 +1483,6 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
         guard let values = sender.representedObject as? [Int], values.count == 2,
               values[0] >= 0, values[0] < rows.count,
               let clip = rows[values[0]].clip else { return }
-        onMove?(clip.source, clip.destination, clip.path, values[1])
+        onMove?(clip.route, clip.path, values[1])
     }
 }
