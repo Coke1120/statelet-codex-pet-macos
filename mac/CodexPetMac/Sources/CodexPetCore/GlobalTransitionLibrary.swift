@@ -38,18 +38,14 @@ public enum TransitionLibraryResolver {
                 isUniversalGlobal: false
             )
         }
-        if let playlist = global.universalPlaylist {
-            return ResolvedTransitionPlaylist(
-                scope: .global,
-                playlist: playlist,
-                isUniversalGlobal: true
-            )
-        }
-        guard let playlist = global.legacyTransitionPlaylist(from: from, to: to) else { return nil }
+        guard let playlist = global.transitionPlaylist(from: from, to: to) else { return nil }
         return ResolvedTransitionPlaylist(
             scope: .global,
             playlist: playlist,
-            isUniversalGlobal: false
+            isUniversalGlobal: !(
+                global.legacyRouteFallbackIsActive
+                    && global.legacyTransitionPlaylist(from: from, to: to) != nil
+            )
         )
     }
 }
@@ -64,15 +60,20 @@ public struct GlobalTransitionLibrary: Codable, Equatable, Sendable {
     /// Route-keyed data retained only for backward-compatible legacy files
     /// whose playlists could not be collapsed without choosing between them.
     public let transitions: [StateTransitionKey: StateMediaPlaylist]
+    /// Distinguishes unresolved route fallbacks from route data archived after
+    /// an explicit migration. Archived routes remain recoverable, but never
+    /// resume playback merely because the universal playlist is later removed.
+    public let legacyRouteFallbackIsActive: Bool
 
     public var requiresLegacyMigration: Bool {
-        universalPlaylist == nil && !transitions.isEmpty
+        legacyRouteFallbackIsActive && !transitions.isEmpty
     }
 
     public init(
         schemaVersion: Int = Self.currentSchemaVersion,
         universalPlaylist: StateMediaPlaylist? = nil,
-        transitions: [StateTransitionKey: StateMediaPlaylist] = [:]
+        transitions: [StateTransitionKey: StateMediaPlaylist] = [:],
+        legacyRouteFallbackIsActive: Bool? = nil
     ) throws {
         guard schemaVersion == Self.currentSchemaVersion else {
             throw PetContractError.unsupportedVersion(schemaVersion)
@@ -80,12 +81,16 @@ public struct GlobalTransitionLibrary: Codable, Equatable, Sendable {
         self.schemaVersion = schemaVersion
         self.universalPlaylist = try Self.normalizedPlaylist(universalPlaylist)
         self.transitions = try Self.normalized(transitions)
+        self.legacyRouteFallbackIsActive = !self.transitions.isEmpty && (
+            legacyRouteFallbackIsActive ?? (self.universalPlaylist == nil)
+        )
     }
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion = "schema_version"
         case universalPlaylist = "universal_playlist"
         case transitions
+        case legacyRouteFallbackIsActive = "legacy_route_fallback_active"
     }
 
     public init(from decoder: Decoder) throws {
@@ -109,7 +114,8 @@ public struct GlobalTransitionLibrary: Codable, Equatable, Sendable {
             try self.init(
                 schemaVersion: Self.currentSchemaVersion,
                 universalPlaylist: migrated.universal,
-                transitions: migrated.legacy
+                transitions: migrated.legacy,
+                legacyRouteFallbackIsActive: !migrated.legacy.isEmpty
             )
         case Self.currentSchemaVersion:
             try self.init(
@@ -118,7 +124,11 @@ public struct GlobalTransitionLibrary: Codable, Equatable, Sendable {
                     StateMediaPlaylist.self,
                     forKey: .universalPlaylist
                 ),
-                transitions: normalizedTransitions
+                transitions: normalizedTransitions,
+                legacyRouteFallbackIsActive: container.decodeIfPresent(
+                    Bool.self,
+                    forKey: .legacyRouteFallbackIsActive
+                )
             )
         default:
             throw PetContractError.unsupportedVersion(schemaVersion)
@@ -129,6 +139,7 @@ public struct GlobalTransitionLibrary: Codable, Equatable, Sendable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(schemaVersion, forKey: .schemaVersion)
         try container.encodeIfPresent(universalPlaylist, forKey: .universalPlaylist)
+        try container.encode(legacyRouteFallbackIsActive, forKey: .legacyRouteFallbackIsActive)
         try container.encode(
             Dictionary(uniqueKeysWithValues: transitions.map { ($0.key.storageKey, $0.value) }),
             forKey: .transitions
@@ -141,7 +152,11 @@ public struct GlobalTransitionLibrary: Codable, Equatable, Sendable {
 
     public func transitionPlaylist(from: PetState, to: PetState) -> StateMediaPlaylist? {
         guard from != to else { return nil }
-        return universalPlaylist ?? legacyTransitionPlaylist(from: from, to: to)
+        if legacyRouteFallbackIsActive,
+           let legacy = legacyTransitionPlaylist(from: from, to: to) {
+            return legacy
+        }
+        return universalPlaylist
     }
 
     public func legacyTransitionPlaylist(from: PetState, to: PetState) -> StateMediaPlaylist? {
@@ -197,7 +212,36 @@ public struct GlobalTransitionLibrary: Codable, Equatable, Sendable {
         return try Self(
             schemaVersion: schemaVersion,
             universalPlaylist: playlist,
-            transitions: transitions
+            transitions: transitions,
+            legacyRouteFallbackIsActive: false
+        )
+    }
+
+    /// Recovers a route-scoped conversion started by an older build. If the
+    /// route map was already collapsed to a universal playlist while the
+    /// conversion was in flight, reconstruct an unresolved route variant so
+    /// the recovered media remains visible and requires an explicit choice.
+    public func recoveringLegacyTransitionEntry(
+        _ entry: MediaEntry,
+        from: PetState,
+        to: PetState
+    ) throws -> Self {
+        let key = try StateTransitionKey(from: from, to: to)
+        var updated = transitions
+        if let playlist = updated[key] {
+            if playlist.entry(path: entry.path) == nil {
+                updated[key] = try playlist.appending(entry)
+            }
+        } else if let universalPlaylist {
+            updated[key] = try universalPlaylist.appending(entry)
+        } else {
+            updated[key] = try StateMediaPlaylist(entries: [entry])
+        }
+        return try Self(
+            schemaVersion: schemaVersion,
+            universalPlaylist: universalPlaylist,
+            transitions: updated,
+            legacyRouteFallbackIsActive: true
         )
     }
 
@@ -350,10 +394,15 @@ public struct GlobalTransitionLibrary: Codable, Equatable, Sendable {
     }
 
     private func replacingTransitions(_ transitions: [StateTransitionKey: StateMediaPlaylist]) throws -> Self {
-        try Self(
+        let activatesNewLegacyFallback = self.transitions.isEmpty
+            && universalPlaylist == nil
+            && !transitions.isEmpty
+        return try Self(
             schemaVersion: schemaVersion,
             universalPlaylist: universalPlaylist,
-            transitions: transitions
+            transitions: transitions,
+            legacyRouteFallbackIsActive: legacyRouteFallbackIsActive
+                || activatesNewLegacyFallback
         )
     }
 
@@ -361,7 +410,8 @@ public struct GlobalTransitionLibrary: Codable, Equatable, Sendable {
         try Self(
             schemaVersion: schemaVersion,
             universalPlaylist: playlist,
-            transitions: transitions
+            transitions: transitions,
+            legacyRouteFallbackIsActive: legacyRouteFallbackIsActive
         )
     }
 

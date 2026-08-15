@@ -1299,7 +1299,7 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
             return cell
         case TransitionColumn.preview:
             let cell = actionCell(identifier: TransitionColumn.preview, title: "Preview", action: #selector(previewTransition(_:)))
-            let isPreviewing = clip?.path == previewPath
+            let isPreviewing = clip.map { $0.path == previewPath } ?? false
             cell.button.title = isPreviewing ? "Stop" : "Preview"
             cell.button.isEnabled = canEditCurrentScope && (isPreviewing || (clip?.exists == true && !reduceMotion && !busy))
             let disabledReason: String?

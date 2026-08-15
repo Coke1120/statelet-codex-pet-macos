@@ -72,7 +72,7 @@ final class GlobalTransitionLibraryTests: XCTestCase {
         XCTAssertTrue(identical.transitions.isEmpty)
         XCTAssertFalse(identical.requiresLegacyMigration)
 
-        let other = try StateMediaPlaylist(entries: [MediaEntry(path: "other.mov")])
+        let other = try StateMediaPlaylist(entries: [MediaEntry(path: "other.mov", loop: false)])
         let otherJSON = try JSONSerialization.jsonObject(
             with: JSONEncoder().encode(other)
         )
@@ -87,6 +87,10 @@ final class GlobalTransitionLibraryTests: XCTestCase {
         XCTAssertNil(conflicting.universalPlaylist)
         XCTAssertEqual(conflicting.transitions.count, 2)
         XCTAssertTrue(conflicting.requiresLegacyMigration)
+        XCTAssertEqual(
+            conflicting.transitionPlaylist(from: .running, to: .waiting),
+            other
+        )
 
         let migrated = try conflicting.migratingLegacyToUniversal(using: idleRunning)
         XCTAssertEqual(migrated.universalPlaylist, playlist)
@@ -95,6 +99,116 @@ final class GlobalTransitionLibraryTests: XCTestCase {
         XCTAssertThrowsError(
             try conflicting.settingUniversalTransition(MediaEntry(path: "replacement.mov"))
         )
+    }
+
+    func testRemovingLastUniversalEntryDoesNotReactivateArchivedLegacyRoutes() throws {
+        let idleRunning = try StateTransitionKey(from: .idle, to: .running)
+        let runningWaiting = try StateTransitionKey(from: .running, to: .waiting)
+        let selected = try StateMediaPlaylist(entries: [MediaEntry(path: "selected.mov")])
+        let other = try StateMediaPlaylist(entries: [MediaEntry(path: "other.mov")])
+        let unresolved = try GlobalTransitionLibrary(transitions: [
+            idleRunning: selected,
+            runningWaiting: other,
+        ])
+
+        let migrated = try unresolved.migratingLegacyToUniversal(using: idleRunning)
+        let mutatedArchive = try migrated.replacingTransitionEntry(
+            from: .running,
+            to: .waiting,
+            path: "other.mov",
+            with: MediaEntry(path: "archived-other.mov")
+        )
+        XCTAssertFalse(mutatedArchive.legacyRouteFallbackIsActive)
+        XCTAssertFalse(mutatedArchive.requiresLegacyMigration)
+        XCTAssertEqual(
+            mutatedArchive.transitionPlaylist(from: .running, to: .waiting)?
+                .entries.map(\.path),
+            ["selected.mov"]
+        )
+
+        let removed = try mutatedArchive.removingUniversalTransitionEntry(path: "selected.mov")
+
+        XCTAssertNil(removed.universalPlaylist)
+        XCTAssertFalse(removed.requiresLegacyMigration)
+        XCTAssertFalse(removed.legacyRouteFallbackIsActive)
+        XCTAssertEqual(
+            removed.transitions[runningWaiting]?.entries.map(\.path),
+            ["archived-other.mov"]
+        )
+        XCTAssertEqual(Set(removed.allEntries.map(\.path)), ["selected.mov", "archived-other.mov"])
+        XCTAssertNil(removed.transitionPlaylist(from: .idle, to: .running))
+        XCTAssertNil(TransitionLibraryResolver.resolve(
+            from: .idle,
+            to: .running,
+            character: try MediaMap(),
+            global: removed
+        ))
+
+        let roundTripped = try JSONDecoder().decode(
+            GlobalTransitionLibrary.self,
+            from: JSONEncoder().encode(removed)
+        )
+        XCTAssertEqual(roundTripped, removed)
+        XCTAssertFalse(roundTripped.requiresLegacyMigration)
+    }
+
+    func testOldRouteRecoveryAfterIdenticalV1MigrationReconstructsVisibleConflict() throws {
+        let route = try StateTransitionKey(from: .idle, to: .running)
+        let otherRoute = try StateTransitionKey(from: .running, to: .waiting)
+        let legacy = try StateMediaPlaylist(entries: [MediaEntry(path: "legacy.mov")])
+        let playlistJSON = try JSONSerialization.jsonObject(with: JSONEncoder().encode(legacy))
+        let data = try JSONSerialization.data(withJSONObject: [
+            "schema_version": 1,
+            "transitions": [
+                route.storageKey: playlistJSON,
+                otherRoute.storageKey: playlistJSON,
+            ],
+        ])
+        let collapsed = try JSONDecoder().decode(GlobalTransitionLibrary.self, from: data)
+
+        let recovered = try collapsed.recoveringLegacyTransitionEntry(
+            MediaEntry(path: "recovered.mov"),
+            from: route.from,
+            to: route.to
+        )
+
+        XCTAssertTrue(recovered.requiresLegacyMigration)
+        XCTAssertTrue(recovered.legacyRouteFallbackIsActive)
+        XCTAssertEqual(
+            recovered.transitionPlaylist(from: route.from, to: route.to)?.entries.map(\.path),
+            ["legacy.mov", "recovered.mov"]
+        )
+        XCTAssertEqual(
+            recovered.transitionPlaylist(from: otherRoute.from, to: otherRoute.to)?.entries.map(\.path),
+            ["legacy.mov"]
+        )
+        XCTAssertEqual(recovered.allEntries.map(\.path).sorted(), [
+            "legacy.mov", "legacy.mov", "recovered.mov",
+        ])
+
+        let resolved = try recovered.migratingLegacyToUniversal(using: route)
+        XCTAssertFalse(resolved.requiresLegacyMigration)
+        XCTAssertEqual(resolved.universalPlaylist?.entries.map(\.path), [
+            "legacy.mov", "recovered.mov",
+        ])
+        XCTAssertEqual(resolved.transitions, recovered.transitions)
+    }
+
+    func testDecodesLegacyV2ResolvedArchiveWithoutExplicitActivityMarker() throws {
+        let route = try StateTransitionKey(from: .idle, to: .running)
+        let playlist = try StateMediaPlaylist(entries: [MediaEntry(path: "legacy.mov", loop: false)])
+        let playlistJSON = try JSONSerialization.jsonObject(with: JSONEncoder().encode(playlist))
+        let data = try JSONSerialization.data(withJSONObject: [
+            "schema_version": 2,
+            "universal_playlist": playlistJSON,
+            "transitions": [route.storageKey: playlistJSON],
+        ])
+
+        let decoded = try JSONDecoder().decode(GlobalTransitionLibrary.self, from: data)
+
+        XCTAssertFalse(decoded.requiresLegacyMigration)
+        XCTAssertFalse(decoded.legacyRouteFallbackIsActive)
+        XCTAssertEqual(decoded.transitionPlaylist(from: .idle, to: .running), playlist)
     }
 
     func testMutationOperationsMatchMediaMapTransitionSemantics() throws {

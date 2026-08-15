@@ -4740,11 +4740,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                                 guard from != to else {
                                     throw PetContractError.invalidValue("same-state transitions are character-scoped")
                                 }
-                                var updated = globalOwner.library
-                                if updated.legacyTransitionPlaylist(from: from, to: to)?
-                                    .entry(path: journal.outputBasename) == nil {
-                                    updated = try updated.appendingTransitionEntry(entry, from: from, to: to)
-                                }
+                                let updated = try globalOwner.library.recoveringLegacyTransitionEntry(
+                                    entry,
+                                    from: from,
+                                    to: to
+                                )
                                 try Self.requireValidatedFilesUnchanged(
                                     validation,
                                     outputURL: outputURL,

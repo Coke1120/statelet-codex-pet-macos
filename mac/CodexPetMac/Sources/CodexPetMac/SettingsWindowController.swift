@@ -1621,8 +1621,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                     }
                 }
             )
-        } else {
+        } else if snapshot.globalTransitionLibrary.legacyRouteFallbackIsActive {
             globalFallbackRoutes = Set(snapshot.globalTransitionLibrary.transitions.keys)
+        } else {
+            globalFallbackRoutes = []
         }
         if selectedTransitionScope == .character {
             transitionClips += snapshot.mediaMap.inStateTransitions.map { state, entry in
