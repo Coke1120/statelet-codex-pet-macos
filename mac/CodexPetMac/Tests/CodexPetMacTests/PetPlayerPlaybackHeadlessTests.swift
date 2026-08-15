@@ -370,4 +370,18 @@ final class PetPlayerPlaybackHeadlessTests: XCTestCase {
         XCTAssertTrue(NSApplication.shared.sendAction(runningItem.action!, to: runningItem.target, from: runningItem))
         XCTAssertEqual(selectedState, .running)
     }
+
+    @MainActor
+    func testTerminationShutdownDetachesBasePlaybackSurface() {
+        let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
+        let controller = PetPlayerController(view: view)
+
+        XCTAssertNotNil(view.playerLayer.player)
+        XCTAssertTrue(controller.shutdownForTermination())
+        XCTAssertTrue(controller.isQuiescentForTerminationForTesting)
+        XCTAssertNil(view.playerLayer.player)
+        XCTAssertNil(view.destinationPlayerLayer.player)
+        XCTAssertNil(view.lifecycleTransitionPlayerLayer.player)
+        XCTAssertTrue(controller.shutdownForTermination(), "shutdown must remain idempotent")
+    }
 }

@@ -1272,6 +1272,63 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
     }
 
     @MainActor
+    func testTerminationQuiescenceWaitsForCancellationResponsiveImport() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dialogue-quiescence-cancel-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let started = DispatchSemaphore(value: 0)
+        let coordinator = DialogueVoiceCoordinator(
+            applicationSupportRoot: root,
+            qwenPackageInstall: { _, _, _, _ in
+                started.signal()
+                while !Task.isCancelled {
+                    Thread.sleep(forTimeInterval: 0.001)
+                }
+                throw CancellationError()
+            }
+        )
+        coordinator.start()
+        coordinator.configureQwenProfile(
+            sourceURL: root,
+            pythonExecutableURL: URL(fileURLWithPath: "/usr/bin/python3")
+        )
+        XCTAssertEqual(started.wait(timeout: .now() + 1), .success)
+
+        XCTAssertTrue(coordinator.shutdownAndWaitForQuiescence(timeout: 1))
+        await Task.yield()
+    }
+
+    @MainActor
+    func testTerminationQuiescenceTimesOutForCancellationInsensitiveImport() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dialogue-quiescence-timeout-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let started = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let coordinator = DialogueVoiceCoordinator(
+            applicationSupportRoot: root,
+            qwenPackageInstall: { _, _, _, _ in
+                started.signal()
+                release.wait()
+                throw CancellationError()
+            }
+        )
+        coordinator.start()
+        coordinator.configureQwenProfile(
+            sourceURL: root,
+            pythonExecutableURL: URL(fileURLWithPath: "/usr/bin/python3")
+        )
+        XCTAssertEqual(started.wait(timeout: .now() + 1), .success)
+
+        XCTAssertFalse(coordinator.shutdownAndWaitForQuiescence(timeout: 0.02))
+        release.signal()
+        XCTAssertTrue(coordinator.shutdownAndWaitForQuiescence(timeout: 1))
+        await Task.yield()
+    }
+
+    @MainActor
     func testCoordinatorCleansReplacedImportButPreservesCurrentImportUntilShutdown() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("dialogue-import-replacement-tests-\(UUID().uuidString)", isDirectory: true)

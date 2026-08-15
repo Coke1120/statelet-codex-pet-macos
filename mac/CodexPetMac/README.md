@@ -298,6 +298,15 @@ framing. Google Omni or Grok Imagine, Minimax H3, Seedance 2.5, and LSX2.3 are
 listed only as user-provided generator examples, not endorsements or claims
 about availability, features, or output quality.
 
+The current **Help** pane is separate from **Prompts**. It collects first-run,
+lifecycle, animation, voice/privacy, recovery, and diagnostics guidance and
+shows the installed version plus the privacy-safe update status. Automatic
+checks do not block the local app; verified installation waits for a safe
+restart boundary and never replaces an unmanaged app. Installation also stays
+fail-closed until a release artifact carries the configured Statelet Developer
+ID team signature; the current source-only releases do not contain installable
+update packages.
+
 Only convert character media you own or are authorized to use for the intended
 derivative and distribution scope. Keep private input, alpha masters, reports,
 and runtime movies outside a public checkout. Do not commit them to this

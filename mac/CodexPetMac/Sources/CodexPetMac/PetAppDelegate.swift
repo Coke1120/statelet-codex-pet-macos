@@ -523,6 +523,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var oneShotArbiter = OneShotPlaybackArbiter()
     private var activeOneShotPreview: ActiveOneShotPreview?
     private var settingsController: SettingsWindowController?
+    private var updateCoordinator: StateletUpdateCoordinator?
+    private var updateRecoveryBlocked = false
     private var dialogueVoiceCoordinator: DialogueVoiceCoordinator!
     private let toolchainDiscovery = AlphaToolchainDiscovery()
     private var toolchainState: AlphaToolchainState = .checking
@@ -582,6 +584,24 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     func applicationDidFinishLaunching(_ notification: Notification) {
         conversionProfile = AlphaConversionProfile.restored()
         options = LaunchOptions.parse(arguments: CommandLine.arguments)
+        do {
+            try StateletUpdateInstaller.reconcilePendingTransaction()
+        } catch {
+            updateRecoveryBlocked = true
+            logger.error("event=update_transaction_recovery_failed action=retain_journal")
+        }
+        if !updateRecoveryBlocked {
+            let updater = StateletUpdateCoordinator(
+                installer: { downloaded, _ in
+                    try StateletUpdateInstaller.install(downloaded)
+                }
+            )
+            updater.onSnapshot = { [weak self] snapshot in
+                self?.settingsController?.update(update: snapshot)
+            }
+            updateCoordinator = updater
+            updater.startAutomaticChecks()
+        }
         configuredMediaMapURL = options.mediaMapURL
         configureCharacterLibrary()
         loadMediaMap()
@@ -736,8 +756,27 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         positionSaveGeneration &+= 1
         positionSaveWorkItem?.cancel()
         positionSaveWorkItem = nil
-        _ = conversionCoordinator.terminateAndWait()
-        dialogueVoiceCoordinator?.shutdown()
+        let playerQuiescent = player?.shutdownForTermination() ?? true
+        let conversionQuiescent = conversionCoordinator.terminateAndWait()
+        let voiceQuiescent = dialogueVoiceCoordinator?.shutdownAndWaitForQuiescence() ?? true
+        let updateCheckQuiescent = updateCoordinator?.shutdownAndWaitForQuiescence() ?? true
+        let updaterWorkQuiescent = playerQuiescent
+            && conversionQuiescent
+            && voiceQuiescent
+            && updateCheckQuiescent
+        do {
+            if let candidate = try updateCoordinator?.commitScheduledUpdateAtTermination(
+                ifQuiescent: updaterWorkQuiescent
+            ) {
+                logger.info("event=update_committed_at_termination version=\(candidate.version.description, privacy: .public)")
+            } else if !updaterWorkQuiescent,
+                      updateCoordinator?.snapshot.isScheduledForRestart == true {
+                logger.error("event=update_commit_skipped reason=work_not_quiescent action=retain_current_app")
+            }
+        } catch {
+            logger.error("event=update_commit_failed action=retain_current_or_recover_on_launch")
+        }
+        updateCoordinator?.discardPreparedUpdateAtTermination()
         savePanelFrame()
         NotificationCenter.default.removeObserver(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
@@ -2429,6 +2468,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
         refreshDiagnosticsSnapshot()
         refreshSettings()
+        if let snapshot = updateCoordinator?.snapshot {
+            settingsController?.update(update: snapshot)
+        }
         settingsController?.show()
     }
 
@@ -2503,6 +2545,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         controller.onRepairInstallation = { [weak self] in self?.repairStartupInstallation() }
         controller.onLaunchAtLoginChange = { [weak self] enabled in self?.setLaunchAtLogin(enabled) }
         controller.onCleanUnusedMedia = { [weak self] in self?.cleanUnusedMedia() }
+        controller.onCheckForUpdates = { [weak self] in self?.updateCoordinator?.checkNow() }
+        controller.onCancelUpdate = { [weak self] in self?.updateCoordinator?.cancel() }
+        controller.onInstallUpdate = { [weak self] in self?.updateCoordinator?.installReadyUpdate() }
+        controller.onAutomaticInstallChange = { [weak self] enabled in
+            self?.updateCoordinator?.setAutomaticInstall(enabled)
+        }
         controller.onImportVoiceAsset = { [weak self] kind, draft in
             self?.chooseVoiceAsset(kind: kind, preserving: draft)
         }
@@ -2548,6 +2596,24 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         controller.update(toolchainState: toolchainState)
         controller.update(conversionProfile: conversionProfile)
         controller.update(dialogueVoice: dialogueVoiceCoordinator.snapshot)
+        if let snapshot = updateCoordinator?.snapshot {
+            controller.update(update: snapshot)
+        } else if updateRecoveryBlocked {
+            controller.update(
+                update: StateletUpdateSnapshot(
+                    status: StateletUpdaterError.transactionRecoveryRequired.safeStatus,
+                    installedVersion: StateletVersion.current().description,
+                    candidateVersion: nil,
+                    releaseNotes: nil,
+                    progress: nil,
+                    isChecking: false,
+                    isReadyToInstall: false,
+                    isScheduledForRestart: false,
+                    isBlocked: true,
+                    automaticInstallEnabled: false
+                )
+            )
+        }
         if let pendingRecoveryNotice {
             controller.update(activity: .failed(pendingRecoveryNotice.0, pendingRecoveryNotice.1))
         }

@@ -549,7 +549,19 @@ When they differ because of `playback_rate`, the source value is labeled as
 nominal. These are media metadata and playback intent, not a measurement of
 rendered frames. Reduce Motion posters display `Still`.
 
-## Prompts and source recommendations
+## Help, updates, prompts and source recommendations
+
+**Settings → Help** is the local first-run and recovery guide. It explains the
+four lifecycle states, animation and voice privacy boundaries, click-through
+recovery, and diagnostics. It also shows the installed version and update
+status. Statelet checks for releases automatically at launch and at most once
+per day; **Check Now** is available when a manual refresh is useful. Automatic
+installation is opt-in and only applies a verified update at a safe restart
+boundary. Offline checks leave the current app running unchanged.
+Installation remains fail-closed until a release package is signed by the
+configured Statelet Developer ID team and passes the bundle identity,
+architecture, macOS, checksum, and transaction-journal checks. The current
+source-only releases intentionally do not install themselves.
 
 **Settings → Prompts** provides copy-ready, vendor-neutral authoring prompts for
 Idle, Running, Waiting, and Review. Replace the character placeholder with a

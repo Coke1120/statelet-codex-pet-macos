@@ -11,6 +11,7 @@ enum StateletIdentity {
     static let playerLaunchAgentLabel = "com.coke1120.statelet.mac-player"
     static let aggregatorLaunchAgentLabel = "com.coke1120.statelet.state-aggregator"
     static let appManagedPlistKey = "StateletManaged"
+    static let updateSigningTeamIdentifierKey = "StateletUpdateSigningTeamIdentifier"
     static let launchAgentManagedPlistKey = "StateletManaged"
     static let managedMarker = "statelet-v2"
 
