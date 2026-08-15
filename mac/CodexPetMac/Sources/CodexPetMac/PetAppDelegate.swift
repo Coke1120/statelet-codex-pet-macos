@@ -759,7 +759,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         let playerQuiescent = player?.shutdownForTermination() ?? true
         let conversionQuiescent = conversionCoordinator.terminateAndWait()
         let voiceQuiescent = dialogueVoiceCoordinator?.shutdownAndWaitForQuiescence() ?? true
-        let updaterWorkQuiescent = playerQuiescent && conversionQuiescent && voiceQuiescent
+        let updateCheckQuiescent = updateCoordinator?.shutdownAndWaitForQuiescence() ?? true
+        let updaterWorkQuiescent = playerQuiescent
+            && conversionQuiescent
+            && voiceQuiescent
+            && updateCheckQuiescent
         do {
             if let candidate = try updateCoordinator?.commitScheduledUpdateAtTermination(
                 ifQuiescent: updaterWorkQuiescent

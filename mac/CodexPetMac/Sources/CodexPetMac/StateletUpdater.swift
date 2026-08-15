@@ -576,6 +576,80 @@ struct StateletDownloadedUpdate {
     }
 }
 
+final class StateletUpdateDetachedActivityTracker: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var activeCount = 0
+    private var terminating = false
+    private var ownedUpdates: [String: StateletDownloadedUpdate] = [:]
+
+    func begin(owning update: StateletDownloadedUpdate? = nil) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        guard !terminating else { return false }
+        if let update, let key = ownershipKey(for: update) {
+            ownedUpdates[key] = update
+        }
+        activeCount += 1
+        return true
+    }
+
+    func finish() {
+        condition.lock()
+        activeCount -= 1
+        if activeCount == 0 {
+            condition.broadcast()
+        }
+        condition.unlock()
+    }
+
+    func track(_ update: StateletDownloadedUpdate) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        guard !terminating else { return false }
+        if let key = ownershipKey(for: update) {
+            ownedUpdates[key] = update
+        }
+        return true
+    }
+
+    func release(_ update: StateletDownloadedUpdate) {
+        guard let key = ownershipKey(for: update) else { return }
+        condition.lock()
+        ownedUpdates.removeValue(forKey: key)
+        condition.unlock()
+    }
+
+    func beginTermination() {
+        condition.lock()
+        terminating = true
+        condition.unlock()
+    }
+
+    func waitForQuiescence(timeout: TimeInterval) -> Bool {
+        let deadline = Date(timeIntervalSinceNow: max(0, timeout))
+        condition.lock()
+        defer { condition.unlock() }
+        while activeCount > 0 {
+            if !condition.wait(until: deadline), activeCount > 0 {
+                return false
+            }
+        }
+        return true
+    }
+
+    func takeOwnedUpdates() -> [StateletDownloadedUpdate] {
+        condition.lock()
+        defer { condition.unlock() }
+        let updates = Array(ownedUpdates.values)
+        ownedUpdates.removeAll()
+        return updates
+    }
+
+    private func ownershipKey(for update: StateletDownloadedUpdate) -> String? {
+        update.cleanupRootURL?.standardizedFileURL.path
+    }
+}
+
 struct StateletUpdateSnapshot: Equatable {
     let status: String
     let installedVersion: String
@@ -663,9 +737,11 @@ final class StateletUpdateCoordinator {
     private let prepareDownloadedUpdate: DownloadPreparation
     private let installer: Installer
     private let validateBundle: BundleValidation
+    private let detachedActivities: StateletUpdateDetachedActivityTracker
     private var operation: Task<Void, Never>?
     private var readyUpdate: (StateletDownloadedUpdate, StateletUpdateCandidate)?
     private var downloadProgressToken: UUID?
+    private var isTerminating = false
 
     convenience init(
         defaults: UserDefaults = .standard,
@@ -677,6 +753,7 @@ final class StateletUpdateCoordinator {
             // The standalone core intentionally cannot replace the running app.
             throw StateletUpdaterError.unsafeInstallBoundary
         }
+        let detachedActivities = StateletUpdateDetachedActivityTracker()
         self.init(
             installedVersion: .current(bundle: bundle),
             defaults: defaults,
@@ -693,15 +770,26 @@ final class StateletUpdateCoordinator {
                 )
             },
             download: { asset, progress in
-                try await Self.downloadArtifact(asset: asset, progress: progress)
+                try await Self.downloadArtifact(
+                    asset: asset,
+                    progress: progress,
+                    detachedActivities: detachedActivities
+                )
             },
             prepareDownloadedUpdate: { downloaded in
-                try await Self.expandDownloadedUpdate(downloaded)
+                try await Self.expandDownloadedUpdate(
+                    downloaded,
+                    detachedActivities: detachedActivities
+                )
             },
             installer: resolvedInstaller,
             validateBundle: { url in
-                try await Self.validateBundleOffMain(url)
-            }
+                try await Self.validateBundleOffMain(
+                    url,
+                    detachedActivities: detachedActivities
+                )
+            },
+            detachedActivities: detachedActivities
         )
     }
 
@@ -717,9 +805,8 @@ final class StateletUpdateCoordinator {
         download: @escaping Downloader,
         prepareDownloadedUpdate: @escaping DownloadPreparation = { $0 },
         installer: @escaping Installer,
-        validateBundle: @escaping BundleValidation = { url in
-            try await StateletUpdateCoordinator.validateBundleOffMain(url)
-        }
+        validateBundle: BundleValidation? = nil,
+        detachedActivities: StateletUpdateDetachedActivityTracker = .init()
     ) {
         self.installedVersion = installedVersion
         self.defaults = defaults
@@ -732,7 +819,13 @@ final class StateletUpdateCoordinator {
         self.download = download
         self.prepareDownloadedUpdate = prepareDownloadedUpdate
         self.installer = installer
-        self.validateBundle = validateBundle
+        self.validateBundle = validateBundle ?? { url in
+            try await StateletUpdateCoordinator.validateBundleOffMain(
+                url,
+                detachedActivities: detachedActivities
+            )
+        }
+        self.detachedActivities = detachedActivities
         let automaticInstall = defaults.bool(forKey: automaticInstallKey)
         snapshot = StateletUpdateSnapshot(
             status: "Ready to check for updates.",
@@ -826,6 +919,22 @@ final class StateletUpdateCoordinator {
         readyUpdate = nil
     }
 
+    @MainActor
+    @discardableResult
+    func shutdownAndWaitForQuiescence(timeout: TimeInterval = 5) -> Bool {
+        isTerminating = true
+        detachedActivities.beginTermination()
+        let hadInFlightOperation = operation != nil
+        operation?.cancel()
+        operation = nil
+        downloadProgressToken = nil
+        let detachedWorkQuiescent = detachedActivities.waitForQuiescence(timeout: timeout)
+        for update in detachedActivities.takeOwnedUpdates() {
+            update.removeOwnedStaging()
+        }
+        return !hadInFlightOperation && detachedWorkQuiescent
+    }
+
     func cancel() {
         defaults.removeObject(forKey: pendingInstallRetryKey)
         Task { @MainActor [weak self] in self?.operation?.cancel() }
@@ -833,7 +942,8 @@ final class StateletUpdateCoordinator {
 
     @MainActor
     private func beginCheck() {
-        guard operation == nil,
+        guard !isTerminating,
+              operation == nil,
               readyUpdate == nil,
               !snapshot.isScheduledForRestart,
               !snapshot.isBlocked else { return }
@@ -895,16 +1005,26 @@ final class StateletUpdateCoordinator {
                     )
                 }
             }
+            guard detachedActivities.track(downloaded) else {
+                downloaded.removeOwnedStaging()
+                throw CancellationError()
+            }
+            stagingToCleanup = downloaded
             await Task.yield()
             downloadProgressToken = nil
-            stagingToCleanup = downloaded
             try Task.checkCancellation()
             try await Self.verifyArtifactOffMain(
                 downloaded.artifactURL,
                 expectedSize: candidate.packageAsset.size,
-                expectedSHA256: expectedHash
+                expectedSHA256: expectedHash,
+                detachedActivities: detachedActivities
             )
             let preparedUpdate = try await prepareDownloadedUpdate(downloaded)
+            detachedActivities.release(downloaded)
+            guard detachedActivities.track(preparedUpdate) else {
+                preparedUpdate.removeOwnedStaging()
+                throw CancellationError()
+            }
             stagingToCleanup = preparedUpdate
             try Task.checkCancellation()
             let metadata = try await validateBundle(preparedUpdate.bundleURL)
@@ -914,6 +1034,7 @@ final class StateletUpdateCoordinator {
                   candidate.version.build == 0 || metadata.version.build == candidate.version.build else {
                 throw StateletUpdaterError.versionMismatch
             }
+            detachedActivities.release(preparedUpdate)
             readyUpdate = (preparedUpdate, candidate)
             stagingToCleanup = nil
             publish(
@@ -943,7 +1064,10 @@ final class StateletUpdateCoordinator {
             publish(status: "Unable to check for updates. Statelet will keep running normally.")
         }
         if let stagingToCleanup {
-            await Self.removeOwnedStagingOffMain(stagingToCleanup)
+            await Self.removeOwnedStagingOffMain(
+                stagingToCleanup,
+                detachedActivities: detachedActivities
+            )
         }
     }
 
@@ -994,9 +1118,12 @@ final class StateletUpdateCoordinator {
     private static func verifyArtifactOffMain(
         _ url: URL,
         expectedSize: Int64,
-        expectedSHA256: String
+        expectedSHA256: String,
+        detachedActivities: StateletUpdateDetachedActivityTracker
     ) async throws {
+        guard detachedActivities.begin() else { throw CancellationError() }
         let verification = Task.detached(priority: .utility) {
+            defer { detachedActivities.finish() }
             try StateletArtifactVerifier.verifyFile(
                 at: url,
                 expectedSize: expectedSize,
@@ -1010,8 +1137,13 @@ final class StateletUpdateCoordinator {
         }
     }
 
-    private static func validateBundleOffMain(_ url: URL) async throws -> StateletBundleMetadata {
+    private static func validateBundleOffMain(
+        _ url: URL,
+        detachedActivities: StateletUpdateDetachedActivityTracker
+    ) async throws -> StateletBundleMetadata {
+        guard detachedActivities.begin() else { throw CancellationError() }
         let validation = Task.detached(priority: .utility) {
+            defer { detachedActivities.finish() }
             try Task.checkCancellation()
             let metadata = try StateletBundleValidator.validate(at: url)
             try Task.checkCancellation()
@@ -1024,15 +1156,26 @@ final class StateletUpdateCoordinator {
         }
     }
 
-    private static func removeOwnedStagingOffMain(_ update: StateletDownloadedUpdate) async {
-        await Task.detached(priority: .utility) {
+    private static func removeOwnedStagingOffMain(
+        _ update: StateletDownloadedUpdate,
+        detachedActivities: StateletUpdateDetachedActivityTracker
+    ) async {
+        guard detachedActivities.begin() else {
             update.removeOwnedStaging()
+            detachedActivities.release(update)
+            return
+        }
+        await Task.detached(priority: .utility) {
+            defer { detachedActivities.finish() }
+            update.removeOwnedStaging()
+            detachedActivities.release(update)
         }.value
     }
 
     private static func downloadArtifact(
         asset: StateletReleaseAsset,
-        progress: @escaping (Double) -> Void
+        progress: @escaping (Double) -> Void,
+        detachedActivities: StateletUpdateDetachedActivityTracker
     ) async throws -> StateletDownloadedUpdate {
         guard asset.browserDownloadURL.scheme?.lowercased() == "https", asset.size > 0 else {
             throw StateletUpdaterError.invalidArtifact
@@ -1057,36 +1200,61 @@ final class StateletUpdateCoordinator {
               http.url?.scheme?.lowercased() == "https" else {
             throw StateletUpdaterError.invalidArtifact
         }
-        let result = try await Task.detached(priority: .utility) {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StateletUpdates", isDirectory: true)
+        let staging = base.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let artifact = staging.appendingPathComponent("Statelet-update.zip")
+        let trackedUpdate = StateletDownloadedUpdate(
+            artifactURL: artifact,
+            bundleURL: artifact,
+            cleanupRootURL: staging
+        )
+        guard detachedActivities.begin(owning: trackedUpdate) else {
+            throw CancellationError()
+        }
+        let finalization = Task.detached(priority: .utility) {
+            defer { detachedActivities.finish() }
+            try Task.checkCancellation()
             let manager = FileManager.default
-            let base = manager.temporaryDirectory
-                .appendingPathComponent("StateletUpdates", isDirectory: true)
-            try manager.createDirectory(at: base, withIntermediateDirectories: true)
-            try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: base.path)
-            let staging = base.appendingPathComponent(UUID().uuidString, isDirectory: true)
-            try manager.createDirectory(at: staging, withIntermediateDirectories: false)
-            try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: staging.path)
             do {
-                let artifact = staging.appendingPathComponent("Statelet-update.zip")
+                try manager.createDirectory(at: base, withIntermediateDirectories: true)
+                try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: base.path)
+                try manager.createDirectory(at: staging, withIntermediateDirectories: false)
+                try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: staging.path)
+                try Task.checkCancellation()
                 try manager.moveItem(at: temporaryURL, to: artifact)
-                return StateletDownloadedUpdate(
-                    artifactURL: artifact,
-                    bundleURL: artifact,
-                    cleanupRootURL: staging
-                )
+                try Task.checkCancellation()
+                return trackedUpdate
             } catch {
                 try? manager.removeItem(at: staging)
+                detachedActivities.release(trackedUpdate)
                 throw error
             }
-        }.value
+        }
+        let result: StateletDownloadedUpdate
+        do {
+            result = try await withTaskCancellationHandler {
+                try await finalization.value
+            } onCancel: {
+                finalization.cancel()
+            }
+            try Task.checkCancellation()
+        } catch {
+            trackedUpdate.removeOwnedStaging()
+            detachedActivities.release(trackedUpdate)
+            throw error
+        }
         progress(1)
         return result
     }
 
     private static func expandDownloadedUpdate(
-        _ downloaded: StateletDownloadedUpdate
+        _ downloaded: StateletDownloadedUpdate,
+        detachedActivities: StateletUpdateDetachedActivityTracker
     ) async throws -> StateletDownloadedUpdate {
+        guard detachedActivities.begin() else { throw CancellationError() }
         let expansion = Task.detached(priority: .utility) {
+            defer { detachedActivities.finish() }
             try Task.checkCancellation()
             let manager = FileManager.default
             let staging = downloaded.artifactURL.deletingLastPathComponent()

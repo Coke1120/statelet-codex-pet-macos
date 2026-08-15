@@ -585,6 +585,66 @@ final class StateletUpdaterTests: XCTestCase {
     }
 
     @MainActor
+    func testTerminationCancelsInFlightValidationAndCleansStagingBeforeExit() async throws {
+        let directory = try makeOwnedStagingDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let artifact = directory.appendingPathComponent("Statelet-update.zip")
+        let payload = Data("termination-during-validation".utf8)
+        try payload.write(to: artifact)
+        let digest = SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()
+        let bundle = try makeBundle(in: directory, identifier: StateletIdentity.bundleIdentifier)
+        let suite = "StateletUpdaterTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let validationStarted = expectation(description: "validation started")
+        let cancellationObserved = expectation(description: "cancellation observed")
+        let validationGate = AsyncTestGate()
+        let candidateVersion = try XCTUnwrap(StateletVersion(version: "2.0.0", build: "20"))
+        let coordinator = StateletUpdateCoordinator(
+            installedVersion: try XCTUnwrap(StateletVersion(version: "1.0.0", build: "1")),
+            defaults: defaults,
+            fetchReleases: { self.releaseFeedJSON(size: payload.count, digest: digest) },
+            fetchAssetData: { _ in Data() },
+            download: { _, _ in
+                StateletDownloadedUpdate(
+                    artifactURL: artifact,
+                    bundleURL: bundle,
+                    cleanupRootURL: directory
+                )
+            },
+            installer: { _, _ in XCTFail("in-flight update must not install") },
+            validateBundle: { _ in
+                validationStarted.fulfill()
+                await validationGate.wait()
+                return StateletBundleMetadata(
+                    version: candidateVersion,
+                    minimumSystemVersion: OperatingSystemVersion(
+                        majorVersion: 13,
+                        minorVersion: 0,
+                        patchVersion: 0
+                    )
+                )
+            }
+        )
+        coordinator.onSnapshot = { snapshot in
+            if snapshot.status == StateletUpdaterError.cancelled.safeStatus {
+                cancellationObserved.fulfill()
+            }
+        }
+
+        coordinator.checkNow()
+        await fulfillment(of: [validationStarted], timeout: 2)
+
+        XCTAssertFalse(coordinator.shutdownAndWaitForQuiescence(timeout: 0.2))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+        XCTAssertFalse(coordinator.snapshot.isReadyToInstall)
+        XCTAssertFalse(coordinator.snapshot.isScheduledForRestart)
+
+        await validationGate.open()
+        await fulfillment(of: [cancellationObserved], timeout: 2)
+    }
+
+    @MainActor
     func testCoordinatorVerifiesStagesAndCommitsOnlyAtTerminationBoundary() async throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -784,7 +844,9 @@ final class StateletUpdaterTests: XCTestCase {
         XCTAssertEqual(installCount, 0)
         XCTAssertTrue(coordinator.snapshot.isScheduledForRestart)
 
-        _ = try coordinator.commitScheduledUpdateAtTermination(ifQuiescent: true)
+        let updateQuiescent = coordinator.shutdownAndWaitForQuiescence()
+        XCTAssertTrue(updateQuiescent)
+        _ = try coordinator.commitScheduledUpdateAtTermination(ifQuiescent: updateQuiescent)
         await fulfillment(of: [installed], timeout: 2)
         XCTAssertEqual(installCount, 1)
         XCTAssertEqual(coordinator.snapshot.status, "Update installed. Reopen Statelet to use the new version.")
