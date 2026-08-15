@@ -28,7 +28,9 @@ try:
         VALID_STATES,
         aggregate_state_with_source,
         default_state_dir,
+        read_session_activity,
         read_session_snapshot,
+        SESSION_ACTIVITY_FILENAME,
     )
 except ModuleNotFoundError as error:
     if error.name != "statelet_state":
@@ -43,7 +45,9 @@ except ModuleNotFoundError as error:
         VALID_STATES,
         aggregate_state_with_source,
         default_state_dir,
+        read_session_activity,
         read_session_snapshot,
+        SESSION_ACTIVITY_FILENAME,
     )
 
 
@@ -64,6 +68,7 @@ DEFAULT_POLL_INTERVAL = 0.25
 # writer liveness observable, so keep it low-frequency to avoid needless SSD
 # churn while an idle companion runs all day.
 DEFAULT_HEARTBEAT_INTERVAL = 60.0
+OPTIONAL_ACTIVITY_DIAGNOSTIC_INTERVAL = 60.0
 DEFAULT_FORCE_DURATION = 30.0
 MAX_FORCE_DURATION = 300.0
 TTL_DEADLINE_EPSILON = 0.001
@@ -193,6 +198,130 @@ def sanitize_rejection_diagnostics(
             ):
                 reasons[reason] = min(1_000_000, count)
     return {"count": min(1_000_000, sum(reasons.values())), "reasons": reasons}
+
+
+def _open_owner_activity_directory(path: Path) -> int:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.getuid():
+            raise OSError("session activity directory is not owner-controlled")
+        os.fchmod(descriptor, 0o700)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def atomic_write_session_activity(
+    output_path: Path,
+    snapshot: Dict[str, object],
+    emitted_at: float,
+) -> Dict[str, object]:
+    """Publish the bounded privacy-safe session activity sidecar."""
+    if not math.isfinite(emitted_at):
+        raise ValueError("activity emitted_at must be finite")
+    active = snapshot.get("active", [])
+    completed = snapshot.get("completed", [])
+    if not isinstance(active, list) or not isinstance(completed, list):
+        raise ValueError("activity groups must be lists")
+    record: Dict[str, object] = {
+        "version": 1,
+        "schema_version": 1,
+        "emitted_at": emitted_at,
+        "active": active,
+        "completed": completed,
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    directory_fd = _open_owner_activity_directory(output_path.parent)
+    fd = -1
+    temporary = ""
+    try:
+        for attempt in range(16):
+            temporary = ".session-activity-{}-{}-{}.json".format(
+                os.getpid(), time.time_ns(), attempt
+            )
+            try:
+                fd = os.open(
+                    temporary,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+                break
+            except FileExistsError:
+                continue
+        if fd < 0:
+            raise OSError("could not reserve session activity temporary file")
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(record, handle, separators=(",", ":"), sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(
+            temporary,
+            output_path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        temporary = ""
+        os.fsync(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temporary:
+            try:
+                os.unlink(temporary, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        os.close(directory_fd)
+    return record
+
+
+class SessionActivityPublisher:
+    """Suppress unchanged activity sidecar writes until the heartbeat."""
+
+    def __init__(self, output_path: Path, heartbeat: float) -> None:
+        self.output_path = output_path
+        self.heartbeat = heartbeat
+        self.last_fingerprint: Optional[str] = None
+        self.next_heartbeat_at = 0.0
+
+    def publish_if_due(
+        self,
+        snapshot: Dict[str, object],
+        wall_time: float,
+        monotonic_time: float,
+    ) -> Optional[Dict[str, object]]:
+        fingerprint = json.dumps(
+            {
+                "active": snapshot.get("active", []),
+                "completed": snapshot.get("completed", []),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if (
+            fingerprint == self.last_fingerprint
+            and monotonic_time < self.next_heartbeat_at
+        ):
+            return None
+        record = atomic_write_session_activity(self.output_path, snapshot, wall_time)
+        self.last_fingerprint = fingerprint
+        self.next_heartbeat_at = monotonic_time + self.heartbeat
+        return record
 
 
 class StatePublisher:
@@ -577,6 +706,54 @@ def print_mode_diagnostic(mode: str, reason: Optional[str]) -> None:
     raise ValueError("invalid state aggregator mode diagnostic")
 
 
+def print_activity_diagnostic(message: str) -> None:
+    allowed = frozenset(
+        (
+            "Statelet session activity sidecar status=degraded reason=io_error",
+            "Statelet session activity sidecar status=degraded reason=encoding_error",
+            "Statelet session activity sidecar status=degraded reason=invalid_projection",
+            "Statelet session activity sidecar status=recovered",
+        )
+    )
+    if message not in allowed:
+        raise ValueError("invalid activity sidecar diagnostic")
+    print(message, file=sys.stderr)
+
+
+class OptionalActivityDiagnostic:
+    def __init__(
+        self,
+        diagnostic: Callable[[str], None],
+        interval: float = OPTIONAL_ACTIVITY_DIAGNOSTIC_INTERVAL,
+    ) -> None:
+        self.diagnostic = diagnostic
+        self.interval = interval
+        self.degraded = False
+        self.reported_degraded = False
+        self.next_report_at = 0.0
+
+    def failure(self, reason: str, monotonic_time: float) -> None:
+        if reason not in ("io_error", "encoding_error", "invalid_projection"):
+            raise ValueError("invalid activity sidecar failure reason")
+        if monotonic_time >= self.next_report_at:
+            self.diagnostic(
+                "Statelet session activity sidecar status=degraded reason={}".format(
+                    reason
+                )
+            )
+            self.next_report_at = monotonic_time + self.interval
+            self.reported_degraded = True
+        self.degraded = True
+
+    def recovery(self) -> None:
+        if not self.degraded:
+            return
+        if self.reported_degraded:
+            self.diagnostic("Statelet session activity sidecar status=recovered")
+        self.degraded = False
+        self.reported_degraded = False
+
+
 def force_is_active(
     forced_state: Optional[str],
     once: bool,
@@ -702,8 +879,14 @@ def run(
     waiter: Optional[DirectoryEventWaiter] = None,
     wall_clock: Callable[[], float] = time.time,
     monotonic_clock: Callable[[], float] = time.monotonic,
+    activity_diagnostic: Callable[[str], None] = print_activity_diagnostic,
 ) -> int:
     publisher = StatePublisher(output_path, heartbeat)
+    activity_publisher = SessionActivityPublisher(
+        state_dir / SESSION_ACTIVITY_FILENAME,
+        heartbeat,
+    )
+    activity_health = OptionalActivityDiagnostic(activity_diagnostic)
     force_started_at = wall_clock() if forced_state is not None else None
     force_deadline = (
         monotonic_clock() + force_seconds
@@ -759,6 +942,27 @@ def run(
             )
             if record is not None and print_state:
                 print(state, flush=True)
+            # The activity rail is an optional projection. Publish the
+            # authoritative lifecycle state first, then fail soft only for
+            # expected filesystem/serialization errors in the sidecar path.
+            try:
+                activity_snapshot = read_session_activity(
+                    state_dir,
+                    now=wall_time,
+                    active_ttl=active_ttl,
+                )
+                activity_publisher.publish_if_due(
+                    activity_snapshot,
+                    wall_time,
+                    monotonic_time,
+                )
+                activity_health.recovery()
+            except OSError:
+                activity_health.failure("io_error", monotonic_time)
+            except UnicodeError:
+                activity_health.failure("encoding_error", monotonic_time)
+            except (TypeError, ValueError):
+                activity_health.failure("invalid_projection", monotonic_time)
             if once:
                 break
             timeout = next_wake_timeout(

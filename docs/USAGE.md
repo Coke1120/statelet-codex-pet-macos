@@ -63,6 +63,25 @@ The badge reports:
   future, with safe Idle fallback; and
 - **Preview** for developer-forced state presentation.
 
+### Session activity beside the pet
+
+When Codex activity exists, Statelet shows a compact rail beside the pet with
+two groups: active sessions (Running, Waiting, or Review) and completed
+sessions whose result is still unread. The rail uses deterministic lifecycle
+priority/newest ordering, collapses to bounded count pills at compact sizes,
+and stays hidden when both groups are empty.
+
+Completed entries are not marked read merely by being displayed. Use **Mark as
+read** to acknowledge one; acknowledgements persist locally and are pruned with
+the bounded activity history. The rail is informational unless a future,
+documented Codex activation contract is available. Its labels are derived from
+safe lifecycle event categories and bounded start/completion times. It never
+displays prompts,
+tool output, transcript or repository paths, session identifiers, private
+media, voice data, credentials, or other session content. The activity sidecar
+is owner-only at `~/Library/Application Support/Statelet/sessions/activity-v1.json`
+and does not change the aggregate lifecycle state or animation priority.
+
 ## Move, resize, and interact
 
 - Drag the pet body to move the panel.

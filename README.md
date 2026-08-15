@@ -24,6 +24,8 @@ use, not a Developer ID-signed or notarized public binary.
 - Shows `idle`, `running`, `waiting`, and `review` as distinct animation states.
 - Aggregates several simultaneous Codex sessions with
   `waiting > review > running > idle` priority.
+- Shows active sessions and completed-unread sessions in a compact rail beside
+  the pet without exposing prompts or transcript content.
 - Provides a movable, border-and-corner-resizable transparent AppKit panel.
 - Keeps recovery controls in the menu bar when the panel is click-through.
 - Keeps several named characters in one local library and switches each
@@ -52,13 +54,22 @@ Codex lifecycle hooks
   -> local multi-session state aggregator
      waiting > review > running > idle
   -> current_state.json
-  -> Statelet AppKit panel and AVFoundation player
+  -> activity-v1.json + Statelet AppKit panels
+  -> AVFoundation player
 ```
 
-Each hook record contains only a schema version, mapped state, event name, and
-timestamp. Its filename is derived from a truncated SHA-256 hash of the session
-identifier. Statelet does not store prompts, tool output, transcript paths, or
-working directories in those records.
+Each hook record contains only a schema version, mapped state, safe event
+category, bounded lifecycle timestamps, and terminal status. Its filename is
+derived from a truncated SHA-256 hash of the session identifier. Statelet does
+not store prompts, tool output, transcript paths, or working directories in
+those records.
+
+The optional `sessions/activity-v1.json` sidecar contains only bounded active
+and terminal session summaries keyed by those opaque hashes. Each entry carries
+safe lifecycle/category labels plus bounded start, last-event, and completion
+timestamps. Statelet uses it to show the activity rail beside the pet;
+completed entries remain unread until the user explicitly marks them as read,
+and acknowledgement state stays local and owner-only.
 
 See [the lifecycle and media reference](docs/MACOS_COMPANION.md) for freshness,
 heartbeat, playlist, and filesystem contracts. Developers can use the

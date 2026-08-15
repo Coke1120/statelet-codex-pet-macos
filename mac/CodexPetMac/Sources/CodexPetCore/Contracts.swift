@@ -98,6 +98,30 @@ public enum CurrentStateHookEvent: String, Codable, CaseIterable, Sendable {
     case userPromptSubmit = "UserPromptSubmit"
 }
 
+public enum SessionActivityCategory: String, Codable, Equatable, Sendable {
+    case codex
+    case approval
+    case tool
+    case review
+    case subagent
+    case activity
+
+    public static func inferred(from event: CurrentStateHookEvent) -> Self {
+        switch event {
+        case .permissionRequest: return .approval
+        case .preToolUse, .postToolUse: return .tool
+        case .preCompact, .postCompact: return .review
+        case .subagentStart, .subagentStop: return .subagent
+        case .sessionStart, .sessionEnd, .userPromptSubmit, .stop: return .codex
+        case .unknown: return .activity
+        }
+    }
+
+    public var displayName: String {
+        rawValue.capitalized
+    }
+}
+
 public struct CurrentStateRejectionDiagnostics: Codable, Equatable, Sendable {
     public static let maximumCount = 1_000_000
     public static let maximumReasons = 8
@@ -306,6 +330,218 @@ public struct CurrentState: Codable, Equatable, Sendable {
         try container.encodeIfPresent(latestEvent, forKey: .latestEvent)
         try container.encodeIfPresent(latestEventAt, forKey: .latestEventAt)
         try container.encode(rejectionDiagnostics, forKey: .rejectionDiagnostics)
+    }
+}
+
+/// A bounded, privacy-safe view of the individual Codex sessions used by the
+/// optional activity rail. The identifier is the 24-hex truncated hash already
+/// used for owner-only hook record filenames; prompts and transcript metadata
+/// never cross this contract boundary.
+public struct SessionActivityItem: Codable, Equatable, Sendable {
+    public static let maximumIdentifierLength = 24
+
+    public let id: String
+    public let state: PetState
+    public let event: CurrentStateHookEvent
+    public let eventAt: Double
+    public let startedAt: Double
+    public let completedAt: Double?
+    public let category: SessionActivityCategory
+    public let terminal: Bool
+
+    public init(
+        id: String,
+        state: PetState,
+        event: CurrentStateHookEvent,
+        eventAt: Double,
+        terminal: Bool,
+        startedAt: Double? = nil,
+        completedAt: Double? = nil,
+        category: SessionActivityCategory? = nil
+    ) throws {
+        guard id.count == Self.maximumIdentifierLength,
+              id.unicodeScalars.allSatisfy(
+                  String("0123456789abcdef").unicodeScalars.contains
+              ) else {
+            throw PetContractError.invalidValue("session activity identifier is invalid")
+        }
+        guard eventAt.isFinite else {
+            throw PetContractError.invalidNumber("session activity event_at")
+        }
+        let resolvedStartedAt = startedAt ?? eventAt
+        guard resolvedStartedAt.isFinite else {
+            throw PetContractError.invalidNumber("session activity started_at")
+        }
+        let resolvedCompletedAt = completedAt ?? (terminal ? eventAt : nil)
+        if let resolvedCompletedAt {
+            guard resolvedCompletedAt.isFinite else {
+                throw PetContractError.invalidNumber("session activity completed_at")
+            }
+            guard terminal else {
+                throw PetContractError.invalidValue("active session activity cannot have completed_at")
+            }
+        } else if terminal {
+            throw PetContractError.invalidValue("terminal session activity is missing completed_at")
+        }
+        let terminalEvent = event == .sessionEnd || event == .stop
+        guard terminal == terminalEvent else {
+            throw PetContractError.invalidValue("session activity terminal event is inconsistent")
+        }
+        guard terminal || state != .idle else {
+            throw PetContractError.invalidValue("active session activity cannot be idle")
+        }
+        guard !terminal || state == .idle else {
+            throw PetContractError.invalidValue("terminal session activity must be idle")
+        }
+        guard resolvedStartedAt <= eventAt else {
+            throw PetContractError.invalidValue("session activity started_at is after event_at")
+        }
+        if let resolvedCompletedAt, resolvedCompletedAt < eventAt {
+            throw PetContractError.invalidValue("session activity completed_at is before event_at")
+        }
+        let resolvedCategory = category ?? .inferred(from: event)
+        guard resolvedCategory == .inferred(from: event) else {
+            throw PetContractError.invalidValue("session activity category is inconsistent")
+        }
+        self.id = id
+        self.state = state
+        self.event = event
+        self.eventAt = eventAt
+        self.startedAt = resolvedStartedAt
+        self.completedAt = resolvedCompletedAt
+        self.category = resolvedCategory
+        self.terminal = terminal
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case state
+        case event
+        case eventAt = "event_at"
+        case startedAt = "started_at"
+        case completedAt = "completed_at"
+        case category
+        case terminal
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let event = try container.decode(CurrentStateHookEvent.self, forKey: .event)
+        let eventAt = try container.decode(Double.self, forKey: .eventAt)
+        let terminal = try container.decode(Bool.self, forKey: .terminal)
+        try self.init(
+            id: container.decode(String.self, forKey: .id),
+            state: container.decode(PetState.self, forKey: .state),
+            event: event,
+            eventAt: eventAt,
+            terminal: terminal,
+            startedAt: container.decodeIfPresent(Double.self, forKey: .startedAt) ?? eventAt,
+            completedAt: container.decodeIfPresent(Double.self, forKey: .completedAt),
+            category: container.decodeIfPresent(SessionActivityCategory.self, forKey: .category)
+        )
+    }
+}
+
+public struct SessionActivitySnapshot: Codable, Equatable, Sendable {
+    public static let version = 1
+    public static let maximumItemsPerGroup = 64
+
+    public let version: Int
+    public let schemaVersion: Int
+    public let emittedAt: Double
+    public let active: [SessionActivityItem]
+    public let completed: [SessionActivityItem]
+
+    public init(
+        version: Int = Self.version,
+        schemaVersion: Int = Self.version,
+        emittedAt: Double,
+        active: [SessionActivityItem] = [],
+        completed: [SessionActivityItem] = []
+    ) throws {
+        guard version == Self.version, schemaVersion == Self.version else {
+            throw PetContractError.unsupportedVersion(max(version, schemaVersion))
+        }
+        guard emittedAt.isFinite else {
+            throw PetContractError.invalidNumber("session activity emitted_at")
+        }
+        guard active.count <= Self.maximumItemsPerGroup,
+              completed.count <= Self.maximumItemsPerGroup else {
+            throw PetContractError.invalidValue("session activity contains too many items")
+        }
+        guard active.allSatisfy({ !$0.terminal }),
+              completed.allSatisfy(\.terminal) else {
+            throw PetContractError.invalidValue("session activity item group is invalid")
+        }
+        let activeIDs = Set(active.map(\.id))
+        let completedIDs = Set(completed.map(\.id))
+        guard activeIDs.count == active.count,
+              completedIDs.count == completed.count,
+              activeIDs.isDisjoint(with: completedIDs) else {
+            throw PetContractError.invalidValue("session activity contains duplicate items")
+        }
+        self.version = version
+        self.schemaVersion = schemaVersion
+        self.emittedAt = emittedAt
+        self.active = active
+        self.completed = completed
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case version
+        case schemaVersion = "schema_version"
+        case emittedAt = "emitted_at"
+        case active
+        case completed
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            version: container.decodeIfPresent(Int.self, forKey: .version) ?? Self.version,
+            schemaVersion: container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? Self.version,
+            emittedAt: container.decode(Double.self, forKey: .emittedAt),
+            active: container.decodeIfPresent([SessionActivityItem].self, forKey: .active) ?? [],
+            completed: container.decodeIfPresent([SessionActivityItem].self, forKey: .completed) ?? []
+        )
+    }
+}
+
+public enum SessionActivityAcceptanceDecision: String, Equatable, Sendable {
+    case acceptInitial = "accept_initial"
+    case acceptNewer = "accept_newer"
+    case rejectDuplicate = "duplicate"
+    case rejectEqualTimestampConflict = "equal_timestamp_conflict"
+    case rejectRollback = "rollback"
+    case rejectStale = "stale"
+    case rejectFutureSkew = "future_skew"
+
+    public var shouldAccept: Bool {
+        self == .acceptInitial || self == .acceptNewer
+    }
+}
+
+/// Applies the lifecycle publisher's freshness budget plus a monotonic
+/// emitted-at barrier to the optional activity sidecar.
+public enum SessionActivityAcceptancePolicy {
+    public static func decide(
+        lastAccepted: SessionActivitySnapshot?,
+        incoming: SessionActivitySnapshot,
+        now: TimeInterval,
+        freshnessPolicy: StateFreshnessPolicy = .production
+    ) -> SessionActivityAcceptanceDecision {
+        switch freshnessPolicy.freshness(emittedAt: incoming.emittedAt, now: now) {
+        case .stale:
+            return .rejectStale
+        case .futureSkew:
+            return .rejectFutureSkew
+        case .fresh:
+            break
+        }
+        guard let lastAccepted else { return .acceptInitial }
+        if incoming.emittedAt > lastAccepted.emittedAt { return .acceptNewer }
+        if incoming.emittedAt < lastAccepted.emittedAt { return .rejectRollback }
+        return incoming == lastAccepted ? .rejectDuplicate : .rejectEqualTimestampConflict
     }
 }
 
