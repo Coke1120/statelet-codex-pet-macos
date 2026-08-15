@@ -666,6 +666,143 @@ class MacOSAlphaCommandTests(unittest.TestCase):
                     reject_edge_contact=False,
                 )
 
+    def test_allow_empty_frames_still_rejects_an_entirely_empty_animation(self):
+        if alpha.np is None:
+            self.skipTest("NumPy is required")
+        np = alpha.np
+        empty = np.zeros((4, 4, 4), dtype=np.uint8)
+        info = alpha.VideoInfo(
+            width=4,
+            height=4,
+            frame_count=1,
+            fps=Fraction(24, 1),
+            duration_seconds=1 / 24,
+            codec_name="h264",
+            pixel_format="yuv420p",
+        )
+        decoder = mock.Mock()
+        encoder = mock.Mock()
+        encoder.stdin = mock.Mock()
+        encoder.wait.return_value = 0
+
+        def fake_matte(*_args, diagnostics, **_kwargs):
+            diagnostics.update(
+                preclean_outer_edge_alpha_maximum=0,
+                preclean_outer_edge_contact_pixels=0,
+            )
+            return empty
+
+        with tempfile.TemporaryDirectory() as temp:
+            intermediate = Path(temp) / "intermediate.mov"
+            intermediate.write_bytes(b"prores")
+            with mock.patch.object(
+                converter,
+                "_start_matte_process_pair",
+                return_value=(decoder, encoder),
+            ), mock.patch.object(
+                converter, "read_raw_frames", return_value=iter([object()])
+            ), mock.patch.object(
+                converter, "matte_frame", side_effect=fake_matte
+            ), mock.patch.object(
+                converter, "_write_all_with_deadline"
+            ), mock.patch.object(converter, "close_process"):
+                with self.assertRaisesRegex(
+                    alpha.FrameQualityError,
+                    "animation contains no foreground pixels",
+                ):
+                    converter._stream_matte_to_prores(
+                        Path("source.mp4"),
+                        intermediate,
+                        Path(temp) / "alpha.raw",
+                        info=info,
+                        width=4,
+                        height=4,
+                        ffmpeg="ffmpeg",
+                        border_width=1,
+                        key_floor=0.06,
+                        key_ceiling=0.94,
+                        despill_strength=0.8,
+                        despill_allowance=2.0,
+                        max_green_edge_ratio=0.15,
+                        max_magenta_edge_ratio=0.15,
+                        source_edge_alpha_floor=64,
+                        max_green_edge_excess=96,
+                        max_magenta_edge_excess=96,
+                        allow_empty_frame=True,
+                        reject_edge_contact=False,
+                    )
+
+    def test_allow_empty_frames_reports_empty_frames_when_foreground_exists(self):
+        if alpha.np is None:
+            self.skipTest("NumPy is required")
+        np = alpha.np
+        empty = np.zeros((4, 4, 4), dtype=np.uint8)
+        foreground = empty.copy()
+        foreground[2, 2] = (220, 180, 160, 255)
+        outputs = iter([empty, foreground])
+        info = alpha.VideoInfo(
+            width=4,
+            height=4,
+            frame_count=2,
+            fps=Fraction(24, 1),
+            duration_seconds=2 / 24,
+            codec_name="h264",
+            pixel_format="yuv420p",
+        )
+        decoder = mock.Mock()
+        encoder = mock.Mock()
+        encoder.stdin = mock.Mock()
+        encoder.wait.return_value = 0
+
+        def fake_matte(*_args, diagnostics, **_kwargs):
+            diagnostics.update(
+                preclean_outer_edge_alpha_maximum=0,
+                preclean_outer_edge_contact_pixels=0,
+            )
+            return next(outputs)
+
+        with tempfile.TemporaryDirectory() as temp:
+            intermediate = Path(temp) / "intermediate.mov"
+            intermediate.write_bytes(b"prores")
+            with mock.patch.object(
+                converter,
+                "_start_matte_process_pair",
+                return_value=(decoder, encoder),
+            ), mock.patch.object(
+                converter,
+                "read_raw_frames",
+                return_value=iter([object(), object()]),
+            ), mock.patch.object(
+                converter, "matte_frame", side_effect=fake_matte
+            ), mock.patch.object(
+                converter, "_write_all_with_deadline"
+            ), mock.patch.object(converter, "close_process"):
+                report = converter._stream_matte_to_prores(
+                    Path("source.mp4"),
+                    intermediate,
+                    Path(temp) / "alpha.raw",
+                    info=info,
+                    width=4,
+                    height=4,
+                    ffmpeg="ffmpeg",
+                    border_width=1,
+                    key_floor=0.06,
+                    key_ceiling=0.94,
+                    despill_strength=0.8,
+                    despill_allowance=2.0,
+                    max_green_edge_ratio=0.15,
+                    max_magenta_edge_ratio=0.15,
+                    source_edge_alpha_floor=64,
+                    max_green_edge_excess=96,
+                    max_magenta_edge_excess=96,
+                    allow_empty_frame=True,
+                    reject_edge_contact=False,
+                )
+
+        self.assertEqual(report["empty_frames"], 1)
+        self.assertEqual(report["maximum_consecutive_empty_frames"], 1)
+        self.assertGreater(report["foreground_pixels"], 0)
+
     def test_parser_exposes_practical_matting_and_tool_flags(self):
         args = converter.build_parser().parse_args(
             [
@@ -2479,8 +2616,46 @@ class MacOSAlphaCommandTests(unittest.TestCase):
                 progress=progress,
             )
         self.assertEqual(report["frames_checked"], 3)
+        self.assertEqual(report["strict_background_attestation_frames"], 3)
+        self.assertEqual(report["temporal_occlusion_frames"], 0)
         self.assertEqual(progress.emit.call_count, 3)
         self.assertEqual(progress.emit.call_args.kwargs["frame_completed"], 3)
+
+    def test_source_background_preflight_reuses_attested_green_during_occlusion(self):
+        if alpha.np is None:
+            self.skipTest("NumPy is required")
+        np = alpha.np
+        green = np.zeros((100, 100, 3), dtype=np.uint8)
+        green[:, :] = (0, 255, 0)
+        occluded = np.zeros((100, 100, 3), dtype=np.uint8)
+        occluded[:, :] = (40, 90, 150)
+        occluded[:21, :21] = (0, 255, 0)
+        info = alpha.VideoInfo(
+            width=100,
+            height=100,
+            frame_count=4,
+            fps=Fraction(24, 1),
+            duration_seconds=4 / 24,
+            codec_name="h264",
+            pixel_format="yuv420p",
+        )
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(
+            converter, "_start_process", return_value=mock.Mock()
+        ), mock.patch.object(
+            converter,
+            "read_raw_frames",
+            return_value=iter([green, green, green, occluded]),
+        ), mock.patch.object(converter, "close_process"):
+            report = converter._verify_source_background(
+                Path(temp) / "source.mp4",
+                background_reference=Path(temp) / "background.rgb",
+                info=info,
+                ffmpeg="ffmpeg",
+                timeout_seconds=10,
+            )
+
+        self.assertEqual(report["strict_background_attestation_frames"], 3)
+        self.assertEqual(report["temporal_occlusion_frames"], 1)
 
     def test_roundtrip_verification_threads_nondefault_timeout_everywhere(self):
         if alpha.np is None:
@@ -3815,6 +3990,34 @@ class MacOSAlphaSyntheticMatteTests(unittest.TestCase):
             alpha.FrameQualityError, "green-screen background"
         ):
             alpha.assess_green_background(frame)
+
+    def test_temporal_source_attestation_accepts_matching_sparse_green_pocket(self):
+        np = alpha.np
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        frame[:, :] = (40, 90, 150)
+        frame[:21, :21] = (0, 255, 0)
+
+        evidence = alpha.assess_temporally_occluded_green_background(
+            frame,
+            trusted_background_rgb=(0, 255, 0),
+        )
+
+        self.assertTrue(evidence["used_temporal_occlusion_policy"])
+        self.assertEqual(evidence["background_rgb"], [0, 255, 0])
+
+    def test_temporal_source_attestation_rejects_mismatched_green_pocket(self):
+        np = alpha.np
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        frame[:, :] = (40, 90, 150)
+        frame[:21, :21] = (30, 200, 0)
+
+        with self.assertRaisesRegex(
+            alpha.FrameQualityError, "previously attested background"
+        ):
+            alpha.assess_temporally_occluded_green_background(
+                frame,
+                trusted_background_rgb=(0, 255, 0),
+            )
 
     def test_relaxed_edge_contact_uses_attested_source_green_not_cropped_perimeter(self):
         np = alpha.np

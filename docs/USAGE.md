@@ -271,6 +271,14 @@ retain a working alpha channel backed by its current converter report. Reportles
 or visually opaque transition assets are rejected, including during character
 bundle import and export.
 
+Large transition effects may temporarily cover most of the green screen. After
+earlier frames establish a stable background, Statelet accepts those occluded
+frames only when remaining border green matches the attested colour; all alpha,
+edge, and composite gates still run on every frame. Fully transparent keyed
+frames are allowed inside a transition when the complete clip retains real
+foreground. An entirely transparent clip is rejected, and ordinary looping
+state animations still require foreground in every frame.
+
 For a real A → B lifecycle change, Statelet selects one readable variant after
 accepting the authoritative change. Initial launch, same-state heartbeat,
 refresh, state-playlist rotation, Next Clip, Play Once, transition preview, and

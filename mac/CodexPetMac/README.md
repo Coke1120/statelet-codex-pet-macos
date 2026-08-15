@@ -4,7 +4,7 @@ Statelet is a personal-local Codex lifecycle companion for macOS 13 or newer.
 It is an AppKit accessory application: the transparent panel can be moved by dragging
 its body and resized from any border or corner without taking keyboard focus,
 AVFoundation owns exactly one decoder, and the menu-bar item keeps click-through
-recoverable. The current app version is 1.8.0 (build 14). New builds and
+recoverable. The current app version is 1.8.1 (build 15). New builds and
 installations use
 `Statelet.app`, bundle identifier `com.coke1120.Statelet`, `CFBundleName` and
 executable `Statelet`, Application Support under
@@ -320,7 +320,12 @@ stable 320×480 authoring canvas, produces a continuous alpha matte, applies con
 green despill, records source foreground edge contact, clears only the
 pre-codec output border, writes a ProRes 4444 intermediate, and uses Apple's
 `avconvert` for HEVC with alpha. It allows character motion and effects to
-cross that crop instead of squeezing them. The Apple-roundtripped delivery
+cross that crop instead of squeezing them. When earlier frames establish a
+stable green background, a heavily occluded frame may reuse that reference
+only if its remaining border green is sufficient and colour-matched.
+Transition imports may contain transparent keyed frames when the complete clip
+still contains foreground; ordinary state clips continue to require foreground
+in every frame. The Apple-roundtripped delivery
 border remains bounded at alpha `16` to tolerate limited codec ringing.
 Source-only unsupported green and magenta edge limits default to a `0.15` ratio
 and `96` channel excess to accept stronger authored effects. Low-alpha RGB

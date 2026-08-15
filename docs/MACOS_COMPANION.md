@@ -1,7 +1,7 @@
 # Statelet lifecycle and media reference
 
-This reference documents the internal contracts behind Statelet 1.8.0 (build
-14), the native Codex lifecycle companion for macOS. Start with
+This reference documents the internal contracts behind Statelet 1.8.1 (build
+15), the native Codex lifecycle companion for macOS. Start with
 [Deployment](DEPLOYMENT.md) for installation or [Using Statelet](USAGE.md) for
 daily operation.
 
@@ -201,7 +201,8 @@ converter:
 
 1. probes a constant-frame-rate, square-pixel source and records audio tracks;
 2. aspect-fills a stable 320×480 authoring canvas, independent of window points;
-3. estimates the observed green background per frame;
+3. estimates the observed green background per frame, reusing an earlier
+   attested reference only for colour-matched, border-visible heavy occlusion;
 4. creates continuous alpha and controlled despill;
 5. records source edge contact, informational loop-seam metrics, and clears the
    pre-codec output border;
@@ -216,6 +217,9 @@ Statelet copies and revalidates both before atomically updating the media map.
 The running app never chroma-keys green video. Import results surface audio
 removal, non-identical loop endpoints, and automatic even-geometry alignment as
 notices; none of them bypasses a delivery acceptance gate.
+Transition imports may contain fully transparent keyed frames when foreground
+exists elsewhere in the clip; state-loop imports still require foreground in
+every frame, and entirely transparent output is always rejected.
 
 ## Managed media safety
 

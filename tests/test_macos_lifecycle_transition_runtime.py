@@ -367,6 +367,7 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         journal_source = source[journal:conversion]
         self.assertIn("transitionScope: scope", journal_source)
         self.assertIn("globalTransitionLibrarySHA256:", journal_source)
+        self.assertIn("allowEmptyFrames: true", source[conversion:])
         self.assertNotIn("if scope == .character", source[:conversion])
 
     def test_conflicting_global_legacy_data_has_an_explicit_migration_action(self):

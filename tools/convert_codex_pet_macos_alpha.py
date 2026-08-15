@@ -30,6 +30,7 @@ import secrets
 import signal
 import shutil
 import stat
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -2093,6 +2094,8 @@ def _verify_source_background(
     minimum_border_ratio = 1.0
     minimum_row_coverage = 1.0
     minimum_column_coverage = 1.0
+    temporal_occlusion_frames = 0
+    strict_background_samples: list[tuple[int, int, int]] = []
     try:
         with background_reference.open("wb") as background_handle:
             for rgb in read_raw_frames(
@@ -2107,7 +2110,37 @@ def _verify_source_background(
                 try:
                     evidence = assess_green_background(rgb)
                 except FrameQualityError as exc:
-                    raise FrameQualityError(f"source frame {frame_number}: {exc}") from exc
+                    if len(strict_background_samples) < 3:
+                        raise FrameQualityError(
+                            f"source frame {frame_number}: {exc}"
+                        ) from exc
+                    trusted_background_rgb = tuple(
+                        int(
+                            round(
+                                statistics.median(
+                                    sample[channel]
+                                    for sample in strict_background_samples
+                                )
+                            )
+                        )
+                        for channel in range(3)
+                    )
+                    try:
+                        evidence = (
+                            alpha_engine.assess_temporally_occluded_green_background(
+                                rgb,
+                                trusted_background_rgb=trusted_background_rgb,
+                            )
+                        )
+                    except FrameQualityError as temporal_exc:
+                        raise FrameQualityError(
+                            f"source frame {frame_number}: {temporal_exc}"
+                        ) from exc
+                    temporal_occlusion_frames += 1
+                else:
+                    strict_background_samples.append(
+                        tuple(int(value) for value in evidence["background_rgb"])
+                    )
                 background_handle.write(bytes(evidence["background_rgb"]))
                 frames_checked += 1
                 if progress is not None:
@@ -2158,6 +2191,8 @@ def _verify_source_background(
         "minimum_green_source_border_ratio": minimum_border_ratio,
         "minimum_green_source_row_coverage": minimum_row_coverage,
         "minimum_green_source_column_coverage": minimum_column_coverage,
+        "strict_background_attestation_frames": len(strict_background_samples),
+        "temporal_occlusion_frames": temporal_occlusion_frames,
         "quality_passed": True,
     }
 
@@ -2249,6 +2284,9 @@ def _stream_matte_to_prores(
     max_magenta_excess = 0
     semitransparent_total = 0
     foreground_total = 0
+    empty_frame_count = 0
+    consecutive_empty_frames = 0
+    maximum_consecutive_empty_frames = 0
     max_preclean_edge_alpha = 0
     preclean_edge_contact_total = 0
     first_rgba: Any | None = None
@@ -2361,7 +2399,17 @@ def _stream_matte_to_prores(
                         matte_diagnostics["preclean_outer_edge_contact_pixels"]
                     )
                     semitransparent_total += int(metrics["semitransparent_edge_pixels"])
-                    foreground_total += int(metrics["foreground_pixels"])
+                    foreground_pixels = int(metrics["foreground_pixels"])
+                    foreground_total += foreground_pixels
+                    if foreground_pixels == 0:
+                        empty_frame_count += 1
+                        consecutive_empty_frames += 1
+                        maximum_consecutive_empty_frames = max(
+                            maximum_consecutive_empty_frames,
+                            consecutive_empty_frames,
+                        )
+                    else:
+                        consecutive_empty_frames = 0
                 alpha_handle.flush()
                 os.fsync(alpha_handle.fileno())
                 if background_handle is not None and background_handle.read(1):
@@ -2402,6 +2450,8 @@ def _stream_matte_to_prores(
         raise AlphaConversionError("matte alpha reference has an unexpected size")
     if first_rgba is None or last_rgba is None:
         raise AlphaConversionError("source produced no frames for loop seam analysis")
+    if foreground_total == 0:
+        raise FrameQualityError("matted animation contains no foreground pixels")
     return {
         "frames_checked": frames_checked,
         "expected_frames": info.frame_count,
@@ -2421,6 +2471,8 @@ def _stream_matte_to_prores(
         },
         "semitransparent_edge_pixels": semitransparent_total,
         "foreground_pixels": foreground_total,
+        "empty_frames": empty_frame_count,
+        "maximum_consecutive_empty_frames": maximum_consecutive_empty_frames,
         "loop_seam": _loop_seam_diagnostics(first_rgba, last_rgba),
         "quality_passed": True,
     }

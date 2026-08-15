@@ -1026,6 +1026,7 @@ final class AlphaConversionCoordinator {
         toolchain: AlphaToolchain,
         invocationChallenge: String,
         profile: AlphaConversionProfile = .fill,
+        allowEmptyFrames: Bool = false,
         phase: @escaping (String) -> Void,
         progress: @escaping (AlphaConversionProgress) -> Void = { _ in },
         completion: @escaping (Result<AlphaConversionResult, Error>) -> Void
@@ -1056,6 +1057,7 @@ final class AlphaConversionCoordinator {
                 toolchain: toolchain,
                 invocationChallenge: invocationChallenge,
                 profile: profile,
+                allowEmptyFrames: allowEmptyFrames,
                 phase: phase,
                 progress: progress
             )
@@ -1159,6 +1161,7 @@ final class AlphaConversionCoordinator {
         toolchain: AlphaToolchain,
         invocationChallenge: String,
         profile: AlphaConversionProfile,
+        allowEmptyFrames: Bool,
         phase: @escaping (String) -> Void,
         progress: @escaping (AlphaConversionProgress) -> Void
     ) -> Result<AlphaConversionResult, Error> {
@@ -1172,7 +1175,7 @@ final class AlphaConversionCoordinator {
         let readGroup = DispatchGroup()
 
         process.executableURL = toolchain.python
-        process.arguments = [
+        var arguments = [
             "-B",
             toolchain.converter.path,
             sourceURL.path,
@@ -1186,8 +1189,10 @@ final class AlphaConversionCoordinator {
             "--profile", profile.commandProfile,
             "--resize-mode", profile.resizeMode,
             "--invocation-challenge", invocationChallenge,
-            "--progress-jsonl",
         ]
+        if allowEmptyFrames { arguments.append("--allow-empty-frame") }
+        arguments.append("--progress-jsonl")
+        process.arguments = arguments
         process.currentDirectoryURL = outputURL.deletingLastPathComponent()
         process.environment = boundedEnvironment(toolchain: toolchain, outputURL: outputURL)
         process.standardOutput = stdoutPipe

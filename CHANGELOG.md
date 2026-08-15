@@ -5,6 +5,26 @@ versioning for the public source release.
 
 ## Unreleased
 
+## [1.8.1] - 2026-08-15
+
+### Changed
+
+- Transition imports can use a color-bound temporal green-background
+  attestation when an effect temporarily obscures most of an otherwise verified
+  background.
+- Transition conversion accepts fully transparent keyed frames needed by
+  fade-in and reveal effects, while still rejecting an animation that is
+  transparent for its entire duration.
+
+### Distribution notes
+
+- No character, animation, voice model, reference audio, session record, or
+  other private runtime data is bundled.
+- This release remains source-only. The local builder produces an
+  ad-hoc-signed app for personal local use; a public updater package still
+  requires Developer ID signing, notarization, stapling, a pinned team
+  identifier, and clean-Mac Gatekeeper verification.
+
 ## [1.8.0] - 2026-08-15
 
 ### Added
@@ -159,6 +179,7 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
+[1.8.1]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.1
 [1.8.0]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.0
 [1.7.1]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.7.1
 [1.7.0]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.7.0

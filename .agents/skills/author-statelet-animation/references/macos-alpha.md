@@ -8,10 +8,17 @@
 - Keep the camera, framing, exposure, scale, and focus stable.
 - Prefer a full subject with about 10% empty border for predictable framing.
   Statelet's relaxed importer accepts edge contact and oversized effects, but
-  pixels outside the selected output canvas cannot be recovered.
+  pixels outside the selected output canvas cannot be recovered. After earlier
+  frames establish a stable green background, a heavily occluded frame may
+  reuse that reference only when its remaining border green is sufficient and
+  its colour matches the attested background; every frame still passes the
+  downstream alpha/composite gates.
 - Use one completely uniform RGB `#00FF00` background with no floor, shadow,
   reflection, particles, text, logo, watermark, entrance, exit, or camera move.
 - Make the first and last frames pixel-identical and minimize motion blur.
+- One-shot transition overlays may contain fully transparent lead-in, middle,
+  or lead-out frames after keying, but the complete clip must retain foreground;
+  ordinary looping state animations still require foreground in every frame.
 
 ## Local toolchain
 

@@ -3924,6 +3924,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 toolchain: toolchain,
                 invocationChallenge: challenge,
                 profile: conversionProfile,
+                allowEmptyFrames: true,
                 phase: { [weak self] phase in
                     guard let self,
                           self.activeTransitionConversionID == conversionID,

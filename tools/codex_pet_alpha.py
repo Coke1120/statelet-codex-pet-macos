@@ -140,6 +140,14 @@ DEFAULT_MIN_GREEN_SOURCE_RATIO = 0.05
 DEFAULT_MIN_GREEN_SOURCE_BORDER_RATIO = 0.02
 DEFAULT_MIN_GREEN_SOURCE_AXIS_COVERAGE = 0.50
 DEFAULT_MIN_GREEN_CONNECTED_RATIO = 0.08
+# Once earlier frames establish a stable green background, a large effect may
+# leave only small disconnected pockets visible. Keep enough source and border
+# evidence to distinguish real chroma backing, and require its median colour to
+# match the already-attested background before reusing that trusted reference.
+DEFAULT_TEMPORAL_OCCLUSION_MIN_GREEN_SOURCE_RATIO = 0.02
+DEFAULT_TEMPORAL_OCCLUSION_MIN_GREEN_SOURCE_BORDER_RATIO = 0.10
+DEFAULT_TEMPORAL_OCCLUSION_MIN_GREEN_CONNECTED_RATIO = 0.01
+DEFAULT_TEMPORAL_BACKGROUND_MAX_CHANNEL_DELTA = 24
 
 
 @dataclass(frozen=True)
@@ -1447,6 +1455,50 @@ def assess_green_background(
         "background_rgb": [int(round(value)) for value in background_rgb],
         "quality_passed": True,
     }
+
+
+def assess_temporally_occluded_green_background(
+    rgb: Any,
+    *,
+    trusted_background_rgb: tuple[int, int, int],
+    max_channel_delta: int = DEFAULT_TEMPORAL_BACKGROUND_MAX_CHANNEL_DELTA,
+) -> dict[str, Any]:
+    """Validate sparse green pockets against a background attested earlier."""
+
+    if len(trusted_background_rgb) != 3 or any(
+        channel < 0 or channel > 255 for channel in trusted_background_rgb
+    ):
+        raise ValueError("trusted background RGB must contain three byte values")
+    if max_channel_delta < 0:
+        raise ValueError("maximum background channel delta must not be negative")
+    evidence = assess_green_background(
+        rgb,
+        min_green_ratio=DEFAULT_TEMPORAL_OCCLUSION_MIN_GREEN_SOURCE_RATIO,
+        min_green_border_ratio=(
+            DEFAULT_TEMPORAL_OCCLUSION_MIN_GREEN_SOURCE_BORDER_RATIO
+        ),
+        min_green_axis_coverage=0.0,
+        min_connected_green_ratio=(
+            DEFAULT_TEMPORAL_OCCLUSION_MIN_GREEN_CONNECTED_RATIO
+        ),
+    )
+    observed_background_rgb = tuple(int(value) for value in evidence["background_rgb"])
+    observed_delta = max(
+        abs(observed - trusted)
+        for observed, trusted in zip(
+            observed_background_rgb, trusted_background_rgb
+        )
+    )
+    if observed_delta > max_channel_delta:
+        raise FrameQualityError(
+            "visible green does not match the previously attested background "
+            f"(maximum channel delta {observed_delta}, allowed {max_channel_delta})"
+        )
+    evidence["background_rgb"] = list(trusted_background_rgb)
+    evidence["temporal_background_observed_rgb"] = list(observed_background_rgb)
+    evidence["temporal_background_max_channel_delta"] = observed_delta
+    evidence["used_temporal_occlusion_policy"] = True
+    return evidence
 
 
 def _largest_connected_mask(mask: Any) -> Any:

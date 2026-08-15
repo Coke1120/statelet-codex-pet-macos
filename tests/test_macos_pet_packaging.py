@@ -366,8 +366,8 @@ esac
             info["NSHumanReadableCopyright"],
             "Copyright © 2026 Statelet contributors. MIT licensed.",
         )
-        self.assertEqual(info["CFBundleShortVersionString"], "1.8.0")
-        self.assertEqual(info["CFBundleVersion"], "14")
+        self.assertEqual(info["CFBundleShortVersionString"], "1.8.1")
+        self.assertEqual(info["CFBundleVersion"], "15")
         self.assertEqual(info["CFBundlePackageType"], "APPL")
         self.assertEqual(info["LSMinimumSystemVersion"], "13.0")
         self.assertTrue(info["LSUIElement"])
@@ -1376,6 +1376,10 @@ struct WatchdogHarness {
         self.assertIn("func persist(to defaults: UserDefaults = .standard)", coordinator)
         self.assertIn('"--profile", profile.commandProfile', coordinator)
         self.assertIn('"--resize-mode", profile.resizeMode', coordinator)
+        self.assertIn(
+            'if allowEmptyFrames { arguments.append("--allow-empty-frame") }',
+            coordinator,
+        )
         self.assertIn("conversionProfile = AlphaConversionProfile.restored()", source)
         self.assertIn("profile.persist()", source)
         self.assertIn("controller.update(conversionProfile: conversionProfile)", source)
