@@ -13,8 +13,8 @@ import json
 import math
 import os
 import re
+import stat
 import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -48,6 +48,7 @@ REVIEW_PATTERN = re.compile(
     r"(?![a-z0-9_])"
 )
 HASH_PATTERN = re.compile(r"^[0-9a-f]{24}$")
+MAX_RECORD_BYTES = 1_048_576
 
 
 def event_category(event: str) -> str:
@@ -122,45 +123,154 @@ def _private_key_hash(payload: Dict[str, Any], key: str) -> Optional[str]:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:24]
 
 
-def _read_existing(path: Path) -> Optional[Dict[str, Any]]:
+def _open_state_directory(path: Path) -> int:
+    absolute_text = os.path.abspath(path.expanduser())
+    if sys.platform == "darwin":
+        for alias, canonical in (("/var", "/private/var"), ("/tmp", "/private/tmp")):
+            if absolute_text == alias or absolute_text.startswith(alias + "/"):
+                absolute_text = canonical + absolute_text[len(alias):]
+                break
+    absolute = Path(absolute_text)
+    descriptor = os.open(
+        "/",
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+    )
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        for component in absolute.parts[1:]:
+            try:
+                child = os.open(
+                    component,
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=descriptor,
+                )
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, 0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                child = os.open(
+                    component,
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=descriptor,
+                )
+            os.close(descriptor)
+            descriptor = child
+        status = os.fstat(descriptor)
+        if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.getuid():
+            raise OSError("state directory is not owner-controlled")
+        os.fchmod(descriptor, 0o700)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _read_existing(directory_fd: int, name: str) -> Optional[Dict[str, Any]]:
+    descriptor: Optional[int] = None
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_fd,
+        )
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_size < 0
+            or before.st_size > MAX_RECORD_BYTES
+        ):
+            return None
+        raw = b""
+        while len(raw) <= before.st_size:
+            chunk = os.read(descriptor, min(65_536, before.st_size + 1 - len(raw)))
+            if not chunk:
+                break
+            raw += chunk
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or before.st_ctime_ns != after.st_ctime_ns
+            or len(raw) != before.st_size
+        ):
+            return None
+        value = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, ValueError):
         return None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
     return value if isinstance(value, dict) else None
 
 
-def _atomic_write_record(destination: Path, record: Dict[str, Any]) -> None:
-    fd, temporary = tempfile.mkstemp(
-        prefix=".event-", suffix=".json", dir=str(destination.parent)
-    )
+def _atomic_write_record(
+    directory_fd: int,
+    destination_name: str,
+    record: Dict[str, Any],
+) -> None:
+    fd = -1
+    temporary = ""
     try:
+        for attempt in range(16):
+            temporary = ".event-{}-{}-{}.json".format(
+                os.getpid(), time.time_ns(), attempt
+            )
+            try:
+                fd = os.open(
+                    temporary,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+                break
+            except FileExistsError:
+                continue
+        if fd < 0:
+            raise OSError("could not reserve hook temporary file")
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             fd = -1
             json.dump(record, handle, separators=(",", ":"), sort_keys=True)
             handle.write("\n")
             handle.flush()
-        os.replace(temporary, destination)
-        destination.chmod(0o600)
+        os.replace(
+            temporary,
+            destination_name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        temporary = ""
         # Publication is complete before best-effort durability work. A hook
         # deadline must not strand the only valid record in a hidden temp file.
         try:
             destination_fd = os.open(
-                destination,
+                destination_name,
                 os.O_RDONLY
                 | getattr(os, "O_CLOEXEC", 0)
                 | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_fd,
             )
             try:
                 os.fsync(destination_fd)
             finally:
                 os.close(destination_fd)
-            directory_fd = os.open(destination.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            os.fsync(directory_fd)
         except OSError:
             pass
     finally:
@@ -169,10 +279,11 @@ def _atomic_write_record(destination: Path, record: Dict[str, Any]) -> None:
                 os.close(fd)
             except OSError:
                 pass
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
+        if temporary:
+            try:
+                os.unlink(temporary, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
 
 
 def _empty_causal_state() -> Dict[str, Any]:
@@ -322,23 +433,32 @@ def _causally_accept(
 
 
 def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
-    state_dir.mkdir(parents=True, exist_ok=True)
-    state_dir.chmod(0o700)
+    directory_fd = _open_state_directory(state_dir)
     event = str(payload.get("hook_event_name") or "")
     accepted_event = event if event in VALID_EVENTS else "unknown"
     received_at = time.time()
-    destination = state_dir / (session_key(payload) + ".json")
-    lock_path = state_dir / ".hook-write.lock"
-    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    destination_name = session_key(payload) + ".json"
+    destination = state_dir / destination_name
+    lock_fd = -1
     try:
+        lock_fd = os.open(
+            ".hook-write.lock",
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        lock_status = os.fstat(lock_fd)
+        if not stat.S_ISREG(lock_status.st_mode) or lock_status.st_uid != os.getuid():
+            raise OSError("hook lock is not owner-controlled")
         os.fchmod(lock_fd, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        existing = _read_existing(destination)
+        existing = _read_existing(directory_fd, destination_name)
         causal = _read_causal_state(existing.get("causal") if existing else None)
         existing_at = None
         existing_started_at = None
         existing_completed_at = None
         existing_category = None
+        existing_terminal = False
         existing_valid = (
             existing is not None
             and existing.get("version") in (1, 2)
@@ -346,6 +466,10 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
             and existing.get("event") in VALID_EVENTS.union(("unknown",))
         )
         if existing_valid:
+            existing_terminal = (
+                existing.get("terminal") is True
+                or existing.get("event") in TERMINAL_EVENTS
+            )
             try:
                 existing_at = float(existing.get("event_at", existing.get("updated_at")))
             except (TypeError, ValueError):
@@ -356,7 +480,7 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
             existing_completed_at = _finite_timestamp(
                 existing.get(
                     "completed_at",
-                    existing_at if existing.get("terminal") is True else None,
+                    existing_at if existing_terminal else None,
                 )
             )
             existing_category = existing.get("category")
@@ -364,13 +488,10 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
                 "codex", "approval", "tool", "review", "subagent", "activity"
             }:
                 existing_category = None
-        incoming_turn = _private_key_hash(payload, "turn_id")
-        causal_turn = causal.get("current_turn")
         terminal_late_callback = (
             existing_valid
-            and existing.get("terminal") is True
+            and existing_terminal
             and accepted_event not in REVIVAL_EVENTS
-            and (incoming_turn is None or incoming_turn == causal_turn)
         )
         proposed_causal = {
             "version": causal["version"],
@@ -383,13 +504,24 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
         }
         causally_accepted = _causally_accept(payload, accepted_event, proposed_causal)
         if terminal_late_callback or not causally_accepted:
+            terminal_reaffirmation = (
+                terminal_late_callback
+                and accepted_event in TERMINAL_EVENTS
+                and causally_accepted
+            )
+            preserved_causal = (
+                proposed_causal
+                if accepted_event in TERMINAL_EVENTS and causally_accepted
+                else causal
+            )
             rejections = existing.get("rejections") if existing_valid else None
             if not isinstance(rejections, dict):
                 rejections = {}
-            count = rejections.get("stale_event", 0)
-            if not isinstance(count, int) or isinstance(count, bool) or count < 0:
-                count = 0
-            rejections["stale_event"] = min(MAX_REJECTION_COUNT, count + 1)
+            if not terminal_reaffirmation:
+                count = rejections.get("stale_event", 0)
+                if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                    count = 0
+                rejections["stale_event"] = min(MAX_REJECTION_COUNT, count + 1)
             if existing_valid:
                 preserved = {
                     "version": 2,
@@ -398,19 +530,17 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
                     "event_at": existing_at,
                     "updated_at": received_at,
                     "terminal": bool(
-                        existing.get(
-                            "terminal", existing.get("event") in TERMINAL_EVENTS
-                        )
+                        existing_terminal
                     ),
                     "started_at": existing_started_at or existing_at or received_at,
                     "completed_at": existing_completed_at
-                    if existing.get("terminal") is True
+                    if existing_terminal
                     else None,
                     "category": existing_category or event_category(existing["event"]),
                     "rejections": rejections,
-                    "causal": causal,
+                    "causal": preserved_causal,
                 }
-                _atomic_write_record(destination, preserved)
+                _atomic_write_record(directory_fd, destination_name, preserved)
             else:
                 record = {
                     "version": 2,
@@ -423,9 +553,9 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
                     "completed_at": None,
                     "category": event_category("unknown"),
                     "rejections": rejections,
-                    "causal": causal,
+                    "causal": preserved_causal,
                 }
-                _atomic_write_record(destination, record)
+                _atomic_write_record(directory_fd, destination_name, record)
             return destination
         record_state = event_state(payload)
         if proposed_causal["pending_permissions"]:
@@ -444,7 +574,7 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
                     or not existing_valid
                     or (
                         accepted_event == "UserPromptSubmit"
-                        and existing.get("terminal") is True
+                        and existing_terminal
                     )
                 )
                 else existing_started_at or existing_at or received_at
@@ -456,9 +586,11 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
             "rejections": {},
             "causal": proposed_causal,
         }
-        _atomic_write_record(destination, record)
+        _atomic_write_record(directory_fd, destination_name, record)
     finally:
-        os.close(lock_fd)
+        if lock_fd >= 0:
+            os.close(lock_fd)
+        os.close(directory_fd)
     return destination
 
 

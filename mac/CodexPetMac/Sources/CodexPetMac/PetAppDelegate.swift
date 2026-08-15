@@ -470,7 +470,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private static let transitionAttestationTimeoutSeconds: TimeInterval = 20
     private static let sessionActivityAcknowledgementKey = "Statelet.sessionActivityAcknowledgements.v1"
     private static let sessionActivityPanelSize = NSSize(width: 230, height: 150)
-    private static let sessionActivityMaximumAcknowledgements = 128
 
     private let logger = Logger(subsystem: StateletIdentity.bundleIdentifier, category: "app")
     private let freshnessPolicy = StateFreshnessPolicy.production
@@ -496,6 +495,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var player: PetPlayerController!
     private var sessionActivityPanel: SessionActivityPanel!
     private var sessionActivityView: SessionActivityView!
+    private var sessionActivityScrollContainer: SessionActivityScrollContainer!
     private var stateWatcher: StateDirectoryWatcher!
     private var sessionActivityWatcher: StateDirectoryWatcher!
     private var mapWatcher: StateDirectoryWatcher!
@@ -519,7 +519,10 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var transientStateReadRetry: DispatchWorkItem?
     private var sessionActivityReadRetry: DispatchWorkItem?
     private var sessionActivitySnapshot: SessionActivitySnapshot?
-    private var acknowledgedSessionActivityIDs: Set<String> = []
+    private var lastAcceptedSessionActivitySnapshot: SessionActivitySnapshot?
+    private var sessionActivityAcknowledgementHistory: [String] = []
+    private var sessionActivityExpandedByUser = false
+    private var sessionActivityLayoutAvailable = true
     private var lastLifecycleStateForSelection: PetState?
     private var lastPresentedState: PetState?
     private var lastCommittedLifecycleState: PetState?
@@ -712,7 +715,10 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             alwaysOnTop: effectiveAlwaysOnTop,
             fullScreenAuxiliary: configuredWindow.fullScreenAuxiliary
         )
-        sessionActivityPanel.contentView = sessionActivityView
+        sessionActivityScrollContainer = SessionActivityScrollContainer(
+            activityView: sessionActivityView
+        )
+        sessionActivityPanel.contentView = sessionActivityScrollContainer
         sessionActivityPanel.ignoresMouseEvents = clickThrough
         sessionActivityPanel.orderFront(nil)
         refreshSessionActivityPresentation()
@@ -1209,8 +1215,19 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         case let .snapshot(snapshot):
             sessionActivityReadRetry?.cancel()
             sessionActivityReadRetry = nil
-            sessionActivitySnapshot = snapshot
-            pruneAcknowledgedSessionActivityIDs()
+            let application = SessionActivityApplicationPolicy.apply(
+                snapshot,
+                lastAccepted: lastAcceptedSessionActivitySnapshot,
+                currentlyDisplayed: sessionActivitySnapshot,
+                acknowledgementHistory: sessionActivityAcknowledgementHistory,
+                now: Date().timeIntervalSince1970
+            )
+            lastAcceptedSessionActivitySnapshot = application.lastAcceptedSnapshot
+            sessionActivitySnapshot = application.displayedSnapshot
+            if application.acknowledgementHistory != sessionActivityAcknowledgementHistory {
+                sessionActivityAcknowledgementHistory = application.acknowledgementHistory
+                persistSessionActivityAcknowledgements()
+            }
             refreshSessionActivityPresentation()
         case .missing, .corrupt:
             guard retryAttempt < 2 else {
@@ -1234,38 +1251,31 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         let values = UserDefaults.standard.array(
             forKey: Self.sessionActivityAcknowledgementKey
         ) as? [String] ?? []
-        acknowledgedSessionActivityIDs = Set(
-            values.filter { $0.count == SessionActivityItem.maximumIdentifierLength }
-        )
+        let normalized = SessionActivityApplicationPolicy.normalizedHistory(values)
+        sessionActivityAcknowledgementHistory = normalized
+        if normalized != values {
+            UserDefaults.standard.set(
+                normalized,
+                forKey: Self.sessionActivityAcknowledgementKey
+            )
+        }
     }
 
     private func persistSessionActivityAcknowledgements() {
-        let values = acknowledgedSessionActivityIDs
-            .sorted()
-            .suffix(Self.sessionActivityMaximumAcknowledgements)
         UserDefaults.standard.set(
-            Array(values),
+            sessionActivityAcknowledgementHistory,
             forKey: Self.sessionActivityAcknowledgementKey
         )
-    }
-
-    private func pruneAcknowledgedSessionActivityIDs() {
-        let activeIDs = Set((sessionActivitySnapshot?.active ?? []).map(\.id))
-        let knownIDs = activeIDs.union(
-            Set((sessionActivitySnapshot?.completed ?? []).map(\.id))
-        )
-        var pruned = acknowledgedSessionActivityIDs.intersection(knownIDs)
-        pruned.subtract(activeIDs)
-        guard pruned != acknowledgedSessionActivityIDs else { return }
-        acknowledgedSessionActivityIDs = pruned
-        persistSessionActivityAcknowledgements()
     }
 
     private func acknowledgeSessionActivity(_ id: String) {
         guard sessionActivitySnapshot?.completed.contains(where: { $0.id == id }) == true else {
             return
         }
-        acknowledgedSessionActivityIDs.insert(id)
+        sessionActivityAcknowledgementHistory = SessionActivityApplicationPolicy.recordingAcknowledgement(
+            id,
+            in: sessionActivityAcknowledgementHistory
+        )
         persistSessionActivityAcknowledgements()
         refreshSessionActivityPresentation()
     }
@@ -1274,60 +1284,80 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         guard let sessionActivityView, let sessionActivityPanel else { return }
         sessionActivityView.update(
             snapshot: sessionActivitySnapshot,
-            acknowledgedIDs: acknowledgedSessionActivityIDs
+            acknowledgedIDs: Set(sessionActivityAcknowledgementHistory)
         )
         if sessionActivityView.isHidden {
+            sessionActivityExpandedByUser = false
+            sessionActivityLayoutAvailable = true
             sessionActivityPanel.orderOut(nil)
         } else {
-            sessionActivityPanel.apply(
-                alwaysOnTop: effectiveAlwaysOnTop,
-                fullScreenAuxiliary: mediaMap.window.fullScreenAuxiliary
-            )
-            sessionActivityPanel.ignoresMouseEvents = clickThrough
-            positionSessionActivityPanel()
-            if effectiveAlwaysOnTop {
-                sessionActivityPanel.orderFrontRegardless()
-            } else {
-                sessionActivityPanel.orderFront(nil)
+            positionSessionActivityPanel(restoreVisibility: false)
+            guard sessionActivityLayoutAvailable else {
+                sessionActivityPanel.orderOut(nil)
+                return
             }
+            orderSessionActivityPanelVisible()
         }
     }
 
-    private func positionSessionActivityPanel() {
+    private func positionSessionActivityPanel(
+        display: Bool = false,
+        restoreVisibility: Bool = true
+    ) {
         guard let panel, let sessionActivityPanel, let sessionActivityView,
               !sessionActivityView.isHidden else { return }
         let visibleFrame = panel.screen?.visibleFrame
             ?? NSScreen.main?.visibleFrame
             ?? panel.frame
-        let fittingSize = sessionActivityView.fittingSize
-        let size = NSSize(
-            width: max(Self.sessionActivityPanelSize.width, fittingSize.width),
-            height: max(Self.sessionActivityPanelSize.height, fittingSize.height)
+        sessionActivityView.setCompactOverride(false)
+        let expandedFittingSize = sessionActivityView.fittingSize
+        let expandedSize = NSSize(
+            width: max(Self.sessionActivityPanelSize.width, expandedFittingSize.width),
+            height: max(Self.sessionActivityPanelSize.height, expandedFittingSize.height)
         )
-        let frame = SessionActivityPanel.anchoredFrame(
+        sessionActivityView.setCompactOverride(true)
+        let compactFittingSize = sessionActivityView.fittingSize
+        let compactSize = NSSize(
+            width: max(190, compactFittingSize.width),
+            height: max(44, compactFittingSize.height)
+        )
+        let layout = SessionActivityLayoutPolicy.layout(
             beside: panel.frame,
-            contentSize: size,
-            visibleFrame: visibleFrame
+            expandedSize: expandedSize,
+            compactSize: compactSize,
+            visibleFrame: visibleFrame,
+            forceExpanded: sessionActivityExpandedByUser
         )
-        sessionActivityPanel.setFrame(frame, display: false)
+        let wasAvailable = sessionActivityLayoutAvailable
+        sessionActivityLayoutAvailable = layout.available
+        guard layout.available else {
+            sessionActivityPanel.orderOut(nil)
+            return
+        }
+        sessionActivityView.setCompactOverride(layout.compact)
+        sessionActivityScrollContainer.setScrollable(layout.scrollable)
+        sessionActivityPanel.setFrame(layout.frame, display: display)
+        if restoreVisibility,
+           SessionActivityPanelVisibilityPolicy.shouldOrderFront(
+               wasAvailable: wasAvailable,
+               isAvailable: layout.available
+           ) {
+            orderSessionActivityPanelVisible()
+        }
+    }
+
+    private func orderSessionActivityPanelVisible() {
+        sessionActivityPanel.apply(
+            alwaysOnTop: effectiveAlwaysOnTop,
+            fullScreenAuxiliary: mediaMap.window.fullScreenAuxiliary
+        )
+        sessionActivityPanel.ignoresMouseEvents = clickThrough
+        sessionActivityPanel.orderVisible(alwaysOnTop: effectiveAlwaysOnTop)
     }
 
     private func expandSessionActivityPanel() {
-        guard let panel, let sessionActivityPanel, let sessionActivityView else { return }
-        let fittingSize = sessionActivityView.fittingSize
-        let size = NSSize(
-            width: max(Self.sessionActivityPanelSize.width, fittingSize.width),
-            height: max(Self.sessionActivityPanelSize.height, fittingSize.height)
-        )
-        let visibleFrame = panel.screen?.visibleFrame
-            ?? NSScreen.main?.visibleFrame
-            ?? panel.frame
-        let frame = SessionActivityPanel.anchoredFrame(
-            beside: panel.frame,
-            contentSize: size,
-            visibleFrame: visibleFrame
-        )
-        sessionActivityPanel.setFrame(frame, display: true)
+        sessionActivityExpandedByUser = true
+        positionSessionActivityPanel(display: true)
     }
 
     private func applyLifecycleStateReadResult(

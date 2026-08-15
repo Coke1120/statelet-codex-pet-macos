@@ -223,7 +223,7 @@ final class SessionActivityView: NSView {
         label.setAccessibilityElement(true)
         label.setAccessibilityRole(.staticText)
         label.setAccessibilityLabel("Active \(item.state.rawValue) session \(ordinal)")
-        label.setAccessibilityValue("\(item.category.displayName), started \(relativeAge(item.startedAt)) ago")
+        label.setAccessibilityValue("\(item.category.displayName), started \(relativeAge(item.startedAt))")
         let row = NSStackView(views: [activityDot(color: item.state.sessionActivityColor), label])
         row.orientation = .horizontal
         row.alignment = .centerY
@@ -241,7 +241,7 @@ final class SessionActivityView: NSView {
         label.setAccessibilityElement(true)
         label.setAccessibilityRole(.staticText)
         label.setAccessibilityLabel("Completed unread session \(ordinal)")
-        label.setAccessibilityValue("\(item.category.displayName), completed \(relativeAge(completionTime)) ago")
+        label.setAccessibilityValue("\(item.category.displayName), completed \(relativeAge(completionTime))")
 
         let acknowledge = NSButton(title: "Mark as read", target: self, action: #selector(markAsRead(_:)))
         acknowledge.bezelStyle = .inline
@@ -298,6 +298,46 @@ final class SessionActivityView: NSView {
     }
 }
 
+final class SessionActivityScrollContainer: NSScrollView {
+    private let activityView: SessionActivityView
+
+    init(activityView: SessionActivityView) {
+        self.activityView = activityView
+        super.init(frame: .zero)
+        drawsBackground = false
+        borderType = .noBorder
+        autohidesScrollers = true
+        documentView = activityView
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("SessionActivityScrollContainer does not support NSCoder initialization")
+    }
+
+    func setScrollable(_ scrollable: Bool) {
+        hasVerticalScroller = scrollable
+        hasHorizontalScroller = scrollable
+        layoutDocument()
+    }
+
+    override func layout() {
+        super.layout()
+        layoutDocument()
+    }
+
+    private func layoutDocument() {
+        let fitting = activityView.fittingSize
+        let viewport = contentSize
+        activityView.frame = NSRect(
+            origin: .zero,
+            size: NSSize(
+                width: max(viewport.width, fitting.width),
+                height: max(viewport.height, fitting.height)
+            )
+        )
+    }
+}
+
 private extension PetState {
     var sessionActivityColor: NSColor {
         switch self {
@@ -310,7 +350,7 @@ private extension PetState {
 }
 
 final class SessionActivityPanel: NSPanel {
-    override var canBecomeKey: Bool { false }
+    override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 
     init(contentRect: NSRect, alwaysOnTop: Bool, fullScreenAuxiliary: Bool) {
@@ -343,21 +383,229 @@ final class SessionActivityPanel: NSPanel {
         collectionBehavior = behavior
     }
 
+    func orderVisible(alwaysOnTop: Bool) {
+        if alwaysOnTop {
+            orderFrontRegardless()
+        } else {
+            orderFront(nil)
+        }
+    }
+
     static func anchoredFrame(
         beside petFrame: NSRect,
         contentSize: NSSize,
         visibleFrame: NSRect,
         gap: CGFloat = 10
     ) -> NSRect {
-        let preferredRight = petFrame.maxX + gap
-        let preferredLeft = petFrame.minX - gap - contentSize.width
-        let x = preferredRight + contentSize.width <= visibleFrame.maxX
-            ? preferredRight
-            : max(visibleFrame.minX, preferredLeft)
-        let y = min(
-            max(visibleFrame.minY, petFrame.maxY - contentSize.height),
-            visibleFrame.maxY - contentSize.height
+        SessionActivityPanelPlacement.frame(
+            beside: petFrame,
+            contentSize: contentSize,
+            visibleFrame: visibleFrame,
+            gap: gap
         )
-        return NSRect(x: x, y: y, width: contentSize.width, height: contentSize.height)
+    }
+}
+
+enum SessionActivityPanelVisibilityPolicy {
+    static func shouldOrderFront(
+        wasAvailable: Bool,
+        isAvailable: Bool
+    ) -> Bool {
+        !wasAvailable && isAvailable
+    }
+}
+
+private enum SessionActivityPanelPlacement {
+    private enum Edge: Int {
+        case right
+        case left
+        case above
+        case below
+    }
+
+    private struct Region {
+        let edge: Edge
+        let frame: NSRect
+    }
+
+    static func frame(
+        beside petFrame: NSRect,
+        contentSize: NSSize,
+        visibleFrame: NSRect,
+        gap: CGFloat
+    ) -> NSRect {
+        let requested = NSSize(
+            width: min(max(1, contentSize.width), visibleFrame.width),
+            height: min(max(1, contentSize.height), visibleFrame.height)
+        )
+        let regions = availableRegions(
+            beside: petFrame,
+            visibleFrame: visibleFrame,
+            gap: gap
+        )
+        if let fitting = regions.first(where: {
+            $0.frame.width >= requested.width && $0.frame.height >= requested.height
+        }) {
+            return positioned(requested, in: fitting, beside: petFrame)
+        }
+        guard let safest = regions.max(by: {
+            usableArea(for: requested, in: $0.frame)
+                < usableArea(for: requested, in: $1.frame)
+        }) else {
+            return NSRect(origin: visibleFrame.origin, size: .zero)
+        }
+        let bounded = NSSize(
+            width: min(requested.width, safest.frame.width),
+            height: min(requested.height, safest.frame.height)
+        )
+        return positioned(bounded, in: safest, beside: petFrame)
+    }
+
+    static func canFit(
+        _ size: NSSize,
+        beside petFrame: NSRect,
+        visibleFrame: NSRect,
+        gap: CGFloat
+    ) -> Bool {
+        availableRegions(beside: petFrame, visibleFrame: visibleFrame, gap: gap).contains {
+            $0.frame.width >= size.width && $0.frame.height >= size.height
+        }
+    }
+
+    private static func availableRegions(
+        beside petFrame: NSRect,
+        visibleFrame: NSRect,
+        gap: CGFloat
+    ) -> [Region] {
+        let rightX = max(visibleFrame.minX, petFrame.maxX + gap)
+        let aboveY = max(visibleFrame.minY, petFrame.maxY + gap)
+        return [
+            Region(
+                edge: .right,
+                frame: NSRect(
+                    x: rightX,
+                    y: visibleFrame.minY,
+                    width: max(0, visibleFrame.maxX - rightX),
+                    height: visibleFrame.height
+                )
+            ),
+            Region(
+                edge: .left,
+                frame: NSRect(
+                    x: visibleFrame.minX,
+                    y: visibleFrame.minY,
+                    width: max(0, min(visibleFrame.maxX, petFrame.minX - gap) - visibleFrame.minX),
+                    height: visibleFrame.height
+                )
+            ),
+            Region(
+                edge: .above,
+                frame: NSRect(
+                    x: visibleFrame.minX,
+                    y: aboveY,
+                    width: visibleFrame.width,
+                    height: max(0, visibleFrame.maxY - aboveY)
+                )
+            ),
+            Region(
+                edge: .below,
+                frame: NSRect(
+                    x: visibleFrame.minX,
+                    y: visibleFrame.minY,
+                    width: visibleFrame.width,
+                    height: max(0, min(visibleFrame.maxY, petFrame.minY - gap) - visibleFrame.minY)
+                )
+            ),
+        ].filter { $0.frame.width > 0 && $0.frame.height > 0 }
+    }
+
+    private static func usableArea(for size: NSSize, in region: NSRect) -> CGFloat {
+        min(size.width, region.width) * min(size.height, region.height)
+    }
+
+    private static func positioned(
+        _ size: NSSize,
+        in region: Region,
+        beside petFrame: NSRect
+    ) -> NSRect {
+        let x: CGFloat
+        let y: CGFloat
+        switch region.edge {
+        case .right:
+            x = region.frame.minX
+            y = min(max(region.frame.minY, petFrame.maxY - size.height), region.frame.maxY - size.height)
+        case .left:
+            x = region.frame.maxX - size.width
+            y = min(max(region.frame.minY, petFrame.maxY - size.height), region.frame.maxY - size.height)
+        case .above:
+            x = min(max(region.frame.minX, petFrame.midX - size.width / 2), region.frame.maxX - size.width)
+            y = region.frame.minY
+        case .below:
+            x = min(max(region.frame.minX, petFrame.midX - size.width / 2), region.frame.maxX - size.width)
+            y = region.frame.maxY - size.height
+        }
+        return NSRect(origin: NSPoint(x: x, y: y), size: size)
+    }
+}
+
+struct SessionActivityPanelLayout: Equatable {
+    let available: Bool
+    let compact: Bool
+    let scrollable: Bool
+    let frame: NSRect
+}
+
+enum SessionActivityLayoutPolicy {
+    static func layout(
+        beside petFrame: NSRect,
+        expandedSize: NSSize,
+        compactSize: NSSize,
+        visibleFrame: NSRect,
+        forceExpanded: Bool,
+        gap: CGFloat = 10
+    ) -> SessionActivityPanelLayout {
+        let expandedFits = SessionActivityPanelPlacement.canFit(
+            expandedSize,
+            beside: petFrame,
+            visibleFrame: visibleFrame,
+            gap: gap
+        )
+        let compactFits = SessionActivityPanelPlacement.canFit(
+            compactSize,
+            beside: petFrame,
+            visibleFrame: visibleFrame,
+            gap: gap
+        )
+        let hasSafeViewport = SessionActivityPanelPlacement.canFit(
+            NSSize(width: 1, height: 1),
+            beside: petFrame,
+            visibleFrame: visibleFrame,
+            gap: gap
+        )
+        guard hasSafeViewport else {
+            // No visible, non-overlapping geometry exists. Report the panel as
+            // unavailable so callers hide it instead of exposing a zero-sized
+            // interactive surface or overlapping the pet.
+            return SessionActivityPanelLayout(
+                available: false,
+                compact: true,
+                scrollable: false,
+                frame: .zero
+            )
+        }
+        let scrollable = !expandedFits && (forceExpanded || !compactFits)
+        let compact = !expandedFits && !scrollable
+        let selectedSize = expandedFits ? expandedSize : compactSize
+        return SessionActivityPanelLayout(
+            available: true,
+            compact: compact,
+            scrollable: scrollable,
+            frame: SessionActivityPanel.anchoredFrame(
+                beside: petFrame,
+                contentSize: selectedSize,
+                visibleFrame: visibleFrame,
+                gap: gap
+            )
+        )
     }
 }

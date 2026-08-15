@@ -383,13 +383,33 @@ public struct SessionActivityItem: Codable, Equatable, Sendable {
         } else if terminal {
             throw PetContractError.invalidValue("terminal session activity is missing completed_at")
         }
+        let terminalEvent = event == .sessionEnd || event == .stop
+        guard terminal == terminalEvent else {
+            throw PetContractError.invalidValue("session activity terminal event is inconsistent")
+        }
+        guard terminal || state != .idle else {
+            throw PetContractError.invalidValue("active session activity cannot be idle")
+        }
+        guard !terminal || state == .idle else {
+            throw PetContractError.invalidValue("terminal session activity must be idle")
+        }
+        guard resolvedStartedAt <= eventAt else {
+            throw PetContractError.invalidValue("session activity started_at is after event_at")
+        }
+        if let resolvedCompletedAt, resolvedCompletedAt < eventAt {
+            throw PetContractError.invalidValue("session activity completed_at is before event_at")
+        }
+        let resolvedCategory = category ?? .inferred(from: event)
+        guard resolvedCategory == .inferred(from: event) else {
+            throw PetContractError.invalidValue("session activity category is inconsistent")
+        }
         self.id = id
         self.state = state
         self.event = event
         self.eventAt = eventAt
         self.startedAt = resolvedStartedAt
         self.completedAt = resolvedCompletedAt
-        self.category = category ?? .inferred(from: event)
+        self.category = resolvedCategory
         self.terminal = terminal
     }
 
@@ -484,6 +504,44 @@ public struct SessionActivitySnapshot: Codable, Equatable, Sendable {
             active: container.decodeIfPresent([SessionActivityItem].self, forKey: .active) ?? [],
             completed: container.decodeIfPresent([SessionActivityItem].self, forKey: .completed) ?? []
         )
+    }
+}
+
+public enum SessionActivityAcceptanceDecision: String, Equatable, Sendable {
+    case acceptInitial = "accept_initial"
+    case acceptNewer = "accept_newer"
+    case rejectDuplicate = "duplicate"
+    case rejectEqualTimestampConflict = "equal_timestamp_conflict"
+    case rejectRollback = "rollback"
+    case rejectStale = "stale"
+    case rejectFutureSkew = "future_skew"
+
+    public var shouldAccept: Bool {
+        self == .acceptInitial || self == .acceptNewer
+    }
+}
+
+/// Applies the lifecycle publisher's freshness budget plus a monotonic
+/// emitted-at barrier to the optional activity sidecar.
+public enum SessionActivityAcceptancePolicy {
+    public static func decide(
+        lastAccepted: SessionActivitySnapshot?,
+        incoming: SessionActivitySnapshot,
+        now: TimeInterval,
+        freshnessPolicy: StateFreshnessPolicy = .production
+    ) -> SessionActivityAcceptanceDecision {
+        switch freshnessPolicy.freshness(emittedAt: incoming.emittedAt, now: now) {
+        case .stale:
+            return .rejectStale
+        case .futureSkew:
+            return .rejectFutureSkew
+        case .fresh:
+            break
+        }
+        guard let lastAccepted else { return .acceptInitial }
+        if incoming.emittedAt > lastAccepted.emittedAt { return .acceptNewer }
+        if incoming.emittedAt < lastAccepted.emittedAt { return .rejectRollback }
+        return incoming == lastAccepted ? .rejectDuplicate : .rejectEqualTimestampConflict
     }
 }
 

@@ -332,6 +332,131 @@ class LifecycleStateTests(unittest.TestCase):
             self.assertFalse((directory / f"{1:024x}.json").exists())
             self.assertTrue((directory / ("f" * 24 + ".json")).exists())
 
+    def test_session_activity_excludes_fresh_idle_start_without_pruning_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            record = record_path(directory, "a")
+            write_v2_record(record, "idle", "SessionStart", 99.0)
+
+            activity = state.read_session_activity(directory, now=100.0)
+            aggregate = state.read_session_snapshot(directory, now=100.0)
+            record_exists = record.exists()
+
+        self.assertEqual(activity["active"], [])
+        self.assertTrue(record_exists)
+        self.assertEqual(aggregate["active"], [("idle", 99.0)])
+
+    def test_hook_record_reader_ignores_symlinks_and_special_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            outside = directory / "outside.json"
+            write_v2_record(outside, "waiting", "PermissionRequest", 99.0)
+            link = record_path(directory, "a")
+            link.symlink_to(outside)
+            fifo = record_path(directory, "b")
+            os.mkfifo(fifo)
+
+            snapshot = state.read_session_snapshot(directory, now=100.0)
+            link_is_symlink = link.is_symlink()
+            fifo_is_fifo = stat.S_ISFIFO(os.lstat(fifo).st_mode)
+
+        self.assertEqual(snapshot["active"], [])
+        self.assertEqual(snapshot["rejections"], {})
+        self.assertTrue(link_is_symlink)
+        self.assertTrue(fifo_is_fifo)
+
+    def test_owner_regular_corrupt_records_remain_bounded_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            malformed_json = record_path(directory, "c")
+            malformed_utf8 = record_path(directory, "d")
+            read_failure = record_path(directory, "e")
+            malformed_json.write_text("{not-json", encoding="utf-8")
+            malformed_utf8.write_bytes(b"\xff\xfe")
+            write_v2_record(read_failure, "running", "UserPromptSubmit", 99.0)
+            real_read = state.os.read
+            failure_inode = read_failure.stat().st_ino
+
+            def fail_one_read(descriptor, count):
+                if os.fstat(descriptor).st_ino == failure_inode:
+                    raise OSError("ordinary read failure")
+                return real_read(descriptor, count)
+
+            with mock.patch.object(state.os, "read", side_effect=fail_one_read):
+                snapshot = state.read_session_snapshot(directory, now=100.0)
+
+            files_remain = all(
+                path.exists() for path in (malformed_json, malformed_utf8, read_failure)
+            )
+
+        self.assertEqual(snapshot["active"], [])
+        self.assertEqual(snapshot["rejections"], {"invalid_record": 3})
+        self.assertTrue(files_remain)
+
+    def test_pruning_preserves_a_pathname_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            record = record_path(directory, "a")
+            write_v2_record(record, "running", "UserPromptSubmit", 1.0)
+            real_rename = state.os.rename
+            replaced = False
+
+            def replace_before_rename(source, destination, **kwargs):
+                nonlocal replaced
+                if not replaced and source == record.name:
+                    replaced = True
+                    replacement = directory / ".replacement.json"
+                    write_v2_record(
+                        replacement,
+                        "waiting",
+                        "PermissionRequest",
+                        100.0,
+                    )
+                    os.replace(replacement, record)
+                return real_rename(source, destination, **kwargs)
+
+            with mock.patch.object(state.os, "rename", side_effect=replace_before_rename):
+                state.read_session_snapshot(directory, now=100.0, active_ttl=10.0)
+
+            preserved = json.loads(record.read_text(encoding="utf-8"))
+
+        self.assertTrue(replaced)
+        self.assertEqual(preserved["state"], "waiting")
+        self.assertEqual(preserved["event_at"], 100.0)
+
+    def test_pruning_uses_open_directory_when_parent_path_is_swapped(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / "sessions"
+            directory.mkdir()
+            record = record_path(directory, "a")
+            write_v2_record(record, "running", "UserPromptSubmit", 1.0)
+            original_read = state._read_hook_record
+            swapped = False
+
+            def swap_after_read(directory_fd, name):
+                nonlocal swapped
+                result = original_read(directory_fd, name)
+                if not swapped:
+                    swapped = True
+                    directory.rename(root / "old-sessions")
+                    directory.mkdir()
+                    write_v2_record(
+                        record_path(directory, "a"),
+                        "waiting",
+                        "PermissionRequest",
+                        100.0,
+                    )
+                return result
+
+            with mock.patch.object(state, "_read_hook_record", side_effect=swap_after_read):
+                state.read_session_snapshot(directory, now=100.0, active_ttl=10.0)
+
+            preserved = json.loads(record_path(directory, "a").read_text(encoding="utf-8"))
+
+        self.assertTrue(swapped)
+        self.assertEqual(preserved["state"], "waiting")
+
     def test_private_event_string_is_rejected_before_aggregation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -426,6 +551,55 @@ class PublisherTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
             self.assertNotIn("/Users/", output.read_text(encoding="utf-8"))
 
+    def test_activity_writer_rejects_symlinked_state_directory_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target-sessions"
+            target.mkdir(mode=0o755)
+            os.chmod(target, 0o755)
+            target_activity = target / state.SESSION_ACTIVITY_FILENAME
+            target_activity.write_text("keep\n", encoding="utf-8")
+            os.chmod(target_activity, 0o644)
+            linked = root / "sessions"
+            linked.symlink_to(target, target_is_directory=True)
+            snapshot = {"active": [], "completed": []}
+
+            with self.assertRaises(OSError):
+                aggregator.atomic_write_session_activity(
+                    linked / state.SESSION_ACTIVITY_FILENAME,
+                    snapshot,
+                    100.0,
+                )
+
+            clock = FakeClock(wall_time=100.0, monotonic_time=10.0)
+            current_state = root / "runtime" / "current_state.json"
+            aggregator.run(
+                linked,
+                current_state,
+                poll=0.25,
+                heartbeat=60.0,
+                active_ttl=900.0,
+                once=True,
+                print_state=False,
+                forced_state=None,
+                force_seconds=30.0,
+                should_stop=lambda: False,
+                waiter=ScriptedWaiter(clock),
+                wall_clock=clock.wall,
+                monotonic_clock=clock.monotonic,
+                activity_diagnostic=lambda _message: None,
+            )
+
+            target_contents = target_activity.read_text(encoding="utf-8")
+            target_mode = stat.S_IMODE(target.stat().st_mode)
+            target_file_mode = stat.S_IMODE(target_activity.stat().st_mode)
+            published = json.loads(current_state.read_text(encoding="utf-8"))
+
+        self.assertEqual(target_contents, "keep\n")
+        self.assertEqual(target_mode, 0o755)
+        self.assertEqual(target_file_mode, 0o644)
+        self.assertEqual(published["state"], "idle")
+
     def test_run_publishes_session_activity_sidecar_with_lifecycle_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state_dir = Path(temporary) / "sessions"
@@ -460,6 +634,133 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(activity["active"][0]["id"], "a" * 24)
         self.assertEqual(activity["active"][0]["state"], "running")
         self.assertEqual(activity["active"][0]["category"], "codex")
+
+    def test_optional_activity_projection_failure_does_not_block_current_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "sessions"
+            output = Path(temporary) / "runtime" / "current_state.json"
+            state_dir.mkdir()
+            write_v2_record(
+                record_path(state_dir, "a"),
+                "running",
+                "UserPromptSubmit",
+                100.0,
+            )
+            clock = FakeClock(wall_time=100.0, monotonic_time=10.0)
+            diagnostics = []
+            with mock.patch.object(
+                aggregator,
+                "read_session_activity",
+                side_effect=OSError("optional projection failed"),
+            ):
+                aggregator.run(
+                    state_dir,
+                    output,
+                    poll=0.25,
+                    heartbeat=60.0,
+                    active_ttl=900.0,
+                    once=True,
+                    print_state=False,
+                    forced_state=None,
+                    force_seconds=30.0,
+                    should_stop=lambda: False,
+                    waiter=ScriptedWaiter(clock),
+                    wall_clock=clock.wall,
+                    monotonic_clock=clock.monotonic,
+                    activity_diagnostic=diagnostics.append,
+                )
+
+            published = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(published["state"], "running")
+        self.assertEqual(published["active_sessions"], 1)
+        self.assertEqual(
+            diagnostics,
+            ["Statelet session activity sidecar status=degraded reason=io_error"],
+        )
+
+    def test_optional_activity_write_failure_happens_after_current_state_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "sessions"
+            output = Path(temporary) / "runtime" / "current_state.json"
+            state_dir.mkdir()
+            write_v2_record(
+                record_path(state_dir, "a"),
+                "waiting",
+                "PermissionRequest",
+                100.0,
+            )
+            clock = FakeClock(wall_time=100.0, monotonic_time=10.0)
+
+            def fail_after_authoritative_publish(*_args, **_kwargs):
+                self.assertEqual(
+                    json.loads(output.read_text(encoding="utf-8"))["state"],
+                    "waiting",
+                )
+                raise OSError("optional write failed")
+
+            with mock.patch.object(
+                aggregator,
+                "atomic_write_session_activity",
+                side_effect=fail_after_authoritative_publish,
+            ):
+                aggregator.run(
+                    state_dir,
+                    output,
+                    poll=0.25,
+                    heartbeat=60.0,
+                    active_ttl=900.0,
+                    once=True,
+                    print_state=False,
+                    forced_state=None,
+                    force_seconds=30.0,
+                    should_stop=lambda: False,
+                    waiter=ScriptedWaiter(clock),
+                    wall_clock=clock.wall,
+                    monotonic_clock=clock.monotonic,
+                    activity_diagnostic=lambda _message: None,
+                )
+
+    def test_optional_activity_diagnostic_is_rate_limited_and_reports_recovery(self) -> None:
+        messages = []
+        diagnostic = aggregator.OptionalActivityDiagnostic(messages.append, interval=60.0)
+
+        diagnostic.failure("io_error", 10.0)
+        diagnostic.failure("invalid_projection", 20.0)
+        diagnostic.failure("encoding_error", 70.0)
+        diagnostic.recovery()
+        diagnostic.recovery()
+
+        self.assertEqual(
+            messages,
+            [
+                "Statelet session activity sidecar status=degraded reason=io_error",
+                "Statelet session activity sidecar status=degraded reason=encoding_error",
+                "Statelet session activity sidecar status=recovered",
+            ],
+        )
+
+    def test_optional_activity_diagnostic_bounds_tight_failure_recovery_flapping(self) -> None:
+        messages = []
+        diagnostic = aggregator.OptionalActivityDiagnostic(messages.append, interval=60.0)
+
+        diagnostic.failure("io_error", 10.0)
+        diagnostic.recovery()
+        for timestamp in (20.0, 30.0, 40.0):
+            diagnostic.failure("io_error", timestamp)
+            diagnostic.recovery()
+        diagnostic.failure("io_error", 70.0)
+        diagnostic.recovery()
+
+        self.assertEqual(
+            messages,
+            [
+                "Statelet session activity sidecar status=degraded reason=io_error",
+                "Statelet session activity sidecar status=recovered",
+                "Statelet session activity sidecar status=degraded reason=io_error",
+                "Statelet session activity sidecar status=recovered",
+            ],
+        )
 
     def test_shared_current_state_fixture_matches_python_publisher(self) -> None:
         fixture_path = ROOT / "mac" / "contracts" / "current_state-v1.example.json"

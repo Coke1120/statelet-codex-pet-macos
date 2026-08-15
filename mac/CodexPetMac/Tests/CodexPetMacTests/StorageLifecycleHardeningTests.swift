@@ -166,6 +166,49 @@ final class StorageLifecycleHardeningTests: XCTestCase {
         XCTAssertEqual(SessionActivityFileReader.load(oversized), .corrupt)
     }
 
+    func testSessionActivityReaderRejectsSymlinkedContainingDirectory() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("target", isDirectory: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
+        let activity = target.appendingPathComponent("activity.json")
+        try Data(#"{"version":1,"schema_version":1,"emitted_at":10,"active":[],"completed":[]}"#.utf8).write(to: activity)
+        let linked = root.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: linked, withDestinationURL: target)
+
+        XCTAssertEqual(
+            SessionActivityFileReader.load(linked.appendingPathComponent("activity.json")),
+            .corrupt
+        )
+        XCTAssertEqual(try Data(contentsOf: activity), Data(#"{"version":1,"schema_version":1,"emitted_at":10,"active":[],"completed":[]}"#.utf8))
+    }
+
+    func testSessionActivityReaderParentSwapUsesValidatedDirectoryDescriptor() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessions = root.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: false)
+        let activity = sessions.appendingPathComponent("activity.json")
+        let valid = #"{"version":1,"schema_version":1,"emitted_at":10,"active":[],"completed":[]}"#
+        try Data(valid.utf8).write(to: activity)
+        let oldSessions = root.appendingPathComponent("old-sessions", isDirectory: true)
+
+        let result = SessionActivityFileReader.load(activity) {
+            try! FileManager.default.moveItem(at: sessions, to: oldSessions)
+            try! FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: false)
+            try! Data("keep".utf8).write(to: sessions.appendingPathComponent("activity.json"))
+        }
+
+        guard case let .snapshot(snapshot) = result else {
+            return XCTFail("validated directory snapshot was not read")
+        }
+        XCTAssertEqual(snapshot.emittedAt, 10)
+        XCTAssertEqual(
+            try Data(contentsOf: sessions.appendingPathComponent("activity.json")),
+            Data("keep".utf8)
+        )
+    }
+
     func testLifecycleReaderOnlyDeliversNewestGeneration() {
         let firstStarted = expectation(description: "first started")
         let releaseFirst = DispatchSemaphore(value: 0)

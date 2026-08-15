@@ -398,6 +398,76 @@ final class CodexPetCoreTests: XCTestCase {
         )
     }
 
+    func testSessionActivityRejectsSemanticallyMalformedJSON() throws {
+        let malformedItems = [
+            #"{"id":"aaaaaaaaaaaaaaaaaaaaaaaa","state":"running","event":"SessionEnd","event_at":10,"terminal":false}"#,
+            #"{"id":"aaaaaaaaaaaaaaaaaaaaaaaa","state":"running","event":"UserPromptSubmit","event_at":10,"terminal":true}"#,
+            #"{"id":"aaaaaaaaaaaaaaaaaaaaaaaa","state":"idle","event":"SessionStart","event_at":10,"terminal":false}"#,
+            #"{"id":"aaaaaaaaaaaaaaaaaaaaaaaa","state":"running","event":"UserPromptSubmit","event_at":10,"started_at":11,"terminal":false}"#,
+            #"{"id":"aaaaaaaaaaaaaaaaaaaaaaaa","state":"idle","event":"SessionEnd","event_at":10,"completed_at":9,"terminal":true}"#,
+            #"{"id":"aaaaaaaaaaaaaaaaaaaaaaaa","state":"running","event":"PermissionRequest","event_at":10,"category":"tool","terminal":false}"#,
+        ]
+        for item in malformedItems {
+            let json = "{\"version\":1,\"schema_version\":1,\"emitted_at\":20,\"active\":[\(item)],\"completed\":[]}".data(using: .utf8)!
+            XCTAssertThrowsError(try JSONDecoder.codexPet.decode(SessionActivitySnapshot.self, from: json), item)
+        }
+        let nonIdleTerminal = #"{"version":1,"schema_version":1,"emitted_at":20,"active":[],"completed":[{"id":"bbbbbbbbbbbbbbbbbbbbbbbb","state":"running","event":"SessionEnd","event_at":10,"terminal":true}]}"#.data(using: .utf8)!
+        XCTAssertThrowsError(
+            try JSONDecoder.codexPet.decode(SessionActivitySnapshot.self, from: nonIdleTerminal)
+        )
+    }
+
+    func testSessionActivityAcceptanceRejectsStaleFutureRollbackAndTimestampConflict() throws {
+        let freshness = try StateFreshnessPolicy(maximumAge: 10, maximumFutureSkew: 2)
+        let accepted = try SessionActivitySnapshot(emittedAt: 100)
+        let newer = try SessionActivitySnapshot(emittedAt: 101)
+        let rollback = try SessionActivitySnapshot(emittedAt: 99)
+        let stale = try SessionActivitySnapshot(emittedAt: 80)
+        let future = try SessionActivitySnapshot(emittedAt: 103)
+        let conflicting = try SessionActivitySnapshot(
+            emittedAt: 100,
+            completed: [
+                SessionActivityItem(
+                    id: String(repeating: "b", count: 24),
+                    state: .idle,
+                    event: .sessionEnd,
+                    eventAt: 100,
+                    terminal: true
+                )
+            ]
+        )
+
+        XCTAssertEqual(
+            SessionActivityAcceptancePolicy.decide(
+                lastAccepted: nil,
+                incoming: accepted,
+                now: 100,
+                freshnessPolicy: freshness
+            ),
+            .acceptInitial
+        )
+        XCTAssertEqual(
+            SessionActivityAcceptancePolicy.decide(lastAccepted: accepted, incoming: newer, now: 101, freshnessPolicy: freshness),
+            .acceptNewer
+        )
+        XCTAssertEqual(
+            SessionActivityAcceptancePolicy.decide(lastAccepted: accepted, incoming: rollback, now: 100, freshnessPolicy: freshness),
+            .rejectRollback
+        )
+        XCTAssertEqual(
+            SessionActivityAcceptancePolicy.decide(lastAccepted: accepted, incoming: stale, now: 100, freshnessPolicy: freshness),
+            .rejectStale
+        )
+        XCTAssertEqual(
+            SessionActivityAcceptancePolicy.decide(lastAccepted: accepted, incoming: future, now: 100, freshnessPolicy: freshness),
+            .rejectFutureSkew
+        )
+        XCTAssertEqual(
+            SessionActivityAcceptancePolicy.decide(lastAccepted: accepted, incoming: conflicting, now: 100, freshnessPolicy: freshness),
+            .rejectEqualTimestampConflict
+        )
+    }
+
     func testStateFreshnessUsesHeartbeatBudgetAndRejectsFutureSkew() throws {
         let policy = try StateFreshnessPolicy()
         XCTAssertEqual(policy.maximumAge, 150)

@@ -113,6 +113,92 @@ class HookHardeningTests(unittest.TestCase):
             record = json.loads(output.read_text(encoding="utf-8"))
             self.assertRegex(record["causal"]["current_turn"] or "", r"^(?:[0-9a-f]{24})?$")
 
+    def test_hook_writer_rejects_symlinked_state_directory_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target"
+            target.mkdir(mode=0o755)
+            os.chmod(target, 0o755)
+            target_record = target / (hook.session_key({"session_id": "session"}) + ".json")
+            target_record.write_text("keep\n", encoding="utf-8")
+            os.chmod(target_record, 0o644)
+            linked = root / "sessions"
+            linked.symlink_to(target, target_is_directory=True)
+
+            with self.assertRaises(OSError):
+                hook.write_event(
+                    {"session_id": "session", "hook_event_name": "Stop"},
+                    linked,
+                )
+
+            contents = target_record.read_text(encoding="utf-8")
+            directory_mode = stat.S_IMODE(target.stat().st_mode)
+            file_mode = stat.S_IMODE(target_record.stat().st_mode)
+
+        self.assertEqual(contents, "keep\n")
+        self.assertEqual(directory_mode, 0o755)
+        self.assertEqual(file_mode, 0o644)
+
+    def test_hook_writer_never_follows_symlinked_ancestor_when_creating_state_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target"
+            target.mkdir(mode=0o755)
+            linked_parent = root / "linked-parent"
+            linked_parent.symlink_to(target, target_is_directory=True)
+
+            with self.assertRaises(OSError):
+                hook.write_event(
+                    {"session_id": "session", "hook_event_name": "Stop"},
+                    linked_parent / "sessions",
+                )
+
+            target_entries = list(target.iterdir())
+            target_mode = stat.S_IMODE(target.stat().st_mode)
+
+        self.assertEqual(target_entries, [])
+        self.assertEqual(target_mode, 0o755)
+
+    def test_hook_writer_parent_swap_stays_on_validated_directory_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sessions = root / "sessions"
+            sessions.mkdir()
+            old_sessions = root / "old-sessions"
+            destination_name = hook.session_key({"session_id": "session"}) + ".json"
+            real_read = hook._read_existing
+            swapped = False
+
+            def swap_after_read(directory_fd, name):
+                nonlocal swapped
+                result = real_read(directory_fd, name)
+                if not swapped:
+                    swapped = True
+                    sessions.rename(old_sessions)
+                    sessions.mkdir(mode=0o755)
+                    replacement = sessions / destination_name
+                    replacement.write_text("keep\n", encoding="utf-8")
+                    os.chmod(replacement, 0o644)
+                return result
+
+            with mock.patch.object(hook, "_read_existing", side_effect=swap_after_read):
+                hook.write_event(
+                    {"session_id": "session", "hook_event_name": "Stop"},
+                    sessions,
+                )
+
+            replacement = sessions / destination_name
+            replacement_contents = replacement.read_text(encoding="utf-8")
+            replacement_mode = stat.S_IMODE(replacement.stat().st_mode)
+            new_directory_mode = stat.S_IMODE(sessions.stat().st_mode)
+            published = json.loads((old_sessions / destination_name).read_text(encoding="utf-8"))
+
+        self.assertTrue(swapped)
+        self.assertEqual(replacement_contents, "keep\n")
+        self.assertEqual(replacement_mode, 0o644)
+        self.assertEqual(new_directory_mode, 0o755)
+        self.assertEqual(published["event"], "Stop")
+
     def test_causal_metadata_is_embedded_in_the_atomic_session_record(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state_dir = Path(temporary) / "sessions"
@@ -514,6 +600,102 @@ class HookHardeningTests(unittest.TestCase):
 
         self.assertEqual(record["event"], "Stop")
         self.assertTrue(record["terminal"])
+        self.assertEqual(record["rejections"], {"stale_event": 1})
+
+    def test_terminal_stop_blocks_non_revival_callback_from_different_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "sessions"
+            output = hook.write_event(
+                {
+                    "session_id": "session",
+                    "turn_id": "turn-one",
+                    "hook_event_name": "Stop",
+                },
+                state_dir,
+            )
+            hook.write_event(
+                {
+                    "session_id": "session",
+                    "turn_id": "turn-two",
+                    "hook_event_name": "PostToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {},
+                    "tool_use_id": "tool-two",
+                },
+                state_dir,
+            )
+            record = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(record["event"], "Stop")
+        self.assertTrue(record["terminal"])
+        self.assertEqual(record["rejections"], {"stale_event": 1})
+
+    def test_legacy_v1_terminal_blocks_stale_tool_callback_with_tool_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            hook.time, "time", return_value=100.0
+        ):
+            state_dir = Path(temporary) / "sessions"
+            state_dir.mkdir()
+            destination = state_dir / (hook.session_key({"session_id": "session"}) + ".json")
+            destination.write_text(
+                json.dumps({
+                    "version": 1,
+                    "state": "idle",
+                    "event": "Stop",
+                    "updated_at": 50.0,
+                }),
+                encoding="utf-8",
+            )
+
+            hook.write_event(
+                {
+                    "session_id": "session",
+                    "turn_id": "turn",
+                    "hook_event_name": "PostToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {},
+                    "tool_use_id": "tool",
+                },
+                state_dir,
+            )
+            record = json.loads(destination.read_text(encoding="utf-8"))
+
+        self.assertEqual(record["event"], "Stop")
+        self.assertTrue(record["terminal"])
+        self.assertEqual(record["completed_at"], 50.0)
+        self.assertEqual(record["rejections"], {"stale_event": 1})
+
+    def test_legacy_v1_terminal_blocks_stale_tool_callback_without_tool_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            hook.time, "time", return_value=100.0
+        ):
+            state_dir = Path(temporary) / "sessions"
+            state_dir.mkdir()
+            destination = state_dir / (hook.session_key({"session_id": "session"}) + ".json")
+            destination.write_text(
+                json.dumps({
+                    "version": 1,
+                    "state": "idle",
+                    "event": "SessionEnd",
+                    "updated_at": 60.0,
+                }),
+                encoding="utf-8",
+            )
+
+            hook.write_event(
+                {
+                    "session_id": "session",
+                    "hook_event_name": "PostToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {},
+                },
+                state_dir,
+            )
+            record = json.loads(destination.read_text(encoding="utf-8"))
+
+        self.assertEqual(record["event"], "SessionEnd")
+        self.assertTrue(record["terminal"])
+        self.assertEqual(record["completed_at"], 60.0)
         self.assertEqual(record["rejections"], {"stale_event": 1})
 
     def test_stop_without_timestamp_ignores_late_tool_but_new_prompt_revives(self) -> None:
