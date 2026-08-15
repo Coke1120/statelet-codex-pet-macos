@@ -486,6 +486,12 @@ Lifecycle priority is `waiting > review > running > idle`. The player reads:
 ~/Library/Application Support/Statelet/runtime/current_state.json
 ```
 
+The activity rail reads the bounded, owner-only companion sidecar:
+
+```text
+~/Library/Application Support/Statelet/sessions/activity-v1.json
+```
+
 The complete serial-free state path is:
 
 ```text
@@ -493,18 +499,24 @@ Codex lifecycle hooks
   -> per-session JSON in Application Support
   -> board-independent priority aggregator
   -> runtime/current_state.json
-  -> Swift file watcher
-  -> requested lifecycle badge and animation
+  -> sessions/activity-v1.json + Swift file watchers
+  -> requested lifecycle badge, activity rail, and animation
 ```
 
 Each hook invocation writes one privacy-safe record named with the first 24
 hexadecimal characters of the session ID's SHA-256 hash. The versioned record
-contains only mapped lifecycle state, event name, authoritative event time,
-local receipt time, terminal status, bounded rejection counts, and bounded
-24-hex hashes of turn/tool correlation IDs with closed event phases. It excludes
+contains only mapped lifecycle state, event name, safe event category,
+authoritative event time, bounded start/completion timestamps, local receipt
+time, terminal status, bounded rejection counts, and bounded 24-hex hashes of
+turn/tool correlation IDs with closed event phases. It excludes
 prompts, tool output, transcript paths, and working directories.
 Correlation metadata stays inside the owner-only session record and is never
 forwarded into `current_state.json` or diagnostics.
+The activity sidecar exposes only bounded active/terminal summaries keyed by
+the same opaque filename hash, with safe event categories and start/event/
+completion timestamps. Completed items remain unread until the user explicitly
+acknowledges them in the rail; no prompt, transcript, repository, media, voice,
+or credential data is included.
 `UserPromptSubmit` and subagent events map to Running; `PermissionRequest` maps
 to Waiting; compact events map to Review; and tool events map to Review for
 test, lint, typecheck, or review work and Running otherwise. `SessionStart`,

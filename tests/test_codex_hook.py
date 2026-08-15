@@ -66,6 +66,29 @@ class HookHardeningTests(unittest.TestCase):
         self.assertEqual(record["event"], "unknown")
         self.assertNotIn(private_event, json.dumps(record))
 
+    def test_session_activity_metadata_preserves_start_and_terminal_times(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            hook.time, "time", side_effect=[100.0, 110.0, 120.0]
+        ):
+            state_dir = Path(temporary)
+            hook.write_event(
+                {"session_id": "session", "hook_event_name": "SessionStart"},
+                state_dir,
+            )
+            hook.write_event(
+                {"session_id": "session", "hook_event_name": "UserPromptSubmit"},
+                state_dir,
+            )
+            output = hook.write_event(
+                {"session_id": "session", "hook_event_name": "Stop"},
+                state_dir,
+            )
+            record = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(record["started_at"], 100.0)
+        self.assertEqual(record["completed_at"], 120.0)
+        self.assertEqual(record["category"], "codex")
+
     def test_session_identity_aliases_are_hashed_and_distinct(self) -> None:
         aliases = ("session_id", "thread_id", "conversation_id", "sessionId")
         keys = {

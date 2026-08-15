@@ -10,6 +10,7 @@ import UniformTypeIdentifiers
 private struct LaunchOptions {
     var mediaMapURL: URL
     var stateURL: URL
+    var sessionActivityURL: URL
     var forcedState: PetState?
     var clickThroughOverride: Bool?
     var alwaysOnTopOverride: Bool?
@@ -23,9 +24,11 @@ private struct LaunchOptions {
             )
         let defaultMap = support.appendingPathComponent("media/media-map.json")
         let defaultState = support.appendingPathComponent("runtime/current_state.json")
+        let defaultSessionActivity = support.appendingPathComponent("sessions/activity-v1.json")
         var options = LaunchOptions(
             mediaMapURL: defaultMap,
             stateURL: defaultState,
+            sessionActivityURL: defaultSessionActivity,
             forcedState: nil,
             clickThroughOverride: nil,
             alwaysOnTopOverride: nil,
@@ -40,6 +43,12 @@ private struct LaunchOptions {
                 guard index + 1 < arguments.count else { break }
                 let url = URL(fileURLWithPath: arguments[index + 1]).standardizedFileURL
                 if argument == "--media-map" { options.mediaMapURL = url } else { options.stateURL = url }
+                index += 1
+            case "--session-activity":
+                guard index + 1 < arguments.count else { break }
+                options.sessionActivityURL = URL(
+                    fileURLWithPath: arguments[index + 1]
+                ).standardizedFileURL
                 index += 1
             case "--force-state":
                 guard index + 1 < arguments.count else { break }
@@ -459,6 +468,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private static let portableCopyTimeoutSeconds: TimeInterval = 120
     private static let portableValidationTimeoutSeconds: TimeInterval = 30
     private static let transitionAttestationTimeoutSeconds: TimeInterval = 20
+    private static let sessionActivityAcknowledgementKey = "Statelet.sessionActivityAcknowledgements.v1"
+    private static let sessionActivityPanelSize = NSSize(width: 230, height: 150)
+    private static let sessionActivityMaximumAcknowledgements = 128
 
     private let logger = Logger(subsystem: StateletIdentity.bundleIdentifier, category: "app")
     private let freshnessPolicy = StateFreshnessPolicy.production
@@ -478,10 +490,14 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         qos: .utility
     )
     private let lifecycleStateReader = LifecycleStateFileReader()
+    private let sessionActivityReader = SessionActivityFileReader()
     private var characterCountRefreshGeneration: UInt64 = 0
     private var panel: PetPanel!
     private var player: PetPlayerController!
+    private var sessionActivityPanel: SessionActivityPanel!
+    private var sessionActivityView: SessionActivityView!
     private var stateWatcher: StateDirectoryWatcher!
+    private var sessionActivityWatcher: StateDirectoryWatcher!
     private var mapWatcher: StateDirectoryWatcher!
     private var characterLibraryWatcher: StateDirectoryWatcher!
     private var globalTransitionLibraryWatcher: StateDirectoryWatcher!
@@ -501,6 +517,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var lastPublicationRejectionReason: String?
     private var publicationRejectionReasons: [String: Int] = [:]
     private var transientStateReadRetry: DispatchWorkItem?
+    private var sessionActivityReadRetry: DispatchWorkItem?
+    private var sessionActivitySnapshot: SessionActivitySnapshot?
+    private var acknowledgedSessionActivityIDs: Set<String> = []
     private var lastLifecycleStateForSelection: PetState?
     private var lastPresentedState: PetState?
     private var lastCommittedLifecycleState: PetState?
@@ -590,6 +609,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     func applicationDidFinishLaunching(_ notification: Notification) {
         conversionProfile = AlphaConversionProfile.restored()
         options = LaunchOptions.parse(arguments: CommandLine.arguments)
+        loadSessionActivityAcknowledgements()
         do {
             try StateletUpdateInstaller.reconcilePendingTransaction()
         } catch {
@@ -674,10 +694,34 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         player.view.onTemporaryStateSelection = { [weak self] state in
             self?.selectTemporaryState(state, reason: "pet_button")
         }
+        sessionActivityView = SessionActivityView(
+            frame: NSRect(origin: .zero, size: Self.sessionActivityPanelSize)
+        )
+        sessionActivityView.onAcknowledge = { [weak self] id in
+            self?.acknowledgeSessionActivity(id)
+        }
+        sessionActivityView.onExpand = { [weak self] in
+            self?.expandSessionActivityPanel()
+        }
+        sessionActivityPanel = SessionActivityPanel(
+            contentRect: SessionActivityPanel.anchoredFrame(
+                beside: panel.frame,
+                contentSize: Self.sessionActivityPanelSize,
+                visibleFrame: NSScreen.main?.visibleFrame ?? panel.frame
+            ),
+            alwaysOnTop: effectiveAlwaysOnTop,
+            fullScreenAuxiliary: configuredWindow.fullScreenAuxiliary
+        )
+        sessionActivityPanel.contentView = sessionActivityView
+        sessionActivityPanel.ignoresMouseEvents = clickThrough
+        sessionActivityPanel.orderFront(nil)
+        refreshSessionActivityPresentation()
         reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         player.setReduceMotion(reduceMotion)
         clickThrough = options.clickThroughOverride ?? configuredWindow.clickThrough
         panel.ignoresMouseEvents = clickThrough
+        sessionActivityPanel.ignoresMouseEvents = clickThrough
+        positionSessionActivityPanel()
         if effectiveAlwaysOnTop {
             panel.orderFrontRegardless()
         } else {
@@ -723,6 +767,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             }
             handleGlobalTransitionLibraryReloadRequest()
             readState(from: options.stateURL)
+            readSessionActivity(from: options.sessionActivityURL)
             installHealthCheckTimer()
         }
         if options.openSettings {
@@ -750,10 +795,13 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     func applicationWillTerminate(_ notification: Notification) {
         transientStateReadRetry?.cancel()
         transientStateReadRetry = nil
+        sessionActivityReadRetry?.cancel()
+        sessionActivityReadRetry = nil
         pendingLifecycleTransitionAttestationTask?.cancel()
         pendingLifecycleTransitionAttestationTask = nil
         pendingLifecycleTransitionAttestation = nil
         stateWatcher?.stop()
+        sessionActivityWatcher?.stop()
         mapWatcher?.stop()
         characterLibraryWatcher?.stop()
         globalTransitionLibraryWatcher?.stop()
@@ -788,8 +836,14 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
-    func windowDidMove(_ notification: Notification) { schedulePositionSave() }
-    func windowDidResize(_ notification: Notification) { schedulePositionSave() }
+    func windowDidMove(_ notification: Notification) {
+        schedulePositionSave()
+        positionSessionActivityPanel()
+    }
+    func windowDidResize(_ notification: Notification) {
+        schedulePositionSave()
+        positionSessionActivityPanel()
+    }
     func windowDidChangeOcclusionState(_ notification: Notification) {
         updateWindowOcclusionSuspension()
     }
@@ -802,6 +856,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     @objc private func screenParametersChanged() {
         guard let panel else { return }
         panel.setFrame(positionStore.clampedFrame(panel.frame), display: false)
+        positionSessionActivityPanel()
         savePanelFrame()
     }
 
@@ -848,6 +903,10 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         guard options.forcedState == nil else { return }
         stateWatcher = StateDirectoryWatcher(fileURL: options.stateURL)
         stateWatcher.start(emitInitial: false) { [weak self] url in self?.readState(from: url) }
+        sessionActivityWatcher = StateDirectoryWatcher(fileURL: options.sessionActivityURL)
+        sessionActivityWatcher.start(emitInitial: false) { [weak self] url in
+            self?.readSessionActivity(from: url)
+        }
         installMapWatcher()
         characterLibraryWatcher = StateDirectoryWatcher(fileURL: characterLibraryStorage.catalogURL)
         characterLibraryWatcher.start(emitInitial: false) { [weak self] _ in
@@ -885,6 +944,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             self.handleCharacterLibraryReloadRequest()
             self.handleGlobalTransitionLibraryReloadRequest()
             self.readState(from: self.options.stateURL)
+            self.readSessionActivity(from: self.options.sessionActivityURL)
         }
         healthCheckTimer = timer
         timer.resume()
@@ -1102,10 +1162,17 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         panel.setFrame(positionStore.clampedFrame(resized), display: true)
         clickThrough = options.clickThroughOverride ?? mediaMap.window.clickThrough
         panel.ignoresMouseEvents = clickThrough
+        sessionActivityPanel?.ignoresMouseEvents = clickThrough
         panel.apply(
             alwaysOnTop: options.alwaysOnTopOverride ?? mediaMap.window.alwaysOnTop,
             fullScreenAuxiliary: mediaMap.window.fullScreenAuxiliary
         )
+        sessionActivityPanel?.apply(
+            alwaysOnTop: effectiveAlwaysOnTop,
+            fullScreenAuxiliary: mediaMap.window.fullScreenAuxiliary
+        )
+        positionSessionActivityPanel()
+        refreshSessionActivityPresentation()
         player?.applyAppearance(mediaMap.window.appearance)
     }
 
@@ -1117,6 +1184,150 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         lifecycleStateReader.read(url) { [weak self] result in
             self?.applyLifecycleStateReadResult(result, from: url, retryAttempt: retryAttempt)
         }
+    }
+
+    private func readSessionActivity(from url: URL, retryAttempt: Int = 0) {
+        if retryAttempt == 0 {
+            sessionActivityReadRetry?.cancel()
+            sessionActivityReadRetry = nil
+        }
+        sessionActivityReader.read(url) { [weak self] result in
+            self?.applySessionActivityReadResult(
+                result,
+                from: url,
+                retryAttempt: retryAttempt
+            )
+        }
+    }
+
+    private func applySessionActivityReadResult(
+        _ result: SessionActivityReadResult,
+        from url: URL,
+        retryAttempt: Int
+    ) {
+        switch result {
+        case let .snapshot(snapshot):
+            sessionActivityReadRetry?.cancel()
+            sessionActivityReadRetry = nil
+            sessionActivitySnapshot = snapshot
+            pruneAcknowledgedSessionActivityIDs()
+            refreshSessionActivityPresentation()
+        case .missing, .corrupt:
+            guard retryAttempt < 2 else {
+                sessionActivitySnapshot = nil
+                refreshSessionActivityPresentation()
+                return
+            }
+            sessionActivityReadRetry?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                self?.readSessionActivity(from: url, retryAttempt: retryAttempt + 1)
+            }
+            sessionActivityReadRetry = work
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + .milliseconds(100 * (retryAttempt + 1)),
+                execute: work
+            )
+        }
+    }
+
+    private func loadSessionActivityAcknowledgements() {
+        let values = UserDefaults.standard.array(
+            forKey: Self.sessionActivityAcknowledgementKey
+        ) as? [String] ?? []
+        acknowledgedSessionActivityIDs = Set(
+            values.filter { $0.count == SessionActivityItem.maximumIdentifierLength }
+        )
+    }
+
+    private func persistSessionActivityAcknowledgements() {
+        let values = acknowledgedSessionActivityIDs
+            .sorted()
+            .suffix(Self.sessionActivityMaximumAcknowledgements)
+        UserDefaults.standard.set(
+            Array(values),
+            forKey: Self.sessionActivityAcknowledgementKey
+        )
+    }
+
+    private func pruneAcknowledgedSessionActivityIDs() {
+        let activeIDs = Set((sessionActivitySnapshot?.active ?? []).map(\.id))
+        let knownIDs = activeIDs.union(
+            Set((sessionActivitySnapshot?.completed ?? []).map(\.id))
+        )
+        var pruned = acknowledgedSessionActivityIDs.intersection(knownIDs)
+        pruned.subtract(activeIDs)
+        guard pruned != acknowledgedSessionActivityIDs else { return }
+        acknowledgedSessionActivityIDs = pruned
+        persistSessionActivityAcknowledgements()
+    }
+
+    private func acknowledgeSessionActivity(_ id: String) {
+        guard sessionActivitySnapshot?.completed.contains(where: { $0.id == id }) == true else {
+            return
+        }
+        acknowledgedSessionActivityIDs.insert(id)
+        persistSessionActivityAcknowledgements()
+        refreshSessionActivityPresentation()
+    }
+
+    private func refreshSessionActivityPresentation() {
+        guard let sessionActivityView, let sessionActivityPanel else { return }
+        sessionActivityView.update(
+            snapshot: sessionActivitySnapshot,
+            acknowledgedIDs: acknowledgedSessionActivityIDs
+        )
+        if sessionActivityView.isHidden {
+            sessionActivityPanel.orderOut(nil)
+        } else {
+            sessionActivityPanel.apply(
+                alwaysOnTop: effectiveAlwaysOnTop,
+                fullScreenAuxiliary: mediaMap.window.fullScreenAuxiliary
+            )
+            sessionActivityPanel.ignoresMouseEvents = clickThrough
+            positionSessionActivityPanel()
+            if effectiveAlwaysOnTop {
+                sessionActivityPanel.orderFrontRegardless()
+            } else {
+                sessionActivityPanel.orderFront(nil)
+            }
+        }
+    }
+
+    private func positionSessionActivityPanel() {
+        guard let panel, let sessionActivityPanel, let sessionActivityView,
+              !sessionActivityView.isHidden else { return }
+        let visibleFrame = panel.screen?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? panel.frame
+        let fittingSize = sessionActivityView.fittingSize
+        let size = NSSize(
+            width: max(Self.sessionActivityPanelSize.width, fittingSize.width),
+            height: max(Self.sessionActivityPanelSize.height, fittingSize.height)
+        )
+        let frame = SessionActivityPanel.anchoredFrame(
+            beside: panel.frame,
+            contentSize: size,
+            visibleFrame: visibleFrame
+        )
+        sessionActivityPanel.setFrame(frame, display: false)
+    }
+
+    private func expandSessionActivityPanel() {
+        guard let panel, let sessionActivityPanel, let sessionActivityView else { return }
+        let fittingSize = sessionActivityView.fittingSize
+        let size = NSSize(
+            width: max(Self.sessionActivityPanelSize.width, fittingSize.width),
+            height: max(Self.sessionActivityPanelSize.height, fittingSize.height)
+        )
+        let visibleFrame = panel.screen?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? panel.frame
+        let frame = SessionActivityPanel.anchoredFrame(
+            beside: panel.frame,
+            contentSize: size,
+            visibleFrame: visibleFrame
+        )
+        sessionActivityPanel.setFrame(frame, display: true)
     }
 
     private func applyLifecycleStateReadResult(
@@ -2445,6 +2656,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                     guard let self else { return }
                     self.clickThrough = value
                     self.panel.ignoresMouseEvents = value
+                    self.sessionActivityPanel?.ignoresMouseEvents = value
                     self.updateStatusMenu()
                     self.refreshSettings()
                 },
@@ -5932,6 +6144,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             options.clickThroughOverride = nil
             clickThrough = update.clickThrough
             panel.ignoresMouseEvents = clickThrough
+            sessionActivityPanel?.ignoresMouseEvents = clickThrough
             applyPublishedMediaMap(updated, refreshPlayback: false)
         } catch {
             presentSettingsError("The window setting could not be saved.")

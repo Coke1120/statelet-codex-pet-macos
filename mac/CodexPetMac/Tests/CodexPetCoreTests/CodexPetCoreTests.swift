@@ -337,6 +337,67 @@ final class CodexPetCoreTests: XCTestCase {
         XCTAssertNil(decoded.sourceUpdatedAt)
     }
 
+    func testSessionActivitySnapshotDecodesBoundedActiveAndCompletedGroups() throws {
+        let json = """
+        {
+          "version": 1,
+          "schema_version": 1,
+          "emitted_at": 1710000000.5,
+          "active": [
+            {"id":"aaaaaaaaaaaaaaaaaaaaaaaa","state":"running","event":"UserPromptSubmit","event_at":1710000000.0,"terminal":false}
+          ],
+          "completed": [
+            {"id":"bbbbbbbbbbbbbbbbbbbbbbbb","state":"idle","event":"SessionEnd","event_at":1709999999.0,"terminal":true}
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let decoded = try JSONDecoder.codexPet.decode(SessionActivitySnapshot.self, from: json)
+        XCTAssertEqual(decoded.active.count, 1)
+        XCTAssertEqual(decoded.active[0].state, .running)
+        XCTAssertEqual(decoded.completed.count, 1)
+        XCTAssertTrue(decoded.completed[0].terminal)
+    }
+
+    func testSessionActivitySnapshotRejectsInvalidIdentifiersDuplicatesAndGroups() throws {
+        let invalidID = try? SessionActivityItem(
+            id: "not-a-session-id",
+            state: .running,
+            event: .userPromptSubmit,
+            eventAt: 1,
+            terminal: false
+        )
+        XCTAssertNil(invalidID)
+
+        let active = try SessionActivityItem(
+            id: String(repeating: "a", count: 24),
+            state: .running,
+            event: .userPromptSubmit,
+            eventAt: 1,
+            terminal: false
+        )
+        let duplicate = try SessionActivityItem(
+            id: String(repeating: "a", count: 24),
+            state: .review,
+            event: .preCompact,
+            eventAt: 2,
+            terminal: false
+        )
+        XCTAssertThrowsError(
+            try SessionActivitySnapshot(
+                emittedAt: 3,
+                active: [active, duplicate]
+            )
+        )
+        XCTAssertThrowsError(
+            try SessionActivitySnapshot(
+                emittedAt: 3,
+                active: [active],
+                completed: [active]
+            )
+        )
+    }
+
     func testStateFreshnessUsesHeartbeatBudgetAndRejectsFutureSkew() throws {
         let policy = try StateFreshnessPolicy()
         XCTAssertEqual(policy.maximumAge, 150)

@@ -250,6 +250,88 @@ class LifecycleStateTests(unittest.TestCase):
         self.assertNotIn("a" * 24, json.dumps(snapshot))
         self.assertNotIn("b" * 24, json.dumps(snapshot))
 
+    def test_session_activity_orders_groups_and_retains_terminal_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            write_v2_record(
+                record_path(directory, "a"),
+                "running",
+                "UserPromptSubmit",
+                130.0,
+            )
+            write_v2_record(
+                record_path(directory, "b"),
+                "waiting",
+                "PermissionRequest",
+                120.0,
+            )
+            write_v2_record(
+                record_path(directory, "c"),
+                "idle",
+                "SessionEnd",
+                100.0,
+                terminal=True,
+            )
+
+            activity = state.read_session_activity(
+                directory,
+                now=130.0 + state.DEFAULT_ACTIVE_TTL + 1.0,
+                active_ttl=state.DEFAULT_ACTIVE_TTL,
+            )
+            aggregate = state.read_session_snapshot(
+                directory,
+                now=130.0 + state.DEFAULT_ACTIVE_TTL + 1.0,
+                active_ttl=state.DEFAULT_ACTIVE_TTL,
+            )
+
+        self.assertEqual([item["id"] for item in activity["active"]], [])
+        self.assertEqual([item["id"] for item in activity["completed"]], ["c" * 24])
+        self.assertTrue(aggregate["active"] == [])
+        self.assertTrue(activity["completed"][0]["terminal"])
+        self.assertEqual(activity["completed"][0]["started_at"], 100.0)
+        self.assertEqual(activity["completed"][0]["completed_at"], 100.0)
+        self.assertEqual(activity["completed"][0]["category"], "codex")
+
+    def test_session_activity_deterministically_prioritizes_active_states(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            write_v2_record(record_path(directory, "a"), "running", "UserPromptSubmit", 108.0)
+            write_v2_record(record_path(directory, "b"), "waiting", "PermissionRequest", 101.0)
+            write_v2_record(record_path(directory, "c"), "review", "PreCompact", 109.0)
+
+            activity = state.read_session_activity(directory, now=110.0)
+
+        self.assertEqual(
+            [item["id"] for item in activity["active"]],
+            ["b" * 24, "c" * 24, "a" * 24],
+        )
+        self.assertEqual(activity["active"][0]["category"], "approval")
+        self.assertNotIn("prompt", json.dumps(activity))
+
+    def test_session_activity_prunes_terminal_overflow_but_not_active_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            for index in range(66):
+                write_v2_record(
+                    directory / f"{index:024x}.json",
+                    "idle",
+                    "SessionEnd",
+                    100.0 + index,
+                    terminal=True,
+                )
+            write_v2_record(
+                record_path(directory, "f"),
+                "running",
+                "UserPromptSubmit",
+                100.0,
+            )
+
+            activity = state.read_session_activity(directory, now=165.0)
+            self.assertEqual(len(activity["completed"]), state.MAX_ACTIVITY_ENTRIES)
+            self.assertFalse((directory / f"{0:024x}.json").exists())
+            self.assertFalse((directory / f"{1:024x}.json").exists())
+            self.assertTrue((directory / ("f" * 24 + ".json")).exists())
+
     def test_private_event_string_is_rejected_before_aggregation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -318,6 +400,66 @@ class LifecycleStateTests(unittest.TestCase):
 class PublisherTests(unittest.TestCase):
     def test_default_heartbeat_is_low_frequency(self) -> None:
         self.assertGreaterEqual(aggregator.DEFAULT_HEARTBEAT_INTERVAL, 60.0)
+
+    def test_atomic_write_session_activity_is_private_and_versioned(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "sessions" / state.SESSION_ACTIVITY_FILENAME
+            snapshot = {
+                "active": [
+                    {
+                        "id": "a" * 24,
+                        "state": "running",
+                        "event": "UserPromptSubmit",
+                        "event_at": 100.0,
+                        "started_at": 100.0,
+                        "completed_at": None,
+                        "category": "codex",
+                        "terminal": False,
+                    }
+                ],
+                "completed": [],
+            }
+            record = aggregator.atomic_write_session_activity(output, snapshot, 101.0)
+
+            self.assertEqual(record["version"], 1)
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8")), record)
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+            self.assertNotIn("/Users/", output.read_text(encoding="utf-8"))
+
+    def test_run_publishes_session_activity_sidecar_with_lifecycle_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "sessions"
+            output = Path(temporary) / "runtime" / "current_state.json"
+            state_dir.mkdir()
+            write_v2_record(
+                record_path(state_dir, "a"),
+                "running",
+                "UserPromptSubmit",
+                100.0,
+            )
+            clock = FakeClock(wall_time=100.0, monotonic_time=10.0)
+            aggregator.run(
+                state_dir,
+                output,
+                poll=0.25,
+                heartbeat=60.0,
+                active_ttl=900.0,
+                once=True,
+                print_state=False,
+                forced_state=None,
+                force_seconds=30.0,
+                should_stop=lambda: False,
+                waiter=ScriptedWaiter(clock),
+                wall_clock=clock.wall,
+                monotonic_clock=clock.monotonic,
+            )
+            activity_path = state_dir / state.SESSION_ACTIVITY_FILENAME
+            activity = json.loads(activity_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(activity["version"], 1)
+        self.assertEqual(activity["active"][0]["id"], "a" * 24)
+        self.assertEqual(activity["active"][0]["state"], "running")
+        self.assertEqual(activity["active"][0]["category"], "codex")
 
     def test_shared_current_state_fixture_matches_python_publisher(self) -> None:
         fixture_path = ROOT / "mac" / "contracts" / "current_state-v1.example.json"

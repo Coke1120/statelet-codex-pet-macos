@@ -146,6 +146,26 @@ final class StorageLifecycleHardeningTests: XCTestCase {
         XCTAssertEqual(LifecycleStateFileReader.load(oversized), .corrupt)
     }
 
+    func testSessionActivityReaderRejectsSymlinkAndOversizedFile() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let real = root.appendingPathComponent("activity.json")
+        let payload = """
+        {"version":1,"schema_version":1,"emitted_at":10,"active":[],"completed":[]}
+        """
+        try Data(payload.utf8).write(to: real)
+        let link = root.appendingPathComponent("activity-link.json")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: real)
+        XCTAssertEqual(SessionActivityFileReader.load(link), .corrupt)
+
+        let oversized = root.appendingPathComponent("activity-oversized.json")
+        XCTAssertTrue(FileManager.default.createFile(atPath: oversized.path, contents: nil))
+        let handle = try FileHandle(forWritingTo: oversized)
+        try handle.truncate(atOffset: SessionActivityFileReader.maximumBytes + 1)
+        try handle.close()
+        XCTAssertEqual(SessionActivityFileReader.load(oversized), .corrupt)
+    }
+
     func testLifecycleReaderOnlyDeliversNewestGeneration() {
         let firstStarted = expectation(description: "first started")
         let releaseFirst = DispatchSemaphore(value: 0)

@@ -28,7 +28,9 @@ try:
         VALID_STATES,
         aggregate_state_with_source,
         default_state_dir,
+        read_session_activity,
         read_session_snapshot,
+        SESSION_ACTIVITY_FILENAME,
     )
 except ModuleNotFoundError as error:
     if error.name != "statelet_state":
@@ -43,7 +45,9 @@ except ModuleNotFoundError as error:
         VALID_STATES,
         aggregate_state_with_source,
         default_state_dir,
+        read_session_activity,
         read_session_snapshot,
+        SESSION_ACTIVITY_FILENAME,
     )
 
 
@@ -193,6 +197,89 @@ def sanitize_rejection_diagnostics(
             ):
                 reasons[reason] = min(1_000_000, count)
     return {"count": min(1_000_000, sum(reasons.values())), "reasons": reasons}
+
+
+def atomic_write_session_activity(
+    output_path: Path,
+    snapshot: Dict[str, object],
+    emitted_at: float,
+) -> Dict[str, object]:
+    """Publish the bounded privacy-safe session activity sidecar."""
+    if not math.isfinite(emitted_at):
+        raise ValueError("activity emitted_at must be finite")
+    active = snapshot.get("active", [])
+    completed = snapshot.get("completed", [])
+    if not isinstance(active, list) or not isinstance(completed, list):
+        raise ValueError("activity groups must be lists")
+    record: Dict[str, object] = {
+        "version": 1,
+        "schema_version": 1,
+        "emitted_at": emitted_at,
+        "active": active,
+        "completed": completed,
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.parent.chmod(0o700)
+    fd, temporary = tempfile.mkstemp(
+        prefix=".session-activity-", suffix=".json", dir=str(output_path.parent)
+    )
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(record, handle, separators=(",", ":"), sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, output_path)
+        output_path.chmod(0o600)
+        directory_fd = os.open(output_path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+    return record
+
+
+class SessionActivityPublisher:
+    """Suppress unchanged activity sidecar writes until the heartbeat."""
+
+    def __init__(self, output_path: Path, heartbeat: float) -> None:
+        self.output_path = output_path
+        self.heartbeat = heartbeat
+        self.last_fingerprint: Optional[str] = None
+        self.next_heartbeat_at = 0.0
+
+    def publish_if_due(
+        self,
+        snapshot: Dict[str, object],
+        wall_time: float,
+        monotonic_time: float,
+    ) -> Optional[Dict[str, object]]:
+        fingerprint = json.dumps(
+            {
+                "active": snapshot.get("active", []),
+                "completed": snapshot.get("completed", []),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if (
+            fingerprint == self.last_fingerprint
+            and monotonic_time < self.next_heartbeat_at
+        ):
+            return None
+        record = atomic_write_session_activity(self.output_path, snapshot, wall_time)
+        self.last_fingerprint = fingerprint
+        self.next_heartbeat_at = monotonic_time + self.heartbeat
+        return record
 
 
 class StatePublisher:
@@ -704,6 +791,10 @@ def run(
     monotonic_clock: Callable[[], float] = time.monotonic,
 ) -> int:
     publisher = StatePublisher(output_path, heartbeat)
+    activity_publisher = SessionActivityPublisher(
+        state_dir / SESSION_ACTIVITY_FILENAME,
+        heartbeat,
+    )
     force_started_at = wall_clock() if forced_state is not None else None
     force_deadline = (
         monotonic_clock() + force_seconds
@@ -717,6 +808,16 @@ def run(
             active_waiter.prepare()
             wall_time = wall_clock()
             monotonic_time = monotonic_clock()
+            activity_snapshot = read_session_activity(
+                state_dir,
+                now=wall_time,
+                active_ttl=active_ttl,
+            )
+            activity_publisher.publish_if_due(
+                activity_snapshot,
+                wall_time,
+                monotonic_time,
+            )
             forced = force_is_active(
                 forced_state, once, force_deadline, monotonic_time
             )

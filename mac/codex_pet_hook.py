@@ -10,6 +10,7 @@ transcript paths, or working directories.
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -47,6 +48,29 @@ REVIEW_PATTERN = re.compile(
     r"(?![a-z0-9_])"
 )
 HASH_PATTERN = re.compile(r"^[0-9a-f]{24}$")
+
+
+def event_category(event: str) -> str:
+    """Return a safe, bounded client/category label derived from the event."""
+    if event == "PermissionRequest":
+        return "approval"
+    if event in ("PreToolUse", "PostToolUse"):
+        return "tool"
+    if event in ("PreCompact", "PostCompact"):
+        return "review"
+    if event in ("SubagentStart", "SubagentStop"):
+        return "subagent"
+    if event in ("SessionStart", "SessionEnd", "UserPromptSubmit", "Stop"):
+        return "codex"
+    return "activity"
+
+
+def _finite_timestamp(value: Any) -> Optional[float]:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
 
 
 def default_state_dir() -> Path:
@@ -312,6 +336,9 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
         existing = _read_existing(destination)
         causal = _read_causal_state(existing.get("causal") if existing else None)
         existing_at = None
+        existing_started_at = None
+        existing_completed_at = None
+        existing_category = None
         existing_valid = (
             existing is not None
             and existing.get("version") in (1, 2)
@@ -323,6 +350,20 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
                 existing_at = float(existing.get("event_at", existing.get("updated_at")))
             except (TypeError, ValueError):
                 existing_at = None
+            existing_started_at = _finite_timestamp(
+                existing.get("started_at", existing_at)
+            )
+            existing_completed_at = _finite_timestamp(
+                existing.get(
+                    "completed_at",
+                    existing_at if existing.get("terminal") is True else None,
+                )
+            )
+            existing_category = existing.get("category")
+            if not isinstance(existing_category, str) or existing_category not in {
+                "codex", "approval", "tool", "review", "subagent", "activity"
+            }:
+                existing_category = None
         incoming_turn = _private_key_hash(payload, "turn_id")
         causal_turn = causal.get("current_turn")
         terminal_late_callback = (
@@ -361,6 +402,11 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
                             "terminal", existing.get("event") in TERMINAL_EVENTS
                         )
                     ),
+                    "started_at": existing_started_at or existing_at or received_at,
+                    "completed_at": existing_completed_at
+                    if existing.get("terminal") is True
+                    else None,
+                    "category": existing_category or event_category(existing["event"]),
                     "rejections": rejections,
                     "causal": causal,
                 }
@@ -373,6 +419,9 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
                     "event_at": received_at,
                     "updated_at": received_at,
                     "terminal": False,
+                    "started_at": received_at,
+                    "completed_at": None,
+                    "category": event_category("unknown"),
                     "rejections": rejections,
                     "causal": causal,
                 }
@@ -388,6 +437,22 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
             "event_at": received_at,
             "updated_at": received_at,
             "terminal": accepted_event in TERMINAL_EVENTS,
+            "started_at": (
+                received_at
+                if (
+                    accepted_event == "SessionStart"
+                    or not existing_valid
+                    or (
+                        accepted_event == "UserPromptSubmit"
+                        and existing.get("terminal") is True
+                    )
+                )
+                else existing_started_at or existing_at or received_at
+            ),
+            "completed_at": (
+                received_at if accepted_event in TERMINAL_EVENTS else None
+            ),
+            "category": event_category(accepted_event),
             "rejections": {},
             "causal": proposed_causal,
         }
