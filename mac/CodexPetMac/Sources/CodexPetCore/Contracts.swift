@@ -797,9 +797,27 @@ public struct StateTransitionKey: Hashable, Codable, Sendable {
 }
 
 public enum LifecycleTransitionMediaPolicy {
-    /// Transition clips are decorative and must not conceal an authoritative
-    /// lifecycle destination for more than four seconds.
+    /// Preserve the existing portable transition contract. Runtime playback
+    /// may accelerate an accepted source so the decorative foreground does not
+    /// delay the authoritative destination for the source's full duration.
     public static let maximumDuration: TimeInterval = 4.0
+    public static let maximumPresentationDuration: TimeInterval = 1.5
+
+    public static func presentationPlaybackRate(
+        sourceDuration: TimeInterval,
+        requestedRate: Double
+    ) -> Double {
+        let safeRequestedRate = requestedRate.isFinite && requestedRate > 0
+            ? requestedRate
+            : 1.0
+        guard sourceDuration.isFinite, sourceDuration > 0 else {
+            return safeRequestedRate
+        }
+        return max(
+            safeRequestedRate,
+            sourceDuration / maximumPresentationDuration
+        )
+    }
 }
 
 public struct WindowConfiguration: Codable, Equatable, Sendable {

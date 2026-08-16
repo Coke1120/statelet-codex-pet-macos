@@ -11,7 +11,7 @@ transparent desktop presence. It runs without a development board, keeps its
 runtime data on the Mac, and uses AppKit and AVFoundation rather than a browser
 runtime.
 
-Statelet 1.8.1 (build 15) requires macOS 13 or newer. The public release remains
+Statelet 1.8.2 (build 16) requires macOS 13 or newer. The public release remains
 source-only: the build script creates an ad-hoc-signed app for personal local
 use, not a Developer ID-signed or notarized public binary.
 
@@ -209,12 +209,16 @@ verified transparent MOVs, then preview, replace, reorder, or remove individual
 variants. Character bundles include only that character's local transition
 playlists and assets; they never include or modify the Global library. A
 configured variant plays once before Statelet commits the destination
-animation; clips are limited to 4 seconds and must carry a current
+animation; source clips are limited to 4 seconds, are accelerated when needed
+to finish on screen within 1.5 seconds, and must carry a current
 alpha-validation report. During a real lifecycle handoff,
 Statelet retains the outgoing animation until the transition's first frame is
 display-ready, composites the transparent transition above it, and starts the
-destination animation below the foreground before the transition ends. The
-default overlap is deterministic: at most 350 ms, or half of a shorter clip.
+destination animation's hidden player below the foreground so it is ready for
+an atomic swap. For same-state clip-end rotation, the next clip starts
+pre-rolling as soon as the transition foreground is ready, but remains hidden;
+only one state animation is ever visible. The default overlap budget is
+deterministic: at most 350 ms, or half of a shorter distinct-state clip.
 This is layered alpha compositing, not an opacity cross-fade. Reduce Motion
 skips transition video and presents the destination's static fallback without
 clearing the current presentation first. Existing maps without a `transitions`
@@ -331,8 +335,8 @@ Statelet uses one canonical identity for new builds and installations:
 | Application Support | `~/Library/Application Support/Statelet` |
 | LaunchAgents | `com.coke1120.statelet.state-aggregator`, `com.coke1120.statelet.mac-player` |
 | Managed marker | `statelet-v2` |
-| App version | `1.8.1` |
-| Build number | `15` |
+| App version | `1.8.2` |
+| Build number | `16` |
 
 ## Uninstall
 

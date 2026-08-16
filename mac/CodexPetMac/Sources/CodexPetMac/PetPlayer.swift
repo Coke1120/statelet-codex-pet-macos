@@ -641,13 +641,9 @@ final class PetPlayerView: NSView {
         lifecycleTransitionPlayerLayer.isHidden = false
     }
 
-    func revealLifecycleDestination() {
-        destinationPlayerLayer.isHidden = false
-    }
-
-    /// Promotes the already-visible destination layer without removing it from
-    /// the hierarchy. The old base becomes the hidden standby for the next
-    /// handoff; z-order changes are committed without implicit animations.
+    /// Atomically promotes the display-ready hidden destination. The old base
+    /// becomes the hidden standby for the next handoff; z-order and visibility
+    /// changes are committed without implicit animations.
     func promoteLifecycleDestination() {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -970,7 +966,10 @@ final class PetPlayerController {
         var destinationDisplayReady = false
         var destinationDisplayReset = false
         var destinationStarted = false
-        var destinationVisible = false
+        // Readiness is tracked separately from visibility. The destination
+        // may preroll underneath the transition, but it remains hidden until
+        // the transition has ended so two state animations never composite.
+        var destinationReadyToReveal = false
         var destinationRetryCount = 0
         var transitionItemReady = false
         var transitionPrerollStarted = false
@@ -1557,7 +1556,6 @@ final class PetPlayerController {
         directTimeoutWorkItem?.cancel()
         directTimeoutWorkItem = nil
         clearDirectReplacementObservers()
-        view.revealLifecycleDestination()
         let outgoingPlayer = queuePlayer
         invalidateActiveTransition()
         queuePlayer = replacement.player
@@ -1677,7 +1675,7 @@ final class PetPlayerController {
             handoff.destinationItemReady = true
             activeLifecycleHandoff = handoff
             startLifecycleDestinationPrerollIfNeeded(item: item, transitionID: transitionID)
-            tryRevealLifecycleDestination(transitionID: transitionID)
+            tryMarkLifecycleDestinationReady(transitionID: transitionID)
         case .failed:
             retryLifecycleDestination(transitionID: transitionID)
         case .unknown:
@@ -1705,7 +1703,7 @@ final class PetPlayerController {
         guard handoff.destinationDisplayReset else { return }
         handoff.destinationDisplayReady = true
         activeLifecycleHandoff = handoff
-        tryRevealLifecycleDestination(transitionID: transitionID)
+        tryMarkLifecycleDestinationReady(transitionID: transitionID)
     }
 
     private func handleLifecycleTransitionItemStatus(
@@ -1741,7 +1739,8 @@ final class PetPlayerController {
         handoff.transitionPrerollStarted = true
         activeLifecycleHandoff = handoff
         let player = handoff.transitionPlayer
-        player.preroll(atRate: Float(handoff.transitionPlaybackRate)) { [weak self, weak item] ready in
+        let playbackRate = lifecycleTransitionPlaybackRate(for: handoff)
+        player.preroll(atRate: Float(playbackRate)) { [weak self, weak item] ready in
             guard let item else { return }
             DispatchQueue.main.async {
                 guard let self,
@@ -1789,7 +1788,7 @@ final class PetPlayerController {
                 active.destinationPrerollCompleted = true
                 self.activeLifecycleHandoff = active
                 self.startLifecycleDestinationPlaybackIfReady(transitionID: transitionID)
-                self.tryRevealLifecycleDestination(transitionID: transitionID)
+                self.tryMarkLifecycleDestinationReady(transitionID: transitionID)
             }
         }
     }
@@ -1831,10 +1830,18 @@ final class PetPlayerController {
         scheduleLifecyclePlaybackStallTimeout(transitionID: transitionID)
         if suspensionPolicy.reasons.isEmpty {
             handoff.transitionPlayer.playImmediately(
-                atRate: Float(max(handoff.transitionPlaybackRate, 0.01))
+                atRate: Float(lifecycleTransitionPlaybackRate(for: handoff))
             )
         }
-        scheduleLifecycleDestinationCue(transitionID: transitionID)
+        if handoff.source == handoff.destination {
+            // A same-state clip-end handoff starts after the outgoing queue has
+            // naturally ended. Start its replacement under the foreground as
+            // soon as the transition is visible, rather than holding the old
+            // clip's final frame until the final overlap window.
+            startLifecycleDestination(transitionID: transitionID)
+        } else {
+            scheduleLifecycleDestinationCue(transitionID: transitionID)
+        }
         logger.info("event=lifecycle_transition_first_frame transition_id=\(transitionID, privacy: .public)")
     }
 
@@ -1843,7 +1850,7 @@ final class PetPlayerController {
               handoff.id == transitionID else { return }
         removeLifecycleCueTimeObserver(from: handoff.transitionPlayer)
         let duration = handoff.transitionItem.duration.seconds
-        let transitionRate = max(handoff.transitionPlaybackRate, 0.01)
+        let transitionRate = lifecycleTransitionPlaybackRate(for: handoff)
         let playbackDuration = duration.isFinite && duration > 0
             ? duration / transitionRate
             : LayeredLifecycleHandoffPolicy.maximumOverlap
@@ -1864,7 +1871,7 @@ final class PetPlayerController {
         handoff.destinationStarted = true
         activeLifecycleHandoff = handoff
         startLifecycleDestinationPlaybackIfReady(transitionID: transitionID)
-        tryRevealLifecycleDestination(transitionID: transitionID)
+        tryMarkLifecycleDestinationReady(transitionID: transitionID)
         logger.info("event=lifecycle_destination_preroll_started transition_id=\(transitionID, privacy: .public)")
     }
 
@@ -1879,19 +1886,20 @@ final class PetPlayerController {
         )
     }
 
-    private func tryRevealLifecycleDestination(transitionID: UInt64) {
+    /// Marks the hidden destination ready for the atomic promotion. The
+    /// destination layer is not revealed while the foreground is active.
+    private func tryMarkLifecycleDestinationReady(transitionID: UInt64) {
         guard var handoff = activeLifecycleHandoff,
               handoff.id == transitionID,
               handoff.destinationStarted,
               handoff.destinationItemReady,
               handoff.destinationPrerollCompleted,
               handoff.destinationDisplayReady,
-              !handoff.destinationVisible,
+              !handoff.destinationReadyToReveal,
               suspensionPolicy.reasons.isEmpty else { return }
-        handoff.destinationVisible = true
+        handoff.destinationReadyToReveal = true
         activeLifecycleHandoff = handoff
-        view.revealLifecycleDestination()
-        logger.info("event=lifecycle_destination_first_frame transition_id=\(transitionID, privacy: .public)")
+        logger.info("event=lifecycle_destination_ready transition_id=\(transitionID, privacy: .public)")
         if handoff.transitionEnded {
             promoteLifecycleDestination(transitionID: transitionID)
         }
@@ -1904,9 +1912,11 @@ final class PetPlayerController {
         activeLifecycleHandoff = handoff
         lifecyclePlaybackStallTimeoutWorkItem?.cancel()
         lifecyclePlaybackStallTimeoutWorkItem = nil
-        view.lifecycleTransitionPlayerLayer.isHidden = true
+        // Keep the final transition frame in the foreground until the
+        // destination has a display-ready frame. Hiding it first exposes a
+        // frozen outgoing frame (or a blank layer) between the two commits.
         startLifecycleDestination(transitionID: transitionID)
-        if activeLifecycleHandoff?.destinationVisible == true {
+        if activeLifecycleHandoff?.destinationReadyToReveal == true {
             promoteLifecycleDestination(transitionID: transitionID)
         } else {
             scheduleLifecycleReadinessTimeout(transitionID: transitionID)
@@ -1916,7 +1926,7 @@ final class PetPlayerController {
     private func promoteLifecycleDestination(transitionID: UInt64) {
         guard let handoff = activeLifecycleHandoff,
               handoff.id == transitionID,
-              handoff.destinationVisible else { return }
+              handoff.destinationReadyToReveal else { return }
         let outgoingPlayer = queuePlayer
         invalidateActiveTransition()
         clearLifecycleHandoffObservers()
@@ -1972,18 +1982,18 @@ final class PetPlayerController {
         guard let handoffID = activeLifecycleHandoff?.id else { return }
         tryRevealLifecycleTransition(transitionID: handoffID)
         guard let handoff = activeLifecycleHandoff, handoff.id == handoffID else { return }
-        if !handoff.transitionVisible || (handoff.transitionEnded && !handoff.destinationVisible) {
+        if !handoff.transitionVisible || (handoff.transitionEnded && !handoff.destinationReadyToReveal) {
             scheduleLifecycleReadinessTimeout(transitionID: handoff.id)
         }
         if handoff.transitionVisible, !handoff.transitionEnded {
             scheduleLifecyclePlaybackStallTimeout(transitionID: handoff.id)
             handoff.transitionPlayer.playImmediately(
-                atRate: Float(max(handoff.transitionPlaybackRate, 0.01))
+                atRate: Float(lifecycleTransitionPlaybackRate(for: handoff))
             )
         }
         if handoff.destinationStarted {
             startLifecycleDestinationPlaybackIfReady(transitionID: handoff.id)
-            tryRevealLifecycleDestination(transitionID: handoff.id)
+            tryMarkLifecycleDestinationReady(transitionID: handoff.id)
         }
     }
 
@@ -1996,6 +2006,15 @@ final class PetPlayerController {
         // Keep the committed outgoing base visible and let the app retry the
         // next request-local playlist candidate before using direct fallback.
         cancelLifecycleHandoff(notifyFailure: true)
+    }
+
+    private func lifecycleTransitionPlaybackRate(
+        for handoff: ActiveLifecycleHandoff
+    ) -> Double {
+        LifecycleTransitionMediaPolicy.presentationPlaybackRate(
+            sourceDuration: handoff.transitionItem.duration.seconds,
+            requestedRate: handoff.transitionPlaybackRate
+        )
     }
 
     /// A destination decode failure gets one fresh item attempt on the hidden
@@ -2015,7 +2034,7 @@ final class PetPlayerController {
         handoff.destinationDisplayReady = false
         handoff.destinationDisplayReset = false
         handoff.destinationStarted = false
-        handoff.destinationVisible = false
+        handoff.destinationReadyToReveal = false
         handoff.destinationLooper = nil
         activeLifecycleHandoff = handoff
         lifecycleDestinationItemObservation = nil
@@ -2304,7 +2323,7 @@ final class PetPlayerController {
     private func handleLifecycleReadinessTimeout(transitionID: UInt64) {
         guard let handoff = activeLifecycleHandoff,
               handoff.id == transitionID,
-              !handoff.transitionVisible || (handoff.transitionEnded && !handoff.destinationVisible) else {
+              !handoff.transitionVisible || (handoff.transitionEnded && !handoff.destinationReadyToReveal) else {
             return
         }
         logger.error(

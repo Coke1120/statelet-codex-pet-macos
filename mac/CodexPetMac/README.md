@@ -4,7 +4,7 @@ Statelet is a personal-local Codex lifecycle companion for macOS 13 or newer.
 It is an AppKit accessory application: the transparent panel can be moved by dragging
 its body and resized from any border or corner without taking keyboard focus,
 AVFoundation owns exactly one decoder, and the menu-bar item keeps click-through
-recoverable. The current app version is 1.8.1 (build 15). New builds and
+recoverable. The current app version is 1.8.2 (build 16). New builds and
 installations use
 `Statelet.app`, bundle identifier `com.coke1120.Statelet`, `CFBundleName` and
 executable `Statelet`, Application Support under
@@ -161,7 +161,11 @@ variants, selection mode, default path, and in-memory cursor.
   unchanged.
 
 The chosen variant keeps the outgoing state visible until its first frame is
-ready, then starts the destination underneath before the foreground completes.
+ready, then pre-rolls the destination in a hidden lower player before the
+foreground completes.
+Same-state clip-end handoffs start the replacement as soon as the transition
+foreground is ready, but keep the replacement layer hidden until the atomic
+promotion. Only one state animation is visible at a time.
 If a variant is unreadable or fails runtime attestation/readiness, Statelet
 tries each other eligible variant once for that request before committing the
 newest destination directly. A superseding lifecycle change cancels obsolete

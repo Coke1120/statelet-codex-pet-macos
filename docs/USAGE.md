@@ -266,10 +266,11 @@ Use **Set** in the Default column to change the fixed/default path. Moving rows
 changes Sequential order. Preview plays that exact variant without changing
 the route cursor.
 
-A transition clip is decorative, must be no longer than 4 seconds, and must
-retain a working alpha channel backed by its current converter report. Reportless
-or visually opaque transition assets are rejected, including during character
-bundle import and export.
+A transition clip is decorative, may be no longer than 4 seconds, and must
+retain a working alpha channel backed by its current converter report. Runtime
+playback accelerates longer clips so the foreground finishes within 1.5
+seconds. Reportless or visually opaque transition assets are rejected,
+including during character bundle import and export.
 
 Large transition effects may temporarily cover most of the green screen. After
 earlier frames establish a stable background, Statelet accepts those occluded
@@ -285,9 +286,12 @@ refresh, state-playlist rotation, Next Clip, Play Once, transition preview, and
 Temporary State do not consume a transition selection. Statelet keeps A
 attached while it prepares the chosen transition and B. The transition becomes
 a foreground layer only after its first frame is display-ready. B then starts
-below that foreground before the transition ends; the default lead-in is the
-final 350 ms, or half of a shorter clip. When the foreground completes, only
-that layer is removed and the already running B animation continues.
+pre-rolling in a hidden lower player; the default lead-in budget is the final
+350 ms, or half of a shorter distinct-state clip. Same-state clip-end
+handoffs start B pre-rolling as soon as the foreground is ready, but keep B
+hidden. When the foreground completes, it remains in place until B is
+display-ready, then Statelet atomically swaps to B so two state animations are
+never visible together.
 
 If the selected variant is unreadable or fails runtime attestation/readiness,
 Statelet tries each other eligible variant for that request at most once, then

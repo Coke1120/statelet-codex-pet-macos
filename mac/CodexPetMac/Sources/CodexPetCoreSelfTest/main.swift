@@ -223,15 +223,47 @@ private func runSelfTest() throws {
         "destination did not pre-roll below the transition"
     )
     try require(
-        handoff.destinationBecameReady(id: 17) == .revealDestination(.running),
-        "ready destination was not revealed below the transition"
+        handoff.destinationBecameReady(id: 17) == .none,
+        "ready destination was revealed before the transition completed"
     )
+    try require(handoff.lowerLayer == .outgoing(.idle), "destination readiness exposed a second state layer")
     try require(handoff.transitionVisible, "destination pre-roll removed the transition early")
     try require(handoff.transitionFinished(id: 17) == .finish(.running), "handoff did not finish on destination")
     try require(handoff.preservesVisibleContent, "layered handoff exposed an empty presentation")
+    var lateDestination = LayeredLifecycleHandoff(id: 18, source: .running, destination: .running)
+    try require(lateDestination.transitionBecameReady(id: 18) == .revealTransition, "late handoff did not reveal transition")
+    try require(lateDestination.destinationPrerollCueReached(id: 18) == .startDestinationPreroll(.running), "late handoff did not start destination pre-roll")
+    try require(lateDestination.transitionFinished(id: 18) == .none, "late destination exposed an incomplete handoff")
+    try require(lateDestination.transitionVisible, "late destination removed the transition foreground")
+    try require(lateDestination.destinationBecameReady(id: 18) == .finish(.running), "late destination did not finish the handoff")
+    var failedAfterReady = LayeredLifecycleHandoff(id: 19, source: .idle, destination: .review)
+    try require(
+        failedAfterReady.transitionBecameReady(id: 19) == .revealTransition,
+        "failing handoff did not reveal transition"
+    )
+    try require(
+        failedAfterReady.destinationPrerollCueReached(id: 19) == .startDestinationPreroll(.review),
+        "failing handoff did not start destination pre-roll"
+    )
+    try require(
+        failedAfterReady.destinationBecameReady(id: 19) == .none,
+        "failing handoff revealed destination before transition failure"
+    )
+    try require(
+        failedAfterReady.transitionFailed(id: 19) == .finish(.review),
+        "ready destination did not finish after transition failure"
+    )
+    try require(
+        failedAfterReady.lowerLayer == .destination(.review),
+        "transition failure reported completion without promoting destination"
+    )
+    try require(
+        !failedAfterReady.transitionVisible,
+        "failed transition remained visible after destination promotion"
+    )
     try require(handoff.transitionFinished(id: 16) == .none, "stale handoff callback changed state")
     try require(
-        abs(LayeredLifecycleHandoffPolicy.destinationPrerollTime(duration: 4) - 3.65) < 0.0001,
+        abs(LayeredLifecycleHandoffPolicy.destinationPrerollTime(duration: 1.5) - 1.15) < 0.0001,
         "layered handoff overlap is not deterministic"
     )
     var progressParser = AlphaConversionProgressParser()

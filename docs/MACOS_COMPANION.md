@@ -1,7 +1,7 @@
 # Statelet lifecycle and media reference
 
-This reference documents the internal contracts behind Statelet 1.8.1 (build
-15), the native Codex lifecycle companion for macOS. Start with
+This reference documents the internal contracts behind Statelet 1.8.2 (build
+16), the native Codex lifecycle companion for macOS. Start with
 [Deployment](DEPLOYMENT.md) for installation or [Using Statelet](USAGE.md) for
 daily operation.
 
@@ -159,13 +159,16 @@ Selection occurs once for an accepted real lifecycle change. Initial launch,
 same-state heartbeats, forced refresh, playlist rotation, Next Clip, Play Once,
 transition preview, and Temporary State do not consume a route cursor. Reduce
 Motion also skips selection and leaves the cursor unchanged. A selected
-transition plays once and is bounded to 4 seconds. The player retains the
-outgoing animation until the transition foreground has a display-ready first
-frame. It prepares the destination on a separate lower player and starts it
-during the final 350 ms, or halfway through a shorter transition. Completion
-removes the foreground and promotes the already-running destination without
-clearing every layer. This is alpha compositing rather than an opacity
-cross-fade.
+transition source may be up to 4 seconds, but playback is accelerated when
+needed so the foreground is bounded to 1.5 seconds on screen. The player
+retains the outgoing animation until the transition foreground has a
+display-ready first frame. It prepares the destination on a separate lower
+player and starts it during the final 350 ms, or halfway through a shorter
+distinct-state transition. Same-state clip-end handoffs start the destination
+as soon as the foreground is ready, but keep its layer hidden. Completion keeps
+the foreground until that destination is display-ready, then atomically swaps
+to the destination so two state animations are never visible together. This
+is alpha compositing rather than an opacity cross-fade.
 
 Transition movies require current alpha reports; reportless or opaque assets
 cannot round-trip through a character bundle. When a selected variant is

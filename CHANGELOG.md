@@ -5,6 +5,33 @@ versioning for the public source release.
 
 ## Unreleased
 
+## [1.8.2] - 2026-08-16
+
+### Changed
+
+- Transition source clips remain compatible up to four seconds, while runtime
+  playback accelerates longer effects so the foreground completes within 1.5
+  seconds on screen.
+- Lifecycle handoffs pre-roll the destination on a hidden player and promote it
+  atomically after the transition ends and the destination is display-ready.
+  Same-state clip-end handoffs start that hidden pre-roll as soon as the
+  transition foreground is ready.
+
+### Fixed
+
+- A layered handoff whose destination was ready when the transition failed now
+  commits that destination consistently instead of reporting completion while
+  retaining the outgoing layer.
+
+### Distribution notes
+
+- No character, animation, voice model, reference audio, session record, or
+  other private runtime data is bundled.
+- This release remains source-only. The local builder produces an
+  ad-hoc-signed app for personal local use; a public updater package still
+  requires Developer ID signing, notarization, stapling, a pinned team
+  identifier, and clean-Mac Gatekeeper verification.
+
 ## [1.8.1] - 2026-08-15
 
 ### Changed
@@ -179,6 +206,7 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
+[1.8.2]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.2
 [1.8.1]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.1
 [1.8.0]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.0
 [1.7.1]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.7.1

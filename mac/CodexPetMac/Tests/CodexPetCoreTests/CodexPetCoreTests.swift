@@ -61,11 +61,11 @@ final class CodexPetCoreTests: XCTestCase {
 
         XCTAssertEqual(handoff.destinationBecameReady(id: 7), .none)
         XCTAssertEqual(handoff.destinationPrerollCueReached(id: 7), .startDestinationPreroll(.running))
-        XCTAssertEqual(handoff.destinationBecameReady(id: 7), .revealDestination(.running))
-        XCTAssertEqual(handoff.lowerLayer, .destination(.running))
+        XCTAssertEqual(handoff.destinationBecameReady(id: 7), .none)
+        XCTAssertEqual(handoff.lowerLayer, .outgoing(.idle))
         XCTAssertTrue(handoff.transitionVisible)
         XCTAssertTrue(handoff.destinationPrerollStarted)
-        XCTAssertEqual(handoff.visibleLayers, [.destination(.running), .transitionForeground])
+        XCTAssertEqual(handoff.visibleLayers, [.outgoing(.idle), .transitionForeground])
 
         XCTAssertEqual(handoff.transitionFinished(id: 7), .finish(.running))
         XCTAssertFalse(handoff.transitionVisible)
@@ -95,8 +95,9 @@ final class CodexPetCoreTests: XCTestCase {
         XCTAssertEqual(handoff.lowerLayer, .outgoing(.running))
         XCTAssertEqual(handoff.transitionBecameReady(id: 41), .revealTransition)
         XCTAssertEqual(handoff.destinationPrerollCueReached(id: 41), .startDestinationPreroll(.running))
-        XCTAssertEqual(handoff.destinationBecameReady(id: 41), .revealDestination(.running))
-        XCTAssertEqual(handoff.lowerLayer, .destination(.running))
+        XCTAssertEqual(handoff.destinationBecameReady(id: 41), .none)
+        XCTAssertEqual(handoff.lowerLayer, .outgoing(.running))
+        XCTAssertEqual(handoff.visibleLayers, [.outgoing(.running), .transitionForeground])
         XCTAssertEqual(handoff.transitionFinished(id: 41), .finish(.running))
 
         var failed = LayeredLifecycleHandoff(id: 42, source: .running, destination: .running)
@@ -106,6 +107,30 @@ final class CodexPetCoreTests: XCTestCase {
         XCTAssertEqual(failed.lowerLayer, .outgoing(.running))
         XCTAssertTrue(failed.preservesVisibleContent)
         XCTAssertEqual(failed.destinationBecameReady(id: 41), .none)
+    }
+
+    func testLayeredHandoffKeepsForegroundUntilLateDestinationBecomesVisible() {
+        var handoff = LayeredLifecycleHandoff(id: 43, source: .running, destination: .running)
+        XCTAssertEqual(handoff.transitionBecameReady(id: 43), .revealTransition)
+        XCTAssertEqual(handoff.destinationPrerollCueReached(id: 43), .startDestinationPreroll(.running))
+        XCTAssertEqual(handoff.transitionFinished(id: 43), .none)
+        XCTAssertTrue(handoff.transitionVisible)
+        XCTAssertEqual(handoff.destinationBecameReady(id: 43), .finish(.running))
+        XCTAssertFalse(handoff.transitionVisible)
+        XCTAssertTrue(handoff.preservesVisibleContent)
+    }
+
+    func testLayeredHandoffPromotesReadyDestinationWhenTransitionFails() {
+        var handoff = LayeredLifecycleHandoff(id: 44, source: .idle, destination: .review)
+        XCTAssertEqual(handoff.transitionBecameReady(id: 44), .revealTransition)
+        XCTAssertEqual(handoff.destinationPrerollCueReached(id: 44), .startDestinationPreroll(.review))
+        XCTAssertEqual(handoff.destinationBecameReady(id: 44), .none)
+        XCTAssertEqual(handoff.lowerLayer, .outgoing(.idle))
+
+        XCTAssertEqual(handoff.transitionFailed(id: 44), .finish(.review))
+        XCTAssertEqual(handoff.lowerLayer, .destination(.review))
+        XCTAssertEqual(handoff.visibleLayers, [.destination(.review)])
+        XCTAssertTrue(handoff.preservesVisibleContent)
     }
 
     func testSameStateFallbackReusesSelectedPlaylistEntryWithoutDoubleAdvancingCursor() throws {
@@ -167,7 +192,7 @@ final class CodexPetCoreTests: XCTestCase {
     }
 
     func testLayeredLifecycleHandoffUsesDeterministicBoundedOverlap() {
-        XCTAssertEqual(LayeredLifecycleHandoffPolicy.destinationPrerollTime(duration: 4), 3.65, accuracy: 0.0001)
+        XCTAssertEqual(LayeredLifecycleHandoffPolicy.destinationPrerollTime(duration: 1.5), 1.15, accuracy: 0.0001)
         XCTAssertEqual(LayeredLifecycleHandoffPolicy.destinationPrerollTime(duration: 0.2), 0.1, accuracy: 0.0001)
         XCTAssertEqual(LayeredLifecycleHandoffPolicy.destinationPrerollTime(duration: 0), 0)
     }
@@ -1216,6 +1241,15 @@ final class CodexPetCoreTests: XCTestCase {
         XCTAssertEqual(map.transition(from: .running, to: .idle), reverse)
         XCTAssertNil(map.transition(from: .idle, to: .idle))
         XCTAssertEqual(LifecycleTransitionMediaPolicy.maximumDuration, 4)
+        XCTAssertEqual(LifecycleTransitionMediaPolicy.maximumPresentationDuration, 1.5)
+        XCTAssertEqual(
+            LifecycleTransitionMediaPolicy.presentationPlaybackRate(
+                sourceDuration: 4,
+                requestedRate: 1
+            ),
+            4 / 1.5,
+            accuracy: 0.0001
+        )
         XCTAssertFalse(
             try MediaMap().settingTransition(
                 from: .idle,

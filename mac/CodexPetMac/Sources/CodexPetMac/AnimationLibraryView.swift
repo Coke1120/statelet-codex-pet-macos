@@ -1048,7 +1048,7 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
     )
     private let migrateButton = NSButton(title: "Resolve Legacy…", target: nil, action: nil)
     private let guidance = NSTextField(
-        wrappingLabelWithString: "Optional directional clips play once before the destination animation. Maximum duration: 4 seconds."
+        wrappingLabelWithString: "Optional directional clips play once before the destination animation. Source maximum: 4 seconds; on-screen maximum: 1.5 seconds."
     )
     private var rows: [SettingsTransitionRowModel] = []
     private var previewPath: String?
@@ -1218,8 +1218,8 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
             guidance.stringValue = reduceMotion
                 ? "Reduce Motion is on for \(libraryName) transitions. Video preview and playback are skipped; the destination fallback is presented."
                 : scope == .global
-                    ? "One optional transition for every lifecycle state change without a character override. Maximum duration: 4 seconds."
-                    : "Optional directional and same-state clip-end handoffs for \(libraryName). Maximum duration: 4 seconds."
+                    ? "One optional transition for every lifecycle state change without a character override. Source maximum: 4 seconds; on-screen maximum: 1.5 seconds."
+                    : "Optional directional and same-state clip-end handoffs for \(libraryName). Source maximum: 4 seconds; on-screen maximum: 1.5 seconds."
         }
         guidance.setAccessibilityHelp(guidance.stringValue)
         tableView.setAccessibilityLabel(scope == .character

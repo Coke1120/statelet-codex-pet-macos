@@ -190,22 +190,33 @@ final class PetPlayerPlaybackHeadlessTests: XCTestCase {
         ))
     }
 
-    func testTransitionSourceDurationRemainsFourSecondsWhilePlaybackRateControlsVisibleTime() {
+    func testTransitionSourceDurationRemainsCompatibleWhileVisibleTimeIsBounded() {
         XCTAssertEqual(LifecycleTransitionMediaPolicy.maximumDuration, 4)
-        XCTAssertEqual(4 / 0.5, 8)
+        XCTAssertEqual(LifecycleTransitionMediaPolicy.maximumPresentationDuration, 1.5)
+        XCTAssertEqual(
+            LifecycleTransitionMediaPolicy.presentationPlaybackRate(
+                sourceDuration: 4,
+                requestedRate: 0.5
+            ),
+            4 / 1.5,
+            accuracy: 0.0001
+        )
     }
 
     func testSlowTransitionCueUsesMediaTimeScaledByPlaybackRate() {
         let sourceDuration = 4.0
-        let playbackRate = 0.5
+        let playbackRate = LifecycleTransitionMediaPolicy.presentationPlaybackRate(
+            sourceDuration: sourceDuration,
+            requestedRate: 0.5
+        )
         let visibleDuration = sourceDuration / playbackRate
         let cueWallTime = LayeredLifecycleHandoffPolicy.destinationPrerollTime(
             duration: visibleDuration
         )
         let cueMediaTime = cueWallTime * playbackRate
 
-        XCTAssertEqual(cueWallTime, 7.65, accuracy: 0.001)
-        XCTAssertEqual(cueMediaTime, 3.825, accuracy: 0.001)
+        XCTAssertEqual(cueWallTime, 1.15, accuracy: 0.001)
+        XCTAssertEqual(cueMediaTime, 3.0667, accuracy: 0.001)
         XCTAssertLessThan(cueMediaTime, sourceDuration)
     }
 

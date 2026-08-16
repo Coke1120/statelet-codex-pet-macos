@@ -201,7 +201,7 @@ class MacAnimationLibraryUISourceTests(unittest.TestCase):
         self.assertIn("snapshot.globalTransitionLibrary.resolvedURL(", self.controller)
 
     def test_transition_editor_documents_duration_and_destination_commit(self) -> None:
-        self.assertIn("Maximum duration: 4 seconds.", self.source)
+        self.assertIn("Source maximum: 4 seconds; on-screen maximum: 1.5 seconds.", self.source)
         self.assertIn("Plays once, then commits destination", self.source)
         self.assertIn("Destination animation is used directly", self.source)
         self.assertIn('setAccessibilityLabel("Directional lifecycle transitions")', self.source)

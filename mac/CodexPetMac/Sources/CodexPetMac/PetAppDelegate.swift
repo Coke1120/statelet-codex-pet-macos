@@ -3745,7 +3745,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                     let duration = installed.validation.durationSeconds
                     guard duration.isFinite, duration > 0,
                           duration <= LifecycleTransitionMediaPolicy.maximumDuration else {
-                        throw PetContractError.invalidValue("Transition movies must be no longer than \(Int(LifecycleTransitionMediaPolicy.maximumDuration)) seconds.")
+                        throw PetContractError.invalidValue("Transition movies must be no longer than \(LifecycleTransitionMediaPolicy.maximumDuration) seconds.")
                     }
                     try Self.requireValidatedFilesUnchanged(
                         installed.validation,
@@ -3998,7 +3998,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                             let duration = validation.durationSeconds
                             guard duration.isFinite, duration > 0,
                                   duration <= LifecycleTransitionMediaPolicy.maximumDuration else {
-                                throw PetContractError.invalidValue("Transition movies must be no longer than \(Int(LifecycleTransitionMediaPolicy.maximumDuration)) seconds.")
+                                throw PetContractError.invalidValue("Transition movies must be no longer than \(LifecycleTransitionMediaPolicy.maximumDuration) seconds.")
                             }
                             try Self.requireValidatedFilesUnchanged(
                                 validation,

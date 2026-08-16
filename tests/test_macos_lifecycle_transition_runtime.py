@@ -281,6 +281,23 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         self.assertIn("setTransitionSelectionCursor(", finish_source)
         self.assertIn("for: active.transitionScope", finish_source)
 
+    def test_same_state_handoff_prerolls_hidden_destination_and_keeps_foreground_until_ready(self):
+        reveal = self.player.index("private func tryRevealLifecycleTransition")
+        reveal_end = self.player.index("private func scheduleLifecycleDestinationCue", reveal)
+        reveal_source = self.player[reveal:reveal_end]
+        self.assertIn("if handoff.source == handoff.destination", reveal_source)
+        self.assertIn("startLifecycleDestination(transitionID: transitionID)", reveal_source)
+        self.assertIn("scheduleLifecycleDestinationCue(transitionID: transitionID)", reveal_source)
+
+        ended = self.player.index("private func handleLifecycleTransitionEnded")
+        ended_end = self.player.index("private func promoteLifecycleDestination", ended)
+        ended_source = self.player[ended:ended_end]
+        self.assertIn("Keep the final transition frame in the foreground", ended_source)
+        self.assertNotIn("lifecycleTransitionPlayerLayer.isHidden = true", ended_source)
+        self.assertIn("destinationReadyToReveal == true", ended_source)
+
+        self.assertNotIn("revealLifecycleDestination", self.player)
+
     def test_app_replacement_paths_keep_visible_content_until_authoritative_commit(self):
         self.assertIn("let hasVisiblePresentation = currentURL != nil || view.hasVisiblePoster", self.player)
         self.assertIn("if !hasVisiblePresentation", self.player)
@@ -316,7 +333,9 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         self.assertIn("lifecycleTransitionPlayerLayer.player = transitionPlayer", source)
         self.assertIn("playerLayer.isHidden = false", source)
         self.assertIn("view.revealLifecycleTransition()", self.player)
-        self.assertIn("view.revealLifecycleDestination()", self.player)
+        self.assertNotIn("view.revealLifecycleDestination()", self.player)
+        self.assertIn("view.promoteLifecycleDestination()", self.player)
+        self.assertIn("LifecycleTransitionMediaPolicy.presentationPlaybackRate", self.player)
         self.assertIn("LayeredLifecycleHandoffPolicy.destinationPrerollTime", self.player)
         self.assertIn("CharacterLibraryStorage.attestRuntimeTransition", self.app)
         self.assertIn("transitionAttestation.requireUnchanged", self.player)

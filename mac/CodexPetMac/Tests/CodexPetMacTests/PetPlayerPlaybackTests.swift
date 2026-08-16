@@ -96,8 +96,8 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
             !view.lifecycleTransitionPlayerLayer.isHidden
         }
         XCTAssertTrue(view.playerLayer.player === outgoingPlayer)
-        try Self.waitUntil("destination did not begin underneath transition") {
-            !view.destinationPlayerLayer.isHidden
+        try Self.waitUntil("destination did not pre-roll while hidden") {
+            view.destinationPlayerLayer.isHidden
                 && (view.destinationPlayerLayer.player?.currentTime().seconds ?? 0) > 0
         }
         XCTAssertFalse(view.lifecycleTransitionPlayerLayer.isHidden)
@@ -128,9 +128,10 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
         let outgoingURL = directory.appendingPathComponent("same-state-outgoing.mov")
         let transitionURL = directory.appendingPathComponent("same-state-transition.mov")
         let destinationURL = directory.appendingPathComponent("same-state-destination.mov")
-        for url in [outgoingURL, transitionURL, destinationURL] {
+        for url in [outgoingURL, destinationURL] {
             try Self.writeTestMovie(to: url)
         }
+        try Self.writeTestMovie(to: transitionURL, frameCount: 120)
 
         let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         let controller = PetPlayerController(view: view)
@@ -179,15 +180,29 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
         try Self.waitUntil("same-state transition foreground never became visible") {
             !view.lifecycleTransitionPlayerLayer.isHidden
         }
-        try Self.waitUntil("same-state destination did not preroll underneath transition") {
-            !view.destinationPlayerLayer.isHidden
+        let transitionVisibleAt = Date()
+        let transitionPlayer = try XCTUnwrap(view.lifecycleTransitionPlayerLayer.player)
+        let transitionDuration = try XCTUnwrap(transitionPlayer.currentItem).duration.seconds
+        let expectedTransitionRate = LifecycleTransitionMediaPolicy.presentationPlaybackRate(
+            sourceDuration: transitionDuration,
+            requestedRate: transitionEntry.playbackRate.value
+        )
+        XCTAssertGreaterThan(expectedTransitionRate, 2)
+        XCTAssertEqual(Double(transitionPlayer.rate), expectedTransitionRate, accuracy: 0.05)
+        try Self.waitUntil("same-state destination did not preroll while hidden") {
+            view.destinationPlayerLayer.isHidden
                 && (view.destinationPlayerLayer.player?.currentTime().seconds ?? 0) > 0
         }
+        XCTAssertFalse(view.lifecycleTransitionPlayerLayer.isHidden)
         try Self.waitUntil("same-state transition did not promote its destination") {
             endedIDs == [144]
                 && view.playerLayer.player !== outgoingPlayer
                 && view.destinationPlayerLayer.isHidden
         }
+        XCTAssertLessThan(
+            Date().timeIntervalSince(transitionVisibleAt),
+            LifecycleTransitionMediaPolicy.maximumPresentationDuration + 0.75
+        )
         XCTAssertEqual(controller.currentState, .running)
         XCTAssertEqual(controller.currentURL, destinationURL)
         XCTAssertNotEqual(controller.currentURL, outgoingURL)
@@ -781,7 +796,7 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
     }
 
     @MainActor
-    private static func writeTestMovie(to url: URL) throws {
+    private static func writeTestMovie(to url: URL, frameCount: Int = 30) throws {
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         let width = 32
         let height = 32
@@ -811,7 +826,7 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
         }
         writer.startSession(atSourceTime: .zero)
 
-        for frameIndex in 0..<30 {
+        for frameIndex in 0..<frameCount {
             try waitUntil("asset writer input did not become ready") {
                 input.isReadyForMoreMediaData
             }

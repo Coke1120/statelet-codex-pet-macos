@@ -27,8 +27,11 @@ public struct LayeredLifecycleHandoff: Equatable, Sendable {
     public private(set) var lowerLayer: LowerLayer
     public private(set) var transitionVisible = false
     public private(set) var transitionReady = false
+    /// The destination has a display-ready frame, but remains hidden until
+    /// the foreground transition completes.
     public private(set) var destinationReady = false
     public private(set) var destinationPrerollStarted = false
+    public private(set) var transitionEnded = false
 
     public init(id: UInt64, source: PetState, destination: PetState) {
         self.id = id
@@ -55,20 +58,29 @@ public struct LayeredLifecycleHandoff: Equatable, Sendable {
               destinationPrerollStarted,
               !destinationReady else { return .none }
         destinationReady = true
-        lowerLayer = .destination(destination)
-        return .revealDestination(destination)
+        if transitionEnded {
+            lowerLayer = .destination(destination)
+            transitionVisible = false
+            return .finish(destination)
+        }
+        return .none
     }
 
     public mutating func transitionFinished(id callbackID: UInt64) -> Action {
         guard callbackID == id else { return .none }
+        transitionEnded = true
+        guard destinationReady else { return .none }
+        lowerLayer = .destination(destination)
         transitionVisible = false
-        return destinationReady ? .finish(destination) : .fallBack(destination)
+        return .finish(destination)
     }
 
     public mutating func transitionFailed(id callbackID: UInt64) -> Action {
         guard callbackID == id else { return .none }
         transitionVisible = false
-        return destinationReady ? .finish(destination) : .fallBack(destination)
+        guard destinationReady else { return .fallBack(destination) }
+        lowerLayer = .destination(destination)
+        return .finish(destination)
     }
 
     public mutating func destinationFailed(id callbackID: UInt64) -> Action {
@@ -93,9 +105,13 @@ public struct LayeredLifecycleHandoff: Equatable, Sendable {
 }
 
 public enum LayeredLifecycleHandoffPolicy {
-    /// Start the destination on the lower layer while at least this much of the
-    /// transparent foreground remains visible. Short clips use half their
-    /// duration, which keeps the cue deterministic and strictly before the end.
+    /// Begin destination pre-roll while at least this much of the transparent
+    /// foreground remains visible for distinct-state handoffs. The destination
+    /// layer stays hidden until the foreground completes.
+    /// Same-state clip-end handoffs bypass this delay and start immediately
+    /// once the transition foreground is ready. Short distinct-state clips use
+    /// half their duration, which keeps the cue deterministic and strictly
+    /// before the end.
     public static let maximumOverlap: TimeInterval = 0.35
 
     public static func destinationPrerollTime(duration: TimeInterval) -> TimeInterval {
