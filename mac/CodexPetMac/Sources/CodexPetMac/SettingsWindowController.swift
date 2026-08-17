@@ -5,6 +5,105 @@ private final class TopAlignedSettingsDocumentView: NSView {
     override var isFlipped: Bool { true }
 }
 
+private final class SessionActivityAppearancePreviewView: NSView {
+    private let label = NSTextField(labelWithString: "Running · Tool #1 · just now")
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer = CALayer()
+        layer?.cornerCurve = .continuous
+        layer?.cornerRadius = 10
+        label.alignment = .center
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+        setAccessibilityElement(true)
+        setAccessibilityRole(.staticText)
+        setAccessibilityLabel("Activity popup appearance preview")
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("SessionActivityAppearancePreviewView does not support NSCoder initialization")
+    }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: 260, height: 42)
+    }
+
+    func apply(_ appearance: SessionActivityPanelAppearance) {
+        let increaseContrast = NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
+        let reduceTransparency = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
+        let resolved = SessionActivityView.resolveAppearance(
+            appearance: appearance,
+            systemBackgroundColor: .windowBackgroundColor,
+            systemTextColor: .labelColor,
+            secondaryTextColor: .secondaryLabelColor,
+            reduceTransparency: reduceTransparency,
+            increaseContrast: increaseContrast
+        )
+        layer?.backgroundColor = resolved.backgroundColor
+            .withAlphaComponent(CGFloat(resolved.opacity))
+            .cgColor
+        label.textColor = resolved.primaryTextColor
+        setAccessibilityValue(
+            "\(appearance.automaticContrast ? "Automatic" : "Custom") contrast, ratio \(String(format: "%.1f", resolved.contrastRatio))"
+        )
+    }
+}
+
+private final class DialogueAppearancePreviewView: NSView {
+    private let label = NSTextField(labelWithString: "Statelet dialogue preview")
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer = CALayer()
+        layer?.cornerCurve = .continuous
+        layer?.cornerRadius = 10
+        label.alignment = .center
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+        setAccessibilityElement(true)
+        setAccessibilityRole(.staticText)
+        setAccessibilityLabel("Dialogue bubble appearance preview")
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("DialogueAppearancePreviewView does not support NSCoder initialization")
+    }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: 260, height: 42)
+    }
+
+    func apply(_ appearance: PetAppearanceConfiguration) {
+        let resolved = PetPlayerView.resolveDialogueAppearance(
+            configuration: appearance,
+            systemBackgroundColor: .windowBackgroundColor,
+            systemTextColor: .labelColor,
+            reduceTransparency: NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency,
+            increaseContrast: NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
+        )
+        layer?.backgroundColor = resolved.backgroundColor
+            .withAlphaComponent(CGFloat(resolved.backgroundOpacity))
+            .cgColor
+        label.textColor = resolved.textColor
+        setAccessibilityValue("Contrast ratio \(String(format: "%.1f", resolved.contrastRatio))")
+    }
+}
+
 private final class SettingsAnimationsPaneView: NSView {
     weak var statusView: NSView?
     weak var modeView: NSView?
@@ -177,6 +276,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private static let preferredContentSize = NSSize(width: 760, height: 650)
     private static let minimumContentSize = NSSize(width: 700, height: 570)
     private static let screenMargin: CGFloat = 12
+    private static let sidebarWidth: CGFloat = 148
+    private static let selectedSectionDefaultsKey = "Statelet.Settings.selectedSection"
+    private static let sectionLabels = [
+        "Animations",
+        "Voice",
+        "Appearance",
+        "General",
+        "Diagnostics",
+        "Help",
+        "Prompts",
+        "Recommendation",
+    ]
 
     var onImportMP4: ((PetState) -> Void)?
     var onDropMP4s: ((PetState, [URL]) -> Void)?
@@ -203,6 +314,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     var onConversionProfileChange: ((AlphaConversionProfile) -> Void)?
     var onWindowSettingsChange: ((WindowSettingsUpdate) -> Void)?
     var onResetPosition: (() -> Void)?
+    var onSessionActivityAppearanceChange: ((SessionActivityPanelAppearance) -> Void)?
+    var onResetActivityPosition: (() -> Void)?
     var onRefreshDiagnostics: (() -> Void)?
     var onRepairInstallation: (() -> Void)?
     var onLaunchAtLoginChange: ((Bool) -> Void)?
@@ -244,7 +357,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     var onTransitionModeChange: ((TransitionLibraryScope, SettingsTransitionRoute, MediaPlaybackMode) -> Void)?
     var onSetFixedTransition: ((TransitionLibraryScope, SettingsTransitionRoute, String) -> Void)?
 
-    private let tabs = NSSegmentedControl(labels: ["Animations", "Voice", "Appearance", "General", "Diagnostics", "Help", "Prompts", "Recommendation"], trackingMode: .selectOne, target: nil, action: nil)
+    private let sidebar = NSVisualEffectView()
+    private let sidebarScrollView = NSScrollView()
+    private let sidebarTableView = NSTableView()
+    private let sidebarDivider = NSBox()
     private let paneHost = NSView()
     private let animationsPane = SettingsAnimationsPaneView()
     private let dialogueVoiceView = DialogueVoiceSettingsView()
@@ -292,6 +408,17 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let fpsEnabledCheckbox = NSButton(checkboxWithTitle: "Show video FPS", target: nil, action: nil)
     private let fpsColorWell = NSColorWell()
     private let fpsSizePopup = NSPopUpButton()
+    private let activityBackgroundColorWell = NSColorWell()
+    private let activityOpacitySlider = NSSlider(value: 92, minValue: 0, maxValue: 100, target: nil, action: nil)
+    private let activityOpacityLabel = NSTextField(labelWithString: "92%")
+    private let activityContrastPopup = NSPopUpButton()
+    private let activityAppearancePreview = SessionActivityAppearancePreviewView()
+    private let dialogueBackgroundColorWell = NSColorWell()
+    private let dialogueTextColorWell = NSColorWell()
+    private let dialogueOpacitySlider = NSSlider(value: 88, minValue: 0, maxValue: 100, target: nil, action: nil)
+    private let dialogueOpacityLabel = NSTextField(labelWithString: "88%")
+    private let dialogueContrastPopup = NSPopUpButton()
+    private let dialogueAppearancePreview = DialogueAppearancePreviewView()
     private let reduceMotionLabel = NSTextField(labelWithString: "Reduce Motion: Checking")
     private let helpStatePopup = NSPopUpButton()
     private let helpPromptTextView = NSTextView()
@@ -330,6 +457,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private var minimumPaneHeightConstraint: NSLayoutConstraint?
     private var hasShownWindow = false
     private let defaults: UserDefaults
+    private var sessionActivityAppearance = try! SessionActivityPanelAppearance()
+    private var selectedSectionIndex = 0
     private var usePreferredSizeOnFirstShow = true
     private var aspectRatio = 1.5
     private let stateLabelPositions: [StateLabelPosition] = [.topLeft, .topRight, .bottomLeft, .bottomRight]
@@ -351,6 +480,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         window.center()
         super.init(window: window)
         window.delegate = self
+        if defaults.object(forKey: Self.selectedSectionDefaultsKey) != nil {
+            let restoredSection = defaults.integer(forKey: Self.selectedSectionDefaultsKey)
+            if Self.sectionLabels.indices.contains(restoredSection) {
+                selectedSectionIndex = restoredSection
+            }
+        }
         buildInterface()
         configureWindowActions()
         fitWindowToVisibleScreen(usePreferredSize: false)
@@ -418,6 +553,16 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         launchAtLoginLabel.stringValue = snapshot.launchAtLoginSummary
         repairButton.isEnabled = snapshot.repairAvailable
         updateCharacterSelector()
+    }
+
+    func update(sessionActivityAppearance appearance: SessionActivityPanelAppearance) {
+        sessionActivityAppearance = appearance
+        activityBackgroundColorWell.color = NSColor.codexPet(hex: appearance.backgroundColor)
+        activityOpacitySlider.doubleValue = appearance.opacity * 100
+        activityContrastPopup.selectItem(at: appearance.automaticContrast ? 0 : 1)
+        activityOpacityLabel.stringValue = "\(Int(activityOpacitySlider.doubleValue.rounded()))%"
+        activityAppearancePreview.apply(appearance)
+        updateAppearanceLabelsAndEnabledState()
     }
 
     func update(toolchainState: AlphaToolchainState) {
@@ -550,12 +695,37 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private func buildInterface() {
         guard let contentView = window?.contentView else { return }
-        tabs.translatesAutoresizingMaskIntoConstraints = false
-        tabs.selectedSegment = 0
-        tabs.segmentDistribution = .fillEqually
-        tabs.target = self
-        tabs.action = #selector(changePane)
-        tabs.setAccessibilityLabel("Settings section")
+        let initialSectionIndex = selectedSectionIndex
+        sidebar.translatesAutoresizingMaskIntoConstraints = false
+        sidebar.material = .sidebar
+        sidebar.blendingMode = .behindWindow
+        sidebar.state = .followsWindowActiveState
+        sidebar.setAccessibilityElement(false)
+        sidebarScrollView.translatesAutoresizingMaskIntoConstraints = false
+        sidebarScrollView.documentView = sidebarTableView
+        sidebarScrollView.drawsBackground = false
+        sidebarScrollView.hasVerticalScroller = true
+        sidebarScrollView.autohidesScrollers = true
+        sidebarScrollView.scrollerStyle = .overlay
+        sidebarScrollView.setAccessibilityLabel("Settings navigation sidebar")
+        sidebarTableView.headerView = nil
+        sidebarTableView.backgroundColor = .clear
+        sidebarTableView.style = .sourceList
+        sidebarTableView.rowHeight = 32
+        sidebarTableView.intercellSpacing = NSSize(width: 0, height: 2)
+        sidebarTableView.allowsEmptySelection = false
+        sidebarTableView.allowsMultipleSelection = false
+        sidebarTableView.focusRingType = .default
+        sidebarTableView.delegate = self
+        sidebarTableView.dataSource = self
+        sidebarTableView.setAccessibilityLabel("Settings navigation")
+        sidebarTableView.setAccessibilityRole(.list)
+        let sidebarColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("SettingsSidebarColumn"))
+        sidebarColumn.resizingMask = .autoresizingMask
+        sidebarTableView.addTableColumn(sidebarColumn)
+        sidebar.addSubview(sidebarScrollView)
+        sidebarDivider.translatesAutoresizingMaskIntoConstraints = false
+        sidebarDivider.boxType = .separator
         paneHost.translatesAutoresizingMaskIntoConstraints = false
         animationsPane.translatesAutoresizingMaskIntoConstraints = false
         dialogueVoiceView.translatesAutoresizingMaskIntoConstraints = false
@@ -565,25 +735,42 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         helpPane.translatesAutoresizingMaskIntoConstraints = false
         promptsPane.translatesAutoresizingMaskIntoConstraints = false
         recommendationPane.translatesAutoresizingMaskIntoConstraints = false
-        contentView.addSubview(tabs)
+        for pane in [
+            animationsPane,
+            dialogueVoiceView,
+            appearancePane,
+            generalPane,
+            diagnosticsPane,
+            helpPane,
+            promptsPane,
+            recommendationPane,
+        ] {
+            pane.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        }
+        contentView.addSubview(sidebar)
+        contentView.addSubview(sidebarDivider)
         contentView.addSubview(paneHost)
-        tabs.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let preferredTabsWidth = tabs.widthAnchor.constraint(equalToConstant: 680)
-        preferredTabsWidth.priority = .defaultHigh
-        let minimumPaneWidth = paneHost.widthAnchor.constraint(greaterThanOrEqualToConstant: 660)
-        let minimumPaneHeight = paneHost.heightAnchor.constraint(greaterThanOrEqualToConstant: 498)
+        let minimumPaneWidth = paneHost.widthAnchor.constraint(greaterThanOrEqualToConstant: 495)
+        let minimumPaneHeight = paneHost.heightAnchor.constraint(greaterThanOrEqualToConstant: 534)
         minimumPaneWidthConstraint = minimumPaneWidth
         minimumPaneHeightConstraint = minimumPaneHeight
         NSLayoutConstraint.activate([
             minimumPaneWidth,
             minimumPaneHeight,
-            tabs.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 16),
-            tabs.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
-            tabs.leadingAnchor.constraint(greaterThanOrEqualTo: contentView.leadingAnchor, constant: 12),
-            tabs.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -12),
-            preferredTabsWidth,
-            paneHost.topAnchor.constraint(equalTo: tabs.bottomAnchor, constant: 14),
-            paneHost.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
+            sidebar.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            sidebar.topAnchor.constraint(equalTo: contentView.topAnchor),
+            sidebar.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+            sidebar.widthAnchor.constraint(equalToConstant: Self.sidebarWidth),
+            sidebarScrollView.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 8),
+            sidebarScrollView.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -8),
+            sidebarScrollView.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 16),
+            sidebarScrollView.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor, constant: -12),
+            sidebarDivider.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            sidebarDivider.widthAnchor.constraint(equalToConstant: 1),
+            sidebarDivider.topAnchor.constraint(equalTo: contentView.topAnchor),
+            sidebarDivider.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+            paneHost.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 18),
+            paneHost.leadingAnchor.constraint(equalTo: sidebarDivider.trailingAnchor, constant: 16),
             paneHost.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
             paneHost.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -18),
         ])
@@ -595,6 +782,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         buildHelpPane()
         buildPromptsPane()
         buildRecommendationPane()
+        sidebarTableView.reloadData()
+        sidebarTableView.selectRowIndexes(IndexSet(integer: initialSectionIndex), byExtendingSelection: false)
         changePane()
     }
 
@@ -993,19 +1182,112 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         fpsStack.spacing = 9
         let fpsBox = makeSection(title: "Playback FPS", content: fpsStack)
 
+        activityBackgroundColorWell.target = self
+        activityBackgroundColorWell.action = #selector(activityAppearanceChanged)
+        if #available(macOS 14.0, *) {
+            activityBackgroundColorWell.supportsAlpha = false
+        }
+        activityBackgroundColorWell.setAccessibilityLabel("Activity popup background color")
+        activityBackgroundColorWell.color = NSColor.codexPet(hex: SessionActivityPanelAppearance.defaultBackgroundColor)
+        activityOpacitySlider.target = self
+        activityOpacitySlider.action = #selector(activityAppearanceChanged)
+        activityOpacitySlider.isContinuous = false
+        activityOpacitySlider.setAccessibilityLabel("Activity popup background opacity")
+        activityOpacityLabel.alignment = .right
+        activityOpacityLabel.font = .monospacedDigitSystemFont(
+            ofSize: NSFont.smallSystemFontSize,
+            weight: .regular
+        )
+        activityContrastPopup.addItems(withTitles: ["Automatic", "Custom"])
+        activityContrastPopup.selectItem(at: 0)
+        activityContrastPopup.target = self
+        activityContrastPopup.action = #selector(activityAppearanceChanged)
+        activityContrastPopup.setAccessibilityLabel("Activity popup contrast")
+        activityAppearancePreview.translatesAutoresizingMaskIntoConstraints = false
+        activityAppearancePreview.apply(sessionActivityAppearance)
+        let activityHelp = NSTextField(
+            wrappingLabelWithString: "The popup is draggable when click-through is off. Automatic contrast follows the system appearance and accessibility settings; custom mode uses the selected background color with readable labels."
+        )
+        activityHelp.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        activityHelp.textColor = .secondaryLabelColor
+        let resetActivityAppearance = NSButton(
+            title: "Reset Activity Popup Appearance",
+            target: self,
+            action: #selector(resetActivityAppearance)
+        )
+        resetActivityAppearance.controlSize = .small
+        let activityStack = NSStackView(views: [
+            makeAppearanceRow(title: "Contrast", control: activityContrastPopup),
+            makeAppearanceRow(title: "Background", control: activityBackgroundColorWell),
+            makeAppearanceRow(title: "Opacity", control: activityOpacitySlider, value: activityOpacityLabel),
+            activityAppearancePreview,
+            activityHelp,
+            resetActivityAppearance,
+        ])
+        activityStack.orientation = .vertical
+        activityStack.alignment = .leading
+        activityStack.spacing = 9
+        let activityBox = makeSection(title: "Codex Activity Popup", content: activityStack)
+
+        dialogueBackgroundColorWell.target = self
+        dialogueBackgroundColorWell.action = #selector(dialogueAppearanceChanged)
+        if #available(macOS 14.0, *) {
+            dialogueBackgroundColorWell.supportsAlpha = false
+        }
+        dialogueBackgroundColorWell.setAccessibilityLabel("Dialogue bubble background color")
+        dialogueBackgroundColorWell.color = NSColor.codexPet(hex: PetAppearanceConfiguration.defaultDialogueBackgroundColor)
+        dialogueTextColorWell.target = self
+        dialogueTextColorWell.action = #selector(dialogueAppearanceChanged)
+        if #available(macOS 14.0, *) {
+            dialogueTextColorWell.supportsAlpha = false
+        }
+        dialogueTextColorWell.setAccessibilityLabel("Dialogue bubble text color")
+        dialogueTextColorWell.color = NSColor.codexPet(hex: PetAppearanceConfiguration.defaultDialogueTextColor)
+        dialogueOpacitySlider.target = self
+        dialogueOpacitySlider.action = #selector(dialogueAppearanceChanged)
+        dialogueOpacitySlider.isContinuous = false
+        dialogueOpacitySlider.setAccessibilityLabel("Dialogue bubble background opacity")
+        dialogueOpacityLabel.alignment = .right
+        dialogueOpacityLabel.font = .monospacedDigitSystemFont(
+            ofSize: NSFont.smallSystemFontSize,
+            weight: .regular
+        )
+        dialogueContrastPopup.addItems(withTitles: ["Automatic", "Custom"])
+        dialogueContrastPopup.selectItem(at: 0)
+        dialogueContrastPopup.target = self
+        dialogueContrastPopup.action = #selector(dialogueAppearanceChanged)
+        dialogueContrastPopup.setAccessibilityLabel("Dialogue bubble contrast")
+        dialogueAppearancePreview.translatesAutoresizingMaskIntoConstraints = false
+        dialogueAppearancePreview.apply(try! PetAppearanceConfiguration())
+        let dialogueHelp = NSTextField(
+            wrappingLabelWithString: "Automatic contrast follows light/dark mode and accessibility settings. Custom colors are checked at runtime; unsafe combinations fall back to a readable system color without changing dialogue text, voice, or playback timing."
+        )
+        dialogueHelp.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        dialogueHelp.textColor = .secondaryLabelColor
+        let dialogueStack = NSStackView(views: [
+            makeAppearanceRow(title: "Contrast", control: dialogueContrastPopup),
+            makeAppearanceRow(title: "Background", control: dialogueBackgroundColorWell),
+            makeAppearanceRow(title: "Text", control: dialogueTextColorWell),
+            makeAppearanceRow(title: "Opacity", control: dialogueOpacitySlider, value: dialogueOpacityLabel),
+            dialogueAppearancePreview,
+            dialogueHelp,
+        ])
+        dialogueStack.orientation = .vertical
+        dialogueStack.alignment = .leading
+        dialogueStack.spacing = 9
+        let dialogueBox = makeSection(title: "Dialogue Bubble", content: dialogueStack)
+
         let reset = NSButton(title: "Reset Appearance", target: self, action: #selector(resetAppearance))
         reset.controlSize = .small
         let surfaceRow = NSStackView(views: [surfaceBox, borderBox])
-        surfaceRow.orientation = .horizontal
-        surfaceRow.alignment = .top
-        surfaceRow.distribution = .fillEqually
+        surfaceRow.orientation = .vertical
+        surfaceRow.alignment = .leading
         surfaceRow.spacing = 12
         let overlayRow = NSStackView(views: [badgeBox, fpsBox])
-        overlayRow.orientation = .horizontal
-        overlayRow.alignment = .top
-        overlayRow.distribution = .fillEqually
+        overlayRow.orientation = .vertical
+        overlayRow.alignment = .leading
         overlayRow.spacing = 12
-        let stack = NSStackView(views: [surfaceRow, overlayRow, reset])
+        let stack = NSStackView(views: [surfaceRow, overlayRow, dialogueBox, activityBox, reset])
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -1017,7 +1299,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             stack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor),
             surfaceRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            surfaceBox.widthAnchor.constraint(equalTo: surfaceRow.widthAnchor),
+            borderBox.widthAnchor.constraint(equalTo: surfaceRow.widthAnchor),
             overlayRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            badgeBox.widthAnchor.constraint(equalTo: overlayRow.widthAnchor),
+            fpsBox.widthAnchor.constraint(equalTo: overlayRow.widthAnchor),
+            dialogueBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            activityBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
             stack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor),
         ])
     }
@@ -1054,8 +1342,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         clickHelp.textColor = .secondaryLabelColor
         let resetPosition = NSButton(title: "Reset Position", target: self, action: #selector(resetPositionAction))
         resetPosition.alignment = .left
+        let resetActivityPosition = NSButton(
+            title: "Reset Activity Popup Position",
+            target: self,
+            action: #selector(resetActivityPositionAction)
+        )
+        resetActivityPosition.alignment = .left
 
-        let petWindowStack = NSStackView(views: [sizeTitle, sizeControls, alwaysOnTopCheckbox, alwaysOnTopHelp, clickThroughCheckbox, clickHelp, fullScreenCheckbox, resetPosition])
+        let petWindowStack = NSStackView(views: [sizeTitle, sizeControls, alwaysOnTopCheckbox, alwaysOnTopHelp, clickThroughCheckbox, clickHelp, fullScreenCheckbox, resetPosition, resetActivityPosition])
         petWindowStack.orientation = .vertical
         petWindowStack.alignment = .leading
         petWindowStack.spacing = 9
@@ -1079,7 +1373,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let launchHelp = NSTextField(wrappingLabelWithString: "Open Statelet from Finder → Home → Applications. The installed app starts at login and intentionally uses the menu bar instead of a Dock icon.")
         launchHelp.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         launchHelp.textColor = .secondaryLabelColor
-        let localStack = NSStackView(views: [launchHelp, localButtons])
+        let managedMediaLabel = NSTextField(
+            wrappingLabelWithString: "Managed media location: ~/Library/Application Support/Statelet/media/ (Statelet.app stays media-free; external source files are not moved or deleted)."
+        )
+        managedMediaLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        managedMediaLabel.textColor = .secondaryLabelColor
+        let localStack = NSStackView(views: [launchHelp, managedMediaLabel, localButtons])
         localStack.orientation = .vertical
         localStack.alignment = .leading
         localStack.spacing = 9
@@ -1196,6 +1495,22 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             title: "Animation and voice",
             content: NSTextField(wrappingLabelWithString: "Animation imports run through HEVC-with-alpha and playback validation. Use the Animations pane for playlists, transitions and Reduce Motion posters. GPT-SoVITS, Qwen3-TTS and VoxCPM2 run locally; model files, reference audio, dialogue and generated speech stay in private Application Support and are never bundled in releases.")
         )
+        let managedMediaLabel = NSTextField(
+            wrappingLabelWithString: "Managed media location: ~/Library/Application Support/Statelet/media/. Downloads and Finder paths are import sources only. Successful verified media, maps, reports, and character assets remain playable here if the source is moved or removed; Statelet.app never becomes a user-media container."
+        )
+        managedMediaLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        let managedMediaButton = NSButton(
+            title: "Open Managed Media in Finder",
+            target: self,
+            action: #selector(revealMediaFolder)
+        )
+        managedMediaButton.bezelStyle = .rounded
+        managedMediaButton.setAccessibilityLabel("Open managed media location in Finder")
+        let managedMediaStack = NSStackView(views: [managedMediaLabel, managedMediaButton])
+        managedMediaStack.orientation = .vertical
+        managedMediaStack.alignment = .leading
+        managedMediaStack.spacing = 8
+        let managedMedia = makeSection(title: "Managed media location", content: managedMediaStack)
         let accessibility = makeSection(
             title: "Interaction and accessibility",
             content: NSTextField(wrappingLabelWithString: "Settings supports keyboard navigation and VoiceOver labels. Reduce Motion replaces transition motion with verified posters when available. If click-through prevents pointer access to the pet, use the Statelet menu-bar icon to reopen Settings or turn click-through off.")
@@ -1263,6 +1578,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             quickStart,
             lifecycle,
             media,
+            managedMedia,
             accessibility,
             recovery,
             links,
@@ -1272,7 +1588,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 14
-        for view in [quickStart, lifecycle, media, accessibility, recovery, updateBox] {
+        for view in [quickStart, lifecycle, media, managedMedia, accessibility, recovery, updateBox] {
             view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
 
@@ -1490,6 +1806,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         if let index = stateLabelSizes.firstIndex(of: appearance.fpsLabelSize) {
             fpsSizePopup.selectItem(at: index)
         }
+        dialogueBackgroundColorWell.color = NSColor.codexPet(hex: appearance.dialogueBackgroundColor)
+        dialogueTextColorWell.color = NSColor.codexPet(hex: appearance.dialogueTextColor)
+        dialogueOpacitySlider.doubleValue = appearance.dialogueBackgroundOpacity * 100
+        dialogueContrastPopup.selectItem(at: appearance.dialogueContrastMode == .automatic ? 0 : 1)
+        dialogueOpacityLabel.stringValue = "\(Int(dialogueOpacitySlider.doubleValue.rounded()))%"
+        dialogueAppearancePreview.apply(appearance)
+        activityOpacityLabel.stringValue = "\(Int(activityOpacitySlider.doubleValue.rounded()))%"
+        activityAppearancePreview.apply(sessionActivityAppearance)
         updateAppearanceLabelsAndEnabledState()
     }
 
@@ -1514,7 +1838,19 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                 : stateLabelColorWell.color.codexPetHex,
             showFPS: fpsEnabledCheckbox.state == .on,
             fpsColor: fpsColorWell.color.codexPetHex,
-            fpsLabelSize: stateLabelSizes[fpsSizeIndex]
+            fpsLabelSize: stateLabelSizes[fpsSizeIndex],
+            dialogueBackgroundColor: dialogueBackgroundColorWell.color.codexPetHex,
+            dialogueTextColor: dialogueTextColorWell.color.codexPetHex,
+            dialogueBackgroundOpacity: dialogueOpacitySlider.doubleValue / 100,
+            dialogueContrastMode: dialogueContrastPopup.indexOfSelectedItem == 0 ? .automatic : .custom
+        )
+    }
+
+    private func currentSessionActivityAppearance() -> SessionActivityPanelAppearance? {
+        try? SessionActivityPanelAppearance(
+            backgroundColor: activityBackgroundColorWell.color.codexPetHex,
+            opacity: activityOpacitySlider.doubleValue / 100,
+            automaticContrast: activityContrastPopup.indexOfSelectedItem == 0
         )
     }
 
@@ -1538,6 +1874,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let fpsEnabled = fpsEnabledCheckbox.state == .on
         fpsColorWell.isEnabled = fpsEnabled
         fpsSizePopup.isEnabled = fpsEnabled
+        let dialogueCustom = dialogueContrastPopup.indexOfSelectedItem == 1
+        dialogueBackgroundColorWell.isEnabled = dialogueCustom
+        dialogueTextColorWell.isEnabled = dialogueCustom
+        activityBackgroundColorWell.isEnabled = activityContrastPopup.indexOfSelectedItem == 1
+        dialogueOpacityLabel.stringValue = "\(Int(dialogueOpacitySlider.doubleValue.rounded()))%"
+        activityOpacityLabel.stringValue = "\(Int(activityOpacitySlider.doubleValue.rounded()))%"
     }
 
     private func refreshRows() {
@@ -1809,7 +2151,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         fitWindowToVisibleScreen(usePreferredSize: false)
     }
 
-    @objc private func changePane() {
+    private func changePane() {
         let panes = [
             animationsPane,
             dialogueVoiceView,
@@ -1820,7 +2162,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             promptsPane,
             recommendationPane,
         ]
-        let index = max(0, min(tabs.selectedSegment, panes.count - 1))
+        let requestedIndex = sidebarTableView.selectedRow
+        let index = panes.indices.contains(requestedIndex) ? requestedIndex : selectedSectionIndex
+        selectedSectionIndex = index
+        defaults.set(index, forKey: Self.selectedSectionDefaultsKey)
         let selectedPane = panes[index]
         guard displayedPane !== selectedPane else { return }
         let preservedContentSize = window?.contentLayoutRect.size
@@ -1838,6 +2183,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         NSLayoutConstraint.activate(displayedPaneConstraints)
         displayedPane = selectedPane
         if let preservedContentSize {
+            window?.contentView?.layoutSubtreeIfNeeded()
             window?.setContentSize(preservedContentSize)
         }
     }
@@ -1853,8 +2199,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             width: min(Self.minimumContentSize.width, maximumContentSize.width),
             height: min(Self.minimumContentSize.height, maximumContentSize.height)
         )
-        minimumPaneWidthConstraint?.constant = max(0, effectiveMinimumSize.width - 40)
-        minimumPaneHeightConstraint?.constant = max(0, effectiveMinimumSize.height - 72)
+        minimumPaneWidthConstraint?.constant = max(
+            0,
+            effectiveMinimumSize.width - Self.sidebarWidth - 1 - 36
+        )
+        minimumPaneHeightConstraint?.constant = max(0, effectiveMinimumSize.height - 36)
         window.contentMinSize = effectiveMinimumSize
         window.contentMaxSize = maximumContentSize
 
@@ -2082,6 +2431,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     @objc private func revealLogs() { onRevealLogs?() }
     @objc private func revealApp() { onRevealApp?() }
     @objc private func resetPositionAction() { onResetPosition?() }
+    @objc private func resetActivityPositionAction() { onResetActivityPosition?() }
     @objc private func refreshDiagnostics() { onRefreshDiagnostics?() }
     @objc private func repairInstallation() { onRepairInstallation?() }
     @objc private func launchAtLoginChanged() { onLaunchAtLoginChange?(launchAtLoginCheckbox.state == .on) }
@@ -2095,12 +2445,34 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     @objc private func appearanceChanged() {
         updateAppearanceLabelsAndEnabledState()
+        dialogueAppearancePreview.apply(currentAppearance() ?? (try! PetAppearanceConfiguration()))
         publishWindowSettings(width: sizeSlider.doubleValue)
+    }
+
+    @objc private func dialogueAppearanceChanged() {
+        updateAppearanceLabelsAndEnabledState()
+        guard let appearance = currentAppearance() else { return }
+        dialogueAppearancePreview.apply(appearance)
+        publishWindowSettings(width: sizeSlider.doubleValue)
+    }
+
+    @objc private func activityAppearanceChanged() {
+        guard let appearance = currentSessionActivityAppearance() else { return }
+        sessionActivityAppearance = appearance
+        activityAppearancePreview.apply(appearance)
+        onSessionActivityAppearanceChange?(appearance)
+    }
+
+    @objc private func resetActivityAppearance() {
+        let appearance = try! SessionActivityPanelAppearance()
+        update(sessionActivityAppearance: appearance)
+        onSessionActivityAppearanceChange?(appearance)
     }
 
     @objc private func resetAppearance() {
         updateAppearanceControls(try! PetAppearanceConfiguration())
         publishWindowSettings(width: sizeSlider.doubleValue)
+        resetActivityAppearance()
     }
 
     @objc private func showSetupGuide() {
@@ -2156,6 +2528,46 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private func sizeDescription(width: Double, height: Double) -> String {
         "\(Int(width.rounded())) × \(Int(height.rounded())) pt"
+    }
+}
+
+extension SettingsWindowController: NSTableViewDataSource, NSTableViewDelegate {
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        Self.sectionLabels.count
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard Self.sectionLabels.indices.contains(row) else { return nil }
+        let identifier = NSUserInterfaceItemIdentifier("SettingsSidebarCell")
+        let cell: NSTableCellView
+        if let reusedCell = tableView.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView {
+            cell = reusedCell
+        } else {
+            cell = NSTableCellView()
+            cell.identifier = identifier
+            let label = NSTextField(labelWithString: "")
+            label.translatesAutoresizingMaskIntoConstraints = false
+            label.lineBreakMode = .byTruncatingTail
+            cell.textField = label
+            cell.addSubview(label)
+            NSLayoutConstraint.activate([
+                label.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
+                label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
+                label.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            ])
+        }
+        let label = Self.sectionLabels[row]
+        cell.textField?.stringValue = label
+        cell.textField?.setAccessibilityLabel(label)
+        cell.setAccessibilityElement(true)
+        cell.setAccessibilityRole(.staticText)
+        cell.setAccessibilityLabel(label)
+        cell.setAccessibilityValue(row == sidebarTableView.selectedRow ? "Selected" : "Not selected")
+        return cell
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        changePane()
     }
 }
 

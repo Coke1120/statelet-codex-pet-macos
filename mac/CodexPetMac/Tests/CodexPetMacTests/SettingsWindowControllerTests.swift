@@ -72,6 +72,134 @@ final class SettingsWindowControllerTests: XCTestCase {
         XCTAssertEqual(resetSize.height, window.contentLayoutRect.height, accuracy: 1)
     }
 
+    func testSettingsSidebarProvidesOrderedAccessibleKeyboardNavigationAndPersistsSelection() throws {
+        let suiteName = "statelet-settings-sidebar-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let controller = SettingsWindowController(defaults: defaults)
+        let window = try XCTUnwrap(controller.window)
+        controller.show()
+        Self.pumpMainRunLoop(for: 0.1)
+        window.setContentSize(NSSize(width: 700, height: 570))
+        Self.pumpMainRunLoop(for: 0.05)
+
+        let sidebar = try Self.settingsSidebar(in: window)
+        let expectedLabels = [
+            "Animations",
+            "Voice",
+            "Appearance",
+            "General",
+            "Diagnostics",
+            "Help",
+            "Prompts",
+            "Recommendation",
+        ]
+        XCTAssertEqual(sidebar.numberOfRows, expectedLabels.count)
+        XCTAssertEqual(
+            (0 ..< sidebar.numberOfRows).map { Self.sidebarLabel(in: sidebar, row: $0) },
+            expectedLabels
+        )
+        XCTAssertEqual(sidebar.accessibilityLabel(), "Settings navigation")
+        XCTAssertEqual(sidebar.accessibilityRole(), .list)
+        XCTAssertEqual(sidebar.selectedRow, 0)
+        XCTAssertFalse(
+            Self.descendants(of: window.contentView).compactMap { $0 as? NSSegmentedControl }.contains {
+                $0.accessibilityLabel() == "Settings section"
+            }
+        )
+        XCTAssertGreaterThanOrEqual(sidebar.enclosingScrollView?.frame.width ?? 0, 125)
+        XCTAssertLessThanOrEqual(sidebar.enclosingScrollView?.frame.width ?? .greatestFiniteMagnitude, 160)
+        XCTAssertEqual(window.contentLayoutRect.width, 700, accuracy: 1)
+        XCTAssertEqual(window.contentLayoutRect.height, 570, accuracy: 1)
+
+        XCTAssertTrue(window.makeFirstResponder(sidebar))
+        let downArrow = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: window.windowNumber,
+            context: nil,
+            characters: "\u{F701}",
+            charactersIgnoringModifiers: "\u{F701}",
+            isARepeat: false,
+            keyCode: 125
+        ))
+        sidebar.keyDown(with: downArrow)
+        Self.pumpMainRunLoop(for: 0.05)
+        XCTAssertEqual(sidebar.selectedRow, 1)
+
+        sidebar.selectRowIndexes(IndexSet(integer: 6), byExtendingSelection: false)
+        Self.pumpMainRunLoop(for: 0.05)
+        XCTAssertEqual(sidebar.selectedRowIndexes, IndexSet(integer: 6))
+        XCTAssertEqual(sidebar.accessibilitySelectedRows()?.count, 1)
+        XCTAssertEqual(defaults.integer(forKey: "Statelet.Settings.selectedSection"), 6)
+        window.close()
+        Self.pumpMainRunLoop(for: 0.05)
+
+        let restoredController = SettingsWindowController(defaults: defaults)
+        let restoredWindow = try XCTUnwrap(restoredController.window)
+        restoredController.show()
+        Self.pumpMainRunLoop(for: 0.1)
+        defer {
+            restoredWindow.close()
+            Self.pumpMainRunLoop(for: 0.05)
+        }
+        XCTAssertEqual(try Self.settingsSidebar(in: restoredWindow).selectedRow, 6)
+    }
+
+    @MainActor
+    func testAppearanceExposesDialogueAndActivityPopupControlsAndPreviews() throws {
+        let controller = SettingsWindowController()
+        let window = try XCTUnwrap(controller.window)
+        controller.update(
+            snapshot: SettingsSnapshot(
+                mediaMap: try MediaMap(),
+                mediaMapURL: URL(fileURLWithPath: "/tmp/media-map.json"),
+                publisherSummary: "Test",
+                reduceMotion: false
+            )
+        )
+        controller.show()
+        Self.pumpMainRunLoop(for: 0.1)
+        defer {
+            window.close()
+            Self.pumpMainRunLoop(for: 0.05)
+        }
+
+        let sidebar = try Self.settingsSidebar(in: window)
+        sidebar.selectRowIndexes(IndexSet(integer: 2), byExtendingSelection: false)
+        Self.pumpMainRunLoop(for: 0.05)
+
+        let labels = Self.descendants(of: window.contentView)
+            .compactMap { $0.accessibilityLabel() }
+        for label in [
+            "Dialogue bubble background color",
+            "Dialogue bubble text color",
+            "Dialogue bubble background opacity",
+            "Dialogue bubble contrast",
+            "Activity popup background color",
+            "Activity popup background opacity",
+            "Activity popup contrast",
+            "Dialogue bubble appearance preview",
+            "Activity popup appearance preview",
+        ] {
+            XCTAssertTrue(labels.contains(label), "missing \(label)")
+        }
+        sidebar.selectRowIndexes(IndexSet(integer: 5), byExtendingSelection: false)
+        Self.pumpMainRunLoop(for: 0.05)
+        XCTAssertTrue(Self.descendants(of: window.contentView).compactMap { $0 as? NSTextField }.contains {
+            $0.stringValue.contains("Managed media location")
+        })
+        XCTAssertNotNil(
+            Self.descendants(of: window.contentView).compactMap { $0 as? NSButton }.first {
+                $0.accessibilityLabel() == "Open managed media location in Finder"
+            }
+        )
+    }
+
     func testStaticSettingsPanesProvideScrollableOverflow() throws {
         let suiteName = "statelet-settings-scroll-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -87,14 +215,9 @@ final class SettingsWindowControllerTests: XCTestCase {
             Self.pumpMainRunLoop(for: 0.05)
         }
 
-        let tabs = try XCTUnwrap(
-            Self.descendants(of: window.contentView).compactMap { $0 as? NSSegmentedControl }.first {
-                $0.accessibilityLabel() == "Settings section"
-            }
-        )
+        let sidebar = try Self.settingsSidebar(in: window)
         for section in [2, 3, 5, 6] {
-            tabs.selectedSegment = section
-            NSApp.sendAction(tabs.action!, to: tabs.target, from: tabs)
+            sidebar.selectRowIndexes(IndexSet(integer: section), byExtendingSelection: false)
             Self.pumpMainRunLoop(for: 0.05)
             let scrollView = try XCTUnwrap(
                 Self.descendants(of: window.contentView).compactMap { $0 as? NSScrollView }.first {
@@ -127,17 +250,12 @@ final class SettingsWindowControllerTests: XCTestCase {
             Self.pumpMainRunLoop(for: 0.05)
         }
 
-        let tabs = try XCTUnwrap(
-            Self.descendants(of: window.contentView).compactMap { $0 as? NSSegmentedControl }.first {
-                $0.accessibilityLabel() == "Settings section"
-            }
-        )
-        XCTAssertEqual(tabs.segmentCount, 8)
-        XCTAssertEqual(tabs.label(forSegment: 5), "Help")
-        XCTAssertEqual(tabs.label(forSegment: 6), "Prompts")
+        let sidebar = try Self.settingsSidebar(in: window)
+        XCTAssertEqual(sidebar.numberOfRows, 8)
+        XCTAssertEqual(Self.sidebarLabel(in: sidebar, row: 5), "Help")
+        XCTAssertEqual(Self.sidebarLabel(in: sidebar, row: 6), "Prompts")
 
-        tabs.selectedSegment = 5
-        NSApp.sendAction(tabs.action!, to: tabs.target, from: tabs)
+        sidebar.selectRowIndexes(IndexSet(integer: 5), byExtendingSelection: false)
         Self.pumpMainRunLoop(for: 0.05)
         XCTAssertNotNil(
             Self.descendants(of: window.contentView).compactMap { $0 as? NSTextField }.first {
@@ -188,8 +306,7 @@ final class SettingsWindowControllerTests: XCTestCase {
         XCTAssertEqual(updateControls.count, 4)
         XCTAssertTrue(updateControls.allSatisfy { !$0.isEnabled })
 
-        tabs.selectedSegment = 6
-        NSApp.sendAction(tabs.action!, to: tabs.target, from: tabs)
+        sidebar.selectRowIndexes(IndexSet(integer: 6), byExtendingSelection: false)
         Self.pumpMainRunLoop(for: 0.05)
         XCTAssertNotNil(
             Self.descendants(of: window.contentView).compactMap { $0 as? NSTextField }.first {
@@ -199,7 +316,12 @@ final class SettingsWindowControllerTests: XCTestCase {
     }
 
     func testInitialPaneDoesNotInflateRequestedWindowSize() throws {
-        let controller = SettingsWindowController()
+        let suiteName = "statelet-settings-pane-size-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let controller = SettingsWindowController(defaults: defaults)
         let window = try XCTUnwrap(controller.window)
 
         controller.show()
@@ -209,11 +331,9 @@ final class SettingsWindowControllerTests: XCTestCase {
             Self.pumpMainRunLoop(for: 0.05)
         }
 
-        let tabs = try XCTUnwrap(
-            Self.descendants(of: window.contentView).compactMap { $0 as? NSSegmentedControl }.first {
-                $0.accessibilityLabel() == "Settings section"
-            }
-        )
+        let sidebar = try Self.settingsSidebar(in: window)
+        sidebar.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        Self.pumpMainRunLoop(for: 0.05)
         let animationModes = try XCTUnwrap(
             Self.descendants(of: window.contentView).compactMap { $0 as? NSSegmentedControl }.first {
                 $0.accessibilityLabel() == "Animation library mode"
@@ -247,9 +367,8 @@ final class SettingsWindowControllerTests: XCTestCase {
         Self.pumpMainRunLoop(for: 0.05)
         XCTAssertEqual(transitionScope.accessibilityValue() as? String, "Global")
 
-        for section in 0 ..< tabs.segmentCount {
-            tabs.selectedSegment = section
-            NSApp.sendAction(tabs.action!, to: tabs.target, from: tabs)
+        for section in 0 ..< sidebar.numberOfRows {
+            sidebar.selectRowIndexes(IndexSet(integer: section), byExtendingSelection: false)
             Self.pumpMainRunLoop(for: 0.05)
 
             XCTAssertGreaterThanOrEqual(window.contentLayoutRect.width, 700, "section \(section)")
@@ -292,6 +411,9 @@ final class SettingsWindowControllerTests: XCTestCase {
             Self.pumpMainRunLoop(for: 0.05)
         }
 
+        let sidebar = try Self.settingsSidebar(in: window)
+        sidebar.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        Self.pumpMainRunLoop(for: 0.05)
         let animationModes = try XCTUnwrap(
             Self.descendants(of: window.contentView).compactMap { $0 as? NSSegmentedControl }.first {
                 $0.accessibilityLabel() == "Animation library mode"
@@ -373,6 +495,19 @@ final class SettingsWindowControllerTests: XCTestCase {
     private static func descendants(of root: NSView?) -> [NSView] {
         guard let root else { return [] }
         return [root] + root.subviews.flatMap { descendants(of: $0) }
+    }
+
+    private static func settingsSidebar(in window: NSWindow) throws -> NSTableView {
+        try XCTUnwrap(
+            descendants(of: window.contentView).compactMap { $0 as? NSTableView }.first {
+                $0.accessibilityLabel() == "Settings navigation"
+            }
+        )
+    }
+
+    private static func sidebarLabel(in sidebar: NSTableView, row: Int) -> String? {
+        guard let cell = sidebar.view(atColumn: 0, row: row, makeIfNecessary: true) else { return nil }
+        return descendants(of: cell).compactMap { $0 as? NSTextField }.first?.stringValue
     }
 
     private static func pumpMainRunLoop(for duration: TimeInterval) {

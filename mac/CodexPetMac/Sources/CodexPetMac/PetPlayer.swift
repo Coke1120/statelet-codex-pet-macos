@@ -59,6 +59,13 @@ enum PlaybackPresentationStatus: Equatable {
     }
 }
 
+struct DialogueBubbleResolvedAppearance {
+    let backgroundColor: NSColor
+    let textColor: NSColor
+    let backgroundOpacity: Double
+    let contrastRatio: Double
+}
+
 /// Retains a resume request while `AVPlayerLooper` is still populating its
 /// queue. A later suspension cancels the deferred request; clearing that
 /// suspension produces a fresh directive from `PlaybackSuspensionPolicy`.
@@ -228,6 +235,16 @@ final class PetPlayerView: NSView {
         layoutDialogueBubble()
     }
 
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        let workspace = NSWorkspace.shared
+        applyDialogueBubbleAppearance(
+            configuration: appearanceConfiguration,
+            reduceTransparency: workspace.accessibilityDisplayShouldReduceTransparency,
+            increaseContrast: workspace.accessibilityDisplayShouldIncreaseContrast
+        )
+    }
+
     override func resetCursorRects() {
         super.resetCursorRects()
         let width = Self.resizeHandleWidth
@@ -383,7 +400,6 @@ final class PetPlayerView: NSView {
 
     private func configureDialogueBubble() {
         dialogueBubble.wantsLayer = true
-        dialogueBubble.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.88).cgColor
         dialogueBubble.layer?.cornerCurve = .continuous
         dialogueBubble.layer?.cornerRadius = 10
         dialogueBubble.isHidden = true
@@ -393,7 +409,6 @@ final class PetPlayerView: NSView {
 
         dialogueLabel.alignment = .center
         dialogueLabel.font = .systemFont(ofSize: 13, weight: .medium)
-        dialogueLabel.textColor = .labelColor
         dialogueLabel.maximumNumberOfLines = 4
         dialogueLabel.lineBreakMode = .byWordWrapping
         dialogueLabel.translatesAutoresizingMaskIntoConstraints = true
@@ -524,12 +539,115 @@ final class PetPlayerView: NSView {
             configuration: configuration,
             reduceTransparency: reduceTransparency
         )
+        applyDialogueBubbleAppearance(
+            configuration: configuration,
+            reduceTransparency: reduceTransparency,
+            increaseContrast: increaseContrast
+        )
         stateBadge.isHidden = !configuration.showStateLabel
         refreshStateBadge(
             reduceTransparency: reduceTransparency,
             increaseContrast: increaseContrast
         )
         needsLayout = true
+    }
+
+    private func applyDialogueBubbleAppearance(
+        configuration: PetAppearanceConfiguration,
+        reduceTransparency: Bool,
+        increaseContrast: Bool
+    ) {
+        let resolved = Self.resolveDialogueAppearance(
+            configuration: configuration,
+            systemBackgroundColor: .windowBackgroundColor,
+            systemTextColor: .labelColor,
+            reduceTransparency: reduceTransparency,
+            increaseContrast: increaseContrast
+        )
+        dialogueBubble.layer?.backgroundColor = resolved.backgroundColor.withAlphaComponent(
+            CGFloat(resolved.backgroundOpacity)
+        ).cgColor
+        dialogueLabel.textColor = resolved.textColor
+    }
+
+    static func resolveDialogueAppearance(
+        configuration: PetAppearanceConfiguration,
+        systemBackgroundColor: NSColor,
+        systemTextColor: NSColor,
+        reduceTransparency: Bool,
+        increaseContrast: Bool
+    ) -> DialogueBubbleResolvedAppearance {
+        var backgroundColor: NSColor
+        let requestedTextColor: NSColor
+        switch configuration.dialogueContrastMode {
+        case .automatic:
+            backgroundColor = systemBackgroundColor
+            requestedTextColor = systemTextColor
+        case .custom:
+            backgroundColor = NSColor.codexPet(hex: configuration.dialogueBackgroundColor)
+            requestedTextColor = NSColor.codexPet(hex: configuration.dialogueTextColor)
+        }
+
+        let minimumContrast = increaseContrast ? 7.0 : 4.5
+        let requestedContrast = contrastRatio(
+            foreground: requestedTextColor,
+            background: backgroundColor
+        )
+        var textColor: NSColor
+        var resolvedContrast: Double
+        if requestedContrast >= minimumContrast {
+            textColor = requestedTextColor
+            resolvedContrast = requestedContrast
+        } else {
+            let blackContrast = contrastRatio(foreground: .black, background: backgroundColor)
+            let whiteContrast = contrastRatio(foreground: .white, background: backgroundColor)
+            if blackContrast >= whiteContrast {
+                textColor = .black
+                resolvedContrast = blackContrast
+            } else {
+                textColor = .white
+                resolvedContrast = whiteContrast
+            }
+        }
+        if resolvedContrast < minimumContrast {
+            backgroundColor = .black
+            textColor = .white
+            resolvedContrast = 21
+        }
+
+        let backgroundOpacity: Double
+        if reduceTransparency {
+            backgroundOpacity = 1
+        } else if increaseContrast {
+            backgroundOpacity = max(configuration.dialogueBackgroundOpacity, 0.92)
+        } else {
+            backgroundOpacity = configuration.dialogueBackgroundOpacity
+        }
+        return DialogueBubbleResolvedAppearance(
+            backgroundColor: backgroundColor,
+            textColor: textColor,
+            backgroundOpacity: backgroundOpacity,
+            contrastRatio: resolvedContrast
+        )
+    }
+
+    private static func contrastRatio(foreground: NSColor, background: NSColor) -> Double {
+        let lighter = max(relativeLuminance(foreground), relativeLuminance(background))
+        let darker = min(relativeLuminance(foreground), relativeLuminance(background))
+        return (lighter + 0.05) / (darker + 0.05)
+    }
+
+    private static func relativeLuminance(_ color: NSColor) -> Double {
+        guard let color = color.usingColorSpace(.sRGB) else { return 0 }
+        func linearized(_ component: CGFloat) -> Double {
+            let value = Double(component)
+            return value <= 0.04045
+                ? value / 12.92
+                : pow((value + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * linearized(color.redComponent)
+            + 0.7152 * linearized(color.greenComponent)
+            + 0.0722 * linearized(color.blueComponent)
     }
 
     func updateStateBadge(state: PetState, publisherStatus: PublisherBadgeVisualStatus) {

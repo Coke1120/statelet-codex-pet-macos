@@ -51,16 +51,20 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         cls.ci = read(ROOT / ".github" / "workflows" / "ci.yml")
 
     def test_voice_help_and_prompts_are_distinct_accessible_settings_panes(self) -> None:
-        tab_match = re.search(
-            r"NSSegmentedControl\(labels:\s*\[(?P<labels>[^]]+)\]",
+        sidebar_match = re.search(
+            r"private\s+static\s+let\s+sectionLabels\s*=\s*\[(?P<labels>[^]]+)\]",
             self.settings,
         )
-        self.assertIsNotNone(tab_match, "Settings tab labels were not found")
-        labels = re.findall(r'"([^"]+)"', tab_match.group("labels"))
+        self.assertIsNotNone(sidebar_match, "Settings sidebar labels were not found")
+        labels = re.findall(r'"([^"]+)"', sidebar_match.group("labels"))
         self.assertEqual(len(labels), 8)
         self.assertEqual(labels[1], "Voice")
         self.assertEqual(labels[5], "Help")
         self.assertEqual(labels[6], "Prompts")
+        self.assertIn('sidebarTableView.setAccessibilityLabel("Settings navigation")', self.settings)
+        self.assertIn("sidebarTableView.delegate = self", self.settings)
+        self.assertIn("sidebarTableView.dataSource = self", self.settings)
+        self.assertNotIn('tabs.setAccessibilityLabel("Settings section")', self.settings)
         self.assertIn("dialogueVoiceView,", self.settings)
         self.assertIn("let selectedPane = panes[index]", self.settings)
         self.assertIn("paneHost.addSubview(selectedPane)", self.settings)

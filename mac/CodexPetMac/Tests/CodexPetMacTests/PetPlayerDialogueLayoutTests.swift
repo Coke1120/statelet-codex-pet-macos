@@ -5,6 +5,88 @@ import XCTest
 
 final class PetPlayerDialogueLayoutTests: XCTestCase {
     @MainActor
+    func testCustomWhiteOnWhiteDialogueFallsBackToReadableText() throws {
+        let appearance = try PetAppearanceConfiguration(
+            dialogueBackgroundColor: "#FFFFFF",
+            dialogueTextColor: "#FFFFFF",
+            dialogueBackgroundOpacity: 1,
+            dialogueContrastMode: .custom
+        )
+
+        let resolved = PetPlayerView.resolveDialogueAppearance(
+            configuration: appearance,
+            systemBackgroundColor: .black,
+            systemTextColor: .white,
+            reduceTransparency: false,
+            increaseContrast: false
+        )
+
+        XCTAssertEqual(resolved.backgroundColor.codexPetHex, "#FFFFFF")
+        XCTAssertEqual(resolved.textColor.codexPetHex, "#000000")
+        XCTAssertGreaterThanOrEqual(resolved.contrastRatio, 4.5)
+        XCTAssertEqual(resolved.backgroundOpacity, 1)
+
+        let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 480))
+        view.applyAppearance(appearance)
+        let bubble = try XCTUnwrap(
+            view.subviews.first { $0.accessibilityLabel() == "Statelet message" }
+        )
+        let label = try XCTUnwrap(bubble.subviews.compactMap { $0 as? NSTextField }.first)
+        XCTAssertEqual(label.textColor?.codexPetHex, "#000000")
+    }
+
+    @MainActor
+    func testAutomaticDialogueUsesReadableDynamicSystemColorsInLightAndDarkAppearances() throws {
+        let appearance = try PetAppearanceConfiguration(
+            dialogueBackgroundColor: "#FFFFFF",
+            dialogueTextColor: "#FFFFFF",
+            dialogueContrastMode: .automatic
+        )
+
+        for (background, text) in [(NSColor.white, NSColor.black), (.black, .white)] {
+            let resolved = PetPlayerView.resolveDialogueAppearance(
+                configuration: appearance,
+                systemBackgroundColor: background,
+                systemTextColor: text,
+                reduceTransparency: false,
+                increaseContrast: false
+            )
+            XCTAssertEqual(resolved.backgroundColor.codexPetHex, background.codexPetHex)
+            XCTAssertEqual(resolved.textColor.codexPetHex, text.codexPetHex)
+            XCTAssertGreaterThanOrEqual(resolved.contrastRatio, 4.5)
+        }
+    }
+
+    @MainActor
+    func testDialogueAccessibilityOptionsRaiseOpacityAndContrast() throws {
+        let appearance = try PetAppearanceConfiguration(
+            dialogueBackgroundColor: "#777777",
+            dialogueTextColor: "#888888",
+            dialogueBackgroundOpacity: 0.2,
+            dialogueContrastMode: .custom
+        )
+        let increasedContrast = PetPlayerView.resolveDialogueAppearance(
+            configuration: appearance,
+            systemBackgroundColor: .white,
+            systemTextColor: .black,
+            reduceTransparency: false,
+            increaseContrast: true
+        )
+        XCTAssertGreaterThanOrEqual(increasedContrast.contrastRatio, 7)
+        XCTAssertGreaterThanOrEqual(increasedContrast.backgroundOpacity, 0.92)
+
+        let reducedTransparency = PetPlayerView.resolveDialogueAppearance(
+            configuration: appearance,
+            systemBackgroundColor: .white,
+            systemTextColor: .black,
+            reduceTransparency: true,
+            increaseContrast: false
+        )
+        XCTAssertEqual(reducedTransparency.backgroundOpacity, 1)
+        XCTAssertGreaterThanOrEqual(reducedTransparency.contrastRatio, 4.5)
+    }
+
+    @MainActor
     func testDialogueBubbleAvoidsOverlaysWithTopLeftStateLabel() throws {
         try assertDialogueBubbleAvoidsOverlays(stateLabelPosition: .topLeft)
     }

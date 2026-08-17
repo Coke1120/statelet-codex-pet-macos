@@ -528,6 +528,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var sessionActivityAcknowledgementHistory: [String] = []
     private var sessionActivityExpandedByUser = false
     private var sessionActivityLayoutAvailable = true
+    private var sessionActivityAppearance = try! SessionActivityPanelAppearance()
+    private var sessionActivityUserOrigin: NSPoint?
+    private var isPositioningSessionActivityPanel = false
     private var lastLifecycleStateForSelection: PetState?
     private var lastPresentedState: PetState?
     private var lastCommittedLifecycleState: PetState?
@@ -634,6 +637,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         conversionProfile = AlphaConversionProfile.restored()
         options = LaunchOptions.parse(arguments: CommandLine.arguments)
         loadSessionActivityAcknowledgements()
+        sessionActivityAppearance = SessionActivityPanelAppearanceStore.restored()
+        sessionActivityUserOrigin = SessionActivityPanelPositionStore.restored()
         do {
             try StateletUpdateInstaller.reconcilePendingTransaction()
         } catch {
@@ -735,6 +740,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         sessionActivityView = SessionActivityView(
             frame: NSRect(origin: .zero, size: Self.sessionActivityPanelSize)
         )
+        sessionActivityView.applyAppearance(sessionActivityAppearance)
         sessionActivityView.onAcknowledge = { [weak self] id in
             self?.acknowledgeSessionActivity(id)
         }
@@ -750,6 +756,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             alwaysOnTop: effectiveAlwaysOnTop,
             fullScreenAuxiliary: configuredWindow.fullScreenAuxiliary
         )
+        sessionActivityPanel.delegate = self
         sessionActivityScrollContainer = SessionActivityScrollContainer(
             activityView: sessionActivityView
         )
@@ -762,6 +769,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         clickThrough = options.clickThroughOverride ?? configuredWindow.clickThrough
         panel.ignoresMouseEvents = clickThrough
         sessionActivityPanel.ignoresMouseEvents = clickThrough
+        sessionActivityPanel.isMovableByWindowBackground = !clickThrough
         positionSessionActivityPanel()
         if effectiveAlwaysOnTop {
             panel.orderFrontRegardless()
@@ -881,10 +889,23 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     func windowDidMove(_ notification: Notification) {
+        if let movedWindow = notification.object as? NSWindow,
+           movedWindow === sessionActivityPanel {
+            guard !isPositioningSessionActivityPanel else { return }
+            sessionActivityUserOrigin = movedWindow.frame.origin
+            SessionActivityPanelPositionStore.persist(movedWindow.frame.origin)
+            positionSessionActivityPanel()
+            return
+        }
         schedulePositionSave()
         positionSessionActivityPanel()
     }
     func windowDidResize(_ notification: Notification) {
+        if let resizedWindow = notification.object as? NSWindow,
+           resizedWindow === sessionActivityPanel {
+            positionSessionActivityPanel()
+            return
+        }
         schedulePositionSave()
         positionSessionActivityPanel()
     }
@@ -913,6 +934,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             apply(state: currentState, forceRefresh: true)
         }
         player?.applyAppearance(mediaMap.window.appearance)
+        sessionActivityView?.applyAppearance(sessionActivityAppearance)
         refreshSettings()
     }
 
@@ -1207,6 +1229,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         clickThrough = options.clickThroughOverride ?? mediaMap.window.clickThrough
         panel.ignoresMouseEvents = clickThrough
         sessionActivityPanel?.ignoresMouseEvents = clickThrough
+        sessionActivityPanel?.isMovableByWindowBackground = !clickThrough
         panel.apply(
             alwaysOnTop: options.alwaysOnTopOverride ?? mediaMap.window.alwaysOnTop,
             fullScreenAuxiliary: mediaMap.window.fullScreenAuxiliary
@@ -1215,6 +1238,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             alwaysOnTop: effectiveAlwaysOnTop,
             fullScreenAuxiliary: mediaMap.window.fullScreenAuxiliary
         )
+        sessionActivityView?.applyAppearance(sessionActivityAppearance)
         positionSessionActivityPanel()
         refreshSessionActivityPresentation()
         player?.applyAppearance(mediaMap.window.appearance)
@@ -1374,7 +1398,24 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
         sessionActivityView.setCompactOverride(layout.compact)
         sessionActivityScrollContainer.setScrollable(layout.scrollable)
-        sessionActivityPanel.setFrame(layout.frame, display: display)
+        let targetFrame: NSRect
+        if let origin = sessionActivityUserOrigin {
+            let clampedOrigin = SessionActivityPanelPositionStore.clamped(
+                origin: origin,
+                size: layout.frame.size,
+                to: visibleFrame
+            )
+            if clampedOrigin != origin {
+                sessionActivityUserOrigin = clampedOrigin
+                SessionActivityPanelPositionStore.persist(clampedOrigin)
+            }
+            targetFrame = NSRect(origin: clampedOrigin, size: layout.frame.size)
+        } else {
+            targetFrame = layout.frame
+        }
+        isPositioningSessionActivityPanel = true
+        sessionActivityPanel.setFrame(targetFrame, display: display)
+        isPositioningSessionActivityPanel = false
         if restoreVisibility,
            SessionActivityPanelVisibilityPolicy.shouldOrderFront(
                wasAvailable: wasAvailable,
@@ -1390,11 +1431,25 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             fullScreenAuxiliary: mediaMap.window.fullScreenAuxiliary
         )
         sessionActivityPanel.ignoresMouseEvents = clickThrough
+        sessionActivityPanel.isMovableByWindowBackground = !clickThrough
         sessionActivityPanel.orderVisible(alwaysOnTop: effectiveAlwaysOnTop)
     }
 
     private func expandSessionActivityPanel() {
         sessionActivityExpandedByUser = true
+        positionSessionActivityPanel(display: true)
+    }
+
+    private func applySessionActivityAppearance(_ appearance: SessionActivityPanelAppearance) {
+        sessionActivityAppearance = appearance
+        SessionActivityPanelAppearanceStore.persist(appearance)
+        sessionActivityView?.applyAppearance(appearance)
+        refreshSessionActivityPresentation()
+    }
+
+    private func resetSessionActivityPanelPosition() {
+        sessionActivityUserOrigin = nil
+        SessionActivityPanelPositionStore.reset()
         positionSessionActivityPanel(display: true)
     }
 
@@ -2852,6 +2907,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                     self.clickThrough = value
                     self.panel.ignoresMouseEvents = value
                     self.sessionActivityPanel?.ignoresMouseEvents = value
+                    self.sessionActivityPanel?.isMovableByWindowBackground = !value
                     self.updateStatusMenu()
                     self.refreshSettings()
                 },
@@ -2968,6 +3024,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
         controller.onWindowSettingsChange = { [weak self] update in self?.applyWindowSettings(update) }
         controller.onResetPosition = { [weak self] in self?.resetPanelPosition() }
+        controller.onSessionActivityAppearanceChange = { [weak self] appearance in
+            self?.applySessionActivityAppearance(appearance)
+        }
+        controller.onResetActivityPosition = { [weak self] in
+            self?.resetSessionActivityPanelPosition()
+        }
         controller.onRefreshDiagnostics = { [weak self] in self?.refreshDiagnosticsSnapshot() }
         controller.onRepairInstallation = { [weak self] in self?.repairStartupInstallation() }
         controller.onLaunchAtLoginChange = { [weak self] enabled in self?.setLaunchAtLogin(enabled) }
@@ -3023,6 +3085,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         controller.update(toolchainState: toolchainState)
         controller.update(conversionProfile: conversionProfile)
         controller.update(dialogueVoice: dialogueVoiceCoordinator.snapshot)
+        controller.update(sessionActivityAppearance: sessionActivityAppearance)
         if let snapshot = updateCoordinator?.snapshot {
             controller.update(update: snapshot)
         } else if updateRecoveryBlocked {
@@ -3087,6 +3150,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         )
         settingsController.update(toolchainState: toolchainState)
         settingsController.update(dialogueVoice: dialogueVoiceCoordinator.snapshot)
+        settingsController.update(sessionActivityAppearance: sessionActivityAppearance)
     }
 
     private func persistCharacterLibrary(_ updated: CharacterLibrary) throws {
@@ -6339,6 +6403,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             clickThrough = update.clickThrough
             panel.ignoresMouseEvents = clickThrough
             sessionActivityPanel?.ignoresMouseEvents = clickThrough
+            sessionActivityPanel?.isMovableByWindowBackground = !clickThrough
             applyPublishedMediaMap(updated, refreshPlayback: false)
         } catch {
             presentSettingsError("The window setting could not be saved.")

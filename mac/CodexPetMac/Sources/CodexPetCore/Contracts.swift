@@ -859,13 +859,25 @@ public struct WindowConfiguration: Codable, Equatable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        let appearance: PetAppearanceConfiguration
+        do {
+            appearance = try container.decodeIfPresent(
+                PetAppearanceConfiguration.self,
+                forKey: .appearance
+            ) ?? PetAppearanceConfiguration()
+        } catch {
+            // Appearance is presentation-only. A malformed or unsafe value
+            // must not make the lifecycle/media contract unusable; use the
+            // readable versioned defaults and continue decoding the map.
+            appearance = try PetAppearanceConfiguration()
+        }
         try self.init(
             width: container.decodeIfPresent(Double.self, forKey: .width) ?? 320,
             height: container.decodeIfPresent(Double.self, forKey: .height) ?? 480,
             alwaysOnTop: container.decodeIfPresent(Bool.self, forKey: .alwaysOnTop) ?? true,
             clickThrough: container.decodeIfPresent(Bool.self, forKey: .clickThrough) ?? false,
             fullScreenAuxiliary: container.decodeIfPresent(Bool.self, forKey: .fullScreenAuxiliary) ?? false,
-            appearance: try container.decodeIfPresent(PetAppearanceConfiguration.self, forKey: .appearance) ?? PetAppearanceConfiguration()
+            appearance: appearance
         )
     }
 }

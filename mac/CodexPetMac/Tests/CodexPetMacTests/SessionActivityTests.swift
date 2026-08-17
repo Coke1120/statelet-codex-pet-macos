@@ -125,6 +125,112 @@ final class SessionActivityTests: XCTestCase {
     }
 
     @MainActor
+    func testActivityRowsAreExplicitlyInformationalWhenActivationIsUnavailable() throws {
+        let active = try item(
+            "a",
+            state: .running,
+            event: .userPromptSubmit,
+            terminal: false,
+            eventAt: 90
+        )
+        let snapshot = try SessionActivitySnapshot(emittedAt: 100, active: [active])
+        let view = SessionActivityView(
+            frame: NSRect(x: 0, y: 0, width: 230, height: 150),
+            clock: { Date(timeIntervalSince1970: 100) }
+        )
+        view.update(snapshot: snapshot, acknowledgedIDs: [])
+        view.layoutSubtreeIfNeeded()
+
+        XCTAssertTrue(
+            allDescendants(of: view).compactMap { $0 as? NSTextField }.contains {
+                $0.stringValue.contains("activation is unavailable")
+            }
+        )
+        let rowLabel = try XCTUnwrap(
+            allDescendants(of: view).compactMap { $0 as? NSTextField }.first {
+                $0.accessibilityLabel()?.contains("Active running") == true
+            }
+        )
+        XCTAssertEqual(rowLabel.accessibilityRole(), .staticText)
+        XCTAssertEqual(rowLabel.accessibilityLabel(), "Active running session 1")
+    }
+
+    @MainActor
+    func testPanelAppearanceAndPositionStoresRejectInvalidValuesAndRoundTrip() throws {
+        let suiteName = "statelet-session-activity-(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        let appearance = try SessionActivityPanelAppearance(
+            backgroundColor: "#aBc123",
+            opacity: 0.41,
+            automaticContrast: false
+        )
+        SessionActivityPanelAppearanceStore.persist(appearance, to: defaults)
+        XCTAssertEqual(SessionActivityPanelAppearanceStore.restored(from: defaults), appearance)
+        defaults.set(Data("{\"opacity\":99}".utf8), forKey: SessionActivityPanelAppearanceStore.defaultsKey)
+        XCTAssertEqual(
+            SessionActivityPanelAppearanceStore.restored(from: defaults),
+            try SessionActivityPanelAppearance()
+        )
+
+        let origin = NSPoint(x: 240, y: 180)
+        SessionActivityPanelPositionStore.persist(origin, to: defaults)
+        XCTAssertEqual(SessionActivityPanelPositionStore.restored(from: defaults), origin)
+        defaults.set(["x": "bad", "y": 10], forKey: SessionActivityPanelPositionStore.defaultsKey)
+        XCTAssertNil(SessionActivityPanelPositionStore.restored(from: defaults))
+
+        let clamped = SessionActivityPanelPositionStore.clamped(
+            origin: NSPoint(x: -500, y: 1_000),
+            size: NSSize(width: 230, height: 150),
+            to: NSRect(x: 0, y: 0, width: 800, height: 600)
+        )
+        XCTAssertTrue(
+            NSRect(origin: clamped, size: NSSize(width: 230, height: 150))
+                .intersection(NSRect(x: 0, y: 0, width: 800, height: 600)).width >= 48
+        )
+    }
+
+    @MainActor
+    func testCustomActivityBackgroundResolvesReadableForeground() throws {
+        let appearance = try SessionActivityPanelAppearance(
+            backgroundColor: "#FFFFFF",
+            opacity: 0.4,
+            automaticContrast: false
+        )
+        let resolved = SessionActivityView.resolveAppearance(
+            appearance: appearance,
+            systemBackgroundColor: .white,
+            systemTextColor: .white,
+            secondaryTextColor: .white,
+            reduceTransparency: false,
+            increaseContrast: false
+        )
+
+        XCTAssertEqual(resolved.backgroundColor.codexPetHex, "#FFFFFF")
+        XCTAssertEqual(resolved.primaryTextColor.codexPetHex, "#000000")
+        XCTAssertEqual(resolved.secondaryTextColor.codexPetHex, "#000000")
+        XCTAssertGreaterThanOrEqual(resolved.contrastRatio, 4.5)
+
+        let increased = SessionActivityView.resolveAppearance(
+            appearance: try SessionActivityPanelAppearance(
+                backgroundColor: "#777777",
+                opacity: 0.2,
+                automaticContrast: false
+            ),
+            systemBackgroundColor: .white,
+            systemTextColor: .white,
+            secondaryTextColor: .white,
+            reduceTransparency: false,
+            increaseContrast: true
+        )
+        XCTAssertGreaterThanOrEqual(increased.contrastRatio, 7)
+        XCTAssertGreaterThanOrEqual(increased.opacity, 0.96)
+    }
+
+    @MainActor
     func testPanelAnchorsRightThenFallsBackLeftWithoutLeavingVisibleFrame() {
         let pet = NSRect(x: 600, y: 400, width: 160, height: 160)
         let visible = NSRect(x: 0, y: 0, width: 1_000, height: 800)
