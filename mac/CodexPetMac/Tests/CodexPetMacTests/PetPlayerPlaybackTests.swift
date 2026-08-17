@@ -128,9 +128,8 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
         let outgoingURL = directory.appendingPathComponent("same-state-outgoing.mov")
         let transitionURL = directory.appendingPathComponent("same-state-transition.mov")
         let destinationURL = directory.appendingPathComponent("same-state-destination.mov")
-        for url in [outgoingURL, destinationURL] {
-            try Self.writeTestMovie(to: url)
-        }
+        try Self.writeTestMovie(to: outgoingURL, frameCount: 120)
+        try Self.writeTestMovie(to: destinationURL, frameCount: 60)
         try Self.writeTestMovie(to: transitionURL, frameCount: 120)
 
         let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
@@ -138,6 +137,33 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
         let outgoingEntry = try MediaEntry(path: outgoingURL.lastPathComponent)
         let transitionEntry = try MediaEntry(path: transitionURL.lastPathComponent)
         let destinationEntry = try MediaEntry(path: destinationURL.lastPathComponent)
+        let attestation = try Self.testTransitionAttestation(for: transitionURL)
+        var preparationIDs: [UInt64] = []
+        var activationPairs: [(transition: UInt64, base: UInt64)] = []
+        var handoffDisposition: PlaybackStartDisposition?
+        controller.onPlaylistClipApproachingEnd = { transitionID, state in
+            preparationIDs.append(transitionID)
+            controller.onPlaylistClipApproachingEnd = nil
+            handoffDisposition = controller.showLifecycleTransition(
+                sourceState: state,
+                destinationState: state,
+                transitionEntry: transitionEntry,
+                transitionURL: transitionURL,
+                transitionAttestation: attestation,
+                destinationEntry: destinationEntry,
+                destinationURL: destinationURL,
+                transitionID: 144,
+                startedAt: DispatchTime.now().uptimeNanoseconds,
+                advancePlaylistWhenEnded: true,
+                sameStateBaseTransitionID: transitionID
+            )
+            return handoffDisposition == .preparing
+        }
+        controller.onPreparedLifecycleTransitionActivation = {
+            transitionID, baseTransitionID, _ in
+            activationPairs.append((transitionID, baseTransitionID))
+            return true
+        }
         XCTAssertEqual(
             controller.show(
                 state: .running,
@@ -154,54 +180,89 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
             controller.currentURL == outgoingURL
         }
         let outgoingPlayer = try XCTUnwrap(view.playerLayer.player)
+        let outgoingLayer = view.playerLayer
         var endedIDs: [UInt64] = []
         controller.onLifecycleTransitionEnded = { endedIDs.append($0) }
 
-        XCTAssertEqual(
-            controller.showLifecycleTransition(
-                sourceState: .running,
-                destinationState: .running,
-                transitionEntry: transitionEntry,
-                transitionURL: transitionURL,
-                transitionAttestation: try Self.testTransitionAttestation(for: transitionURL),
-                destinationEntry: destinationEntry,
-                destinationURL: destinationURL,
-                transitionID: 144,
-                startedAt: DispatchTime.now().uptimeNanoseconds,
-                advancePlaylistWhenEnded: true
-            ),
-            .preparing
-        )
+        try Self.waitUntil("same-state handoff was not prewarmed before clip end") {
+            preparationIDs == [143] && handoffDisposition == .preparing
+        }
         XCTAssertTrue(view.playerLayer.player === outgoingPlayer)
         XCTAssertFalse(view.playerLayer.isHidden)
         XCTAssertTrue(view.destinationPlayerLayer.isHidden)
         XCTAssertTrue(view.lifecycleTransitionPlayerLayer.isHidden)
+        let preparedDestinationPlayer = try XCTUnwrap(view.destinationPlayerLayer.player)
+        let outgoingTimeDuringPrewarm = outgoingPlayer.currentTime().seconds
+        Self.pumpMainRunLoop(for: 0.2)
+        XCTAssertGreaterThan(
+            outgoingPlayer.currentTime().seconds,
+            outgoingTimeDuringPrewarm + 0.05,
+            "prewarm stopped the outgoing state animation"
+        )
+        XCTAssertLessThan(
+            preparedDestinationPlayer.currentTime().seconds,
+            0.03,
+            "prewarm started the destination before its final-third cue"
+        )
 
         try Self.waitUntil("same-state transition foreground never became visible") {
             !view.lifecycleTransitionPlayerLayer.isHidden
         }
         let transitionVisibleAt = Date()
+        let incomingLayer = view.destinationPlayerLayer
         let transitionPlayer = try XCTUnwrap(view.lifecycleTransitionPlayerLayer.player)
         let transitionDuration = try XCTUnwrap(transitionPlayer.currentItem).duration.seconds
+        let outgoingDuration = try XCTUnwrap(outgoingPlayer.currentItem).duration.seconds
         let expectedTransitionRate = LifecycleTransitionMediaPolicy.presentationPlaybackRate(
             sourceDuration: transitionDuration,
             requestedRate: transitionEntry.playbackRate.value
         )
         XCTAssertGreaterThan(expectedTransitionRate, 2)
         XCTAssertEqual(Double(transitionPlayer.rate), expectedTransitionRate, accuracy: 0.05)
-        try Self.waitUntil("same-state destination did not preroll while hidden") {
-            view.destinationPlayerLayer.isHidden
-                && (view.destinationPlayerLayer.player?.currentTime().seconds ?? 0) > 0
-        }
+        XCTAssertLessThanOrEqual(
+            transitionDuration / expectedTransitionRate,
+            LifecycleTransitionMediaPolicy.maximumPresentationDuration + 0.001
+        )
+        XCTAssertLessThan(
+            outgoingPlayer.currentTime().seconds,
+            outgoingDuration - 0.03,
+            "transition appeared only after the outgoing clip froze at its end"
+        )
+        XCTAssertEqual(activationPairs.count, 1)
+        XCTAssertEqual(activationPairs.first?.transition, 144)
+        XCTAssertEqual(activationPairs.first?.base, 143)
         XCTAssertFalse(view.lifecycleTransitionPlayerLayer.isHidden)
-        try Self.waitUntil("same-state transition did not promote its destination") {
-            endedIDs == [144]
-                && view.playerLayer.player !== outgoingPlayer
-                && view.destinationPlayerLayer.isHidden
+        try Self.waitUntil("transition did not enter its outgoing fade phase") {
+            transitionPlayer.currentTime().seconds > 0.15
         }
+        let transitionTimeBeforeSuspension = transitionPlayer.currentTime().seconds
+        let outgoingOpacityBeforeSuspension = outgoingLayer.opacity
+        controller.setSuspended(true, for: .windowOccluded)
+        Self.pumpMainRunLoop(for: 0.25)
+        XCTAssertEqual(
+            transitionPlayer.currentTime().seconds,
+            transitionTimeBeforeSuspension,
+            accuracy: 0.04
+        )
+        XCTAssertEqual(outgoingLayer.opacity, outgoingOpacityBeforeSuspension, accuracy: 0.04)
+        controller.setSuspended(false, for: .windowOccluded)
+
+        let deadline = Date().addingTimeInterval(4)
+        while endedIDs.isEmpty, Date() < deadline {
+            let outgoingOpacity = outgoingLayer.isHidden ? 0 : Double(outgoingLayer.opacity)
+            let incomingOpacity = incomingLayer.isHidden ? 0 : Double(incomingLayer.opacity)
+            XCTAssertFalse(
+                outgoingOpacity > 0.02 && incomingOpacity > 0.02,
+                "two state animations were visible together"
+            )
+            RunLoop.main.run(until: min(deadline, Date().addingTimeInterval(0.01)))
+        }
+        XCTAssertEqual(endedIDs, [144])
+        XCTAssertTrue(view.playerLayer.player !== outgoingPlayer)
+        XCTAssertTrue(view.destinationPlayerLayer.isHidden)
         XCTAssertLessThan(
             Date().timeIntervalSince(transitionVisibleAt),
-            LifecycleTransitionMediaPolicy.maximumPresentationDuration + 0.75
+            LifecycleTransitionMediaPolicy.maximumPresentationDuration + 0.6
         )
         XCTAssertEqual(controller.currentState, .running)
         XCTAssertEqual(controller.currentURL, destinationURL)
@@ -209,6 +270,83 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
         XCTAssertNotEqual(controller.currentURL, transitionURL)
         XCTAssertFalse(view.playerLayer.isHidden)
         XCTAssertNil(view.lifecycleTransitionPlayerLayer.player)
+        controller.clearTransientPresentation()
+    }
+
+    @MainActor
+    func testSameStatePrewarmFailurePreservesOriginalClipEndFallback() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("statelet-same-state-fallback-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let outgoingURL = directory.appendingPathComponent("outgoing.mov")
+        let transitionURL = directory.appendingPathComponent("transition.mov")
+        let invalidDestinationURL = directory.appendingPathComponent("invalid-destination.mov")
+        try Self.writeTestMovie(to: outgoingURL, frameCount: 120)
+        try Self.writeTestMovie(to: transitionURL, frameCount: 120)
+        try Data("not playable media".utf8).write(to: invalidDestinationURL)
+
+        let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
+        let controller = PetPlayerController(view: view)
+        let outgoingEntry = try MediaEntry(path: outgoingURL.lastPathComponent)
+        let transitionEntry = try MediaEntry(path: transitionURL.lastPathComponent)
+        let destinationEntry = try MediaEntry(path: invalidDestinationURL.lastPathComponent)
+        let attestation = try Self.testTransitionAttestation(for: transitionURL)
+        var failedIDs: [UInt64] = []
+        var clipEndIDs: [UInt64] = []
+        controller.onLifecycleTransitionFailed = { failedIDs.append($0) }
+        controller.onPlaylistClipEnded = { transitionID, _ in clipEndIDs.append(transitionID) }
+        controller.onPlaylistClipApproachingEnd = { transitionID, state in
+            controller.onPlaylistClipApproachingEnd = nil
+            return controller.showLifecycleTransition(
+                sourceState: state,
+                destinationState: state,
+                transitionEntry: transitionEntry,
+                transitionURL: transitionURL,
+                transitionAttestation: attestation,
+                destinationEntry: destinationEntry,
+                destinationURL: invalidDestinationURL,
+                transitionID: 154,
+                startedAt: DispatchTime.now().uptimeNanoseconds,
+                advancePlaylistWhenEnded: true,
+                sameStateBaseTransitionID: transitionID
+            ) == .preparing
+        }
+        controller.onPreparedLifecycleTransitionActivation = { _, _, _ in
+            XCTFail("an unready prewarm must not consume the clip-end fallback")
+            return false
+        }
+
+        XCTAssertEqual(
+            controller.show(
+                state: .running,
+                entry: outgoingEntry,
+                url: outgoingURL,
+                posterURL: nil,
+                transitionID: 153,
+                startedAt: DispatchTime.now().uptimeNanoseconds,
+                advancePlaylistWhenEnded: true
+            ),
+            .preparing
+        )
+        try Self.waitUntil("outgoing fallback presentation did not become ready") {
+            controller.currentURL == outgoingURL
+        }
+        let outgoingPlayer = try XCTUnwrap(view.playerLayer.player)
+        let initialTime = outgoingPlayer.currentTime().seconds
+        try Self.waitUntil("invalid destination did not fail its bounded retry") {
+            failedIDs == [154]
+        }
+        XCTAssertGreaterThan(outgoingPlayer.currentTime().seconds, initialTime + 0.2)
+        XCTAssertEqual(controller.currentURL, outgoingURL)
+        XCTAssertFalse(view.playerLayer.isHidden)
+        XCTAssertNil(view.destinationPlayerLayer.player)
+        XCTAssertNil(view.lifecycleTransitionPlayerLayer.player)
+        try Self.waitUntil("prewarm failure consumed the original clip-end callback") {
+            clipEndIDs == [153]
+        }
+        XCTAssertEqual(failedIDs, [154])
+        XCTAssertEqual(clipEndIDs, [153])
         controller.clearTransientPresentation()
     }
 

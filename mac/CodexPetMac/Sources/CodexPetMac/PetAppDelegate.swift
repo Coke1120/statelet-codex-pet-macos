@@ -317,6 +317,11 @@ private struct PendingLifecycleTransitionAttestation {
     let isInState: Bool
 }
 
+private struct PendingInStateTransitionPrewarm {
+    let baseTransitionID: UInt64
+    let request: PendingLifecycleTransitionAttestation
+}
+
 private struct PendingMediaSelectionCommit {
     let transitionID: UInt64
     var request: MediaSelectionRequest
@@ -531,6 +536,10 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var pendingLifecycleTransitionAttestationTask: Task<
         Result<CharacterTransitionRuntimeAttestation, Error>, Never
     >?
+    private var pendingInStateTransitionPrewarm: PendingInStateTransitionPrewarm?
+    private var pendingInStateTransitionPrewarmTask: Task<
+        Result<CharacterTransitionRuntimeAttestation, Error>, Never
+    >?
     private var activeLifecycleTransition: ActiveLifecycleTransition?
     private var pendingMediaSelectionCommit: PendingMediaSelectionCommit?
     private var stateDialoguePresentation: StateDialoguePresentation?
@@ -538,6 +547,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var mapReadFailureReported = false
     private var reduceMotion = false
     private var transitionSequence: UInt64 = 0
+    private var lastIssuedTransitionID: UInt64 = 0
     private var mediaSelectionCursor = MediaSelectionCursor()
     private var transitionSelectionCursorsByCharacterAndScope: [String: TransitionSelectionCursor] = [:]
     private var manualPreviewSelectionCursor = MediaSelectionCursor()
@@ -563,6 +573,17 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var transitionConversionCancellationRequested = false
     private var lastFailedMP4Batch: FailedMP4Batch?
     private var lastConversionFailureDiagnostic: (code: String, stage: String)?
+
+    private func reserveTransitionID() -> UInt64 {
+        lastIssuedTransitionID &+= 1
+        return lastIssuedTransitionID
+    }
+
+    private func beginTransition() -> UInt64 {
+        let transitionID = reserveTransitionID()
+        transitionSequence = transitionID
+        return transitionID
+    }
 
     private func transitionSelectionCursor(
         for scope: TransitionLibraryScope
@@ -676,14 +697,28 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         player.onOneShotEnded = { [weak self] transitionID in
             self?.finishOneShotPreview(transitionID: transitionID, reason: "completed")
         }
+        player.onPlaylistClipApproachingEnd = { [weak self] transitionID, state in
+            self?.beginInStateTransitionPrewarm(
+                baseTransitionID: transitionID,
+                state: state
+            ) ?? false
+        }
         player.onPlaylistClipEnded = { [weak self] transitionID, state in
             self?.advancePlaylistAfterClipEnd(transitionID: transitionID, state: state)
+        }
+        player.onPreparedLifecycleTransitionActivation = {
+            [weak self] transitionID, baseTransitionID, state in
+            self?.activateInStateTransitionPrewarm(
+                transitionID: transitionID,
+                baseTransitionID: baseTransitionID,
+                state: state
+            ) ?? false
         }
         player.onLifecycleTransitionEnded = { [weak self] transitionID in
             self?.finishLifecycleTransition(transitionID: transitionID, outcome: "completed")
         }
         player.onLifecycleTransitionFailed = { [weak self] transitionID in
-            self?.finishLifecycleTransition(transitionID: transitionID, outcome: "failed")
+            self?.handleLifecycleTransitionFailure(transitionID: transitionID)
         }
         player.view.onAdvanceClip = { [weak self] in
             self?.advanceCurrentClip(reason: "pet_button")
@@ -806,6 +841,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         pendingLifecycleTransitionAttestationTask?.cancel()
         pendingLifecycleTransitionAttestationTask = nil
         pendingLifecycleTransitionAttestation = nil
+        pendingInStateTransitionPrewarmTask?.cancel()
+        pendingInStateTransitionPrewarmTask = nil
+        pendingInStateTransitionPrewarm = nil
         stateWatcher?.stop()
         sessionActivityWatcher?.stop()
         mapWatcher?.stop()
@@ -1674,8 +1712,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             stateDialoguePresentation = nil
             player.view.showDialogueMessage(nil)
         }
-        transitionSequence &+= 1
-        let transitionID = transitionSequence
+        let transitionID = beginTransition()
         let request = PendingLifecycleTransitionAttestation(
             id: transitionID,
             source: source,
@@ -1782,8 +1819,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             )
             return
         }
-        transitionSequence &+= 1
-        let retryID = transitionSequence
+        let retryID = beginTransition()
         let transitionLibraryURL = request.transitionScope == .character
             ? mediaMapURL!
             : characterLibraryStorage.globalTransitionLibraryURL
@@ -1897,7 +1933,36 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
     }
 
+    @discardableResult
+    private func cancelInStateTransitionPrewarm(
+        matchingTransitionID: UInt64? = nil,
+        reason: String
+    ) -> Bool {
+        guard let pending = pendingInStateTransitionPrewarm,
+              matchingTransitionID == nil
+                || pending.request.id == matchingTransitionID else { return false }
+        pendingInStateTransitionPrewarm = nil
+        pendingInStateTransitionPrewarmTask?.cancel()
+        pendingInStateTransitionPrewarmTask = nil
+        player?.cancelLifecycleTransition()
+        logger.info(
+            "event=in_state_transition_prewarm_cancelled transition_id=\(pending.request.id, privacy: .public) base_transition_id=\(pending.baseTransitionID, privacy: .public) state=\(pending.request.destination.rawValue, privacy: .public) reason=\(reason, privacy: .public)"
+        )
+        return true
+    }
+
+    private func handleLifecycleTransitionFailure(transitionID: UInt64) {
+        if cancelInStateTransitionPrewarm(
+            matchingTransitionID: transitionID,
+            reason: "preparation_failed"
+        ) {
+            return
+        }
+        finishLifecycleTransition(transitionID: transitionID, outcome: "failed")
+    }
+
     private func cancelActiveLifecycleTransition(reason: String) {
+        _ = cancelInStateTransitionPrewarm(reason: reason)
         var cancelledPending = false
         if let pending = pendingLifecycleTransitionAttestation {
             cancelledPending = true
@@ -1942,8 +2007,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             }
         }
         let started = DispatchTime.now().uptimeNanoseconds
-        transitionSequence &+= 1
-        let transitionID = transitionSequence
+        let transitionID = beginTransition()
         let entry = preselectedEntry ?? selectedEntry(
             for: state,
             advance: advanceSelection,
@@ -2001,17 +2065,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
               state == effectivePresentationState,
               activeOneShotPreview == nil,
               mediaMap.playlist(for: state)?.isContinuousRotationEffective == true else { return }
+        _ = cancelInStateTransitionPrewarm(reason: "source_clip_ended_before_activation")
         pendingPresentationState = nil
         logger.info("event=playlist_advance_triggered transition_id=\(transitionID, privacy: .public) state=\(state.rawValue, privacy: .public) reason=clip_end")
-        if InStateTransitionPolicy.shouldTrigger(
-            trigger: .playlistRotation,
-            reduceMotion: reduceMotion,
-            continuousRotation: true,
-            temporaryPreviewActive: temporaryStatePreviewPolicy.previewState != nil
-        ),
-           beginInStateTransition(state: state) {
-            return
-        }
         let useManualPreviewCursor = temporaryStatePreviewPolicy.previewState != nil
         guard let selectionRequest = mediaSelectionRequest(
             for: state,
@@ -2029,24 +2085,36 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         )
     }
 
-    private func beginInStateTransition(state: PetState) -> Bool {
-        guard !reduceMotion,
+    private func beginInStateTransitionPrewarm(
+        baseTransitionID: UInt64,
+        state: PetState
+    ) -> Bool {
+        guard baseTransitionID == transitionSequence,
+              state == effectivePresentationState,
+              activeLifecycleTransition == nil,
+              pendingLifecycleTransitionAttestation == nil,
+              InStateTransitionPolicy.shouldTrigger(
+                  trigger: .playlistRotation,
+                  reduceMotion: reduceMotion,
+                  continuousRotation: true,
+                  temporaryPreviewActive: temporaryStatePreviewPolicy.previewState != nil
+              ),
               activeOneShotPreview == nil,
               let mediaMapURL,
               let transitionEntry = mediaMap.inStateTransition(for: state) else { return false }
         let transitionURL = mediaMap.resolvedURL(for: transitionEntry, relativeTo: mediaMapURL)
-        guard FileManager.default.isReadableFile(atPath: transitionURL.path) else { return false }
-        guard let destinationSelectionRequest = mediaSelectionRequest(
-            for: state,
-            advance: true,
-            useManualPreviewCursor: false
-        ) else { return false }
+        guard FileManager.default.isReadableFile(atPath: transitionURL.path),
+              let destinationSelectionRequest = mediaSelectionRequest(
+                  for: state,
+                  advance: true,
+                  useManualPreviewCursor: false
+              ) else { return false }
         let destinationEntry = destinationSelectionRequest.entry
         let destinationURL = mediaMap.resolvedURL(for: destinationEntry, relativeTo: mediaMapURL)
         guard FileManager.default.isReadableFile(atPath: destinationURL.path) else { return false }
-        cancelActiveLifecycleTransition(reason: "superseded_in_state")
-        transitionSequence &+= 1
-        let transitionID = transitionSequence
+
+        _ = cancelInStateTransitionPrewarm(reason: "superseded_prewarm")
+        let transitionID = reserveTransitionID()
         let request = PendingLifecycleTransitionAttestation(
             id: transitionID,
             source: state,
@@ -2060,20 +2128,117 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             destinationSelectionRequest: destinationSelectionRequest,
             isInState: true
         )
-        pendingLifecycleTransitionAttestation = request
-        pendingPresentationState = state
+        pendingInStateTransitionPrewarm = PendingInStateTransitionPrewarm(
+            baseTransitionID: baseTransitionID,
+            request: request
+        )
         let verifier = Task.detached(priority: .userInitiated) {
             await Self.attestRuntimeTransition(
                 movieURL: transitionURL,
                 timeoutSeconds: Self.transitionAttestationTimeoutSeconds
             )
         }
-        pendingLifecycleTransitionAttestationTask = verifier
+        pendingInStateTransitionPrewarmTask = verifier
         Task { @MainActor [weak self] in
             let result = await verifier.value
-            self?.finishLifecycleTransitionAttestation(request: request, result: result)
+            self?.finishInStateTransitionPrewarm(
+                baseTransitionID: baseTransitionID,
+                request: request,
+                result: result
+            )
         }
-        logger.info("event=in_state_transition_attestation_started transition_id=\(transitionID, privacy: .public) state=\(state.rawValue, privacy: .public)")
+        logger.info(
+            "event=in_state_transition_prewarm_started transition_id=\(transitionID, privacy: .public) base_transition_id=\(baseTransitionID, privacy: .public) state=\(state.rawValue, privacy: .public)"
+        )
+        return true
+    }
+
+    private func finishInStateTransitionPrewarm(
+        baseTransitionID: UInt64,
+        request: PendingLifecycleTransitionAttestation,
+        result: Result<CharacterTransitionRuntimeAttestation, Error>
+    ) {
+        guard let pending = pendingInStateTransitionPrewarm,
+              pending.baseTransitionID == baseTransitionID,
+              pending.request.id == request.id,
+              transitionSequence == baseTransitionID,
+              currentState == request.destination,
+              temporaryStatePreviewPolicy.previewState == nil,
+              activeOneShotPreview == nil else { return }
+        pendingInStateTransitionPrewarmTask = nil
+        switch result {
+        case .failure:
+            pendingInStateTransitionPrewarm = nil
+            logger.error(
+                "event=in_state_transition_prewarm_unavailable transition_id=\(request.id, privacy: .public) base_transition_id=\(baseTransitionID, privacy: .public) state=\(request.destination.rawValue, privacy: .public) reason=attestation_failed"
+            )
+        case let .success(attestation):
+            let continuousRotation = mediaMap.playlist(
+                for: request.destination
+            )?.isContinuousRotationEffective == true
+            let playback = player.showLifecycleTransition(
+                sourceState: request.source,
+                destinationState: request.destination,
+                transitionEntry: request.transitionEntry,
+                transitionURL: request.transitionURL,
+                transitionAttestation: attestation,
+                destinationEntry: request.destinationEntry,
+                destinationURL: request.destinationURL,
+                transitionID: request.id,
+                startedAt: DispatchTime.now().uptimeNanoseconds,
+                advancePlaylistWhenEnded: continuousRotation,
+                sameStateBaseTransitionID: baseTransitionID
+            )
+            guard playback == .preparing else {
+                _ = cancelInStateTransitionPrewarm(
+                    matchingTransitionID: request.id,
+                    reason: "binding_failed"
+                )
+                return
+            }
+            logger.info(
+                "event=in_state_transition_prewarm_ready transition_id=\(request.id, privacy: .public) base_transition_id=\(baseTransitionID, privacy: .public) state=\(request.destination.rawValue, privacy: .public)"
+            )
+        }
+    }
+
+    private func activateInStateTransitionPrewarm(
+        transitionID: UInt64,
+        baseTransitionID: UInt64,
+        state: PetState
+    ) -> Bool {
+        guard let pending = pendingInStateTransitionPrewarm,
+              pending.baseTransitionID == baseTransitionID,
+              pending.request.id == transitionID,
+              transitionSequence == baseTransitionID,
+              currentState == state,
+              effectivePresentationState == state,
+              temporaryStatePreviewPolicy.previewState == nil,
+              activeOneShotPreview == nil else { return false }
+        let request = pending.request
+        pendingInStateTransitionPrewarm = nil
+        pendingInStateTransitionPrewarmTask?.cancel()
+        pendingInStateTransitionPrewarmTask = nil
+        transitionSequence = transitionID
+        activeLifecycleTransition = ActiveLifecycleTransition(
+            id: request.id,
+            source: request.source,
+            destination: request.destination,
+            transitionEntry: request.transitionEntry,
+            transitionURL: request.transitionURL,
+            destinationEntry: request.destinationEntry,
+            destinationURL: request.destinationURL,
+            transitionScope: request.transitionScope,
+            transitionSelectionRequest: request.transitionSelectionRequest,
+            destinationSelectionRequest: request.destinationSelectionRequest,
+            isInState: true
+        )
+        pendingPresentationState = state
+        logger.info(
+            "event=in_state_transition_prewarm_activated transition_id=\(transitionID, privacy: .public) base_transition_id=\(baseTransitionID, privacy: .public) state=\(state.rawValue, privacy: .public)"
+        )
+        updateStatusMenu()
+        refreshSettings()
         return true
     }
 
@@ -4057,8 +4222,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         guard let entry else { return }
         cancelActiveLifecycleTransition(reason: "transition_preview")
         cancelActiveOneShotWithoutRestore(reason: "transition_preview")
-        transitionSequence &+= 1
-        let transitionID = transitionSequence
+        let transitionID = beginTransition()
         let url = mediaMap.resolvedURL(for: entry, relativeTo: libraryURL)
         guard FileManager.default.isReadableFile(atPath: url.path) else {
             settingsController?.update(
@@ -5610,8 +5774,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 playbackRate: entry.playbackRate.value
             )
             let playback = try oneShotArbiter.start(state: currentState, path: entry.path)
-            transitionSequence &+= 1
-            let transitionID = transitionSequence
+            let transitionID = beginTransition()
             activeOneShotPreview = ActiveOneShotPreview(
                 playback: playback,
                 libraryState: libraryState,

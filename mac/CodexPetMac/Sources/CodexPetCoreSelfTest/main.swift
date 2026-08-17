@@ -266,6 +266,24 @@ private func runSelfTest() throws {
         abs(LayeredLifecycleHandoffPolicy.destinationPrerollTime(duration: 1.5) - 1.15) < 0.0001,
         "layered handoff overlap is not deterministic"
     )
+    let sameStateTimeline = LayeredLifecycleHandoffPolicy.sameStateTimeline(
+        presentationDuration: 1.5
+    )
+    try require(
+        abs(sameStateTimeline.outgoingFadeDuration - 0.5) < 0.0001
+            && abs(sameStateTimeline.incomingFadeStartTime - 1.0) < 0.0001
+            && abs(sameStateTimeline.incomingFadeDuration - 0.5) < 0.0001,
+        "same-state timeline does not fit the transition presentation cap"
+    )
+    for step in 0...60 {
+        let opacities = sameStateTimeline.opacities(
+            at: sameStateTimeline.presentationDuration * Double(step) / 60
+        )
+        try require(
+            !(opacities.outgoing > 0.0001 && opacities.destination > 0.0001),
+            "same-state timeline exposes two state layers"
+        )
+    }
     var progressParser = AlphaConversionProgressParser()
     let noiseProgress = try progressParser.parseLine("converter startup noise")
     try require(noiseProgress == nil, "progress parser accepted noise")

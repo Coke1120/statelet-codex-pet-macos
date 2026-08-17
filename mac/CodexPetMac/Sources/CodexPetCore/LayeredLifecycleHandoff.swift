@@ -27,8 +27,9 @@ public struct LayeredLifecycleHandoff: Equatable, Sendable {
     public private(set) var lowerLayer: LowerLayer
     public private(set) var transitionVisible = false
     public private(set) var transitionReady = false
-    /// The destination has a display-ready frame, but remains hidden until
-    /// the foreground transition completes.
+    /// The destination has a display-ready frame. Distinct-state handoffs
+    /// keep it hidden until the foreground completes; same-state handoffs may
+    /// reveal it through the player-layer fade timeline first.
     public private(set) var destinationReady = false
     public private(set) var destinationPrerollStarted = false
     public private(set) var transitionEnded = false
@@ -114,8 +115,54 @@ public enum LayeredLifecycleHandoffPolicy {
     /// before the end.
     public static let maximumOverlap: TimeInterval = 0.35
 
+    /// Begins hidden preparation early enough that attestation and both player
+    /// prerolls normally finish before the visible transition boundary.
+    public static let sameStatePreparationLeadTime: TimeInterval = 3.0
+
+    /// Divides the actual on-screen transition duration into three phases:
+    /// outgoing fade, transition-only, and destination fade. Opacity is always
+    /// derived from transition media time, so suspension cannot desynchronise
+    /// the state layers from the foreground movie.
+    public static func sameStateTimeline(
+        presentationDuration: TimeInterval
+    ) -> SameStateTransitionTimeline {
+        SameStateTransitionTimeline(presentationDuration: presentationDuration)
+    }
+
     public static func destinationPrerollTime(duration: TimeInterval) -> TimeInterval {
         guard duration.isFinite, duration > 0 else { return 0 }
         return max(0, duration - min(maximumOverlap, duration / 2))
+    }
+}
+
+public struct SameStateTransitionTimeline: Equatable, Sendable {
+    public let presentationDuration: TimeInterval
+    public let outgoingFadeDuration: TimeInterval
+    public let incomingFadeStartTime: TimeInterval
+    public let incomingFadeDuration: TimeInterval
+
+    public init(presentationDuration: TimeInterval) {
+        let boundedDuration = presentationDuration.isFinite && presentationDuration > 0
+            ? min(
+                presentationDuration,
+                LifecycleTransitionMediaPolicy.maximumPresentationDuration
+            )
+            : LifecycleTransitionMediaPolicy.maximumPresentationDuration
+        let phaseDuration = boundedDuration / 3
+        self.presentationDuration = boundedDuration
+        outgoingFadeDuration = phaseDuration
+        incomingFadeStartTime = phaseDuration * 2
+        incomingFadeDuration = phaseDuration
+    }
+
+    public func opacities(
+        at presentationTime: TimeInterval
+    ) -> (outgoing: Double, destination: Double) {
+        let elapsed = min(max(presentationTime, 0), presentationDuration)
+        let outgoing = max(0, 1 - elapsed / outgoingFadeDuration)
+        let destination = elapsed <= incomingFadeStartTime
+            ? 0
+            : min(1, (elapsed - incomingFadeStartTime) / incomingFadeDuration)
+        return (outgoing, destination)
     }
 }

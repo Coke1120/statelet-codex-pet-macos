@@ -285,13 +285,17 @@ accepting the authoritative change. Initial launch, same-state heartbeat,
 refresh, state-playlist rotation, Next Clip, Play Once, transition preview, and
 Temporary State do not consume a transition selection. Statelet keeps A
 attached while it prepares the chosen transition and B. The transition becomes
-a foreground layer only after its first frame is display-ready. B then starts
-pre-rolling in a hidden lower player; the default lead-in budget is the final
-350 ms, or half of a shorter distinct-state clip. Same-state clip-end
-handoffs start B pre-rolling as soon as the foreground is ready, but keep B
-hidden. When the foreground completes, it remains in place until B is
-display-ready, then Statelet atomically swaps to B so two state animations are
-never visible together.
+a foreground layer only after its first frame is display-ready. For a
+distinct-state route, B pre-rolls on a hidden lower player during the final
+350 ms, or half of a shorter clip, then is promoted atomically. For a same-state
+clip-end handoff, Statelet prepares the foreground and B before A ends, while A
+continues moving. The foreground starts from A's media-time cue and its actual
+presentation duration is divided into thirds: fade A out, show only the
+transition, then start and fade B in. At the 1.5-second cap these are three
+0.5-second phases. A is already transparent before B appears, and a late B
+keeps the transition's final frame visible until atomic promotion.
+If that preparation is not ready by clip-end, Statelet directly prepares the
+selected next clip instead of starting a transition over a frozen source.
 
 If the selected variant is unreadable or fails runtime attestation/readiness,
 Statelet tries each other eligible variant for that request at most once, then
@@ -301,7 +305,8 @@ they can advance a cursor or reveal a stale destination. The last valid lower
 presentation remains visible throughout; Statelet never substitutes an empty
 lower layer.
 
-This handoff is transparent layer compositing, not an opacity cross-fade. With
+Distinct-state handoff is transparent layer compositing; same-state handoff
+uses staggered, non-overlapping opacity fades beneath the transition. With
 Reduce Motion enabled, preview is unavailable and runtime transition video is
 skipped; Statelet switches to the destination static presentation without an
 intermediate blank frame or advancing the route cursor.

@@ -196,6 +196,39 @@ final class CodexPetCoreTests: XCTestCase {
         XCTAssertEqual(LayeredLifecycleHandoffPolicy.destinationPrerollTime(duration: 0.2), 0.1, accuracy: 0.0001)
         XCTAssertEqual(LayeredLifecycleHandoffPolicy.destinationPrerollTime(duration: 0), 0)
     }
+
+    func testSameStateLifecycleTimelineFitsActualPresentationAndNeverOverlapsStates() {
+        for duration in [0.6, 1.0, 1.5, 4.0] {
+            let timeline = LayeredLifecycleHandoffPolicy.sameStateTimeline(
+                presentationDuration: duration
+            )
+            XCTAssertLessThanOrEqual(
+                timeline.presentationDuration,
+                LifecycleTransitionMediaPolicy.maximumPresentationDuration
+            )
+            XCTAssertEqual(
+                timeline.incomingFadeStartTime + timeline.incomingFadeDuration,
+                timeline.presentationDuration,
+                accuracy: 0.0001
+            )
+            for step in 0...120 {
+                let time = timeline.presentationDuration * Double(step) / 120
+                let opacities = timeline.opacities(at: time)
+                XCTAssertFalse(
+                    opacities.outgoing > 0.0001 && opacities.destination > 0.0001,
+                    "state layers overlap at \(time)s for \(duration)s timeline"
+                )
+            }
+        }
+        let normal = LayeredLifecycleHandoffPolicy.sameStateTimeline(
+            presentationDuration: 1.5
+        )
+        XCTAssertEqual(normal.outgoingFadeDuration, 0.5, accuracy: 0.0001)
+        XCTAssertEqual(normal.incomingFadeStartTime, 1.0, accuracy: 0.0001)
+        XCTAssertEqual(normal.incomingFadeDuration, 0.5, accuracy: 0.0001)
+        XCTAssertEqual(LayeredLifecycleHandoffPolicy.sameStatePreparationLeadTime, 3.0)
+    }
+
     func testAlphaConversionProgressParserAcceptsMonotonicPathSafeJSONL() throws {
         var parser = AlphaConversionProgressParser()
         let first = try XCTUnwrap(parser.parseLine(

@@ -67,7 +67,7 @@ jobs:
           STATELET_RUN_AVPLAYER_INTEGRATION: "1"
         run: >-
           swift test -c release --package-path mac/CodexPetMac
-          --filter PetPlayerPlaybackIntegrationTests/testSameStateLifecycleHandoffRetainsOutgoingThenPromotesNextClip
+          --filter PetPlayerPlaybackIntegrationTests/testSameState
 
       - name: Run Swift core self-test
         run: swift run --package-path mac/CodexPetMac -c release codex-pet-core-self-test

@@ -5,6 +5,39 @@ versioning for the public source release.
 
 ## Unreleased
 
+## [1.8.3] - 2026-08-18
+
+### Changed
+
+- Same-state clip-end handoffs now prewarm the transition and destination while
+  the outgoing clip is still moving. The visible effect is aligned to the
+  outgoing player's media clock and completes within the transition's actual
+  presentation duration, capped at 1.5 seconds.
+- The visible duration is split into three non-overlapping phases: fade the
+  outgoing state out, show only the transition, then start and fade the
+  destination in. A 1.5-second effect therefore uses three 0.5-second phases.
+
+### Fixed
+
+- Same-state rotation no longer waits for clip-end before attesting and decoding
+  the transition, eliminating the normal frozen-final-frame preparation gap.
+- Opacity is derived from transition media time rather than wall-clock work
+  items, so sleep, occlusion, and resume keep the layers synchronized.
+- Late destination readiness and retry keep the transition's final frame in
+  front; cancellation and promotion reset every layer and time observer.
+- If prewarm cannot finish before clip-end, rotation cuts directly to the
+  already-selected next clip instead of restarting transition preparation on a
+  frozen final frame.
+
+### Distribution notes
+
+- No character, animation, voice model, reference audio, session record, or
+  other private runtime data is bundled.
+- This release remains source-only. The local builder produces an
+  ad-hoc-signed app for personal local use; a public updater package still
+  requires Developer ID signing, notarization, stapling, a pinned team
+  identifier, and clean-Mac Gatekeeper verification.
+
 ## [1.8.2] - 2026-08-16
 
 ### Changed
@@ -206,6 +239,7 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
+[1.8.3]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.3
 [1.8.2]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.2
 [1.8.1]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.1
 [1.8.0]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.0

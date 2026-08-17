@@ -63,12 +63,12 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         self.assertIn("selectionRequest: request.destinationSelectionRequest", retry_source)
         self.assertIn("transitionSelectionRequest: selectionRequest", retry_source)
 
-    def test_same_state_clip_end_uses_layered_handoff_and_direct_fallback(self):
+    def test_same_state_clip_end_only_uses_prewarmed_handoff_or_direct_fallback(self):
         advance = self.app.index("private func advancePlaylistAfterClipEnd")
-        begin = self.app.index("private func beginInStateTransition", advance)
-        advance_source = self.app[advance:begin]
-        self.assertIn("InStateTransitionPolicy.shouldTrigger", advance_source)
-        self.assertIn("beginInStateTransition(state: state)", advance_source)
+        prewarm = self.app.index("private func beginInStateTransitionPrewarm", advance)
+        advance_source = self.app[advance:prewarm]
+        self.assertNotIn("InStateTransitionPolicy.shouldTrigger", advance_source)
+        self.assertNotIn("attestRuntimeTransition", advance_source)
         self.assertIn('refreshReason: "clip_end"', advance_source)
         self.assertIn("mediaSelectionRequest(", advance_source)
         self.assertIn("useManualPreviewCursor: useManualPreviewCursor", advance_source)
@@ -79,15 +79,14 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
             advance_source.index("startLifecyclePresentation("),
         )
 
-        begin_end = self.app.index("private func handlePresentationEvent", begin)
-        begin_source = self.app[begin:begin_end]
-        self.assertIn("destination: state", begin_source)
-        self.assertIn("mediaSelectionRequest(", begin_source)
-        self.assertIn("destinationSelectionRequest: destinationSelectionRequest", begin_source)
-        self.assertNotIn("selectedEntry(", begin_source)
-        self.assertIn("attestRuntimeTransition", begin_source)
-        request_helper = begin_source.index("private func mediaSelectionRequest(")
-        helper_source = begin_source[request_helper:]
+        prewarm_end = self.app.index("private func mediaSelectionRequest(", prewarm)
+        prewarm_source = self.app[prewarm:prewarm_end]
+        self.assertIn("destination: state", prewarm_source)
+        self.assertIn("mediaSelectionRequest(", prewarm_source)
+        self.assertIn("destinationSelectionRequest: destinationSelectionRequest", prewarm_source)
+        self.assertNotIn("selectedEntry(", prewarm_source)
+        self.assertIn("attestRuntimeTransition", prewarm_source)
+        helper_source = self.app[prewarm_end:]
         self.assertIn("return cursor.request(", helper_source)
         self.assertIn("request.commit(to: &mediaSelectionCursor)", helper_source)
         self.assertIn("request.commit(to: &manualPreviewSelectionCursor)", helper_source)
@@ -281,22 +280,42 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         self.assertIn("setTransitionSelectionCursor(", finish_source)
         self.assertIn("for: active.transitionScope", finish_source)
 
-    def test_same_state_handoff_prerolls_hidden_destination_and_keeps_foreground_until_ready(self):
+    def test_same_state_handoff_prewarms_and_uses_media_time_without_state_overlap(self):
+        prewarm = self.app.index("private func beginInStateTransitionPrewarm")
+        prewarm_end = self.app.index("private func mediaSelectionRequest(", prewarm)
+        prewarm_source = self.app[prewarm:prewarm_end]
+        self.assertIn("let transitionID = reserveTransitionID()", prewarm_source)
+        self.assertIn("finishInStateTransitionPrewarm", prewarm_source)
+        self.assertIn("sameStateBaseTransitionID: baseTransitionID", prewarm_source)
+        self.assertIn("private func activateInStateTransitionPrewarm", prewarm_source)
+        activation = prewarm_source.index("private func activateInStateTransitionPrewarm")
+        self.assertIn("transitionSequence = transitionID", prewarm_source[activation:])
+
         reveal = self.player.index("private func tryRevealLifecycleTransition")
         reveal_end = self.player.index("private func scheduleLifecycleDestinationCue", reveal)
         reveal_source = self.player[reveal:reveal_end]
         self.assertIn("if handoff.source == handoff.destination", reveal_source)
-        self.assertIn("startLifecycleDestination(transitionID: transitionID)", reveal_source)
+        self.assertIn("!handoff.sameStateActivationRequested", reveal_source)
+        self.assertIn("scheduleSameStateActivationCueIfNeeded", self.player)
+        self.assertIn("onPreparedLifecycleTransitionActivation", reveal_source)
+        self.assertIn("startSameStateProgressTracking(transitionID: transitionID)", reveal_source)
         self.assertIn("scheduleLifecycleDestinationCue(transitionID: transitionID)", reveal_source)
+        self.assertIn("addPeriodicTimeObserver", reveal_source)
+        self.assertIn("timeline.opacities(at: presentationTime)", reveal_source)
+        self.assertIn("presentationTime >= timeline.incomingFadeStartTime", reveal_source)
+        self.assertIn("applySameStateLifecycleOpacities", reveal_source)
 
         ended = self.player.index("private func handleLifecycleTransitionEnded")
         ended_end = self.player.index("private func promoteLifecycleDestination", ended)
         ended_source = self.player[ended:ended_end]
-        self.assertIn("Keep the final transition frame in the foreground", ended_source)
-        self.assertNotIn("lifecycleTransitionPlayerLayer.isHidden = true", ended_source)
-        self.assertIn("destinationReadyToReveal == true", ended_source)
+        self.assertIn("outgoing: 0", ended_source)
+        self.assertIn("destination: 1", ended_source)
+        self.assertNotIn("hideLifecycleTransition", ended_source)
+        self.assertIn("scheduleLifecycleReadinessTimeout", ended_source)
 
         self.assertNotIn("revealLifecycleDestination", self.player)
+        self.assertIn("removeSameStateActivationCue()", self.player)
+        self.assertIn("removeSameStateProgressObserver()", self.player)
 
     def test_app_replacement_paths_keep_visible_content_until_authoritative_commit(self):
         self.assertIn("let hasVisiblePresentation = currentURL != nil || view.hasVisiblePoster", self.player)

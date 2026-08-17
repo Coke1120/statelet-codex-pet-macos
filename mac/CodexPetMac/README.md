@@ -4,7 +4,7 @@ Statelet is a personal-local Codex lifecycle companion for macOS 13 or newer.
 It is an AppKit accessory application: the transparent panel can be moved by dragging
 its body and resized from any border or corner without taking keyboard focus,
 AVFoundation owns exactly one decoder, and the menu-bar item keeps click-through
-recoverable. The current app version is 1.8.2 (build 16). New builds and
+recoverable. The current app version is 1.8.3 (build 17). New builds and
 installations use
 `Statelet.app`, bundle identifier `com.coke1120.Statelet`, `CFBundleName` and
 executable `Statelet`, Application Support under
@@ -160,12 +160,15 @@ variants, selection mode, default path, and in-memory cursor.
 - Reduce Motion skips transition playback and leaves the route cursor
   unchanged.
 
-The chosen variant keeps the outgoing state visible until its first frame is
-ready, then pre-rolls the destination in a hidden lower player before the
-foreground completes.
-Same-state clip-end handoffs start the replacement as soon as the transition
-foreground is ready, but keep the replacement layer hidden until the atomic
-promotion. Only one state animation is visible at a time.
+For a distinct-state route, the chosen variant keeps the outgoing state visible
+until its first frame is ready, then pre-rolls the destination in a hidden lower
+player before the atomic promotion. Same-state clip-end handoffs prewarm the
+foreground and replacement while the outgoing clip still moves, then align the
+visible effect to the outgoing player's media clock. Its actual duration is
+split into outgoing fade, transition-only, and replacement fade phases. At the
+1.5-second cap each phase is 0.5 seconds. The outgoing layer is transparent
+before the replacement becomes visible, so only one state animation is visible
+at a time.
 If a variant is unreadable or fails runtime attestation/readiness, Statelet
 tries each other eligible variant once for that request before committing the
 newest destination directly. A superseding lifecycle change cancels obsolete

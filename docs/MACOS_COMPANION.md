@@ -1,7 +1,7 @@
 # Statelet lifecycle and media reference
 
-This reference documents the internal contracts behind Statelet 1.8.2 (build
-16), the native Codex lifecycle companion for macOS. Start with
+This reference documents the internal contracts behind Statelet 1.8.3 (build
+17), the native Codex lifecycle companion for macOS. Start with
 [Deployment](DEPLOYMENT.md) for installation or [Using Statelet](USAGE.md) for
 daily operation.
 
@@ -162,13 +162,21 @@ Motion also skips selection and leaves the cursor unchanged. A selected
 transition source may be up to 4 seconds, but playback is accelerated when
 needed so the foreground is bounded to 1.5 seconds on screen. The player
 retains the outgoing animation until the transition foreground has a
-display-ready first frame. It prepares the destination on a separate lower
-player and starts it during the final 350 ms, or halfway through a shorter
-distinct-state transition. Same-state clip-end handoffs start the destination
-as soon as the foreground is ready, but keep its layer hidden. Completion keeps
-the foreground until that destination is display-ready, then atomically swaps
-to the destination so two state animations are never visible together. This
-is alpha compositing rather than an opacity cross-fade.
+display-ready first frame. For a distinct-state change, it prepares the
+destination on a separate hidden player and starts it during the final 350 ms,
+or halfway through a shorter transition, before an atomic promotion. A
+same-state clip-end handoff starts hidden attestation and player preparation up
+to 3 seconds before the source ends, without consuming the source clip's normal
+end fallback. The foreground is revealed from a source-player media-time cue,
+timed to finish with the source when the remaining clip duration permits. Its
+actual duration is split into thirds: outgoing fade, transition only, then
+destination start and fade-in.
+At the 1.5-second cap those phases are 0.5 seconds each. Because the outgoing
+layer is transparent before the destination becomes visible, two state
+animations never composite. A late destination keeps the transition's final
+frame visible until atomic promotion.
+If prewarm fails or misses activation, clip-end takes the direct replacement
+path; Statelet does not restart transition attestation after the source stops.
 
 Transition movies require current alpha reports; reportless or opaque assets
 cannot round-trip through a character bundle. When a selected variant is
