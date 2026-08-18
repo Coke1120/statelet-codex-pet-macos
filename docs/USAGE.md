@@ -82,6 +82,30 @@ media, voice data, credentials, or other session content. The activity sidecar
 is owner-only at `~/Library/Application Support/Statelet/sessions/activity-v1.json`
 and does not change the aggregate lifecycle state or animation priority.
 
+The popup can be moved by dragging its background whenever click-through is
+disabled. Statelet remembers that position, clamps it back onto a visible
+display after monitor changes, and provides **Reset Activity Popup Position** in
+Settings. Its background and opacity are local presentation preferences; the
+default uses dynamic system colors and accessibility contrast/transparency
+settings. This build exposes no supported Codex Desktop activation contract,
+so activity rows are deliberately informational and never manufacture a
+conversation URL.
+
+### Managed animation media
+
+Downloads, Finder paths, and other selected files are import sources only. A
+successful conversion or verified import is copied into Statelet's owner-only
+managed directory:
+
+`~/Library/Application Support/Statelet/media/`
+
+The runtime media, media maps, conversion reports, and character libraries live
+there and remain playable if the original source is moved or removed. Statelet
+does not put user media inside the signed `Statelet.app` bundle, silently delete
+external sources, or publish private media in source, diagnostics, telemetry,
+or update artifacts. Settings → Help and Settings → General both expose the
+managed location and an **Open in Finder** action.
+
 ## Move, resize, and interact
 
 - Drag the pet body to move the panel.
@@ -569,13 +593,21 @@ cleanup record, reports the deferred cleanup, and retries it at next launch.
 
 ## Appearance, resizing, and FPS
 
+Settings uses a persistent native left sidebar for Animations, Voice,
+Appearance, General, Diagnostics, Help, Prompts, and Recommendation. Selecting
+a row swaps only the detail pane; the sidebar remains available while long
+content scrolls.
+
 Open **Settings → Appearance** to configure:
 
 - background color, opacity, enablement, and corner radius;
 - border color, opacity, width, and enablement;
 - lifecycle label visibility, corner position, size, automatic state color, or
   a custom `#RRGGBB` accent; and
-- FPS label visibility, color, and size.
+- FPS label visibility, color, and size;
+- dialogue-bubble background/text colors, opacity, and automatic/custom
+  contrast with a live preview; and
+- Codex activity-popup background, opacity, contrast, and reset controls.
 
 The custom lifecycle color applies to the state text, state symbol, and badge
 border. Publisher health keeps an independent health color.

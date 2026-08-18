@@ -454,6 +454,14 @@ media. Settings imports authorized media into:
 ~/Library/Application Support/Statelet/media/
 ```
 
+The Settings window presents its eight destinations in a persistent native
+sidebar. Settings → Appearance owns the dialogue-bubble contrast controls and
+the activity-popup background/opacity controls; Settings → General and Help
+show the same managed-media location with an **Open in Finder** action. The
+activity popup is draggable when click-through is disabled and remembers its
+position, but this build intentionally treats rows as informational because no
+supported Codex Desktop activation contract is available.
+
 The installer preserves `media-map.json`, `global-transitions.json`,
 `character-library.json`, hidden per-character maps/assets, and user media on
 upgrade. You can still manage the root `media-map.json` directly for

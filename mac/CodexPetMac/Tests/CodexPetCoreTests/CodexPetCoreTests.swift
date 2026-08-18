@@ -705,10 +705,28 @@ final class CodexPetCoreTests: XCTestCase {
         XCTAssertTrue(map.window.appearance.showFPS)
         XCTAssertEqual(map.window.appearance.fpsColor, "#00FF00")
         XCTAssertEqual(map.window.appearance.fpsLabelSize, .small)
+        XCTAssertEqual(map.window.appearance.dialogueBackgroundColor, "#20242A")
+        XCTAssertEqual(map.window.appearance.dialogueTextColor, "#FFFFFF")
+        XCTAssertEqual(map.window.appearance.dialogueBackgroundOpacity, 0.88)
+        XCTAssertEqual(map.window.appearance.dialogueContrastMode, .automatic)
+    }
+
+    func testMalformedAppearanceFailsClosedToReadableDefaultsWithoutDroppingMap() throws {
+        let json = ##"{"version":1,"window":{"appearance":{"background_color":"#ABCDEF","background_opacity":0.61,"border_width":4,"show_fps":false,"dialogue_background_color":"#FFFFFF","dialogue_text_color":"#FFFFFF","dialogue_background_opacity":99,"dialogue_contrast_mode":"custom"}},"states":{"idle":{"path":"idle.mov"}}}"##.data(using: .utf8)!
+        let map = try JSONDecoder.codexPet.decode(MediaMap.self, from: json)
+        XCTAssertEqual(map.entry(for: .idle)?.path, "idle.mov")
+        XCTAssertEqual(map.window.appearance.backgroundColor, "#ABCDEF")
+        XCTAssertEqual(map.window.appearance.backgroundOpacity, 0.61)
+        XCTAssertEqual(map.window.appearance.borderWidth, 4)
+        XCTAssertFalse(map.window.appearance.showFPS)
+        XCTAssertEqual(map.window.appearance.dialogueBackgroundColor, "#FFFFFF")
+        XCTAssertEqual(map.window.appearance.dialogueTextColor, "#FFFFFF")
+        XCTAssertEqual(map.window.appearance.dialogueBackgroundOpacity, 0.88)
+        XCTAssertEqual(map.window.appearance.dialogueContrastMode, .custom)
     }
 
     func testPetAppearanceDecodesDefaultsNormalizesAndRoundTrips() throws {
-        let json = ##"{"background_color":"#a1b2c3","border_color":"#dEf012","border_enabled":false,"border_width":4.5,"corner_radius":31,"show_state_label":false,"state_label_position":"bottom_right","state_label_size":"large","state_label_color":"#1a2B3c","show_fps":false,"fps_color":"#00eE77","fps_label_size":"regular"}"##.data(using: .utf8)!
+        let json = ##"{"background_color":"#a1b2c3","border_color":"#dEf012","border_enabled":false,"border_width":4.5,"corner_radius":31,"show_state_label":false,"state_label_position":"bottom_right","state_label_size":"large","state_label_color":"#1a2B3c","show_fps":false,"fps_color":"#00eE77","fps_label_size":"regular","dialogue_background_color":"#FfFfFf","dialogue_text_color":"#aBc123","dialogue_background_opacity":0.64,"dialogue_contrast_mode":"custom"}"##.data(using: .utf8)!
         let appearance = try JSONDecoder.codexPet.decode(PetAppearanceConfiguration.self, from: json)
 
         XCTAssertEqual(appearance.backgroundColor, "#A1B2C3")
@@ -725,6 +743,10 @@ final class CodexPetCoreTests: XCTestCase {
         XCTAssertFalse(appearance.showFPS)
         XCTAssertEqual(appearance.fpsColor, "#00EE77")
         XCTAssertEqual(appearance.fpsLabelSize, .regular)
+        XCTAssertEqual(appearance.dialogueBackgroundColor, "#FFFFFF")
+        XCTAssertEqual(appearance.dialogueTextColor, "#ABC123")
+        XCTAssertEqual(appearance.dialogueBackgroundOpacity, 0.64)
+        XCTAssertEqual(appearance.dialogueContrastMode, .custom)
 
         let encoded = try JSONEncoder().encode(appearance)
         XCTAssertEqual(try JSONDecoder.codexPet.decode(PetAppearanceConfiguration.self, from: encoded), appearance)
@@ -736,10 +758,13 @@ final class CodexPetCoreTests: XCTestCase {
             XCTAssertThrowsError(try PetAppearanceConfiguration(borderColor: color), "accepted \(color)")
             XCTAssertThrowsError(try PetAppearanceConfiguration(fpsColor: color), "accepted \(color)")
             XCTAssertThrowsError(try PetAppearanceConfiguration(stateLabelColor: color), "accepted \(color)")
+            XCTAssertThrowsError(try PetAppearanceConfiguration(dialogueBackgroundColor: color), "accepted \(color)")
+            XCTAssertThrowsError(try PetAppearanceConfiguration(dialogueTextColor: color), "accepted \(color)")
         }
         for opacity in [-0.01, 1.01, .infinity, .nan] {
             XCTAssertThrowsError(try PetAppearanceConfiguration(backgroundOpacity: opacity))
             XCTAssertThrowsError(try PetAppearanceConfiguration(borderOpacity: opacity))
+            XCTAssertThrowsError(try PetAppearanceConfiguration(dialogueBackgroundOpacity: opacity))
         }
         for width in [-0.01, 12.01, .infinity, .nan] {
             XCTAssertThrowsError(try PetAppearanceConfiguration(borderWidth: width))
@@ -747,7 +772,7 @@ final class CodexPetCoreTests: XCTestCase {
         for radius in [-0.01, 256.01, .infinity, .nan] {
             XCTAssertThrowsError(try PetAppearanceConfiguration(cornerRadius: radius))
         }
-        XCTAssertNoThrow(try PetAppearanceConfiguration(backgroundOpacity: 0, borderOpacity: 1, borderWidth: 12, cornerRadius: 256))
+        XCTAssertNoThrow(try PetAppearanceConfiguration(backgroundOpacity: 0, borderOpacity: 1, borderWidth: 12, cornerRadius: 256, dialogueBackgroundOpacity: 0))
     }
 
     func testPlaybackRateValidation() throws {

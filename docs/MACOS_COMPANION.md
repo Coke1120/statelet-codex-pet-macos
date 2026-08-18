@@ -240,6 +240,11 @@ Imported files live under:
 ~/Library/Application Support/Statelet/media/
 ```
 
+Downloads and Finder paths are import sources only; `Statelet.app` remains
+media-free. Settings → Help and Settings → General show this managed location
+and offer an explicit Finder action without relocating or deleting an external
+source.
+
 Statelet offers file-moving deletion only for an unshared regular movie inside
 that canonical directory while the active media map is also canonical. It
 revalidates the map and filesystem immediately before moving the MOV and sibling

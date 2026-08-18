@@ -2,6 +2,137 @@ import AppKit
 import CodexPetCore
 import Foundation
 
+struct SessionActivityPanelAppearance: Codable, Equatable, Sendable {
+    static let defaultBackgroundColor = "#20242A"
+    static let defaultOpacity = 0.92
+
+    let backgroundColor: String
+    let opacity: Double
+    let automaticContrast: Bool
+
+    init(
+        backgroundColor: String = Self.defaultBackgroundColor,
+        opacity: Double = Self.defaultOpacity,
+        automaticContrast: Bool = true
+    ) throws {
+        let bytes = Array(backgroundColor.utf8)
+        guard bytes.count == 7, bytes.first == 35,
+              bytes.dropFirst().allSatisfy({ byte in
+                  (48...57).contains(byte) || (65...70).contains(byte) || (97...102).contains(byte)
+              }) else {
+            throw PetContractError.invalidValue("activity panel background color must use #RRGGBB format")
+        }
+        guard opacity.isFinite, (0...1).contains(opacity) else {
+            throw PetContractError.invalidValue("activity panel opacity must be between 0 and 1")
+        }
+        self.backgroundColor = backgroundColor.uppercased()
+        self.opacity = opacity
+        self.automaticContrast = automaticContrast
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        do {
+            try self.init(
+                backgroundColor: container.decodeIfPresent(String.self, forKey: .backgroundColor)
+                    ?? Self.defaultBackgroundColor,
+                opacity: container.decodeIfPresent(Double.self, forKey: .opacity)
+                    ?? Self.defaultOpacity,
+                automaticContrast: container.decodeIfPresent(Bool.self, forKey: .automaticContrast)
+                    ?? true
+            )
+        } catch {
+            self = try Self()
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case backgroundColor = "background_color"
+        case opacity
+        case automaticContrast = "automatic_contrast"
+    }
+}
+
+struct SessionActivityPanelResolvedAppearance {
+    let backgroundColor: NSColor
+    let primaryTextColor: NSColor
+    let secondaryTextColor: NSColor
+    let opacity: Double
+    let contrastRatio: Double
+}
+
+enum SessionActivityPanelAppearanceStore {
+    static let defaultsKey = "Statelet.sessionActivityPanelAppearance.v1"
+
+    static func restored(from defaults: UserDefaults = .standard) -> SessionActivityPanelAppearance {
+        guard let data = defaults.data(forKey: defaultsKey),
+              let appearance = try? JSONDecoder.codexPet.decode(
+                  SessionActivityPanelAppearance.self,
+                  from: data
+              ) else {
+            return try! SessionActivityPanelAppearance()
+        }
+        return appearance
+    }
+
+    static func persist(
+        _ appearance: SessionActivityPanelAppearance,
+        to defaults: UserDefaults = .standard
+    ) {
+        guard let data = try? JSONEncoder().encode(appearance) else { return }
+        defaults.set(data, forKey: defaultsKey)
+    }
+
+    static func reset(in defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: defaultsKey)
+    }
+}
+
+enum SessionActivityPanelPositionStore {
+    static let defaultsKey = "Statelet.sessionActivityPanelPosition.v1"
+
+    static func restored(from defaults: UserDefaults = .standard) -> NSPoint? {
+        guard let values = defaults.dictionary(forKey: defaultsKey),
+              let x = (values["x"] as? NSNumber)?.doubleValue,
+              let y = (values["y"] as? NSNumber)?.doubleValue,
+              x.isFinite, y.isFinite,
+              abs(x) <= 10_000_000, abs(y) <= 10_000_000 else {
+            return nil
+        }
+        return NSPoint(x: x, y: y)
+    }
+
+    static func persist(_ origin: NSPoint, to defaults: UserDefaults = .standard) {
+        guard origin.x.isFinite, origin.y.isFinite,
+              abs(origin.x) <= 10_000_000, abs(origin.y) <= 10_000_000 else { return }
+        defaults.set(["x": Double(origin.x), "y": Double(origin.y)], forKey: defaultsKey)
+    }
+
+    static func reset(in defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: defaultsKey)
+    }
+
+    static func clamped(
+        origin: NSPoint,
+        size: NSSize,
+        to visibleFrame: NSRect
+    ) -> NSPoint {
+        clamped(origin: origin, size: size, to: [visibleFrame])
+    }
+
+    static func clamped(
+        origin: NSPoint,
+        size: NSSize,
+        to visibleFrames: [NSRect]
+    ) -> NSPoint {
+        WindowFramePolicy.clamped(
+            NSRect(origin: origin, size: size),
+            to: visibleFrames,
+            minimumVisible: 48
+        ).origin
+    }
+}
+
 struct SessionActivityDisplayState: Equatable {
     let active: [SessionActivityItem]
     let completed: [SessionActivityItem]
@@ -52,6 +183,14 @@ final class SessionActivityView: NSView {
     private var snapshot: SessionActivitySnapshot?
     private var acknowledgedIDs: Set<String> = []
     private var compactOverride: Bool?
+    private var panelAppearance = try! SessionActivityPanelAppearance()
+    private var resolvedAppearance = SessionActivityPanelResolvedAppearance(
+        backgroundColor: .windowBackgroundColor,
+        primaryTextColor: .labelColor,
+        secondaryTextColor: .secondaryLabelColor,
+        opacity: SessionActivityPanelAppearance.defaultOpacity,
+        contrastRatio: 4.5
+    )
     private(set) var displayState = SessionActivityDisplayState(
         active: [],
         completed: [],
@@ -88,6 +227,7 @@ final class SessionActivityView: NSView {
         setAccessibilityElement(true)
         setAccessibilityRole(.group)
         setAccessibilityLabel("Codex session activity")
+        applyAppearance(panelAppearance)
         rebuild()
     }
 
@@ -122,6 +262,89 @@ final class SessionActivityView: NSView {
         rebuild()
     }
 
+    func applyAppearance(_ appearance: SessionActivityPanelAppearance) {
+        panelAppearance = appearance
+        let reduceTransparency = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
+        let increaseContrast = NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
+        resolvedAppearance = Self.resolveAppearance(
+            appearance: appearance,
+            systemBackgroundColor: .windowBackgroundColor,
+            systemTextColor: .labelColor,
+            secondaryTextColor: .secondaryLabelColor,
+            reduceTransparency: reduceTransparency,
+            increaseContrast: increaseContrast
+        )
+        layer?.backgroundColor = resolvedAppearance.backgroundColor
+            .withAlphaComponent(CGFloat(resolvedAppearance.opacity))
+            .cgColor
+        layer?.borderColor = NSColor.separatorColor.withAlphaComponent(
+            increaseContrast || reduceTransparency ? 1 : 0.7
+        ).cgColor
+        layer?.borderWidth = increaseContrast ? 2 : 1
+        rebuild()
+    }
+
+    static func resolveAppearance(
+        appearance: SessionActivityPanelAppearance,
+        systemBackgroundColor: NSColor,
+        systemTextColor: NSColor,
+        secondaryTextColor: NSColor,
+        reduceTransparency: Bool,
+        increaseContrast: Bool
+    ) -> SessionActivityPanelResolvedAppearance {
+        let minimumContrast = increaseContrast ? 7.0 : 4.5
+        var backgroundColor = appearance.automaticContrast
+            ? systemBackgroundColor
+            : NSColor.codexPet(hex: appearance.backgroundColor)
+        let requestedPrimary = systemTextColor
+        let requestedSecondary = secondaryTextColor
+
+        var primaryTextColor = StateletContrast.readableForeground(
+            requested: requestedPrimary,
+            background: backgroundColor,
+            minimumContrast: minimumContrast
+        )
+        if StateletContrast.contrastRatio(foreground: primaryTextColor, background: backgroundColor) < minimumContrast {
+            let blackContrast = StateletContrast.contrastRatio(foreground: .black, background: backgroundColor)
+            let whiteContrast = StateletContrast.contrastRatio(foreground: .white, background: backgroundColor)
+            let useBlackBackground = whiteContrast >= blackContrast
+            backgroundColor = useBlackBackground ? .black : .white
+            primaryTextColor = useBlackBackground ? .white : .black
+        }
+        let minimumSafeOpacity = StateletContrast.minimumSafeOpacity(
+            foreground: primaryTextColor,
+            background: backgroundColor,
+            minimumContrast: minimumContrast
+        )
+        let opacity = reduceTransparency || increaseContrast
+            ? max(appearance.opacity, 0.96)
+            : appearance.opacity
+        let resolvedOpacity = max(opacity, minimumSafeOpacity)
+        let secondaryCandidate = StateletContrast.readableForeground(
+            requested: requestedSecondary,
+            background: backgroundColor,
+            minimumContrast: minimumContrast,
+            fallback: primaryTextColor
+        )
+        let secondaryTextColor = StateletContrast.worstCaseContrast(
+            foreground: secondaryCandidate,
+            background: backgroundColor,
+            opacity: resolvedOpacity
+        ) >= minimumContrast ? secondaryCandidate : primaryTextColor
+        let resolvedContrast = StateletContrast.worstCaseContrast(
+            foreground: primaryTextColor,
+            background: backgroundColor,
+            opacity: resolvedOpacity
+        )
+        return SessionActivityPanelResolvedAppearance(
+            backgroundColor: backgroundColor,
+            primaryTextColor: primaryTextColor,
+            secondaryTextColor: secondaryTextColor,
+            opacity: resolvedOpacity,
+            contrastRatio: resolvedContrast
+        )
+    }
+
     private func rebuild() {
         let compact = compactOverride ?? (bounds.width < 180 || bounds.height < 110)
         displayState = SessionActivityPresentation.displayState(
@@ -154,6 +377,7 @@ final class SessionActivityView: NSView {
                 addCompactPill(title: "Completed · \(completedCount)", accessibility: "Completed unread sessions: \(completedCount)")
             }
         } else {
+            addActivationNotice()
             if !displayState.active.isEmpty {
                 addGroup(
                     title: "Running · \(activeCount)",
@@ -180,6 +404,21 @@ final class SessionActivityView: NSView {
         needsLayout = true
     }
 
+    private func addActivationNotice() {
+        let notice = NSTextField(
+            wrappingLabelWithString: "Codex Desktop activation is unavailable in this installation. Activity rows are informational only."
+        )
+        notice.font = .systemFont(ofSize: 11)
+        notice.textColor = resolvedAppearance.secondaryTextColor
+        notice.setAccessibilityElement(true)
+        notice.setAccessibilityRole(.staticText)
+        notice.setAccessibilityLabel("Codex Desktop activation unavailable; activity rows are informational only")
+        notice.setAccessibilityHelp(
+            "This Statelet build has no supported Codex Desktop activation contract, so rows do not open or acknowledge conversations."
+        )
+        stack.addArrangedSubview(notice)
+    }
+
     private func addGroup(
         title: String,
         accessibility: String,
@@ -189,7 +428,7 @@ final class SessionActivityView: NSView {
     ) {
         let header = NSTextField(labelWithString: title)
         header.font = .systemFont(ofSize: 12, weight: .semibold)
-        header.textColor = .secondaryLabelColor
+        header.textColor = resolvedAppearance.secondaryTextColor
         header.setAccessibilityElement(true)
         header.setAccessibilityRole(.staticText)
         header.setAccessibilityLabel(accessibility)
@@ -206,7 +445,7 @@ final class SessionActivityView: NSView {
         if hiddenCount > 0 {
             let overflow = NSTextField(labelWithString: "+\(hiddenCount) more")
             overflow.font = .systemFont(ofSize: 11)
-            overflow.textColor = .secondaryLabelColor
+            overflow.textColor = resolvedAppearance.secondaryTextColor
             overflow.setAccessibilityElement(true)
             overflow.setAccessibilityRole(.staticText)
             overflow.setAccessibilityLabel("\(hiddenCount) more sessions")
@@ -217,14 +456,18 @@ final class SessionActivityView: NSView {
     private func addActiveRow(_ item: SessionActivityItem, ordinal: Int) {
         let label = NSTextField(labelWithString: "\(item.state.rawValue.capitalized) · \(item.category.displayName) #\(ordinal) · \(relativeAge(item.startedAt))")
         label.font = .systemFont(ofSize: 13, weight: .medium)
-        label.textColor = item.state.sessionActivityColor
+        label.textColor = resolvedActivityColor(item.state.sessionActivityColor)
         label.lineBreakMode = .byTruncatingTail
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         label.setAccessibilityElement(true)
         label.setAccessibilityRole(.staticText)
         label.setAccessibilityLabel("Active \(item.state.rawValue) session \(ordinal)")
         label.setAccessibilityValue("\(item.category.displayName), started \(relativeAge(item.startedAt))")
-        let row = NSStackView(views: [activityDot(color: item.state.sessionActivityColor), label])
+        label.setAccessibilityHelp(
+            "Informational only. No supported Codex Desktop activation contract is available."
+        )
+        let dotColor = resolvedActivityColor(item.state.sessionActivityColor)
+        let row = NSStackView(views: [activityDot(color: dotColor), label])
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 5
@@ -235,13 +478,16 @@ final class SessionActivityView: NSView {
         let completionTime = item.completedAt ?? item.eventAt
         let label = NSTextField(labelWithString: "Completed · \(item.category.displayName) #\(ordinal) · \(relativeAge(completionTime)) · Unread")
         label.font = .systemFont(ofSize: 13, weight: .medium)
-        label.textColor = .systemGreen
+        label.textColor = resolvedActivityColor(.systemGreen)
         label.lineBreakMode = .byTruncatingTail
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         label.setAccessibilityElement(true)
         label.setAccessibilityRole(.staticText)
         label.setAccessibilityLabel("Completed unread session \(ordinal)")
         label.setAccessibilityValue("\(item.category.displayName), completed \(relativeAge(completionTime))")
+        label.setAccessibilityHelp(
+            "Informational only. Use Mark as read to acknowledge this item; no conversation is opened."
+        )
 
         let acknowledge = NSButton(title: "Mark as read", target: self, action: #selector(markAsRead(_:)))
         acknowledge.bezelStyle = .inline
@@ -249,7 +495,8 @@ final class SessionActivityView: NSView {
         acknowledge.setAccessibilityLabel("Mark completed session as read")
         acknowledge.identifier = NSUserInterfaceItemIdentifier(item.id)
 
-        let row = NSStackView(views: [activityDot(color: .systemGreen), label, acknowledge])
+        let dotColor = resolvedActivityColor(.systemGreen)
+        let row = NSStackView(views: [activityDot(color: dotColor), label, acknowledge])
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 6
@@ -272,7 +519,7 @@ final class SessionActivityView: NSView {
         expand.bezelStyle = .inline
         expand.font = .systemFont(ofSize: 13, weight: .semibold)
         expand.alignment = .left
-        expand.contentTintColor = .labelColor
+        expand.contentTintColor = resolvedAppearance.primaryTextColor
         expand.setAccessibilityLabel("Show \(accessibility.lowercased()) details")
         expand.setAccessibilityValue("Compact count; activate to expand")
         stack.addArrangedSubview(expand)
@@ -284,6 +531,24 @@ final class SessionActivityView: NSView {
         if seconds < 3_600 { return "\(Int(seconds / 60))m ago" }
         if seconds < 86_400 { return "\(Int(seconds / 3_600))h ago" }
         return "\(Int(seconds / 86_400))d ago"
+    }
+
+    private func resolvedActivityColor(_ requested: NSColor) -> NSColor {
+        guard panelAppearance.automaticContrast else {
+            return resolvedAppearance.primaryTextColor
+        }
+        let minimumContrast = NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast ? 7.0 : 4.5
+        let candidate = StateletContrast.readableForeground(
+            requested: requested,
+            background: resolvedAppearance.backgroundColor,
+            minimumContrast: minimumContrast,
+            fallback: resolvedAppearance.primaryTextColor
+        )
+        return StateletContrast.worstCaseContrast(
+            foreground: candidate,
+            background: resolvedAppearance.backgroundColor,
+            opacity: resolvedAppearance.opacity
+        ) >= minimumContrast ? candidate : resolvedAppearance.primaryTextColor
     }
 
     @objc private func markAsRead(_ sender: NSButton) {
@@ -369,7 +634,7 @@ final class SessionActivityPanel: NSPanel {
         if fullScreenAuxiliary { collectionBehavior.insert(.fullScreenAuxiliary) }
         hidesOnDeactivate = false
         becomesKeyOnlyIfNeeded = true
-        isMovableByWindowBackground = false
+        isMovableByWindowBackground = true
         titleVisibility = .hidden
         titlebarAppearsTransparent = true
         isReleasedWhenClosed = false

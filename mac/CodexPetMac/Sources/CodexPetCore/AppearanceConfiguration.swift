@@ -20,9 +20,16 @@ public struct PetAppearanceConfiguration: Codable, Equatable, Sendable {
         case custom(String)
     }
 
+    public enum DialogueContrastMode: String, Codable, CaseIterable, Sendable {
+        case automatic
+        case custom
+    }
+
     public static let defaultBackgroundColor = "#20242A"
     public static let defaultBorderColor = "#FFFFFF"
     public static let defaultFPSColor = "#00FF00"
+    public static let defaultDialogueBackgroundColor = "#20242A"
+    public static let defaultDialogueTextColor = "#FFFFFF"
 
     public let backgroundEnabled: Bool
     public let backgroundColor: String
@@ -39,6 +46,10 @@ public struct PetAppearanceConfiguration: Codable, Equatable, Sendable {
     public let showFPS: Bool
     public let fpsColor: String
     public let fpsLabelSize: StateLabelSize
+    public let dialogueBackgroundColor: String
+    public let dialogueTextColor: String
+    public let dialogueBackgroundOpacity: Double
+    public let dialogueContrastMode: DialogueContrastMode
 
     public init(
         backgroundEnabled: Bool = true,
@@ -55,7 +66,11 @@ public struct PetAppearanceConfiguration: Codable, Equatable, Sendable {
         stateLabelColor: String? = nil,
         showFPS: Bool = true,
         fpsColor: String = Self.defaultFPSColor,
-        fpsLabelSize: StateLabelSize = .small
+        fpsLabelSize: StateLabelSize = .small,
+        dialogueBackgroundColor: String = Self.defaultDialogueBackgroundColor,
+        dialogueTextColor: String = Self.defaultDialogueTextColor,
+        dialogueBackgroundOpacity: Double = 0.88,
+        dialogueContrastMode: DialogueContrastMode = .automatic
     ) throws {
         self.backgroundColor = try Self.normalizedColor(backgroundColor, name: "background_color")
         self.borderColor = try Self.normalizedColor(borderColor, name: "border_color")
@@ -63,10 +78,19 @@ public struct PetAppearanceConfiguration: Codable, Equatable, Sendable {
         self.stateLabelColor = try stateLabelColor.map {
             try Self.normalizedColor($0, name: "state_label_color")
         }
+        self.dialogueBackgroundColor = try Self.normalizedColor(
+            dialogueBackgroundColor,
+            name: "dialogue_background_color"
+        )
+        self.dialogueTextColor = try Self.normalizedColor(
+            dialogueTextColor,
+            name: "dialogue_text_color"
+        )
         try Self.validate(backgroundOpacity, in: 0...1, name: "background_opacity")
         try Self.validate(borderOpacity, in: 0...1, name: "border_opacity")
         try Self.validate(borderWidth, in: 0...12, name: "border_width")
         try Self.validate(cornerRadius, in: 0...256, name: "corner_radius")
+        try Self.validate(dialogueBackgroundOpacity, in: 0...1, name: "dialogue_background_opacity")
 
         self.backgroundEnabled = backgroundEnabled
         self.backgroundOpacity = backgroundOpacity
@@ -79,6 +103,8 @@ public struct PetAppearanceConfiguration: Codable, Equatable, Sendable {
         self.stateLabelSize = stateLabelSize
         self.showFPS = showFPS
         self.fpsLabelSize = fpsLabelSize
+        self.dialogueBackgroundOpacity = dialogueBackgroundOpacity
+        self.dialogueContrastMode = dialogueContrastMode
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -97,10 +123,29 @@ public struct PetAppearanceConfiguration: Codable, Equatable, Sendable {
         case showFPS = "show_fps"
         case fpsColor = "fps_color"
         case fpsLabelSize = "fps_label_size"
+        case dialogueBackgroundColor = "dialogue_background_color"
+        case dialogueTextColor = "dialogue_text_color"
+        case dialogueBackgroundOpacity = "dialogue_background_opacity"
+        case dialogueContrastMode = "dialogue_contrast_mode"
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        let dialogueBackgroundColor = Self.decodeDialogueColor(
+            from: container,
+            key: .dialogueBackgroundColor,
+            default: Self.defaultDialogueBackgroundColor
+        )
+        let dialogueTextColor = Self.decodeDialogueColor(
+            from: container,
+            key: .dialogueTextColor,
+            default: Self.defaultDialogueTextColor
+        )
+        let dialogueBackgroundOpacity = Self.decodeDialogueOpacity(from: container)
+        let dialogueContrastMode = (try? container.decode(
+            DialogueContrastMode.self,
+            forKey: .dialogueContrastMode
+        )) ?? .automatic
         try self.init(
             backgroundEnabled: try container.decodeIfPresent(Bool.self, forKey: .backgroundEnabled) ?? true,
             backgroundColor: try container.decodeIfPresent(String.self, forKey: .backgroundColor) ?? Self.defaultBackgroundColor,
@@ -116,8 +161,34 @@ public struct PetAppearanceConfiguration: Codable, Equatable, Sendable {
             stateLabelColor: try container.decodeIfPresent(String.self, forKey: .stateLabelColor),
             showFPS: try container.decodeIfPresent(Bool.self, forKey: .showFPS) ?? true,
             fpsColor: try container.decodeIfPresent(String.self, forKey: .fpsColor) ?? Self.defaultFPSColor,
-            fpsLabelSize: try container.decodeIfPresent(StateLabelSize.self, forKey: .fpsLabelSize) ?? .small
+            fpsLabelSize: try container.decodeIfPresent(StateLabelSize.self, forKey: .fpsLabelSize) ?? .small,
+            dialogueBackgroundColor: dialogueBackgroundColor,
+            dialogueTextColor: dialogueTextColor,
+            dialogueBackgroundOpacity: dialogueBackgroundOpacity,
+            dialogueContrastMode: dialogueContrastMode
         )
+    }
+
+    private static func decodeDialogueColor(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        key: CodingKeys,
+        default defaultColor: String
+    ) -> String {
+        guard let value = try? container.decode(String.self, forKey: key),
+              let normalized = try? normalizedColor(value, name: key.stringValue) else {
+            return defaultColor
+        }
+        return normalized
+    }
+
+    private static func decodeDialogueOpacity(
+        from container: KeyedDecodingContainer<CodingKeys>
+    ) -> Double {
+        guard let value = try? container.decode(Double.self, forKey: .dialogueBackgroundOpacity),
+              value.isFinite, (0...1).contains(value) else {
+            return 0.88
+        }
+        return value
     }
 
     public func replacing(
@@ -135,7 +206,11 @@ public struct PetAppearanceConfiguration: Codable, Equatable, Sendable {
         stateLabelColor: StateLabelColorReplacement = .unchanged,
         showFPS: Bool? = nil,
         fpsColor: String? = nil,
-        fpsLabelSize: StateLabelSize? = nil
+        fpsLabelSize: StateLabelSize? = nil,
+        dialogueBackgroundColor: String? = nil,
+        dialogueTextColor: String? = nil,
+        dialogueBackgroundOpacity: Double? = nil,
+        dialogueContrastMode: DialogueContrastMode? = nil
     ) throws -> PetAppearanceConfiguration {
         let replacementStateLabelColor: String?
         switch stateLabelColor {
@@ -162,7 +237,11 @@ public struct PetAppearanceConfiguration: Codable, Equatable, Sendable {
             stateLabelColor: replacementStateLabelColor,
             showFPS: showFPS ?? self.showFPS,
             fpsColor: fpsColor ?? self.fpsColor,
-            fpsLabelSize: fpsLabelSize ?? self.fpsLabelSize
+            fpsLabelSize: fpsLabelSize ?? self.fpsLabelSize,
+            dialogueBackgroundColor: dialogueBackgroundColor ?? self.dialogueBackgroundColor,
+            dialogueTextColor: dialogueTextColor ?? self.dialogueTextColor,
+            dialogueBackgroundOpacity: dialogueBackgroundOpacity ?? self.dialogueBackgroundOpacity,
+            dialogueContrastMode: dialogueContrastMode ?? self.dialogueContrastMode
         )
     }
 
@@ -186,3 +265,4 @@ public struct PetAppearanceConfiguration: Codable, Equatable, Sendable {
 
 public typealias StateLabelPosition = PetAppearanceConfiguration.StateLabelPosition
 public typealias StateLabelSize = PetAppearanceConfiguration.StateLabelSize
+public typealias DialogueContrastMode = PetAppearanceConfiguration.DialogueContrastMode

@@ -865,7 +865,10 @@ public struct WindowConfiguration: Codable, Equatable, Sendable {
             alwaysOnTop: container.decodeIfPresent(Bool.self, forKey: .alwaysOnTop) ?? true,
             clickThrough: container.decodeIfPresent(Bool.self, forKey: .clickThrough) ?? false,
             fullScreenAuxiliary: container.decodeIfPresent(Bool.self, forKey: .fullScreenAuxiliary) ?? false,
-            appearance: try container.decodeIfPresent(PetAppearanceConfiguration.self, forKey: .appearance) ?? PetAppearanceConfiguration()
+            appearance: try container.decodeIfPresent(
+                PetAppearanceConfiguration.self,
+                forKey: .appearance
+            ) ?? PetAppearanceConfiguration()
         )
     }
 }
