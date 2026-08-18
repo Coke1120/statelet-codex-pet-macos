@@ -11,7 +11,7 @@ transparent desktop presence. It runs without a development board, keeps its
 runtime data on the Mac, and uses AppKit and AVFoundation rather than a browser
 runtime.
 
-Statelet 1.8.3 (build 17) requires macOS 13 or newer. The public release remains
+Statelet 1.8.4 (build 18) requires macOS 13 or newer. The public release remains
 source-only: the build script creates an ad-hoc-signed app for personal local
 use, not a Developer ID-signed or notarized public binary.
 
@@ -340,8 +340,8 @@ Statelet uses one canonical identity for new builds and installations:
 | Application Support | `~/Library/Application Support/Statelet` |
 | LaunchAgents | `com.coke1120.statelet.state-aggregator`, `com.coke1120.statelet.mac-player` |
 | Managed marker | `statelet-v2` |
-| App version | `1.8.3` |
-| Build number | `17` |
+| App version | `1.8.4` |
+| Build number | `18` |
 
 ## Uninstall
 

@@ -5,6 +5,33 @@ versioning for the public source release.
 
 ## Unreleased
 
+## [1.8.4] - 2026-08-18
+
+### Added
+
+- Configurable dialogue-bubble background, text, opacity, and contrast behavior
+  with readable light/dark and accessibility fallbacks.
+- A movable, appearance-configurable activity popup with persisted,
+  screen-clamped placement and a reset-to-default position action.
+- Native Settings navigation with a stable AppKit source-list sidebar and
+  managed-media location/status guidance.
+
+### Changed
+
+- Activity rows remain privacy-safe and explicitly informational when no
+  supported Codex Desktop activation contract is available.
+- Imported animation media remains in Statelet's private managed Application
+  Support directory; the signed app bundle stays media-free.
+
+### Distribution notes
+
+- No character, animation, voice model, reference audio, session record, or
+  other private runtime data is bundled.
+- This release remains source-only. The local builder produces an
+  ad-hoc-signed app for personal local use; a public updater package still
+  requires Developer ID signing, notarization, stapling, a pinned team
+  identifier, and clean-Mac Gatekeeper verification.
+
 ## [1.8.3] - 2026-08-18
 
 ### Changed
@@ -239,6 +266,7 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
+[1.8.4]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.4
 [1.8.3]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.3
 [1.8.2]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.2
 [1.8.1]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.1
