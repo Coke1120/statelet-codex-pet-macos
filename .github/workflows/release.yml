@@ -1,0 +1,246 @@
+name: Signed Statelet Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable version tag to publish
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: statelet-release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-sign-publish:
+    name: Build, sign, and publish Statelet
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out Statelet with full history
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve and authorize release tag
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_TAG: ${{ inputs.tag }}
+          PUSH_TAG: ${{ github.ref_name }}
+          ACTUAL_REPOSITORY: ${{ github.repository }}
+          ACTUAL_REPOSITORY_ID: ${{ github.repository_id }}
+        run: |
+          set -euo pipefail
+          [[ "$ACTUAL_REPOSITORY" == "Coke1120/statelet-codex-pet-macos" ]]
+          [[ "$ACTUAL_REPOSITORY_ID" == "1329561047" ]]
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            tag="$DISPATCH_TAG"
+          else
+            tag="$PUSH_TAG"
+          fi
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+
+          git fetch --force --tags origin
+          git fetch --force origin +refs/heads/main:refs/remotes/origin/main
+          commit_sha="$(git rev-parse --verify "refs/tags/$tag^{commit}")"
+          [[ "$commit_sha" =~ ^[0-9a-f]{40}$ ]]
+          git merge-base --is-ancestor "$commit_sha" refs/remotes/origin/main
+          git checkout --detach "$commit_sha"
+
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' mac/CodexPetMac/Resources/Info.plist)"
+          build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' mac/CodexPetMac/Resources/Info.plist)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$tag" == "v$version" ]]
+          [[ "$build" =~ ^[1-9][0-9]*$ ]]
+
+          {
+            echo "tag=$tag"
+            echo "ref=refs/tags/$tag"
+            echo "commit_sha=$commit_sha"
+            echo "version=$version"
+            echo "build=$build"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run focused updater tests
+        run: >-
+          swift test -c release --package-path mac/CodexPetMac
+          --filter StateletUpdaterTests
+
+      - name: Build ad-hoc signed Statelet app
+        run: bash mac/CodexPetMac/scripts/build_app.sh
+
+      - name: Package exactly one architecture-labelled app
+        id: package
+        run: |
+          set -euo pipefail
+          app="mac/CodexPetMac/dist/Statelet.app"
+          binary="$app/Contents/MacOS/Statelet"
+          [[ -d "$app" && -f "$binary" ]]
+
+          architectures="$(lipo -archs "$binary")"
+          case "$architectures" in
+            arm64|x86_64) architecture="$architectures" ;;
+            *) echo "Release binary must contain exactly one supported architecture: $architectures" >&2; exit 1 ;;
+          esac
+
+          mkdir -p release-artifacts
+          asset_name="Statelet-macos-$architecture.zip"
+          asset_path="release-artifacts/$asset_name"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$asset_path"
+
+          entries="$(zipinfo -1 "$asset_path")"
+          [[ -n "$entries" ]]
+          if printf '%s\n' "$entries" | awk '!/^Statelet\.app\// { bad=1 } END { exit bad }'; then
+            :
+          else
+            echo "Archive contains an entry outside the single Statelet.app root." >&2
+            exit 1
+          fi
+
+          asset_size="$(stat -f '%z' "$asset_path")"
+          asset_sha256="$(shasum -a 256 "$asset_path" | awk '{print $1}')"
+          [[ "$asset_size" =~ ^[1-9][0-9]*$ ]]
+          [[ "$asset_sha256" =~ ^[0-9a-f]{64}$ ]]
+          {
+            echo "asset_name=$asset_name"
+            echo "asset_path=$asset_path"
+            echo "asset_size=$asset_size"
+            echo "asset_sha256=$asset_sha256"
+            echo "manifest_path=$asset_path.manifest.json"
+            echo "signature_path=$asset_path.manifest.sig"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate canonical update manifest
+        env:
+          RELEASE_REF: ${{ steps.release.outputs.ref }}
+          RELEASE_COMMIT_SHA: ${{ steps.release.outputs.commit_sha }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_BUILD: ${{ steps.release.outputs.build }}
+          ASSET_NAME: ${{ steps.package.outputs.asset_name }}
+          ASSET_SIZE: ${{ steps.package.outputs.asset_size }}
+          ASSET_SHA256: ${{ steps.package.outputs.asset_sha256 }}
+          MANIFEST_PATH: ${{ steps.package.outputs.manifest_path }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+
+          manifest = {
+              "schema_version": 1,
+              "repository": "Coke1120/statelet-codex-pet-macos",
+              "repository_id": 1329561047,
+              "ref": os.environ["RELEASE_REF"],
+              "commit_sha": os.environ["RELEASE_COMMIT_SHA"],
+              "version": os.environ["RELEASE_VERSION"],
+              "build": int(os.environ["RELEASE_BUILD"]),
+              "asset_name": os.environ["ASSET_NAME"],
+              "asset_size": int(os.environ["ASSET_SIZE"]),
+              "asset_sha256": os.environ["ASSET_SHA256"],
+          }
+          canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+          with open(os.environ["MANIFEST_PATH"], "wb") as handle:
+              handle.write(canonical)
+          PY
+
+      - name: Sign and verify update manifest
+        env:
+          STATELET_UPDATE_SIGNING_PRIVATE_KEY_B64: ${{ secrets.STATELET_UPDATE_SIGNING_PRIVATE_KEY_B64 }}
+          MANIFEST_PATH: ${{ steps.package.outputs.manifest_path }}
+          SIGNATURE_PATH: ${{ steps.package.outputs.signature_path }}
+        run: |
+          set -euo pipefail
+          [[ -n "$STATELET_UPDATE_SIGNING_PRIVATE_KEY_B64" ]]
+          swiftc -O mac/CodexPetMac/scripts/sign_update_manifest.swift -o "$RUNNER_TEMP/sign-update-manifest"
+          expected_public_key="AXJpDm8ZsTUvMGS7dzbiNxBIGwehb+ern2ietCTAgIg="
+          actual_public_key="$(printf '%s' "$STATELET_UPDATE_SIGNING_PRIVATE_KEY_B64" |
+            "$RUNNER_TEMP/sign-update-manifest" public-key)"
+          [[ "$actual_public_key" == "$expected_public_key" ]]
+          printf '%s' "$STATELET_UPDATE_SIGNING_PRIVATE_KEY_B64" |
+            "$RUNNER_TEMP/sign-update-manifest" sign "$MANIFEST_PATH" "$SIGNATURE_PATH"
+          unset STATELET_UPDATE_SIGNING_PRIVATE_KEY_B64
+          [[ "$(stat -f '%Lp' "$SIGNATURE_PATH")" == "600" ]]
+          [[ "$(base64 -D < "$SIGNATURE_PATH" | wc -c | tr -d ' ')" == "64" ]]
+
+      - name: Create or validate stable GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+          BUILD: ${{ steps.release.outputs.build }}
+          ASSET_NAME: ${{ steps.package.outputs.asset_name }}
+          MANIFEST_PATH: ${{ steps.package.outputs.manifest_path }}
+          SIGNATURE_PATH: ${{ steps.package.outputs.signature_path }}
+        run: |
+          set -euo pipefail
+          expected_title="Statelet $VERSION ($BUILD)"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --latest --generate-notes \
+              --title "$expected_title"
+          fi
+
+          release_json="$(gh release view "$TAG" --json assets,isDraft,isPrerelease,name)"
+          RELEASE_JSON="$release_json" \
+            EXPECTED_TITLE="$expected_title" \
+            EXPECTED_ASSET="$ASSET_NAME" \
+            EXPECTED_MANIFEST="$(basename "$MANIFEST_PATH")" \
+            EXPECTED_SIGNATURE="$(basename "$SIGNATURE_PATH")" \
+            python3 - <<'PY'
+          import json
+          import os
+
+          release = json.loads(os.environ["RELEASE_JSON"])
+          if release["isDraft"] or release["isPrerelease"]:
+              raise SystemExit("existing release must be non-draft and non-prerelease")
+          if release["name"] != os.environ["EXPECTED_TITLE"]:
+              raise SystemExit("existing release title does not match the signed build")
+          allowed = {
+              os.environ["EXPECTED_ASSET"],
+              os.environ["EXPECTED_MANIFEST"],
+              os.environ["EXPECTED_SIGNATURE"],
+          }
+          actual = {asset["name"] for asset in release["assets"]}
+          unexpected = actual - allowed
+          if unexpected:
+              raise SystemExit("release contains unexpected assets: " + ", ".join(sorted(unexpected)))
+          PY
+
+      - name: Upload signed update assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          ASSET_PATH: ${{ steps.package.outputs.asset_path }}
+          MANIFEST_PATH: ${{ steps.package.outputs.manifest_path }}
+          SIGNATURE_PATH: ${{ steps.package.outputs.signature_path }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" --clobber -- "$ASSET_PATH" "$MANIFEST_PATH" "$SIGNATURE_PATH"
+          release_json="$(gh release view "$TAG" --json assets)"
+          RELEASE_JSON="$release_json" \
+            EXPECTED_ASSET="$(basename "$ASSET_PATH")" \
+            EXPECTED_MANIFEST="$(basename "$MANIFEST_PATH")" \
+            EXPECTED_SIGNATURE="$(basename "$SIGNATURE_PATH")" \
+            python3 - <<'PY'
+          import json
+          import os
+
+          release = json.loads(os.environ["RELEASE_JSON"])
+          expected = {
+              os.environ["EXPECTED_ASSET"],
+              os.environ["EXPECTED_MANIFEST"],
+              os.environ["EXPECTED_SIGNATURE"],
+          }
+          actual = {asset["name"] for asset in release["assets"]}
+          if actual != expected:
+              raise SystemExit("post-upload release assets do not exactly match the signed update set")
+          PY

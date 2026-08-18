@@ -166,6 +166,57 @@ final class StorageLifecycleHardeningTests: XCTestCase {
         XCTAssertEqual(SessionActivityFileReader.load(oversized), .corrupt)
     }
 
+    func testSessionActivityTargetReaderAcceptsMatchingOwnerFileAndRejectsSymlink() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let activityURL = root.appendingPathComponent("activity-v1.json")
+        let id = String(repeating: "a", count: 24)
+        let item = try SessionActivityItem(
+            id: id,
+            state: .running,
+            event: .userPromptSubmit,
+            eventAt: 10,
+            terminal: false
+        )
+        let snapshot = try SessionActivitySnapshot(emittedAt: 11, active: [item])
+        let targetURL = root.appendingPathComponent("activity-targets-v1.json")
+        let payload = #"{"version":1,"schema_version":1,"emitted_at":11,"targets":[{"id":"aaaaaaaaaaaaaaaaaaaaaaaa","thread_id":"thread-1"}]}"#
+        try Data(payload.utf8).write(to: targetURL)
+        XCTAssertEqual(
+            SessionActivityFileReader.loadTargets(for: activityURL, activity: snapshot),
+            [id: "thread-1"]
+        )
+
+        let realURL = root.appendingPathComponent("targets-real.json")
+        try FileManager.default.moveItem(at: targetURL, to: realURL)
+        try FileManager.default.createSymbolicLink(at: targetURL, withDestinationURL: realURL)
+        XCTAssertTrue(
+            SessionActivityFileReader.loadTargets(for: activityURL, activity: snapshot).isEmpty
+        )
+    }
+
+    func testSessionActivityTargetReaderDegradesInvalidTargetsWithoutRejectingActivity() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let activityURL = root.appendingPathComponent("activity-v1.json")
+        let activityPayload = #"{"version":1,"schema_version":1,"emitted_at":11,"active":[],"completed":[]}"#
+        try Data(activityPayload.utf8).write(to: activityURL)
+        guard case let .snapshot(snapshot) = SessionActivityFileReader.load(activityURL) else {
+            return XCTFail("valid activity did not load")
+        }
+
+        XCTAssertTrue(
+            SessionActivityFileReader.loadTargets(for: activityURL, activity: snapshot).isEmpty
+        )
+        try Data("not json".utf8).write(
+            to: root.appendingPathComponent("activity-targets-v1.json")
+        )
+        XCTAssertTrue(
+            SessionActivityFileReader.loadTargets(for: activityURL, activity: snapshot).isEmpty
+        )
+        XCTAssertEqual(SessionActivityFileReader.load(activityURL), .snapshot(snapshot))
+    }
+
     func testSessionActivityReaderRejectsSymlinkedContainingDirectory() throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

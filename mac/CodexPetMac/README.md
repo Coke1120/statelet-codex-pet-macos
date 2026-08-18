@@ -310,9 +310,13 @@ lifecycle, animation, voice/privacy, recovery, and diagnostics guidance and
 shows the installed version plus the privacy-safe update status. Automatic
 checks do not block the local app; verified installation waits for a safe
 restart boundary and never replaces an unmanaged app. Installation also stays
-fail-closed until a release artifact carries the configured Statelet Developer
-ID team signature; the current source-only releases do not contain installable
-update packages.
+fail-closed until a release artifact carries the pinned Statelet repository
+signature. The signed manifest binds the immutable GitHub repository, `main`
+tag commit, version/build, package identity, size, and SHA-256 before download.
+A configured Developer ID team remains an additional Apple/Gatekeeper check,
+while owner-authorized personal updates may remain ad-hoc signed. The existing
+v1.8.4 app still requires one manual bootstrap install because it predates the
+pinned repository key.
 
 Only convert character media you own or are authorized to use for the intended
 derivative and distribution scope. Keep private input, alpha masters, reports,
@@ -459,8 +463,9 @@ sidebar. Settings → Appearance owns the dialogue-bubble contrast controls and
 the activity-popup background/opacity controls; Settings → General and Help
 show the same managed-media location with an **Open in Finder** action. The
 activity popup is draggable when click-through is disabled and remembers its
-position, but this build intentionally treats rows as informational because no
-supported Codex Desktop activation contract is available.
+position. Rows with a fresh owner-only target expose **Open in Codex** through
+OpenAI's documented `codex://threads/<thread-id>` link; legacy or unverified
+targets remain informational, and opening never marks a completed row as read.
 
 The installer preserves `media-map.json`, `global-transitions.json`,
 `character-library.json`, hidden per-character maps/assets, and user media on
@@ -512,6 +517,13 @@ The activity rail reads the bounded, owner-only companion sidecar:
 ~/Library/Application Support/Statelet/sessions/activity-v1.json
 ```
 
+The optional activation bridge is stored separately so the activity projection
+continues to contain no raw session identifiers:
+
+```text
+~/Library/Application Support/Statelet/sessions/activity-targets-v1.json
+```
+
 The complete serial-free state path is:
 
 ```text
@@ -519,7 +531,8 @@ Codex lifecycle hooks
   -> per-session JSON in Application Support
   -> board-independent priority aggregator
   -> runtime/current_state.json
-  -> sessions/activity-v1.json + Swift file watchers
+  -> sessions/activity-v1.json + private activity-targets-v1.json
+  -> Swift file watchers
   -> requested lifecycle badge, activity rail, and animation
 ```
 
@@ -532,16 +545,21 @@ turn/tool correlation IDs with closed event phases. It excludes
 prompts, tool output, transcript paths, and working directories.
 Correlation metadata stays inside the owner-only session record and is never
 forwarded into `current_state.json` or diagnostics.
-The activity sidecar exposes only bounded active/terminal summaries keyed by
+The activity sidecar exposes only bounded active/completed summaries keyed by
 the same opaque filename hash, with safe event categories and start/event/
 completion timestamps. Completed items remain unread until the user explicitly
 acknowledges them in the rail; no prompt, transcript, repository, media, voice,
 or credential data is included.
+The separate owner-only activation sidecar contains only the opaque hash and a
+bounded technical thread identifier needed for the supported desktop deep link.
+It is optional, freshness-matched to the public sidecar, and never changes
+lifecycle aggregation.
 `UserPromptSubmit` and subagent events map to Running; `PermissionRequest` maps
 to Waiting; compact events map to Review; and tool events map to Review for
 test, lint, typecheck, or review work and Running otherwise. `SessionStart`,
-`SessionEnd`, and `Stop` map only that session to Idle; SessionEnd and Stop also
-terminalize that record.
+`SessionEnd`, and `Stop` map only that session to Idle. `Stop` closes a turn and
+does not create unread completion; `SessionEnd` alone terminalizes the session
+and appears in Completed.
 
 Nonterminal session records remain active for 900 seconds, except a
 `PostToolUse` record, which has a 30-second quiescent grace period when Desktop
@@ -553,9 +571,10 @@ The aggregator chooses the greatest
 tuple of lifecycle priority and event time:
 `waiting > review > running > idle`, with the newest
 timestamp breaking a same-priority tie. An older Waiting session therefore
-beats a newer Running session. When that Waiting session emits Stop, only its
-record becomes terminal, so another active Review or Running session can win. With
-no active record, the result is Idle with no `source_updated_at`.
+beats a newer Running session. When that Waiting session emits Stop, it becomes
+Idle without creating a completed item, so another active Review or Running
+session can win. With no active record, the result is Idle with no
+`source_updated_at`.
 
 The aggregator normally uses macOS `kqueue` directory events to publish a
 changed result immediately. Session TTL, temporary-force, and once-per-minute

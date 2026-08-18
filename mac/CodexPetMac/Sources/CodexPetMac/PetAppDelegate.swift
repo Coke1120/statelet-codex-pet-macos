@@ -495,6 +495,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     )
     private let lifecycleStateReader = LifecycleStateFileReader()
     private let sessionActivityReader = SessionActivityFileReader()
+    private let codexDesktopActivator = CodexDesktopActivator()
     private var characterCountRefreshGeneration: UInt64 = 0
     private var panel: PetPanel!
     private var player: PetPlayerController!
@@ -524,6 +525,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var transientStateReadRetry: DispatchWorkItem?
     private var sessionActivityReadRetry: DispatchWorkItem?
     private var sessionActivitySnapshot: SessionActivitySnapshot?
+    private var sessionActivityTargets: [String: String] = [:]
     private var lastAcceptedSessionActivitySnapshot: SessionActivitySnapshot?
     private var sessionActivityAcknowledgementHistory: [String] = []
     private var sessionActivityExpandedByUser = false
@@ -743,6 +745,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         sessionActivityView.applyAppearance(sessionActivityAppearance)
         sessionActivityView.onAcknowledge = { [weak self] id in
             self?.acknowledgeSessionActivity(id)
+        }
+        sessionActivityView.onOpen = { [weak self] id in
+            self?.openSessionActivity(id)
         }
         sessionActivityView.onExpand = { [weak self] in
             self?.expandSessionActivityPanel()
@@ -1259,9 +1264,10 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             sessionActivityReadRetry?.cancel()
             sessionActivityReadRetry = nil
         }
-        sessionActivityReader.read(url) { [weak self] result in
+        sessionActivityReader.readWithTargets(url) { [weak self] result, targets in
             self?.applySessionActivityReadResult(
                 result,
+                targets: targets,
                 from: url,
                 retryAttempt: retryAttempt
             )
@@ -1270,6 +1276,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
 
     private func applySessionActivityReadResult(
         _ result: SessionActivityReadResult,
+        targets: [String: String],
         from url: URL,
         retryAttempt: Int
     ) {
@@ -1286,6 +1293,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             )
             lastAcceptedSessionActivitySnapshot = application.lastAcceptedSnapshot
             sessionActivitySnapshot = application.displayedSnapshot
+            sessionActivityTargets = SessionActivityTargetAdoptionPolicy.apply(
+                incomingTargets: targets,
+                application: application,
+                currentlyAcceptedTargets: sessionActivityTargets
+            )
             if application.acknowledgementHistory != sessionActivityAcknowledgementHistory {
                 sessionActivityAcknowledgementHistory = application.acknowledgementHistory
                 persistSessionActivityAcknowledgements()
@@ -1294,6 +1306,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         case .missing, .corrupt:
             guard retryAttempt < 2 else {
                 sessionActivitySnapshot = nil
+                sessionActivityTargets = [:]
                 refreshSessionActivityPresentation()
                 return
             }
@@ -1331,7 +1344,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func acknowledgeSessionActivity(_ id: String) {
-        guard sessionActivitySnapshot?.completed.contains(where: { $0.id == id }) == true else {
+        guard sessionActivitySnapshot?.completed.contains(where: {
+            $0.id == id && $0.event == .sessionEnd
+        }) == true else {
             return
         }
         sessionActivityAcknowledgementHistory = SessionActivityApplicationPolicy.recordingAcknowledgement(
@@ -1342,11 +1357,20 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         refreshSessionActivityPresentation()
     }
 
+    private func openSessionActivity(_ id: String) {
+        guard let threadID = sessionActivityTargets[id] else { return }
+        _ = codexDesktopActivator.open(threadID: threadID)
+    }
+
     private func refreshSessionActivityPresentation() {
         guard let sessionActivityView, let sessionActivityPanel else { return }
+        let openableIDs = Set(sessionActivityTargets.compactMap { id, threadID in
+            codexDesktopActivator.canOpen(threadID: threadID) ? id : nil
+        })
         sessionActivityView.update(
             snapshot: sessionActivitySnapshot,
-            acknowledgedIDs: Set(sessionActivityAcknowledgementHistory)
+            acknowledgedIDs: Set(sessionActivityAcknowledgementHistory),
+            openableIDs: openableIDs
         )
         if sessionActivityView.isHidden {
             sessionActivityExpandedByUser = false

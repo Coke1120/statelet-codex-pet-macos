@@ -39,10 +39,10 @@ priority state:
 waiting > review > running > idle
 ```
 
-At equal priority, the newest session event wins. Stop or SessionEnd closes only
-its own session; another active session may still keep Statelet in Waiting,
-Review, or Running. Delayed callbacks cannot replace a newer event for the same
-session.
+At equal priority, the newest session event wins. Stop closes only its current
+turn and makes that session record idle; SessionEnd closes the session. Another
+active session may still keep Statelet in Waiting, Review, or Running. Delayed
+callbacks cannot replace a newer event for the same session.
 
 Session records remain eligible for 900 seconds. On macOS, `kqueue` directory
 events normally wake the aggregator immediately; explicit TTL, temporary-force,
@@ -73,23 +73,27 @@ and stays hidden when both groups are empty.
 
 Completed entries are not marked read merely by being displayed. Use **Mark as
 read** to acknowledge one; acknowledgements persist locally and are pruned with
-the bounded activity history. The rail is informational unless a future,
-documented Codex activation contract is available. Its labels are derived from
-safe lifecycle event categories and bounded start/completion times. It never
-displays prompts,
+the bounded activity history. **Open in Codex** opens a mapped local chat only
+when the owner-only activation sidecar and the verified ChatGPT desktop URL
+handler agree on a supported target. Opening a chat does not mark it as read.
+Legacy, missing, malformed, or unverified targets remain informational. Labels
+are derived from safe lifecycle event categories and bounded start/completion
+times. The popup never displays prompts,
 tool output, transcript or repository paths, session identifiers, private
 media, voice data, credentials, or other session content. The activity sidecar
 is owner-only at `~/Library/Application Support/Statelet/sessions/activity-v1.json`
 and does not change the aggregate lifecycle state or animation priority.
+The optional raw technical thread mapping stays local in the separate owner-only
+`activity-targets-v1.json` sidecar and never enters `activity-v1.json`.
 
 The popup can be moved by dragging its background whenever click-through is
 disabled. Statelet remembers that position, clamps it back onto a visible
 display after monitor changes, and provides **Reset Activity Popup Position** in
 Settings. Its background and opacity are local presentation preferences; the
 default uses dynamic system colors and accessibility contrast/transparency
-settings. This build exposes no supported Codex Desktop activation contract,
-so activity rows are deliberately informational and never manufacture a
-conversation URL.
+settings. Statelet uses only OpenAI's documented `codex://threads/<thread-id>`
+form and verifies that macOS resolves it to the OpenAI desktop app; it never
+manufactures web URLs or opens an unverified handler.
 
 ### Managed animation media
 
@@ -627,9 +631,13 @@ per day; **Check Now** is available when a manual refresh is useful. Automatic
 installation is opt-in and only applies a verified update at a safe restart
 boundary. Offline checks leave the current app running unchanged.
 Installation remains fail-closed until a release package is signed by the
-configured Statelet Developer ID team and passes the bundle identity,
-architecture, macOS, checksum, and transaction-journal checks. The current
-source-only releases intentionally do not install themselves.
+pinned Statelet repository release key, matches the immutable GitHub repository
+and `main` tag commit, and passes the manifest, bundle identity, architecture,
+macOS, checksum, code-signature-integrity, and transaction-journal checks. A
+configured Developer ID team adds Apple signature and Gatekeeper validation,
+but is not required for owner-authorized personal updates. The currently
+installed v1.8.4 build predates this trust path and needs one manual bootstrap
+install before later signed releases can install themselves.
 
 **Settings → Prompts** provides copy-ready, vendor-neutral authoring prompts for
 Idle, Running, Waiting, and Review. Replace the character placeholder with a

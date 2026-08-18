@@ -228,13 +228,19 @@ struct StateletGitHubRelease: Decodable, Equatable {
 
 struct StateletUpdateCandidate: Equatable {
     let version: StateletVersion
+    let releaseTag: String
     let releaseNotes: String
     let releasePageURL: URL
     let packageAsset: StateletReleaseAsset
+    let manifestAsset: StateletReleaseAsset
+    let signatureAsset: StateletReleaseAsset
     let checksumAsset: StateletReleaseAsset?
 }
 
 enum StateletReleaseFeed {
+    static let repository = "Coke1120/statelet-codex-pet-macos"
+    static let repositoryID: Int64 = 1_329_561_047
+    static let releaseSigningPublicKeyBase64 = "AXJpDm8ZsTUvMGS7dzbiNxBIGwehb+ern2ietCTAgIg="
     static let releasesURL = URL(
         string: "https://api.github.com/repos/Coke1120/statelet-codex-pet-macos/releases?per_page=20"
     )!
@@ -260,13 +266,24 @@ enum StateletReleaseFeed {
                   let package = selectPackage(from: release.assets) else {
                 return nil
             }
+            guard let manifest = selectNamedAsset(
+                "\(package.name).manifest.json",
+                from: release.assets,
+                maximumSize: Int64(StateletSignedReleaseManifest.maximumByteCount)
+            ), let signature = selectNamedAsset(
+                "\(package.name).manifest.sig",
+                from: release.assets,
+                maximumSize: Int64(StateletSignedReleaseManifest.signatureMaximumByteCount)
+            ) else { return nil }
             let checksum = selectChecksum(for: package, from: release.assets)
-            guard package.sha256Digest != nil || checksum != nil else { return nil }
             return StateletUpdateCandidate(
                 version: version,
+                releaseTag: release.tagName,
                 releaseNotes: sanitizedNotes(release.body),
                 releasePageURL: release.htmlURL,
                 packageAsset: package,
+                manifestAsset: manifest,
+                signatureAsset: signature,
                 checksumAsset: checksum
             )
         }.max { $0.version < $1.version }
@@ -316,9 +333,120 @@ enum StateletReleaseFeed {
         return nil
     }
 
+    private static func selectNamedAsset(
+        _ name: String,
+        from assets: [StateletReleaseAsset],
+        maximumSize: Int64
+    ) -> StateletReleaseAsset? {
+        assets.first {
+            $0.name == name
+                && $0.browserDownloadURL.scheme?.lowercased() == "https"
+                && $0.size > 0
+                && $0.size <= maximumSize
+        }
+    }
+
     private static func sanitizedNotes(_ value: String?) -> String {
         let notes = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return notes.isEmpty ? "See the release page for details." : String(notes.prefix(20_000))
+    }
+}
+
+struct StateletSignedReleaseManifest: Decodable, Equatable {
+    let schemaVersion: Int
+    let repository: String
+    let repositoryID: Int64
+    let ref: String
+    let commitSHA: String
+    let version: String
+    let build: Int
+    let assetName: String
+    let assetSize: Int64
+    let assetSHA256: String
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case schemaVersion = "schema_version"
+        case repository
+        case repositoryID = "repository_id"
+        case ref
+        case commitSHA = "commit_sha"
+        case version
+        case build
+        case assetName = "asset_name"
+        case assetSize = "asset_size"
+        case assetSHA256 = "asset_sha256"
+    }
+
+    static let maximumByteCount = 64 * 1024
+    static let signatureMaximumByteCount = 1024
+
+    static func decodeStrict(_ data: Data) throws -> Self {
+        guard !data.isEmpty, data.count <= maximumByteCount,
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let dictionary = object as? [String: Any],
+              Set(dictionary.keys) == Set(CodingKeys.allCases.map(\.stringValue)),
+              let manifest = try? JSONDecoder().decode(Self.self, from: data) else {
+            throw StateletUpdaterError.invalidReleaseProvenance
+        }
+        return manifest
+    }
+}
+
+struct StateletReleaseArtifactAuthority: Equatable {
+    let expectedSize: Int64
+    let expectedSHA256: String
+}
+
+enum StateletReleaseProvenance {
+    private static func isLowercaseHex(_ value: String, count: Int) -> Bool {
+        value.utf8.count == count && value.utf8.allSatisfy {
+            (48 ... 57).contains($0) || (97 ... 102).contains($0)
+        }
+    }
+
+    static func verify(
+        candidate: StateletUpdateCandidate,
+        manifestData: Data,
+        signatureData: Data,
+        publicKeyBase64: String = StateletReleaseFeed.releaseSigningPublicKeyBase64
+    ) throws -> StateletReleaseArtifactAuthority {
+        let manifest = try StateletSignedReleaseManifest.decodeStrict(manifestData)
+        guard signatureData.count <= StateletSignedReleaseManifest.signatureMaximumByteCount,
+              let signatureText = String(data: signatureData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              let signature = Data(base64Encoded: signatureText),
+              signature.count == 64,
+              let publicKeyData = Data(base64Encoded: publicKeyBase64),
+              publicKeyData.count == 32,
+              let publicKey = try? Curve25519.Signing.PublicKey(rawRepresentation: publicKeyData),
+              publicKey.isValidSignature(signature, for: manifestData) else {
+            throw StateletUpdaterError.invalidReleaseProvenance
+        }
+        let canonicalVersion = StateletSemanticVersion(manifest.version)
+        guard manifest.schemaVersion == 1,
+              manifest.repository == StateletReleaseFeed.repository,
+              manifest.repositoryID == StateletReleaseFeed.repositoryID,
+              manifest.ref == "refs/tags/\(candidate.releaseTag)",
+              isLowercaseHex(manifest.commitSHA, count: 40),
+              let canonicalVersion,
+              canonicalVersion.description == manifest.version,
+              canonicalVersion == candidate.version.semantic,
+              manifest.build >= 0,
+              manifest.build == candidate.version.build,
+              manifest.assetName == candidate.packageAsset.name,
+              manifest.assetSize > 0,
+              manifest.assetSize == candidate.packageAsset.size,
+              isLowercaseHex(manifest.assetSHA256, count: 64) else {
+            throw StateletUpdaterError.invalidReleaseProvenance
+        }
+        if let githubDigest = candidate.packageAsset.sha256Digest,
+           githubDigest != manifest.assetSHA256 {
+            throw StateletUpdaterError.invalidReleaseProvenance
+        }
+        return StateletReleaseArtifactAuthority(
+            expectedSize: manifest.assetSize,
+            expectedSHA256: manifest.assetSHA256
+        )
     }
 }
 
@@ -424,7 +552,10 @@ enum StateletBundleValidator {
               executableValues?.isExecutable == true else {
             throw StateletUpdaterError.invalidBundleIdentity
         }
-        if requireTrustedSignature { try validateSignature(at: bundleURL) }
+        if requireTrustedSignature {
+            try validateSignature(at: bundleURL)
+            try validateArchitecture(at: bundleURL)
+        }
 
         guard let minimumVersionText = info["LSMinimumSystemVersion"] as? String,
               let minimumVersion = parseOperatingSystemVersion(minimumVersionText) else {
@@ -437,20 +568,22 @@ enum StateletBundleValidator {
     }
 
     private static func validateSignature(at bundleURL: URL) throws {
-        guard let authorizedTeamIdentifier = Bundle.main.object(
+        let configuredTeamIdentifier = Bundle.main.object(
             forInfoDictionaryKey: StateletIdentity.updateSigningTeamIdentifierKey
-        ) as? String,
-        authorizedTeamIdentifier.count == 10,
-        authorizedTeamIdentifier != "$(STATELET_UPDATE_SIGNING_TEAM_IDENTIFIER)" else {
-            throw StateletUpdaterError.untrustedSignature
-        }
+        ) as? String
         var code: SecStaticCode?
         guard SecStaticCodeCreateWithPath(bundleURL as CFURL, [], &code) == errSecSuccess,
               let code else {
             throw StateletUpdaterError.untrustedSignature
         }
         var requirement: SecRequirement?
-        let requirementText = "identifier \"\(StateletIdentity.bundleIdentifier)\" and anchor apple generic"
+        let hasConfiguredTeam = configuredTeamIdentifier?.utf8.count == 10
+            && configuredTeamIdentifier?.utf8.allSatisfy({
+                (48 ... 57).contains($0) || (65 ... 90).contains($0)
+            }) == true
+        let requirementText = hasConfiguredTeam
+            ? "identifier \"\(StateletIdentity.bundleIdentifier)\" and anchor apple generic"
+            : "identifier \"\(StateletIdentity.bundleIdentifier)\""
         guard SecRequirementCreateWithString(requirementText as CFString, [], &requirement) == errSecSuccess,
               let requirement,
               SecStaticCodeCheckValidity(
@@ -460,6 +593,9 @@ enum StateletBundleValidator {
               ) == errSecSuccess else {
             throw StateletUpdaterError.untrustedSignature
         }
+        guard hasConfiguredTeam, let authorizedTeamIdentifier = configuredTeamIdentifier else {
+            return
+        }
         var signingInformation: CFDictionary?
         guard SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &signingInformation) == errSecSuccess,
               let information = signingInformation as? [String: Any],
@@ -468,7 +604,7 @@ enum StateletBundleValidator {
               !certificates.isEmpty else {
             throw StateletUpdaterError.untrustedSignature
         }
-        try validateArchitecture(at: bundleURL)
+        try validateGatekeeper(at: bundleURL)
     }
 
     private static func validateArchitecture(at bundleURL: URL) throws {
@@ -503,6 +639,9 @@ enum StateletBundleValidator {
               text.split(whereSeparator: { $0.isWhitespace }).contains(where: { $0 == requiredArchitecture }) else {
             throw StateletUpdaterError.invalidBundleIdentity
         }
+    }
+
+    private static func validateGatekeeper(at bundleURL: URL) throws {
         let gatekeeper = Process()
         gatekeeper.executableURL = URL(fileURLWithPath: "/usr/sbin/spctl")
         gatekeeper.arguments = ["--assess", "--type", "execute", "--no-cache", bundleURL.path]
@@ -676,6 +815,7 @@ enum StateletUpdaterError: Error, Equatable {
     case invalidReleaseFeed
     case offline
     case noTrustedReleaseAsset
+    case invalidReleaseProvenance
     case missingChecksum
     case invalidArtifact
     case artifactSizeMismatch
@@ -694,6 +834,7 @@ enum StateletUpdaterError: Error, Equatable {
         case .invalidReleaseFeed: return "The update feed could not be verified."
         case .offline: return "Statelet is offline; the current app will keep running."
         case .noTrustedReleaseAsset: return "No trusted Statelet update package is available."
+        case .invalidReleaseProvenance: return "The update release authorization could not be verified."
         case .missingChecksum: return "The update checksum is missing or invalid."
         case .invalidArtifact: return "The downloaded update could not be verified."
         case .artifactSizeMismatch: return "The downloaded update has an unexpected size."
@@ -719,6 +860,11 @@ final class StateletUpdateCoordinator {
     typealias DownloadPreparation = (StateletDownloadedUpdate) async throws -> StateletDownloadedUpdate
     typealias Installer = (StateletDownloadedUpdate, StateletUpdateCandidate) throws -> Void
     typealias BundleValidation = (URL) async throws -> StateletBundleMetadata
+    typealias ProvenanceVerifier = (
+        StateletUpdateCandidate,
+        Data,
+        Data
+    ) throws -> StateletReleaseArtifactAuthority
 
     var onSnapshot: ((StateletUpdateSnapshot) -> Void)? {
         didSet { onSnapshot?(snapshot) }
@@ -733,6 +879,7 @@ final class StateletUpdateCoordinator {
     private let now: () -> Date
     private let fetchReleases: ReleaseFetcher
     private let fetchAssetData: AssetDataFetcher
+    private let verifyProvenance: ProvenanceVerifier
     private let download: Downloader
     private let prepareDownloadedUpdate: DownloadPreparation
     private let installer: Installer
@@ -758,15 +905,25 @@ final class StateletUpdateCoordinator {
             installedVersion: .current(bundle: bundle),
             defaults: defaults,
             fetchReleases: {
-                try await Self.fetchHTTPSData(
+                return try await Self.fetchHTTPSData(
                     from: StateletReleaseFeed.releasesURL,
                     maximumSize: 2 * 1_048_576
                 )
             },
             fetchAssetData: { asset in
-                try await Self.fetchHTTPSData(
+                let maximumSize = asset.name.hasSuffix(".manifest.sig")
+                    ? StateletSignedReleaseManifest.signatureMaximumByteCount
+                    : StateletSignedReleaseManifest.maximumByteCount
+                return try await Self.fetchHTTPSData(
                     from: asset.browserDownloadURL,
-                    maximumSize: 1_048_576
+                    maximumSize: maximumSize
+                )
+            },
+            verifyProvenance: { candidate, manifest, signature in
+                try StateletReleaseProvenance.verify(
+                    candidate: candidate,
+                    manifestData: manifest,
+                    signatureData: signature
                 )
             },
             download: { asset, progress in
@@ -802,6 +959,7 @@ final class StateletUpdateCoordinator {
         now: @escaping () -> Date = Date.init,
         fetchReleases: @escaping ReleaseFetcher,
         fetchAssetData: @escaping AssetDataFetcher,
+        verifyProvenance: @escaping ProvenanceVerifier,
         download: @escaping Downloader,
         prepareDownloadedUpdate: @escaping DownloadPreparation = { $0 },
         installer: @escaping Installer,
@@ -816,6 +974,7 @@ final class StateletUpdateCoordinator {
         self.now = now
         self.fetchReleases = fetchReleases
         self.fetchAssetData = fetchAssetData
+        self.verifyProvenance = verifyProvenance
         self.download = download
         self.prepareDownloadedUpdate = prepareDownloadedUpdate
         self.installer = installer
@@ -974,21 +1133,25 @@ final class StateletUpdateCoordinator {
                 return
             }
             publish(
-                status: "Downloading update…",
+                status: "Verifying release authorization…",
                 candidate: candidate,
                 progress: 0,
                 isChecking: true
             )
-            let checksumData: Data?
-            if let checksumAsset = candidate.checksumAsset,
-               candidate.packageAsset.sha256Digest == nil {
-                checksumData = try await fetchAssetData(checksumAsset)
-            } else {
-                checksumData = nil
-            }
-            let expectedHash = try StateletArtifactVerifier.expectedSHA256(
-                for: candidate.packageAsset,
-                checksumData: checksumData
+            let manifestData = try await fetchAssetData(candidate.manifestAsset)
+            try Task.checkCancellation()
+            let signatureData = try await fetchAssetData(candidate.signatureAsset)
+            try Task.checkCancellation()
+            let authority = try verifyProvenance(
+                candidate,
+                manifestData,
+                signatureData
+            )
+            publish(
+                status: "Downloading update…",
+                candidate: candidate,
+                progress: 0,
+                isChecking: true
             )
             let progressToken = UUID()
             downloadProgressToken = progressToken
@@ -1015,8 +1178,8 @@ final class StateletUpdateCoordinator {
             try Task.checkCancellation()
             try await Self.verifyArtifactOffMain(
                 downloaded.artifactURL,
-                expectedSize: candidate.packageAsset.size,
-                expectedSHA256: expectedHash,
+                expectedSize: authority.expectedSize,
+                expectedSHA256: authority.expectedSHA256,
                 detachedActivities: detachedActivities
             )
             let preparedUpdate = try await prepareDownloadedUpdate(downloaded)

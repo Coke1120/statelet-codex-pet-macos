@@ -4,6 +4,99 @@ import XCTest
 @testable import Statelet
 
 final class StateletUpdaterTests: XCTestCase {
+    func testPinnedReleaseAuthorityIsImmutableRepositoryAndProductionKey() {
+        XCTAssertEqual(StateletReleaseFeed.repository, "Coke1120/statelet-codex-pet-macos")
+        XCTAssertEqual(StateletReleaseFeed.repositoryID, 1_329_561_047)
+        XCTAssertEqual(
+            StateletReleaseFeed.releaseSigningPublicKeyBase64,
+            "AXJpDm8ZsTUvMGS7dzbiNxBIGwehb+ern2ietCTAgIg="
+        )
+    }
+
+    func testSignedReleaseManifestVerifiesRealEd25519Signature() throws {
+        let hash = String(repeating: "a", count: 64)
+        let candidate = try signedCandidate(size: 123, digest: hash)
+        let key = Curve25519.Signing.PrivateKey()
+        let manifest = try signedManifestData(candidate: candidate, sha256: hash)
+        let signature = try key.signature(for: manifest).base64EncodedData()
+
+        XCTAssertEqual(
+            try StateletReleaseProvenance.verify(
+                candidate: candidate,
+                manifestData: manifest,
+                signatureData: signature,
+                publicKeyBase64: key.publicKey.rawRepresentation.base64EncodedString()
+            ),
+            StateletReleaseArtifactAuthority(expectedSize: 123, expectedSHA256: hash)
+        )
+    }
+
+    func testSignedReleaseManifestRejectsTamperWrongAuthorityAndWrongSignature() throws {
+        let hash = String(repeating: "a", count: 64)
+        let candidate = try signedCandidate(size: 123, digest: hash)
+        let key = Curve25519.Signing.PrivateKey()
+        let publicKey = key.publicKey.rawRepresentation.base64EncodedString()
+
+        let validManifest = try signedManifestData(candidate: candidate, sha256: hash)
+        let validSignature = try key.signature(for: validManifest).base64EncodedData()
+        var tampered = validManifest
+        tampered.append(0x20)
+        XCTAssertThrowsError(try StateletReleaseProvenance.verify(
+            candidate: candidate,
+            manifestData: tampered,
+            signatureData: validSignature,
+            publicKeyBase64: publicKey
+        )) { XCTAssertEqual($0 as? StateletUpdaterError, .invalidReleaseProvenance) }
+
+        let invalidAuthorities: [[String: Any]] = [
+            ["repository": "attacker/statelet"],
+            ["repository_id": StateletReleaseFeed.repositoryID + 1],
+            ["ref": "refs/tags/v9.9.9"],
+            ["commit_sha": String(repeating: "A", count: 40)],
+            ["version": "2.0.1"],
+            ["build": candidate.version.build + 1],
+            ["asset_name": "Other.zip"],
+            ["asset_size": candidate.packageAsset.size + 1],
+            ["asset_sha256": String(repeating: "b", count: 64)],
+        ]
+        for override in invalidAuthorities {
+            let manifest = try signedManifestData(
+                candidate: candidate,
+                sha256: hash,
+                overrides: override
+            )
+            let signature = try key.signature(for: manifest).base64EncodedData()
+            XCTAssertThrowsError(try StateletReleaseProvenance.verify(
+                candidate: candidate,
+                manifestData: manifest,
+                signatureData: signature,
+                publicKeyBase64: publicKey
+            )) { XCTAssertEqual($0 as? StateletUpdaterError, .invalidReleaseProvenance) }
+        }
+
+        let extraFieldManifest = try signedManifestData(
+            candidate: candidate,
+            sha256: hash,
+            overrides: ["unexpected": "field"]
+        )
+        let extraFieldSignature = try key.signature(for: extraFieldManifest).base64EncodedData()
+        XCTAssertThrowsError(try StateletReleaseProvenance.verify(
+            candidate: candidate,
+            manifestData: extraFieldManifest,
+            signatureData: extraFieldSignature,
+            publicKeyBase64: publicKey
+        )) { XCTAssertEqual($0 as? StateletUpdaterError, .invalidReleaseProvenance) }
+
+        let wrongKey = Curve25519.Signing.PrivateKey()
+        let wrongSignature = try wrongKey.signature(for: validManifest).base64EncodedData()
+        XCTAssertThrowsError(try StateletReleaseProvenance.verify(
+            candidate: candidate,
+            manifestData: validManifest,
+            signatureData: wrongSignature,
+            publicKeyBase64: publicKey
+        )) { XCTAssertEqual($0 as? StateletUpdaterError, .invalidReleaseProvenance) }
+    }
+
     func testSemanticVersionAndBuildComparison() throws {
         let release = try XCTUnwrap(StateletVersion(version: "1.8.0", build: "14"))
         let rebuild = try XCTUnwrap(StateletVersion(version: "1.8.0", build: "15"))
@@ -63,6 +156,16 @@ final class StateletUpdaterTests: XCTestCase {
                 "name":"Statelet-macos-arm64.zip",
                 "browser_download_url":"https://github.com/assets/statelet-arm64.zip",
                 "size":100,"content_type":"application/zip","digest":"sha256:\(hash)"
+              },
+              {
+                "name":"Statelet-macos-universal.zip.manifest.json",
+                "browser_download_url":"https://github.com/assets/statelet.manifest.json",
+                "size":512,"content_type":"application/json","digest":null
+              },
+              {
+                "name":"Statelet-macos-universal.zip.manifest.sig",
+                "browser_download_url":"https://github.com/assets/statelet.manifest.sig",
+                "size":88,"content_type":"application/octet-stream","digest":null
               }
             ]
           }
@@ -74,11 +177,12 @@ final class StateletUpdaterTests: XCTestCase {
             StateletReleaseFeed.selectCandidate(from: releases, newerThan: installed)
         )
         XCTAssertEqual(candidate.version, StateletVersion(version: "2.0.0", build: "20"))
+        XCTAssertEqual(candidate.releaseTag, "v2.0.0+20")
         XCTAssertEqual(candidate.packageAsset.name, "Statelet-macos-universal.zip")
         XCTAssertEqual(candidate.releaseNotes, "Safe public notes.")
     }
 
-    func testReleaseFeedRejectsMalformedJSONAndPackageWithoutChecksum() throws {
+    func testReleaseFeedRejectsMalformedJSONAndPackageWithoutSignedManifestAssets() throws {
         XCTAssertThrowsError(try StateletReleaseFeed.decode(Data("private path".utf8))) {
             XCTAssertEqual($0 as? StateletUpdaterError, .invalidReleaseFeed)
         }
@@ -94,6 +198,47 @@ final class StateletUpdaterTests: XCTestCase {
         """.utf8))
         let installed = try XCTUnwrap(StateletVersion(version: "1.0.0", build: "1"))
         XCTAssertNil(StateletReleaseFeed.selectCandidate(from: releases, newerThan: installed))
+    }
+
+    @MainActor
+    func testCoordinatorVerifiesProvenanceBeforePackageDownload() async throws {
+        let hash = String(repeating: "a", count: 64)
+        let suite = "StateletUpdaterTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let rejected = expectation(description: "provenance rejected")
+        var fetchedAssetNames = [String]()
+        var downloadCalled = false
+        let coordinator = StateletUpdateCoordinator(
+            installedVersion: try XCTUnwrap(StateletVersion(version: "1.0.0", build: "1")),
+            defaults: defaults,
+            fetchReleases: { self.releaseFeedJSON(size: 123, digest: hash) },
+            fetchAssetData: { asset in
+                fetchedAssetNames.append(asset.name)
+                return Data("bounded".utf8)
+            },
+            verifyProvenance: { _, _, _ in
+                throw StateletUpdaterError.invalidReleaseProvenance
+            },
+            download: { _, _ in
+                downloadCalled = true
+                throw StateletUpdaterError.invalidArtifact
+            },
+            installer: { _, _ in }
+        )
+        coordinator.onSnapshot = { snapshot in
+            if snapshot.status == StateletUpdaterError.invalidReleaseProvenance.safeStatus {
+                rejected.fulfill()
+            }
+        }
+
+        coordinator.checkNow()
+        await fulfillment(of: [rejected], timeout: 2)
+        XCTAssertEqual(fetchedAssetNames, [
+            "Statelet-macos-universal.zip.manifest.json",
+            "Statelet-macos-universal.zip.manifest.sig",
+        ])
+        XCTAssertFalse(downloadCalled)
     }
 
     func testChecksumParsingAndArtifactVerificationFailClosed() throws {
@@ -479,6 +624,7 @@ final class StateletUpdaterTests: XCTestCase {
                 )
             },
             fetchAssetData: { _ in Data() },
+            verifyProvenance: acceptingProvenance,
             download: { _, _ in throw StateletUpdaterError.invalidArtifact },
             installer: { _, _ in }
         )
@@ -507,6 +653,7 @@ final class StateletUpdaterTests: XCTestCase {
             defaults: defaults,
             fetchReleases: { throw URLError(.notConnectedToInternet) },
             fetchAssetData: { _ in Data() },
+            verifyProvenance: acceptingProvenance,
             download: { _, _ in throw StateletUpdaterError.invalidArtifact },
             installer: { _, _ in }
         )
@@ -541,6 +688,7 @@ final class StateletUpdaterTests: XCTestCase {
             defaults: defaults,
             fetchReleases: { self.releaseFeedJSON(size: payload.count, digest: digest) },
             fetchAssetData: { _ in Data() },
+            verifyProvenance: acceptingProvenance,
             download: { _, _ in
                 StateletDownloadedUpdate(
                     artifactURL: artifact,
@@ -605,6 +753,7 @@ final class StateletUpdaterTests: XCTestCase {
             defaults: defaults,
             fetchReleases: { self.releaseFeedJSON(size: payload.count, digest: digest) },
             fetchAssetData: { _ in Data() },
+            verifyProvenance: acceptingProvenance,
             download: { _, _ in
                 StateletDownloadedUpdate(
                     artifactURL: artifact,
@@ -669,6 +818,7 @@ final class StateletUpdaterTests: XCTestCase {
             defaults: defaults,
             fetchReleases: { feed },
             fetchAssetData: { _ in Data() },
+            verifyProvenance: acceptingProvenance,
             download: { _, progress in
                 progress(0.5)
                 return StateletDownloadedUpdate(artifactURL: artifact, bundleURL: bundle)
@@ -735,6 +885,7 @@ final class StateletUpdaterTests: XCTestCase {
             defaults: defaults,
             fetchReleases: { self.releaseFeedJSON(size: firstPayload.count, digest: firstDigest) },
             fetchAssetData: { _ in Data() },
+            verifyProvenance: acceptingProvenance,
             download: { _, _ in
                 StateletDownloadedUpdate(
                     artifactURL: firstArtifact,
@@ -774,6 +925,7 @@ final class StateletUpdaterTests: XCTestCase {
             defaults: defaults,
             fetchReleases: { self.releaseFeedJSON(size: retryPayload.count, digest: retryDigest) },
             fetchAssetData: { _ in Data() },
+            verifyProvenance: acceptingProvenance,
             download: { _, _ in
                 StateletDownloadedUpdate(
                     artifactURL: retryArtifact,
@@ -819,6 +971,7 @@ final class StateletUpdaterTests: XCTestCase {
             defaults: defaults,
             fetchReleases: { self.releaseFeedJSON(size: payload.count, digest: digest) },
             fetchAssetData: { _ in Data() },
+            verifyProvenance: acceptingProvenance,
             download: { _, _ in
                 StateletDownloadedUpdate(
                     artifactURL: artifact,
@@ -864,6 +1017,35 @@ final class StateletUpdaterTests: XCTestCase {
         return try JSONDecoder().decode(StateletReleaseAsset.self, from: data)
     }
 
+    private func signedCandidate(size: Int, digest: String) throws -> StateletUpdateCandidate {
+        let releases = try StateletReleaseFeed.decode(releaseFeedJSON(size: size, digest: digest))
+        return try XCTUnwrap(StateletReleaseFeed.selectCandidate(
+            from: releases,
+            newerThan: try XCTUnwrap(StateletVersion(version: "1.0.0", build: "1"))
+        ))
+    }
+
+    private func signedManifestData(
+        candidate: StateletUpdateCandidate,
+        sha256: String,
+        overrides: [String: Any] = [:]
+    ) throws -> Data {
+        var manifest: [String: Any] = [
+            "schema_version": 1,
+            "repository": StateletReleaseFeed.repository,
+            "repository_id": StateletReleaseFeed.repositoryID,
+            "ref": "refs/tags/\(candidate.releaseTag)",
+            "commit_sha": String(repeating: "b", count: 40),
+            "version": candidate.version.semantic.description,
+            "build": candidate.version.build,
+            "asset_name": candidate.packageAsset.name,
+            "asset_size": candidate.packageAsset.size,
+            "asset_sha256": sha256,
+        ]
+        for (key, value) in overrides { manifest[key] = value }
+        return try JSONSerialization.data(withJSONObject: manifest, options: [.sortedKeys])
+    }
+
     private func releaseFeedJSON(size: Int, digest: String) -> Data {
         Data("""
         [{
@@ -875,9 +1057,26 @@ final class StateletUpdaterTests: XCTestCase {
             "name":"Statelet-macos-universal.zip",
             "browser_download_url":"https://github.com/assets/Statelet.zip",
             "size":\(size),"content_type":"application/zip","digest":"sha256:\(digest)"
+          },{
+            "name":"Statelet-macos-universal.zip.manifest.json",
+            "browser_download_url":"https://github.com/assets/Statelet.zip.manifest.json",
+            "size":512,"content_type":"application/json","digest":null
+          },{
+            "name":"Statelet-macos-universal.zip.manifest.sig",
+            "browser_download_url":"https://github.com/assets/Statelet.zip.manifest.sig",
+            "size":88,"content_type":"application/octet-stream","digest":null
           }]
         }]
         """.utf8)
+    }
+
+    private var acceptingProvenance: StateletUpdateCoordinator.ProvenanceVerifier {
+        { candidate, _, _ in
+            StateletReleaseArtifactAuthority(
+                expectedSize: candidate.packageAsset.size,
+                expectedSHA256: try XCTUnwrap(candidate.packageAsset.sha256Digest)
+            )
+        }
     }
 
     private func makeTemporaryDirectory() throws -> URL {

@@ -6,6 +6,7 @@ import fcntl
 import json
 import math
 import os
+import re
 import select
 import signal
 import stat
@@ -29,8 +30,10 @@ try:
         aggregate_state_with_source,
         default_state_dir,
         read_session_activity,
+        read_session_targets,
         read_session_snapshot,
         SESSION_ACTIVITY_FILENAME,
+        SESSION_ACTIVITY_TARGETS_FILENAME,
     )
 except ModuleNotFoundError as error:
     if error.name != "statelet_state":
@@ -46,8 +49,10 @@ except ModuleNotFoundError as error:
         aggregate_state_with_source,
         default_state_dir,
         read_session_activity,
+        read_session_targets,
         read_session_snapshot,
         SESSION_ACTIVITY_FILENAME,
+        SESSION_ACTIVITY_TARGETS_FILENAME,
     )
 
 
@@ -77,6 +82,9 @@ POLL_FALLBACK_MODE = "poll_fallback"
 FALLBACK_REASONS = frozenset(
     ("unsupported", "open_failed", "registration_failed", "wait_failed")
 )
+TARGET_ID_PATTERN = re.compile(r"^[0-9a-f]{24}$")
+TARGET_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,511}$")
+MAX_ACTIVITY_TARGETS = 128
 
 
 def positive_float(raw: str) -> float:
@@ -290,6 +298,88 @@ def atomic_write_session_activity(
     return record
 
 
+def atomic_write_activity_targets(
+    output_path: Path,
+    snapshot: Dict[str, object],
+    emitted_at: float,
+) -> Dict[str, object]:
+    """Publish the private session-to-Codex activation mapping."""
+    if not math.isfinite(emitted_at):
+        raise ValueError("target emitted_at must be finite")
+    targets = snapshot.get("targets", [])
+    if (
+        not isinstance(targets, list)
+        or len(targets) > MAX_ACTIVITY_TARGETS
+        or any(
+            not isinstance(item, dict)
+            or set(item) != {"id", "thread_id"}
+            or not isinstance(item.get("id"), str)
+            or TARGET_ID_PATTERN.fullmatch(item["id"]) is None
+            or not isinstance(item.get("thread_id"), str)
+            or TARGET_VALUE_PATTERN.fullmatch(item["thread_id"]) is None
+            for item in targets
+        )
+        or len({item["id"] for item in targets}) != len(targets)
+    ):
+        raise ValueError("targets must be a list")
+    record: Dict[str, object] = {
+        "version": 1,
+        "schema_version": 1,
+        "emitted_at": emitted_at,
+        "targets": targets,
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    directory_fd = _open_owner_activity_directory(output_path.parent)
+    fd = -1
+    temporary = ""
+    try:
+        for attempt in range(16):
+            temporary = ".activity-targets-{}-{}-{}.json".format(
+                os.getpid(), time.time_ns(), attempt
+            )
+            try:
+                fd = os.open(
+                    temporary,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+                break
+            except FileExistsError:
+                continue
+        if fd < 0:
+            raise OSError("could not reserve activity target temporary file")
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(record, handle, separators=(",", ":"), sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(
+            temporary,
+            output_path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        temporary = ""
+        os.fsync(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temporary:
+            try:
+                os.unlink(temporary, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        os.close(directory_fd)
+    return record
+
+
 class SessionActivityPublisher:
     """Suppress unchanged activity sidecar writes until the heartbeat."""
 
@@ -298,25 +388,55 @@ class SessionActivityPublisher:
         self.heartbeat = heartbeat
         self.last_fingerprint: Optional[str] = None
         self.next_heartbeat_at = 0.0
+        self.target_retry_needed = False
+        self.last_target_write_status: Optional[str] = None
 
     def publish_if_due(
         self,
         snapshot: Dict[str, object],
         wall_time: float,
         monotonic_time: float,
+        target_snapshot: Optional[Dict[str, object]] = None,
     ) -> Optional[Dict[str, object]]:
+        self.last_target_write_status = None
+        targets = target_snapshot
         fingerprint = json.dumps(
             {
                 "active": snapshot.get("active", []),
                 "completed": snapshot.get("completed", []),
+                "targets": (
+                    targets.get("targets", []) if targets is not None else None
+                ),
             },
             sort_keys=True,
             separators=(",", ":"),
         )
-        if (
+        projection_due = self.target_retry_needed or not (
             fingerprint == self.last_fingerprint
             and monotonic_time < self.next_heartbeat_at
-        ):
+        )
+        # The private mapping is staged first. activity-v1.json is deliberately
+        # replaced last and remains the projection commit marker. A failure in
+        # the optional target bridge cannot block the public activity record.
+        if targets is not None and (projection_due or self.target_retry_needed):
+            try:
+                atomic_write_activity_targets(
+                    self.output_path.with_name(SESSION_ACTIVITY_TARGETS_FILENAME),
+                    targets,
+                    wall_time,
+                )
+                self.target_retry_needed = False
+                self.last_target_write_status = "success"
+            except OSError:
+                self.target_retry_needed = True
+                self.last_target_write_status = "io_error"
+            except UnicodeError:
+                self.target_retry_needed = True
+                self.last_target_write_status = "encoding_error"
+            except (TypeError, ValueError):
+                self.target_retry_needed = True
+                self.last_target_write_status = "invalid_projection"
+        if not projection_due:
             return None
         record = atomic_write_session_activity(self.output_path, snapshot, wall_time)
         self.last_fingerprint = fingerprint
@@ -713,6 +833,10 @@ def print_activity_diagnostic(message: str) -> None:
             "Statelet session activity sidecar status=degraded reason=encoding_error",
             "Statelet session activity sidecar status=degraded reason=invalid_projection",
             "Statelet session activity sidecar status=recovered",
+            "Statelet session activity sidecar component=activation_targets status=degraded reason=io_error",
+            "Statelet session activity sidecar component=activation_targets status=degraded reason=encoding_error",
+            "Statelet session activity sidecar component=activation_targets status=degraded reason=invalid_projection",
+            "Statelet session activity sidecar component=activation_targets status=recovered",
         )
     )
     if message not in allowed:
@@ -725,9 +849,13 @@ class OptionalActivityDiagnostic:
         self,
         diagnostic: Callable[[str], None],
         interval: float = OPTIONAL_ACTIVITY_DIAGNOSTIC_INTERVAL,
+        component: Optional[str] = None,
     ) -> None:
+        if component not in (None, "activation_targets"):
+            raise ValueError("invalid activity sidecar diagnostic component")
         self.diagnostic = diagnostic
         self.interval = interval
+        self.component = component
         self.degraded = False
         self.reported_degraded = False
         self.next_report_at = 0.0
@@ -736,11 +864,18 @@ class OptionalActivityDiagnostic:
         if reason not in ("io_error", "encoding_error", "invalid_projection"):
             raise ValueError("invalid activity sidecar failure reason")
         if monotonic_time >= self.next_report_at:
-            self.diagnostic(
-                "Statelet session activity sidecar status=degraded reason={}".format(
-                    reason
+            if self.component is None:
+                message = (
+                    "Statelet session activity sidecar status=degraded reason={}".format(
+                        reason
+                    )
                 )
-            )
+            else:
+                message = (
+                    "Statelet session activity sidecar component={} "
+                    "status=degraded reason={}".format(self.component, reason)
+                )
+            self.diagnostic(message)
             self.next_report_at = monotonic_time + self.interval
             self.reported_degraded = True
         self.degraded = True
@@ -749,7 +884,14 @@ class OptionalActivityDiagnostic:
         if not self.degraded:
             return
         if self.reported_degraded:
-            self.diagnostic("Statelet session activity sidecar status=recovered")
+            if self.component is None:
+                message = "Statelet session activity sidecar status=recovered"
+            else:
+                message = (
+                    "Statelet session activity sidecar component={} "
+                    "status=recovered".format(self.component)
+                )
+            self.diagnostic(message)
         self.degraded = False
         self.reported_degraded = False
 
@@ -887,6 +1029,10 @@ def run(
         heartbeat,
     )
     activity_health = OptionalActivityDiagnostic(activity_diagnostic)
+    target_health = OptionalActivityDiagnostic(
+        activity_diagnostic,
+        component="activation_targets",
+    )
     force_started_at = wall_clock() if forced_state is not None else None
     force_deadline = (
         monotonic_clock() + force_seconds
@@ -951,11 +1097,32 @@ def run(
                     now=wall_time,
                     active_ttl=active_ttl,
                 )
+                target_snapshot = None
+                try:
+                    target_snapshot = read_session_targets(
+                        state_dir,
+                        activity_snapshot,
+                        now=wall_time,
+                    )
+                except OSError:
+                    target_health.failure("io_error", monotonic_time)
+                except UnicodeError:
+                    target_health.failure("encoding_error", monotonic_time)
+                except (TypeError, ValueError):
+                    target_health.failure("invalid_projection", monotonic_time)
                 activity_publisher.publish_if_due(
                     activity_snapshot,
                     wall_time,
                     monotonic_time,
+                    target_snapshot,
                 )
+                if activity_publisher.last_target_write_status == "success":
+                    target_health.recovery()
+                elif activity_publisher.last_target_write_status is not None:
+                    target_health.failure(
+                        activity_publisher.last_target_write_status,
+                        monotonic_time,
+                    )
                 activity_health.recovery()
             except OSError:
                 activity_health.failure("io_error", monotonic_time)

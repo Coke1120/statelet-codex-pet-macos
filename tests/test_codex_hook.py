@@ -2,6 +2,7 @@
 """Focused hardening tests for the privacy-safe Codex lifecycle hook."""
 
 import importlib.util
+import io
 import json
 import os
 import stat
@@ -66,7 +67,7 @@ class HookHardeningTests(unittest.TestCase):
         self.assertEqual(record["event"], "unknown")
         self.assertNotIn(private_event, json.dumps(record))
 
-    def test_session_activity_metadata_preserves_start_and_terminal_times(self) -> None:
+    def test_session_activity_metadata_preserves_start_and_session_end_time(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
             hook.time, "time", side_effect=[100.0, 110.0, 120.0]
         ):
@@ -80,7 +81,7 @@ class HookHardeningTests(unittest.TestCase):
                 state_dir,
             )
             output = hook.write_event(
-                {"session_id": "session", "hook_event_name": "Stop"},
+                {"session_id": "session", "hook_event_name": "SessionEnd"},
                 state_dir,
             )
             record = json.loads(output.read_text(encoding="utf-8"))
@@ -88,6 +89,23 @@ class HookHardeningTests(unittest.TestCase):
         self.assertEqual(record["started_at"], 100.0)
         self.assertEqual(record["completed_at"], 120.0)
         self.assertEqual(record["category"], "codex")
+
+    def test_stop_ends_only_the_current_turn_without_completing_the_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = hook.write_event(
+                {
+                    "session_id": "session",
+                    "turn_id": "turn-one",
+                    "hook_event_name": "Stop",
+                },
+                Path(temporary),
+            )
+            record = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(record["event"], "Stop")
+        self.assertEqual(record["state"], "idle")
+        self.assertFalse(record["terminal"])
+        self.assertIsNone(record["completed_at"])
 
     def test_session_identity_aliases_are_hashed_and_distinct(self) -> None:
         aliases = ("session_id", "thread_id", "conversation_id", "sessionId")
@@ -573,7 +591,7 @@ class HookHardeningTests(unittest.TestCase):
         self.assertFalse(second_record["terminal"])
         self.assertEqual(second_record["state"], "waiting")
 
-    def test_stop_terminalizes_and_stale_tool_callback_cannot_revive_session(self) -> None:
+    def test_stop_rejects_a_stale_same_turn_tool_callback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state_dir = Path(temporary) / "sessions"
             output = hook.write_event(
@@ -599,10 +617,12 @@ class HookHardeningTests(unittest.TestCase):
             record = json.loads(output.read_text(encoding="utf-8"))
 
         self.assertEqual(record["event"], "Stop")
-        self.assertTrue(record["terminal"])
+        self.assertEqual(record["state"], "idle")
+        self.assertFalse(record["terminal"])
+        self.assertIsNone(record["completed_at"])
         self.assertEqual(record["rejections"], {"stale_event": 1})
 
-    def test_terminal_stop_blocks_non_revival_callback_from_different_turn(self) -> None:
+    def test_stop_rejects_a_same_turn_callback_without_a_tool_id(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state_dir = Path(temporary) / "sessions"
             output = hook.write_event(
@@ -616,21 +636,22 @@ class HookHardeningTests(unittest.TestCase):
             hook.write_event(
                 {
                     "session_id": "session",
-                    "turn_id": "turn-two",
+                    "turn_id": "turn-one",
                     "hook_event_name": "PostToolUse",
                     "tool_name": "Bash",
                     "tool_input": {},
-                    "tool_use_id": "tool-two",
                 },
                 state_dir,
             )
             record = json.loads(output.read_text(encoding="utf-8"))
 
         self.assertEqual(record["event"], "Stop")
-        self.assertTrue(record["terminal"])
+        self.assertEqual(record["state"], "idle")
+        self.assertFalse(record["terminal"])
+        self.assertIsNone(record["completed_at"])
         self.assertEqual(record["rejections"], {"stale_event": 1})
 
-    def test_legacy_v1_terminal_blocks_stale_tool_callback_with_tool_id(self) -> None:
+    def test_legacy_v1_stop_terminal_marker_is_normalized_while_rejecting_stale_callback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
             hook.time, "time", return_value=100.0
         ):
@@ -661,8 +682,9 @@ class HookHardeningTests(unittest.TestCase):
             record = json.loads(destination.read_text(encoding="utf-8"))
 
         self.assertEqual(record["event"], "Stop")
-        self.assertTrue(record["terminal"])
-        self.assertEqual(record["completed_at"], 50.0)
+        self.assertEqual(record["state"], "idle")
+        self.assertFalse(record["terminal"])
+        self.assertIsNone(record["completed_at"])
         self.assertEqual(record["rejections"], {"stale_event": 1})
 
     def test_legacy_v1_terminal_blocks_stale_tool_callback_without_tool_id(self) -> None:
@@ -698,21 +720,30 @@ class HookHardeningTests(unittest.TestCase):
         self.assertEqual(record["completed_at"], 60.0)
         self.assertEqual(record["rejections"], {"stale_event": 1})
 
-    def test_stop_without_timestamp_ignores_late_tool_but_new_prompt_revives(self) -> None:
+    def test_new_turn_prompt_revives_the_same_session_after_stop(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state_dir = Path(temporary) / "sessions"
             output = hook.write_event(
-                {"conversation_id": "conversation", "hook_event_name": "Stop"},
+                {
+                    "conversation_id": "conversation",
+                    "turn_id": "turn-one",
+                    "hook_event_name": "Stop",
+                },
                 state_dir,
             )
             hook.write_event(
-                {"conversation_id": "conversation", "hook_event_name": "PostToolUse"},
+                {
+                    "conversation_id": "conversation",
+                    "turn_id": "turn-one",
+                    "hook_event_name": "PostToolUse",
+                },
                 state_dir,
             )
             stopped = json.loads(output.read_text(encoding="utf-8"))
             hook.write_event(
                 {
                     "conversation_id": "conversation",
+                    "turn_id": "turn-two",
                     "hook_event_name": "UserPromptSubmit",
                 },
                 state_dir,
@@ -720,10 +751,13 @@ class HookHardeningTests(unittest.TestCase):
             revived = json.loads(output.read_text(encoding="utf-8"))
 
         self.assertEqual(stopped["event"], "Stop")
-        self.assertTrue(stopped["terminal"])
+        self.assertFalse(stopped["terminal"])
+        self.assertIsNone(stopped["completed_at"])
         self.assertEqual(stopped["rejections"], {"stale_event": 1})
         self.assertEqual(revived["event"], "UserPromptSubmit")
+        self.assertEqual(revived["state"], "running")
         self.assertFalse(revived["terminal"])
+        self.assertIsNone(revived["completed_at"])
 
     def test_same_turn_delayed_prompt_cannot_revive_stop(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -748,11 +782,12 @@ class HookHardeningTests(unittest.TestCase):
             record = json.loads(output.read_text(encoding="utf-8"))
 
         self.assertEqual(record["event"], "Stop")
-        self.assertTrue(record["terminal"])
+        self.assertFalse(record["terminal"])
+        self.assertIsNone(record["completed_at"])
         self.assertEqual(record["rejections"], {"stale_event": 1})
         self.assertNotIn("delayed private prompt", json.dumps(record))
 
-    def test_new_turn_stop_arriving_before_prompt_remains_terminal(self) -> None:
+    def test_stop_arriving_before_same_turn_prompt_keeps_that_turn_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state_dir = Path(temporary) / "sessions"
             hook.write_event(
@@ -775,8 +810,163 @@ class HookHardeningTests(unittest.TestCase):
             record = json.loads(output.read_text(encoding="utf-8"))
 
         self.assertEqual(record["event"], "Stop")
-        self.assertTrue(record["terminal"])
+        self.assertFalse(record["terminal"])
+        self.assertIsNone(record["completed_at"])
         self.assertEqual(record["rejections"], {"stale_event": 1})
+
+    def test_session_end_terminalizes_the_session_after_stop_closes_its_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            hook.time, "time", side_effect=[100.0, 110.0]
+        ):
+            state_dir = Path(temporary) / "sessions"
+            output = hook.write_event(
+                {
+                    "session_id": "session",
+                    "turn_id": "turn",
+                    "hook_event_name": "Stop",
+                },
+                state_dir,
+            )
+            hook.write_event(
+                {
+                    "session_id": "session",
+                    "turn_id": "turn",
+                    "hook_event_name": "SessionEnd",
+                },
+                state_dir,
+            )
+            record = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(record["event"], "SessionEnd")
+        self.assertEqual(record["state"], "idle")
+        self.assertTrue(record["terminal"])
+        self.assertEqual(record["completed_at"], 110.0)
+        self.assertTrue(record["fence"]["session_closed"])
+
+    def test_accepted_session_activation_events_publish_private_bounded_targets(self) -> None:
+        for event in ("SessionStart", "UserPromptSubmit"):
+            with (
+                self.subTest(event=event),
+                tempfile.TemporaryDirectory() as temporary,
+                mock.patch.object(hook.time, "time", return_value=100.0),
+            ):
+                state_dir = Path(temporary) / "sessions"
+                payload = {
+                    "session_id": "root-session",
+                    "thread_id": "preferred-thread:123",
+                    "hook_event_name": event,
+                }
+                if event == "UserPromptSubmit":
+                    payload["turn_id"] = "turn"
+                lifecycle_path = hook.write_event(payload, state_dir)
+                identifier = hook.session_key(payload)
+                target_path = state_dir / f"{identifier}.target.json"
+                target = json.loads(target_path.read_text(encoding="utf-8"))
+                lifecycle = lifecycle_path.read_text(encoding="utf-8")
+
+                self.assertEqual(
+                    target,
+                    {
+                        "version": 1,
+                        "id": identifier,
+                        "thread_id": "preferred-thread:123",
+                        "updated_at": 100.0,
+                    },
+                )
+                self.assertEqual(stat.S_IMODE(target_path.stat().st_mode), 0o600)
+                self.assertNotIn("preferred-thread:123", lifecycle)
+                self.assertNotIn("root-session", lifecycle)
+
+    def test_rejected_same_turn_prompt_does_not_overwrite_accepted_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "sessions"
+            common = {"session_id": "session", "turn_id": "turn"}
+            hook.write_event(
+                dict(
+                    common,
+                    hook_event_name="UserPromptSubmit",
+                    thread_id="accepted-thread",
+                ),
+                state_dir,
+            )
+            hook.write_event(
+                dict(
+                    common,
+                    hook_event_name="PreToolUse",
+                    tool_name="Bash",
+                    tool_input={},
+                    tool_use_id="tool",
+                ),
+                state_dir,
+            )
+            hook.write_event(
+                dict(
+                    common,
+                    hook_event_name="UserPromptSubmit",
+                    thread_id="rejected-thread",
+                ),
+                state_dir,
+            )
+            identifier = hook.session_key(common)
+            target = json.loads(
+                (state_dir / f"{identifier}.target.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(target["thread_id"], "accepted-thread")
+
+    def test_invalid_activation_target_is_not_published(self) -> None:
+        invalid_values = ("contains whitespace", "contains/slash", "x" * 513)
+        for value in invalid_values:
+            with (
+                self.subTest(value=value[:20]),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                state_dir = Path(temporary) / "sessions"
+                hook.write_event(
+                    {
+                        "session_id": value,
+                        "thread_id": value,
+                        "hook_event_name": "SessionStart",
+                    },
+                    state_dir,
+                )
+
+                self.assertEqual(list(state_dir.glob("*.target.json")), [])
+
+    def test_activation_target_write_failure_warns_without_blocking_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "sessions"
+            payload = {
+                "session_id": "private-session-id",
+                "thread_id": "private-thread:secret",
+                "hook_event_name": "SessionStart",
+            }
+            original_write = hook._atomic_write_record
+
+            def fail_only_target(directory_fd, destination_name, record):
+                if destination_name.endswith(".target.json"):
+                    raise OSError("/Users/private/repository private-thread:secret")
+                return original_write(directory_fd, destination_name, record)
+
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(
+                    hook, "_atomic_write_record", side_effect=fail_only_target
+                ),
+                mock.patch.object(hook.sys, "stderr", stderr),
+            ):
+                lifecycle_path = hook.write_event(payload, state_dir)
+
+            lifecycle = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+            warning = stderr.getvalue()
+
+        self.assertEqual(lifecycle["event"], "SessionStart")
+        self.assertEqual(lifecycle["state"], "idle")
+        self.assertEqual(warning, hook.ACTIVATION_TARGET_WRITE_WARNING + "\n")
+        self.assertEqual(warning.count("\n"), 1)
+        self.assertNotIn("/Users/", warning)
+        self.assertNotIn("private-session-id", warning)
+        self.assertNotIn("private-thread:secret", warning)
 
 
 if __name__ == "__main__":

@@ -15,8 +15,13 @@ state file.
 No animation media is bundled. MP4, MOV, poster, and report files remain
 user-supplied local content.
 
-The first public release is source-only. `build_app.sh` creates an ad-hoc-signed
-app for personal local use; it is not Developer ID signed or notarized.
+Statelet 1.8.4 is source-only. `build_app.sh` creates an ad-hoc-signed app for
+personal local use; future update tags may attach that package for installs
+that already pin the repository key, but it is not Developer ID signed or
+notarized.
+Owner-authorized updates use a pinned Ed25519 repository key plus a signed
+GitHub release manifest; this is Statelet's personal-update authority, not a
+replacement for Developer ID and notarization in public distribution.
 
 ## Lifecycle data flow
 
@@ -68,8 +73,11 @@ The state priority is:
 waiting > review > running > idle
 ```
 
-`Stop` and `SessionEnd` terminalize only their own session. Each other valid
-session record remains active for 900 seconds after its authoritative event
+`Stop` closes the current turn and maps that session to Idle without creating a
+completed-unread activity item. Its private causal fence still rejects delayed
+callbacks from that stopped turn. `SessionEnd` alone terminalizes the session
+and becomes a completed-unread activity item. Each other valid session record
+remains active for 900 seconds after its authoritative event
 time, except a `PostToolUse` record, which has a 30-second quiescent grace
 period when Desktop fails to provide a terminal callback. A later hook event
 refreshes the normal 900-second lease. Records that are malformed, non-finite,

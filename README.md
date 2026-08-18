@@ -11,9 +11,15 @@ transparent desktop presence. It runs without a development board, keeps its
 runtime data on the Mac, and uses AppKit and AVFoundation rather than a browser
 runtime.
 
-Statelet 1.8.4 (build 18) requires macOS 13 or newer. The public release remains
-source-only: the build script creates an ad-hoc-signed app for personal local
-use, not a Developer ID-signed or notarized public binary.
+Statelet 1.8.4 (build 18) requires macOS 13 or newer. That release remains
+source-only. Future tags may attach an ad-hoc-signed update package for existing
+personal installs; it is not a Developer ID-signed or notarized public binary.
+
+For personal installs, future tagged releases can use Statelet's pinned
+Ed25519 repository key: the maintained workflow signs a manifest binding the
+immutable GitHub repository, `main` commit, version/build, and package digest.
+This enables owner-authorized in-app updates without presenting the artifact as
+an Apple-authorized public binary.
 
 > **No character or animation media is bundled.** Import media that you own or
 > are authorized to use. Until at least an Idle clip is configured, the panel
@@ -54,7 +60,8 @@ Codex lifecycle hooks
   -> local multi-session state aggregator
      waiting > review > running > idle
   -> current_state.json
-  -> activity-v1.json + Statelet AppKit panels
+  -> activity-v1.json + private activity-targets-v1.json
+  -> Statelet AppKit panels
   -> AVFoundation player
 ```
 
@@ -65,11 +72,18 @@ not store prompts, tool output, transcript paths, or working directories in
 those records.
 
 The optional `sessions/activity-v1.json` sidecar contains only bounded active
-and terminal session summaries keyed by those opaque hashes. Each entry carries
+and completed-session summaries keyed by those opaque hashes. Each entry carries
 safe lifecycle/category labels plus bounded start, last-event, and completion
 timestamps. Statelet uses it to show the activity rail beside the pet;
 completed entries remain unread until the user explicitly marks them as read,
 and acknowledgement state stays local and owner-only.
+
+When Codex supplies a supported technical thread identifier, Statelet keeps the
+hash-to-thread mapping in the separate owner-only
+`sessions/activity-targets-v1.json` sidecar. The public activity projection
+remains identifier-free. A verified ChatGPT desktop handler can then open the
+matching local chat through the documented `codex://threads/<thread-id>` link;
+legacy or unmapped rows remain informational.
 
 See [the lifecycle and media reference](docs/MACOS_COMPANION.md) for freshness,
 heartbeat, playlist, and filesystem contracts. Developers can use the

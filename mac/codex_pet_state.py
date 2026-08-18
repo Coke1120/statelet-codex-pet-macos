@@ -30,12 +30,16 @@ VALID_EVENTS = frozenset(
 )
 STATE_PRIORITY = {"idle": 0, "running": 1, "review": 2, "waiting": 3}
 HOOK_RECORD_NAME = re.compile(r"^[0-9a-f]{24}\.json$")
+TARGET_RECORD_NAME = re.compile(r"^[0-9a-f]{24}\.target\.json$")
 SESSION_ACTIVITY_FILENAME = "activity-v1.json"
+SESSION_ACTIVITY_TARGETS_FILENAME = "activity-targets-v1.json"
 HOOK_RECORD_KEYS = frozenset(("version", "state", "event", "updated_at"))
 HOOK_RECORD_V2_KEYS = frozenset(
     ("version", "state", "event", "event_at", "updated_at", "terminal", "rejections", "causal")
 )
-HOOK_RECORD_V2_OPTIONAL_KEYS = frozenset(("started_at", "completed_at", "category"))
+HOOK_RECORD_V2_OPTIONAL_KEYS = frozenset(
+    ("started_at", "completed_at", "category", "fence")
+)
 ACTIVITY_CATEGORIES = frozenset(("codex", "approval", "tool", "review", "subagent", "activity"))
 VALID_REJECTION_REASONS = frozenset(
     (
@@ -65,6 +69,9 @@ CAUSAL_HASH = re.compile(r"^[0-9a-f]{24}$")
 CAUSAL_KEYS = frozenset(
     ("version", "current_turn", "prior_turns", "tool_phases", "active_tool", "pending_permissions", "latest_event")
 )
+FENCE_KEYS = frozenset(("version", "turn_closed", "closed_turn", "session_closed"))
+TARGET_RECORD_KEYS = frozenset(("version", "id", "thread_id", "updated_at"))
+OPAQUE_TARGET = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,511}$")
 
 
 def default_state_dir() -> Path:
@@ -226,6 +233,17 @@ def _record_names(directory_fd: int) -> List[str]:
         return []
 
 
+def _target_record_names(directory_fd: int) -> List[str]:
+    try:
+        return sorted(
+            name
+            for name in os.listdir(directory_fd)
+            if TARGET_RECORD_NAME.fullmatch(name) is not None
+        )
+    except OSError:
+        return []
+
+
 def read_active_states(
     state_dir: Path,
     now: Optional[float] = None,
@@ -282,6 +300,28 @@ def _valid_causal_metadata(value: Any) -> bool:
             for key, rank in tool_phases.items()
         )
         and (latest_event is None or latest_event in VALID_EVENTS)
+    )
+
+
+def _valid_fence(value: Any) -> bool:
+    if (
+        not isinstance(value, dict)
+        or set(value) != FENCE_KEYS
+        or value.get("version") != 1
+        or isinstance(value.get("version"), bool)
+    ):
+        return False
+    closed_turn = value.get("closed_turn")
+    return (
+        isinstance(value.get("turn_closed"), bool)
+        and isinstance(value.get("session_closed"), bool)
+        and (
+            closed_turn is None
+            or (
+                isinstance(closed_turn, str)
+                and CAUSAL_HASH.fullmatch(closed_turn) is not None
+            )
+        )
     )
 
 
@@ -361,12 +401,13 @@ def read_session_snapshot(
                 state = record["state"]
                 updated_at = float(record["updated_at"])
                 event_at = float(record.get("event_at", updated_at))
-                terminal = record.get("terminal", event in ("SessionEnd", "Stop"))
+                terminal = record.get("terminal", event == "SessionEnd")
                 started_at = record.get("started_at", event_at)
                 completed_at = record.get("completed_at", event_at if terminal else None)
                 category = record.get("category", _event_category(event))
                 stored_rejections = record.get("rejections", {})
                 causal = record.get("causal")
+                fence = record.get("fence")
             except (ValueError, TypeError, KeyError):
                 _add_rejection(rejections, "invalid_timestamp")
                 continue
@@ -377,11 +418,12 @@ def read_session_snapshot(
                 or _finite_or_none(started_at) is None
                 or (completed_at is not None and _finite_or_none(completed_at) is None)
                 or not isinstance(terminal, bool)
-                or terminal != (event in ("SessionEnd", "Stop"))
+                or (event != "Stop" and terminal != (event == "SessionEnd"))
                 or not isinstance(category, str)
                 or category not in ACTIVITY_CATEGORIES
                 or not isinstance(stored_rejections, dict)
                 or (causal is not None and not _valid_causal_metadata(causal))
+                or (fence is not None and not _valid_fence(fence))
             ):
                 _add_rejection(rejections, "invalid_record")
                 _prune_if_unchanged(directory_fd, name, identity)
@@ -420,7 +462,7 @@ def read_session_snapshot(
             ):
                 latest_event = event
                 latest_event_at = event_at
-            if not terminal:
+            if not terminal and event != "Stop":
                 active.append((state, event_at))
                 active_expiries.append(event_at + event_ttl)
     finally:
@@ -475,7 +517,7 @@ def read_session_activity(
                 state = record.get("state")
                 updated_at = float(record.get("updated_at"))
                 event_at = float(record.get("event_at", updated_at))
-                terminal = record.get("terminal", event in ("SessionEnd", "Stop"))
+                terminal = record.get("terminal", event == "SessionEnd")
                 started_at = _finite_or_none(record.get("started_at", event_at))
                 completed_at = _finite_or_none(
                     record.get("completed_at", event_at if terminal else None)
@@ -492,7 +534,7 @@ def read_session_activity(
                 or (terminal and completed_at is None)
                 or (not terminal and record.get("completed_at") is not None and completed_at is None)
                 or not isinstance(terminal, bool)
-                or terminal != (event in ("SessionEnd", "Stop"))
+                or (event != "Stop" and terminal != (event == "SessionEnd"))
                 or not isinstance(category, str)
                 or category not in ACTIVITY_CATEGORIES
             ):
@@ -503,7 +545,7 @@ def read_session_activity(
                 continue
             identifier = name[:-5]
             record_identities[identifier] = identity
-            is_completed = terminal and event in ("SessionEnd", "Stop")
+            is_completed = terminal and event == "SessionEnd"
             if is_completed:
                 if age > completed_ttl:
                     _prune_if_unchanged(directory_fd, name, identity)
@@ -518,7 +560,7 @@ def read_session_activity(
                     "category": category,
                     "terminal": True,
                 })
-            elif age <= event_ttl and state != "idle":
+            elif event != "Stop" and age <= event_ttl and state != "idle":
                 active.append({
                     "id": identifier,
                     "state": state,
@@ -555,6 +597,68 @@ def read_session_activity(
         "active": active[:MAX_ACTIVITY_ENTRIES],
         "completed": completed[:MAX_ACTIVITY_ENTRIES],
     }
+
+
+def read_session_targets(
+    state_dir: Path,
+    activity: Dict[str, Any],
+    now: Optional[float] = None,
+    target_ttl: float = DEFAULT_COMPLETED_TTL,
+) -> Dict[str, Any]:
+    """Read the private activation mapping for currently projected sessions."""
+    current = time.time() if now is None else now
+    projected_ids = {
+        item.get("id")
+        for group in (activity.get("active", []), activity.get("completed", []))
+        if isinstance(group, list)
+        for item in group
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    targets: List[Dict[str, str]] = []
+    directory_fd = _open_state_directory(state_dir)
+    if directory_fd is None:
+        return {"version": 1, "emitted_at": current, "targets": targets}
+    try:
+        for name in _target_record_names(directory_fd):
+            read_status, record, identity = _read_hook_record(directory_fd, name)
+            if read_status != HOOK_RECORD_OK or identity is None:
+                continue
+            identifier = name[:-12]
+            valid = False
+            try:
+                raw_updated_at = record.get("updated_at") if isinstance(record, dict) else None
+                updated_at = (
+                    float(raw_updated_at)
+                    if not isinstance(raw_updated_at, bool)
+                    else math.nan
+                )
+                thread_id = record.get("thread_id") if isinstance(record, dict) else None
+                valid = (
+                    isinstance(record, dict)
+                    and set(record) == TARGET_RECORD_KEYS
+                    and record.get("version") == 1
+                    and not isinstance(record.get("version"), bool)
+                    and record.get("id") == identifier
+                    and isinstance(thread_id, str)
+                    and OPAQUE_TARGET.fullmatch(thread_id) is not None
+                    and math.isfinite(updated_at)
+                    and -MAX_FUTURE_SKEW <= current - updated_at <= target_ttl
+                )
+            except (TypeError, ValueError):
+                valid = False
+            if not valid:
+                _prune_if_unchanged(directory_fd, name, identity)
+                continue
+            # A normal turn ends with Stop before the main session may later
+            # emit SessionEnd. Keep the private target for its bounded TTL
+            # during that unprojected interval, but never expose it in the
+            # consolidated sidecar until the session is projected again.
+            if identifier in projected_ids:
+                targets.append({"id": identifier, "thread_id": thread_id})
+    finally:
+        os.close(directory_fd)
+    targets.sort(key=lambda item: item["id"])
+    return {"version": 1, "emitted_at": current, "targets": targets}
 
 
 def aggregate_state(active: Iterable[Tuple[str, float]]) -> str:

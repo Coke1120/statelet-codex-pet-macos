@@ -60,7 +60,27 @@ def write_v2_record(
                 "event_at": event_at,
                 "updated_at": event_at,
                 "terminal": terminal,
+                "completed_at": event_at if terminal else None,
                 "rejections": rejections or {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def write_target_record(
+    path: Path,
+    identifier: str,
+    thread_id: str,
+    updated_at: float,
+) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "id": identifier,
+                "thread_id": thread_id,
+                "updated_at": updated_at,
             }
         ),
         encoding="utf-8",
@@ -292,6 +312,77 @@ class LifecycleStateTests(unittest.TestCase):
         self.assertEqual(activity["completed"][0]["completed_at"], 100.0)
         self.assertEqual(activity["completed"][0]["category"], "codex")
 
+    def test_session_activity_omits_stop_and_projects_only_session_end_as_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            write_v2_record(
+                record_path(directory, "a"),
+                "idle",
+                "Stop",
+                99.0,
+                terminal=False,
+            )
+            write_v2_record(
+                record_path(directory, "b"),
+                "idle",
+                "SessionEnd",
+                100.0,
+                terminal=True,
+            )
+
+            activity = state.read_session_activity(directory, now=101.0)
+
+        self.assertEqual(activity["active"], [])
+        self.assertEqual([item["id"] for item in activity["completed"]], ["b" * 24])
+        self.assertEqual(activity["completed"][0]["event"], "SessionEnd")
+        self.assertTrue(activity["completed"][0]["terminal"])
+
+    def test_legacy_stop_record_is_normalized_as_a_nonterminal_turn_end(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            record = record_path(directory, "a")
+            record.write_text(
+                json.dumps({
+                    "version": 1,
+                    "state": "idle",
+                    "event": "Stop",
+                    "updated_at": 100.0,
+                }),
+                encoding="utf-8",
+            )
+
+            activity = state.read_session_activity(directory, now=101.0)
+            record_still_exists = record.exists()
+
+        self.assertEqual(activity["active"], [])
+        self.assertEqual(activity["completed"], [])
+        self.assertTrue(record_still_exists)
+
+    def test_one_session_record_moves_between_activity_groups_without_duplication(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            record = record_path(directory, "a")
+
+            write_v2_record(record, "idle", "Stop", 100.0, terminal=False)
+            after_stop = state.read_session_activity(directory, now=100.0)
+
+            write_v2_record(record, "running", "UserPromptSubmit", 110.0)
+            after_prompt = state.read_session_activity(directory, now=110.0)
+
+            write_v2_record(record, "idle", "SessionEnd", 120.0, terminal=True)
+            after_session_end = state.read_session_activity(directory, now=120.0)
+
+        identifier = "a" * 24
+        self.assertEqual(after_stop["active"], [])
+        self.assertEqual(after_stop["completed"], [])
+        self.assertEqual([item["id"] for item in after_prompt["active"]], [identifier])
+        self.assertEqual(after_prompt["completed"], [])
+        self.assertEqual(after_session_end["active"], [])
+        self.assertEqual(
+            [item["id"] for item in after_session_end["completed"]],
+            [identifier],
+        )
+
     def test_session_activity_deterministically_prioritizes_active_states(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -345,6 +436,110 @@ class LifecycleStateTests(unittest.TestCase):
         self.assertEqual(activity["active"], [])
         self.assertTrue(record_exists)
         self.assertEqual(aggregate["active"], [("idle", 99.0)])
+
+    def test_session_targets_filter_unsafe_records_and_retain_bounded_unprojected_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / "sessions"
+            directory.mkdir()
+            projected = "a" * 24
+            orphan = "b" * 24
+            corrupt = "c" * 24
+            invalid = "d" * 24
+            symlinked = "e" * 24
+            expired = "f" * 24
+            write_target_record(
+                directory / f"{projected}.target.json",
+                projected,
+                "thread:projected",
+                99.0,
+            )
+            write_target_record(
+                directory / f"{orphan}.target.json",
+                orphan,
+                "thread:orphan",
+                99.0,
+            )
+            (directory / f"{corrupt}.target.json").write_text(
+                "{not-json", encoding="utf-8"
+            )
+            write_target_record(
+                directory / f"{invalid}.target.json",
+                invalid,
+                "contains whitespace",
+                99.0,
+            )
+            write_target_record(
+                directory / f"{expired}.target.json",
+                expired,
+                "thread:expired",
+                100.0 - state.DEFAULT_COMPLETED_TTL - 1.0,
+            )
+            outside = root / "outside-target.json"
+            write_target_record(outside, symlinked, "thread:outside", 99.0)
+            link = directory / f"{symlinked}.target.json"
+            link.symlink_to(outside)
+            activity = {
+                "active": [{"id": projected}, {"id": invalid}, {"id": symlinked}],
+                "completed": [],
+            }
+
+            targets = state.read_session_targets(directory, activity, now=100.0)
+
+            self.assertEqual(
+                targets,
+                {
+                    "version": 1,
+                    "emitted_at": 100.0,
+                    "targets": [
+                        {"id": projected, "thread_id": "thread:projected"}
+                    ],
+                },
+            )
+            self.assertTrue((directory / f"{orphan}.target.json").exists())
+            self.assertTrue((directory / f"{corrupt}.target.json").exists())
+            self.assertFalse((directory / f"{invalid}.target.json").exists())
+            self.assertFalse((directory / f"{expired}.target.json").exists())
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(
+                json.loads(outside.read_text(encoding="utf-8"))["thread_id"],
+                "thread:outside",
+            )
+
+    def test_session_target_survives_stop_until_session_end_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "sessions"
+            directory.mkdir()
+            identifier = "a" * 24
+            record = directory / f"{identifier}.json"
+            target = directory / f"{identifier}.target.json"
+            write_target_record(target, identifier, "thread:completed", 99.0)
+            write_v2_record(record, "idle", "Stop", 100.0, terminal=False)
+
+            stopped_activity = state.read_session_activity(directory, now=100.0)
+            stopped_targets = state.read_session_targets(
+                directory, stopped_activity, now=100.0
+            )
+
+            self.assertEqual(stopped_activity["active"], [])
+            self.assertEqual(stopped_activity["completed"], [])
+            self.assertEqual(stopped_targets["targets"], [])
+            self.assertTrue(target.exists())
+
+            write_v2_record(record, "idle", "SessionEnd", 101.0, terminal=True)
+            completed_activity = state.read_session_activity(directory, now=101.0)
+            completed_targets = state.read_session_targets(
+                directory, completed_activity, now=101.0
+            )
+
+        self.assertEqual(
+            [item["id"] for item in completed_activity["completed"]],
+            [identifier],
+        )
+        self.assertEqual(
+            completed_targets["targets"],
+            [{"id": identifier, "thread_id": "thread:completed"}],
+        )
 
     def test_hook_record_reader_ignores_symlinks_and_special_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -550,6 +745,164 @@ class PublisherTests(unittest.TestCase):
             self.assertEqual(json.loads(output.read_text(encoding="utf-8")), record)
             self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
             self.assertNotIn("/Users/", output.read_text(encoding="utf-8"))
+
+    def test_activity_and_private_targets_publish_with_matching_emitted_at(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "sessions"
+            activity_path = state_dir / state.SESSION_ACTIVITY_FILENAME
+            identifier = "a" * 24
+            snapshot = {
+                "active": [
+                    {
+                        "id": identifier,
+                        "state": "running",
+                        "event": "UserPromptSubmit",
+                        "event_at": 100.0,
+                        "started_at": 100.0,
+                        "completed_at": None,
+                        "category": "codex",
+                        "terminal": False,
+                    }
+                ],
+                "completed": [],
+            }
+            target_snapshot = {
+                "targets": [{"id": identifier, "thread_id": "thread:private"}]
+            }
+            publisher = aggregator.SessionActivityPublisher(activity_path, heartbeat=60.0)
+
+            publisher.publish_if_due(snapshot, 123.0, 10.0, target_snapshot)
+
+            activity = json.loads(activity_path.read_text(encoding="utf-8"))
+            targets = json.loads(
+                (state_dir / state.SESSION_ACTIVITY_TARGETS_FILENAME).read_text(encoding="utf-8")
+            )
+            self.assertEqual(activity["emitted_at"], 123.0)
+            self.assertEqual(targets["emitted_at"], 123.0)
+            self.assertNotIn("thread:private", json.dumps(activity))
+            self.assertEqual(
+                stat.S_IMODE(
+                    (state_dir / state.SESSION_ACTIVITY_TARGETS_FILENAME).stat().st_mode
+                ),
+                0o600,
+            )
+            self.assertEqual(
+                targets["targets"],
+                [{"id": identifier, "thread_id": "thread:private"}],
+            )
+
+    def test_target_write_failure_does_not_block_activity_or_current_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "sessions"
+            output = Path(temporary) / "runtime" / "current_state.json"
+            state_dir.mkdir()
+            write_v2_record(
+                record_path(state_dir, "a"),
+                "running",
+                "UserPromptSubmit",
+                100.0,
+            )
+            clock = FakeClock(wall_time=100.0, monotonic_time=10.0)
+            diagnostics = []
+
+            with mock.patch.object(
+                aggregator,
+                "atomic_write_activity_targets",
+                side_effect=OSError(
+                    "/Users/private/repository private-thread:secret"
+                ),
+            ):
+                aggregator.run(
+                    state_dir,
+                    output,
+                    poll=0.25,
+                    heartbeat=60.0,
+                    active_ttl=900.0,
+                    once=True,
+                    print_state=False,
+                    forced_state=None,
+                    force_seconds=30.0,
+                    should_stop=lambda: False,
+                    waiter=ScriptedWaiter(clock),
+                    wall_clock=clock.wall,
+                    monotonic_clock=clock.monotonic,
+                    activity_diagnostic=diagnostics.append,
+                )
+
+            current_state = json.loads(output.read_text(encoding="utf-8"))
+            activity = json.loads(
+                (state_dir / state.SESSION_ACTIVITY_FILENAME).read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(current_state["state"], "running")
+        self.assertEqual(current_state["active_sessions"], 1)
+        self.assertEqual(activity["active"][0]["id"], "a" * 24)
+        self.assertEqual(
+            diagnostics,
+            [
+                "Statelet session activity sidecar component=activation_targets "
+                "status=degraded reason=io_error"
+            ],
+        )
+        self.assertNotIn("/Users/", json.dumps(diagnostics))
+        self.assertNotIn("private-thread:secret", json.dumps(diagnostics))
+
+    def test_target_read_failure_does_not_block_activity_or_current_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "sessions"
+            output = Path(temporary) / "runtime" / "current_state.json"
+            state_dir.mkdir()
+            write_v2_record(
+                record_path(state_dir, "a"),
+                "waiting",
+                "PermissionRequest",
+                100.0,
+            )
+            clock = FakeClock(wall_time=100.0, monotonic_time=10.0)
+            diagnostics = []
+
+            with mock.patch.object(
+                aggregator,
+                "read_session_targets",
+                side_effect=OSError("/Users/private/repository private target"),
+            ):
+                aggregator.run(
+                    state_dir,
+                    output,
+                    poll=0.25,
+                    heartbeat=60.0,
+                    active_ttl=900.0,
+                    once=True,
+                    print_state=False,
+                    forced_state=None,
+                    force_seconds=30.0,
+                    should_stop=lambda: False,
+                    waiter=ScriptedWaiter(clock),
+                    wall_clock=clock.wall,
+                    monotonic_clock=clock.monotonic,
+                    activity_diagnostic=diagnostics.append,
+                )
+
+            current_state = json.loads(output.read_text(encoding="utf-8"))
+            activity = json.loads(
+                (state_dir / state.SESSION_ACTIVITY_FILENAME).read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(current_state["state"], "waiting")
+        self.assertEqual(activity["active"][0]["id"], "a" * 24)
+        self.assertEqual(
+            diagnostics,
+            [
+                "Statelet session activity sidecar component=activation_targets "
+                "status=degraded reason=io_error"
+            ],
+        )
+        self.assertNotIn("/Users/", json.dumps(diagnostics))
+        self.assertNotIn("private target", json.dumps(diagnostics))
 
     def test_activity_writer_rejects_symlinked_state_directory_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -759,6 +1112,92 @@ class PublisherTests(unittest.TestCase):
                 "Statelet session activity sidecar status=recovered",
                 "Statelet session activity sidecar status=degraded reason=io_error",
                 "Statelet session activity sidecar status=recovered",
+            ],
+        )
+
+    def test_activation_target_diagnostic_recovers_only_after_successful_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "sessions"
+            output = state_dir / state.SESSION_ACTIVITY_FILENAME
+            identifier = "a" * 24
+            snapshot = {"active": [], "completed": []}
+            targets = {
+                "targets": [{"id": identifier, "thread_id": "thread:private"}]
+            }
+            publisher = aggregator.SessionActivityPublisher(output, heartbeat=60.0)
+            messages = []
+            health = aggregator.OptionalActivityDiagnostic(
+                messages.append,
+                interval=60.0,
+                component="activation_targets",
+            )
+            original_target_write = aggregator.atomic_write_activity_targets
+            target_write_attempts = 0
+
+            def fail_once_then_write(*args, **kwargs):
+                nonlocal target_write_attempts
+                target_write_attempts += 1
+                if target_write_attempts == 1:
+                    raise OSError("private failure")
+                return original_target_write(*args, **kwargs)
+
+            with mock.patch.object(
+                aggregator,
+                "atomic_write_activity_targets",
+                side_effect=fail_once_then_write,
+            ):
+                first = publisher.publish_if_due(snapshot, 100.0, 10.0, targets)
+                health.failure(publisher.last_target_write_status, 10.0)
+                self.assertEqual(
+                    messages,
+                    [
+                        "Statelet session activity sidecar component=activation_targets "
+                        "status=degraded reason=io_error"
+                    ],
+                )
+
+                retried = publisher.publish_if_due(snapshot, 101.0, 11.0, targets)
+                self.assertEqual(publisher.last_target_write_status, "success")
+                health.recovery()
+
+            self.assertIsNotNone(first)
+            self.assertIsNotNone(retried)
+            self.assertEqual(retried["emitted_at"], 101.0)
+            target_record = json.loads(
+                output.with_name(
+                    state.SESSION_ACTIVITY_TARGETS_FILENAME
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(target_record["emitted_at"], 101.0)
+            self.assertEqual(
+                messages,
+                [
+                    "Statelet session activity sidecar component=activation_targets "
+                    "status=degraded reason=io_error",
+                    "Statelet session activity sidecar component=activation_targets "
+                    "status=recovered",
+                ],
+            )
+
+    def test_activation_target_diagnostic_is_rate_limited(self) -> None:
+        messages = []
+        diagnostic = aggregator.OptionalActivityDiagnostic(
+            messages.append,
+            interval=60.0,
+            component="activation_targets",
+        )
+
+        diagnostic.failure("io_error", 10.0)
+        diagnostic.failure("invalid_projection", 20.0)
+        diagnostic.failure("encoding_error", 70.0)
+
+        self.assertEqual(
+            messages,
+            [
+                "Statelet session activity sidecar component=activation_targets "
+                "status=degraded reason=io_error",
+                "Statelet session activity sidecar component=activation_targets "
+                "status=degraded reason=encoding_error",
             ],
         )
 

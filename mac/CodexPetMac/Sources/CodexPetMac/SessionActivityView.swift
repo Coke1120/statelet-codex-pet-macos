@@ -155,7 +155,7 @@ enum SessionActivityPresentation {
     ) -> SessionActivityDisplayState {
         let active = snapshot?.active ?? []
         let completed = (snapshot?.completed ?? []).filter {
-            !acknowledgedIDs.contains($0.id)
+            $0.event == .sessionEnd && !acknowledgedIDs.contains($0.id)
         }
         guard !compact else {
             return SessionActivityDisplayState(
@@ -182,6 +182,7 @@ final class SessionActivityView: NSView {
     private let clock: () -> Date
     private var snapshot: SessionActivitySnapshot?
     private var acknowledgedIDs: Set<String> = []
+    private var openableIDs: Set<String> = []
     private var compactOverride: Bool?
     private var panelAppearance = try! SessionActivityPanelAppearance()
     private var resolvedAppearance = SessionActivityPanelResolvedAppearance(
@@ -200,6 +201,7 @@ final class SessionActivityView: NSView {
     )
     private(set) var renderedItemIDs: [String] = []
     var onAcknowledge: ((String) -> Void)?
+    var onOpen: ((String) -> Void)?
     var onExpand: (() -> Void)?
 
     init(frame frameRect: NSRect = .zero, clock: @escaping () -> Date = Date.init) {
@@ -251,9 +253,14 @@ final class SessionActivityView: NSView {
         }
     }
 
-    func update(snapshot: SessionActivitySnapshot?, acknowledgedIDs: Set<String>) {
+    func update(
+        snapshot: SessionActivitySnapshot?,
+        acknowledgedIDs: Set<String>,
+        openableIDs: Set<String> = []
+    ) {
         self.snapshot = snapshot
         self.acknowledgedIDs = acknowledgedIDs
+        self.openableIDs = openableIDs
         rebuild()
     }
 
@@ -358,10 +365,8 @@ final class SessionActivityView: NSView {
         }
         renderedItemIDs = []
 
-        let activeCount = snapshot?.active.count ?? 0
-        let completedCount = snapshot?.completed.filter {
-            !acknowledgedIDs.contains($0.id)
-        }.count ?? 0
+        let activeCount = displayState.active.count + displayState.hiddenActiveCount
+        let completedCount = displayState.completed.count + displayState.hiddenCompletedCount
         guard activeCount > 0 || completedCount > 0 else {
             isHidden = true
             invalidateIntrinsicContentSize()
@@ -377,7 +382,8 @@ final class SessionActivityView: NSView {
                 addCompactPill(title: "Completed · \(completedCount)", accessibility: "Completed unread sessions: \(completedCount)")
             }
         } else {
-            addActivationNotice()
+            let visibleIDs = Set((displayState.active + displayState.completed).map(\.id))
+            addActivationNotice(hasOpenableItems: !openableIDs.isDisjoint(with: visibleIDs))
             if !displayState.active.isEmpty {
                 addGroup(
                     title: "Running · \(activeCount)",
@@ -404,17 +410,20 @@ final class SessionActivityView: NSView {
         needsLayout = true
     }
 
-    private func addActivationNotice() {
+    private func addActivationNotice(hasOpenableItems: Bool) {
+        let message = hasOpenableItems
+            ? "Open in Codex is available for linked sessions. Other rows remain informational."
+            : "Codex Desktop activation is unavailable for these sessions. Activity rows are informational only."
         let notice = NSTextField(
-            wrappingLabelWithString: "Codex Desktop activation is unavailable in this installation. Activity rows are informational only."
+            wrappingLabelWithString: message
         )
         notice.font = .systemFont(ofSize: 11)
         notice.textColor = resolvedAppearance.secondaryTextColor
         notice.setAccessibilityElement(true)
         notice.setAccessibilityRole(.staticText)
-        notice.setAccessibilityLabel("Codex Desktop activation unavailable; activity rows are informational only")
+        notice.setAccessibilityLabel(message)
         notice.setAccessibilityHelp(
-            "This Statelet build has no supported Codex Desktop activation contract, so rows do not open or acknowledge conversations."
+            "Only sessions with a verified Codex Desktop target can be opened. Opening never marks a completed session as read."
         )
         stack.addArrangedSubview(notice)
     }
@@ -464,10 +473,16 @@ final class SessionActivityView: NSView {
         label.setAccessibilityLabel("Active \(item.state.rawValue) session \(ordinal)")
         label.setAccessibilityValue("\(item.category.displayName), started \(relativeAge(item.startedAt))")
         label.setAccessibilityHelp(
-            "Informational only. No supported Codex Desktop activation contract is available."
+            openableIDs.contains(item.id)
+                ? "Use Open in Codex to show this session in Codex Desktop."
+                : "Informational only. No verified Codex Desktop target is available."
         )
         let dotColor = resolvedActivityColor(item.state.sessionActivityColor)
-        let row = NSStackView(views: [activityDot(color: dotColor), label])
+        var views: [NSView] = [activityDot(color: dotColor), label]
+        if openableIDs.contains(item.id) {
+            views.append(openButton(for: item.id, accessibility: "Open active session in Codex"))
+        }
+        let row = NSStackView(views: views)
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 5
@@ -486,7 +501,9 @@ final class SessionActivityView: NSView {
         label.setAccessibilityLabel("Completed unread session \(ordinal)")
         label.setAccessibilityValue("\(item.category.displayName), completed \(relativeAge(completionTime))")
         label.setAccessibilityHelp(
-            "Informational only. Use Mark as read to acknowledge this item; no conversation is opened."
+            openableIDs.contains(item.id)
+                ? "Use Open in Codex to show this session, or Mark as read to acknowledge it."
+                : "Informational only. Use Mark as read to acknowledge this item."
         )
 
         let acknowledge = NSButton(title: "Mark as read", target: self, action: #selector(markAsRead(_:)))
@@ -496,7 +513,12 @@ final class SessionActivityView: NSView {
         acknowledge.identifier = NSUserInterfaceItemIdentifier(item.id)
 
         let dotColor = resolvedActivityColor(.systemGreen)
-        let row = NSStackView(views: [activityDot(color: dotColor), label, acknowledge])
+        var views: [NSView] = [activityDot(color: dotColor), label]
+        if openableIDs.contains(item.id) {
+            views.append(openButton(for: item.id, accessibility: "Open completed session in Codex"))
+        }
+        views.append(acknowledge)
+        let row = NSStackView(views: views)
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 6
@@ -512,6 +534,16 @@ final class SessionActivityView: NSView {
         dot.textColor = color
         dot.setAccessibilityElement(false)
         return dot
+    }
+
+    private func openButton(for id: String, accessibility: String) -> NSButton {
+        let button = NSButton(title: "Open in Codex", target: self, action: #selector(openInCodex(_:)))
+        button.bezelStyle = .inline
+        button.controlSize = .small
+        button.identifier = NSUserInterfaceItemIdentifier(id)
+        button.setAccessibilityLabel(accessibility)
+        button.setAccessibilityHelp("Opens this session without marking it as read")
+        return button
     }
 
     private func addCompactPill(title: String, accessibility: String) {
@@ -554,6 +586,11 @@ final class SessionActivityView: NSView {
     @objc private func markAsRead(_ sender: NSButton) {
         guard let id = sender.identifier?.rawValue else { return }
         onAcknowledge?(id)
+    }
+
+    @objc private func openInCodex(_ sender: NSButton) {
+        guard let id = sender.identifier?.rawValue, openableIDs.contains(id) else { return }
+        onOpen?(id)
     }
 
     @objc private func expandCompact(_ sender: NSButton) {

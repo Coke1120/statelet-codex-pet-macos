@@ -7,12 +7,19 @@ The first public release is source-only. The maintained build script produces
 an ad-hoc-signed `.app` for personal local use. It does not produce a DMG,
 Developer ID signature, notarization ticket, or App Store package.
 
-The in-app updater follows the same boundary: it will show release metadata,
-but it will not install an artifact until the signed release build embeds the
-authorized Developer ID team identifier in `StateletUpdateSigningTeamIdentifier`
-and publishes a matching `Statelet*.zip` with a GitHub SHA-256 digest. This
-prevents the current source-only/ad-hoc build from treating an arbitrary
-trusted certificate as a Statelet publisher.
+The in-app updater uses a separate repository authority for personal installs.
+Statelet pins the project's Ed25519 release public key and immutable GitHub
+repository identity. A release is eligible only when its tag resolves to a
+commit on `main` and its `Statelet*.zip`, exact manifest, and manifest signature
+are published by the maintained release workflow. The manifest binds the tag,
+commit, bundle version/build, asset name/size, and SHA-256 before Statelet
+downloads or opens the package.
+
+This repository signature authorizes Statelet's own updater; it is not an Apple
+Developer ID signature and does not make an ad-hoc build suitable for public
+Gatekeeper distribution. When a valid `StateletUpdateSigningTeamIdentifier` is
+embedded, Statelet retains the Developer ID and Gatekeeper checks as an
+additional trust layer.
 
 ## Choose a deployment path
 
@@ -20,6 +27,7 @@ trusted certificate as a Statelet publisher.
 | --- | --- | --- |
 | Try the interface | Build and open the app from `dist/` | Temporary app; no lifecycle publisher, hooks, or login item are installed |
 | Use Statelet daily | Build, then run the installer | App in `~/Applications`, Codex lifecycle hooks, state aggregator, and optional login launch |
+| Publish an owner-authorized update | Push a version tag whose commit is on `main` | The release workflow publishes an ad-hoc package plus a signed manifest for existing Statelet installs |
 | Publish a binary | Complete a separate signed-release process | Developer ID signing, hardened-runtime review, notarization, stapling, and Gatekeeper testing are required |
 
 Do not redistribute the current ad-hoc-signed app as though it were a notarized
@@ -316,10 +324,44 @@ the retained data, open Finder, choose **Go → Go to Folder…**, enter
 `~/Library/Application Support/Statelet`, inspect its contents, and move the
 chosen data to Trash.
 
+## Owner-authorized GitHub updates
+
+The maintained `.github/workflows/release.yml` workflow is the only supported
+producer for Developer-ID-free in-app updates. It runs for `v*` tags (or a
+manual dispatch naming an existing `v*` tag), fetches the complete repository
+history, and refuses to sign unless the tag commit is an ancestor of
+`origin/main` and the immutable GitHub repository name and numeric ID match the
+values pinned by Statelet.
+
+The repository secret `STATELET_UPDATE_SIGNING_PRIVATE_KEY_B64` contains the
+raw Ed25519 private key. It must never be printed, committed, placed in release
+notes, or copied into the app. The matching public key is embedded in Statelet.
+Each workflow run publishes exactly these update inputs:
+
+- an architecture-labelled `Statelet-macos-<arch>.zip` containing one
+  top-level `Statelet.app`;
+- `<package>.manifest.json`, with the repository, tag, commit, version/build,
+  package name/size, and SHA-256; and
+- `<package>.manifest.sig`, containing the Ed25519 signature over the exact
+  manifest bytes.
+
+Statelet verifies the signature and every bound field before downloading the
+ZIP, then retains its existing file hash, bundle identity, version,
+architecture, minimum-macOS, transactional journal, backup, and rollback
+checks. The package's ad-hoc code signature must also be internally valid.
+
+The currently installed v1.8.4 build predates this pinned-key trust path. The
+first build containing it must therefore be installed manually; subsequent
+workflow-produced releases can update that build at the next safe restart.
+Rotating or losing the private key likewise requires a manually installed
+bootstrap build unless a prior authorized release ships an overlapping key.
+
 ## Public binary distribution
 
-The current build is suitable for personal local execution only. Before
-attaching a binary to a public release:
+The workflow-produced update ZIP is publicly downloadable when the repository
+is public, but it is authorized only for personal installs that already pin the
+Statelet release key. Do not present it as an Apple-authorized general-purpose
+binary. Before promoting a Statelet binary for ordinary public installation:
 
 1. sign with an authorized Developer ID Application identity;
 2. decide and review hardened-runtime entitlements;
@@ -332,8 +374,8 @@ attaching a binary to a public release:
 8. complete a rights review for every bundled visual asset.
 
 A DMG is only an optional presentation container. It does not replace signing
-or notarization. The first public Statelet release therefore publishes source,
-not an ad-hoc-signed app.
+or notarization. Statelet 1.8.4 therefore published source only; later personal
+update assets remain distinct from a supported public binary distribution.
 
 ## Release verification
 

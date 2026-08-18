@@ -65,7 +65,7 @@ final class SessionActivityTests: XCTestCase {
         )
         XCTAssertEqual(display.active.count, 3)
         XCTAssertEqual(display.hiddenActiveCount, 1)
-        XCTAssertEqual(display.completed.map(\.id), [String(repeating: "f", count: 24)])
+        XCTAssertTrue(display.completed.isEmpty)
         XCTAssertEqual(display.hiddenCompletedCount, 0)
     }
 
@@ -153,6 +153,145 @@ final class SessionActivityTests: XCTestCase {
         )
         XCTAssertEqual(rowLabel.accessibilityRole(), .staticText)
         XCTAssertEqual(rowLabel.accessibilityLabel(), "Active running session 1")
+    }
+
+    @MainActor
+    func testOpenButtonEmitsOnlyHashedIDAndDoesNotAcknowledge() throws {
+        let completed = try item(
+            "a",
+            state: .idle,
+            event: .sessionEnd,
+            terminal: true,
+            eventAt: 90
+        )
+        let view = SessionActivityView(
+            frame: NSRect(x: 0, y: 0, width: 320, height: 150),
+            clock: { Date(timeIntervalSince1970: 100) }
+        )
+        var opened: String?
+        var acknowledged: String?
+        view.onOpen = { opened = $0 }
+        view.onAcknowledge = { acknowledged = $0 }
+        view.update(
+            snapshot: try SessionActivitySnapshot(emittedAt: 100, completed: [completed]),
+            acknowledgedIDs: [],
+            openableIDs: [completed.id]
+        )
+
+        let buttons = allDescendants(of: view).compactMap { $0 as? NSButton }
+        let open = try XCTUnwrap(buttons.first { $0.title == "Open in Codex" })
+        open.performClick(nil)
+        XCTAssertEqual(opened, completed.id)
+        XCTAssertNil(acknowledged)
+        XCTAssertNotNil(buttons.first { $0.title == "Mark as read" })
+    }
+
+    func testCodexDesktopActivationPolicyEncodesAndFailsClosed() throws {
+        let appURL = URL(fileURLWithPath: "/Applications/Codex.app")
+        var opened: (URL, URL)?
+        let trusted = CodexDesktopActivator(
+            applicationResolver: { _ in appURL },
+            applicationTrustResolver: { _ in true },
+            opener: { opened = ($0, $1) }
+        )
+        XCTAssertTrue(trusted.canOpen(threadID: "thread/with?reserved"))
+        XCTAssertTrue(trusted.open(threadID: "thread/with?reserved"))
+        XCTAssertEqual(opened?.0.absoluteString, "codex://threads/thread%2Fwith%3Freserved")
+        XCTAssertEqual(opened?.1, appURL)
+
+        var untrustedOpened = false
+        let untrusted = CodexDesktopActivator(
+            applicationResolver: { _ in appURL },
+            applicationTrustResolver: { _ in false },
+            opener: { _, _ in untrustedOpened = true }
+        )
+        XCTAssertFalse(untrusted.canOpen(threadID: "valid"))
+        XCTAssertFalse(untrusted.open(threadID: "valid"))
+        XCTAssertFalse(untrustedOpened)
+        XCTAssertEqual(CodexDesktopActivationPolicy.trustedBundleIdentifier, "com.openai.codex")
+        XCTAssertEqual(CodexDesktopActivationPolicy.trustedTeamIdentifier, "2DC432GLL2")
+        XCTAssertNil(CodexDesktopActivationPolicy.deepLink(for: "contains space"))
+        XCTAssertNil(CodexDesktopActivationPolicy.deepLink(
+            for: String(repeating: "a", count: CodexDesktopActivationPolicy.maximumThreadIDBytes + 1)
+        ))
+    }
+
+    func testTargetValidationRequiresExactSnapshotAndKnownUniqueIDs() throws {
+        let active = try item(
+            "a",
+            state: .running,
+            event: .userPromptSubmit,
+            terminal: false,
+            eventAt: 90
+        )
+        let snapshot = try SessionActivitySnapshot(emittedAt: 100, active: [active])
+        let valid = SessionActivityTargets(
+            version: 1,
+            schemaVersion: 1,
+            emittedAt: 100,
+            targets: [.init(id: active.id, threadID: "thread-1")]
+        )
+        XCTAssertEqual(valid.validated(for: snapshot), [active.id: "thread-1"])
+        let stale = SessionActivityTargets(
+            version: 1,
+            schemaVersion: 1,
+            emittedAt: 99,
+            targets: valid.targets
+        )
+        XCTAssertTrue(stale.validated(for: snapshot).isEmpty)
+        let unknown = SessionActivityTargets(
+            version: 1,
+            schemaVersion: 1,
+            emittedAt: 100,
+            targets: [.init(id: String(repeating: "b", count: 24), threadID: "thread-2")]
+        )
+        XCTAssertTrue(unknown.validated(for: snapshot).isEmpty)
+    }
+
+    func testRejectedEqualTimestampConflictCannotReplaceAcceptedTargets() throws {
+        let identifier = String(repeating: "a", count: 24)
+        let accepted = try SessionActivitySnapshot(
+            emittedAt: 100,
+            active: [
+                SessionActivityItem(
+                    id: identifier,
+                    state: .running,
+                    event: .userPromptSubmit,
+                    eventAt: 90,
+                    terminal: false
+                )
+            ]
+        )
+        let conflicting = try SessionActivitySnapshot(
+            emittedAt: 100,
+            active: [
+                SessionActivityItem(
+                    id: identifier,
+                    state: .waiting,
+                    event: .permissionRequest,
+                    eventAt: 95,
+                    terminal: false
+                )
+            ]
+        )
+        let application = SessionActivityApplicationPolicy.apply(
+            conflicting,
+            lastAccepted: accepted,
+            currentlyDisplayed: accepted,
+            acknowledgementHistory: [],
+            now: 100
+        )
+
+        XCTAssertEqual(application.decision, .rejectEqualTimestampConflict)
+        XCTAssertEqual(application.displayedSnapshot, accepted)
+        XCTAssertEqual(
+            SessionActivityTargetAdoptionPolicy.apply(
+                incomingTargets: [identifier: "wrong-thread"],
+                application: application,
+                currentlyAcceptedTargets: [identifier: "accepted-thread"]
+            ),
+            [identifier: "accepted-thread"]
+        )
     }
 
     @MainActor

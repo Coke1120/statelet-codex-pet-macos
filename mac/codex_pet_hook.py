@@ -35,7 +35,8 @@ VALID_EVENTS = frozenset(
         "Stop",
     )
 )
-TERMINAL_EVENTS = frozenset(("SessionEnd", "Stop"))
+TERMINAL_EVENTS = frozenset(("SessionEnd",))
+TURN_CLOSING_EVENTS = frozenset(("Stop",))
 REVIVAL_EVENTS = frozenset(("SessionStart", "UserPromptSubmit"))
 MAX_REJECTION_COUNT = 1_000_000
 MAX_PRIOR_TURNS = 8
@@ -48,7 +49,11 @@ REVIEW_PATTERN = re.compile(
     r"(?![a-z0-9_])"
 )
 HASH_PATTERN = re.compile(r"^[0-9a-f]{24}$")
+OPAQUE_TARGET_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,511}$")
 MAX_RECORD_BYTES = 1_048_576
+ACTIVATION_TARGET_WRITE_WARNING = (
+    "Statelet hook warning: activation target sidecar write failed"
+)
 
 
 def event_category(event: str) -> str:
@@ -103,7 +108,7 @@ def event_state(payload: Dict[str, Any]) -> str:
 
 def session_key(payload: Dict[str, Any]) -> str:
     raw = "global"
-    for key in ("session_id", "thread_id", "conversation_id", "sessionId"):
+    for key in ("session_id", "thread_id", "threadId", "conversation_id", "sessionId"):
         candidate = payload.get(key)
         if isinstance(candidate, (str, int)) and not isinstance(candidate, bool):
             text = str(candidate).strip()
@@ -286,6 +291,46 @@ def _atomic_write_record(
                 pass
 
 
+def _activation_target(payload: Dict[str, Any]) -> Optional[str]:
+    """Return only a documented opaque Codex activation identifier."""
+    for key in ("thread_id", "threadId", "session_id"):
+        value = payload.get(key)
+        if not isinstance(value, str):
+            continue
+        candidate = value.strip()
+        if OPAQUE_TARGET_PATTERN.fullmatch(candidate) is not None:
+            return candidate
+    return None
+
+
+def _publish_activation_target_best_effort(
+    directory_fd: int,
+    payload: Dict[str, Any],
+    identifier: str,
+    updated_at: float,
+) -> None:
+    if payload.get("hook_event_name") not in ("SessionStart", "UserPromptSubmit"):
+        return
+    target = _activation_target(payload)
+    if target is None:
+        return
+    try:
+        _atomic_write_record(
+            directory_fd,
+            identifier + ".target.json",
+            {
+                "version": 1,
+                "id": identifier,
+                "thread_id": target,
+                "updated_at": updated_at,
+            },
+        )
+    except (OSError, TypeError, ValueError):
+        # Activation is optional. Never let its private sidecar interfere with
+        # the authoritative lifecycle publication for the same hook.
+        print(ACTIVATION_TARGET_WRITE_WARNING, file=sys.stderr)
+
+
 def _empty_causal_state() -> Dict[str, Any]:
     return {
         "version": 1,
@@ -296,6 +341,41 @@ def _empty_causal_state() -> Dict[str, Any]:
         "pending_permissions": [],
         "latest_event": None,
     }
+
+
+def _empty_fence() -> Dict[str, Any]:
+    return {
+        "version": 1,
+        "turn_closed": False,
+        "closed_turn": None,
+        "session_closed": False,
+    }
+
+
+def _read_fence(value: Any, existing_event: Optional[str]) -> Dict[str, Any]:
+    if isinstance(value, dict) and set(value) == {
+        "version", "turn_closed", "closed_turn", "session_closed"
+    }:
+        closed_turn = value.get("closed_turn")
+        if (
+            value.get("version") == 1
+            and isinstance(value.get("turn_closed"), bool)
+            and isinstance(value.get("session_closed"), bool)
+            and (
+                closed_turn is None
+                or (
+                    isinstance(closed_turn, str)
+                    and HASH_PATTERN.fullmatch(closed_turn) is not None
+                )
+            )
+        ):
+            return dict(value)
+    fence = _empty_fence()
+    if existing_event == "Stop":
+        fence["turn_closed"] = True
+    elif existing_event == "SessionEnd":
+        fence["session_closed"] = True
+    return fence
 
 
 def _read_causal_state(value: Any) -> Dict[str, Any]:
@@ -432,12 +512,36 @@ def _causally_accept(
     return True
 
 
+def _fence_accepts(payload: Dict[str, Any], event: str, fence: Dict[str, Any]) -> bool:
+    if event == "SessionStart":
+        return True
+    if event in TERMINAL_EVENTS:
+        return True
+    if fence["session_closed"]:
+        return event in REVIVAL_EVENTS
+    if not fence["turn_closed"]:
+        return True
+    if event == "Stop":
+        incoming_turn = _private_key_hash(payload, "turn_id")
+        closed_turn = fence["closed_turn"]
+        return incoming_turn is not None and incoming_turn != closed_turn
+    if event != "UserPromptSubmit":
+        return False
+    incoming_turn = _private_key_hash(payload, "turn_id")
+    closed_turn = fence["closed_turn"]
+    # A turn id proves a distinct prompt. Older payloads without turn ids are
+    # treated as a new prompt because UserPromptSubmit is the only safe revival
+    # boundary available for those clients.
+    return incoming_turn is None or closed_turn is None or incoming_turn != closed_turn
+
+
 def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
     directory_fd = _open_state_directory(state_dir)
     event = str(payload.get("hook_event_name") or "")
     accepted_event = event if event in VALID_EVENTS else "unknown"
     received_at = time.time()
-    destination_name = session_key(payload) + ".json"
+    identifier = session_key(payload)
+    destination_name = identifier + ".json"
     destination = state_dir / destination_name
     lock_fd = -1
     try:
@@ -454,6 +558,16 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         existing = _read_existing(directory_fd, destination_name)
         causal = _read_causal_state(existing.get("causal") if existing else None)
+        fence = _read_fence(
+            existing.get("fence") if existing else None,
+            existing.get("event") if existing else None,
+        )
+        if (
+            existing is not None
+            and existing.get("event") == "Stop"
+            and fence["closed_turn"] is None
+        ):
+            fence["closed_turn"] = causal.get("current_turn")
         existing_at = None
         existing_started_at = None
         existing_completed_at = None
@@ -466,10 +580,7 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
             and existing.get("event") in VALID_EVENTS.union(("unknown",))
         )
         if existing_valid:
-            existing_terminal = (
-                existing.get("terminal") is True
-                or existing.get("event") in TERMINAL_EVENTS
-            )
+            existing_terminal = existing.get("event") in TERMINAL_EVENTS
             try:
                 existing_at = float(existing.get("event_at", existing.get("updated_at")))
             except (TypeError, ValueError):
@@ -490,7 +601,7 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
                 existing_category = None
         terminal_late_callback = (
             existing_valid
-            and existing_terminal
+            and fence["session_closed"]
             and accepted_event not in REVIVAL_EVENTS
         )
         proposed_causal = {
@@ -502,7 +613,10 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
             "pending_permissions": list(causal["pending_permissions"]),
             "latest_event": causal["latest_event"],
         }
-        causally_accepted = _causally_accept(payload, accepted_event, proposed_causal)
+        fence_accepted = _fence_accepts(payload, accepted_event, fence)
+        causally_accepted = fence_accepted and _causally_accept(
+            payload, accepted_event, proposed_causal
+        )
         if terminal_late_callback or not causally_accepted:
             terminal_reaffirmation = (
                 terminal_late_callback
@@ -539,6 +653,7 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
                     "category": existing_category or event_category(existing["event"]),
                     "rejections": rejections,
                     "causal": preserved_causal,
+                    "fence": fence,
                 }
                 _atomic_write_record(directory_fd, destination_name, preserved)
             else:
@@ -554,9 +669,24 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
                     "category": event_category("unknown"),
                     "rejections": rejections,
                     "causal": preserved_causal,
+                    "fence": fence,
                 }
                 _atomic_write_record(directory_fd, destination_name, record)
             return destination
+        if accepted_event == "SessionStart":
+            fence = _empty_fence()
+        elif accepted_event == "UserPromptSubmit":
+            fence["turn_closed"] = False
+            fence["closed_turn"] = None
+            fence["session_closed"] = False
+        elif accepted_event in TURN_CLOSING_EVENTS:
+            fence["turn_closed"] = True
+            fence["closed_turn"] = (
+                _private_key_hash(payload, "turn_id")
+                or proposed_causal.get("current_turn")
+            )
+        elif accepted_event in TERMINAL_EVENTS:
+            fence["session_closed"] = True
         record_state = event_state(payload)
         if proposed_causal["pending_permissions"]:
             record_state = "waiting"
@@ -585,8 +715,12 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
             "category": event_category(accepted_event),
             "rejections": {},
             "causal": proposed_causal,
+            "fence": fence,
         }
         _atomic_write_record(directory_fd, destination_name, record)
+        _publish_activation_target_best_effort(
+            directory_fd, payload, identifier, received_at
+        )
     finally:
         if lock_fd >= 0:
             os.close(lock_fd)
