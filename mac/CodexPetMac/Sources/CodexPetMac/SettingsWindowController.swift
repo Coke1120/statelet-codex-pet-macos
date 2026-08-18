@@ -2567,6 +2567,8 @@ extension SettingsWindowController: NSTableViewDataSource, NSTableViewDelegate {
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
+        let rows = IndexSet(integersIn: 0 ..< Self.sectionLabels.count)
+        sidebarTableView.reloadData(forRowIndexes: rows, columnIndexes: IndexSet(integer: 0))
         changePane()
     }
 }

@@ -130,11 +130,15 @@ final class SettingsWindowControllerTests: XCTestCase {
         sidebar.keyDown(with: downArrow)
         Self.pumpMainRunLoop(for: 0.05)
         XCTAssertEqual(sidebar.selectedRow, 1)
+        XCTAssertEqual(Self.sidebarSelectionValue(in: sidebar, row: 0), "Not selected")
+        XCTAssertEqual(Self.sidebarSelectionValue(in: sidebar, row: 1), "Selected")
 
         sidebar.selectRowIndexes(IndexSet(integer: 6), byExtendingSelection: false)
         Self.pumpMainRunLoop(for: 0.05)
         XCTAssertEqual(sidebar.selectedRowIndexes, IndexSet(integer: 6))
         XCTAssertEqual(sidebar.accessibilitySelectedRows()?.count, 1)
+        XCTAssertEqual(Self.sidebarSelectionValue(in: sidebar, row: 1), "Not selected")
+        XCTAssertEqual(Self.sidebarSelectionValue(in: sidebar, row: 6), "Selected")
         XCTAssertEqual(defaults.integer(forKey: "Statelet.Settings.selectedSection"), 6)
         window.close()
         Self.pumpMainRunLoop(for: 0.05)
@@ -508,6 +512,10 @@ final class SettingsWindowControllerTests: XCTestCase {
     private static func sidebarLabel(in sidebar: NSTableView, row: Int) -> String? {
         guard let cell = sidebar.view(atColumn: 0, row: row, makeIfNecessary: true) else { return nil }
         return descendants(of: cell).compactMap { $0 as? NSTextField }.first?.stringValue
+    }
+
+    private static func sidebarSelectionValue(in sidebar: NSTableView, row: Int) -> String? {
+        sidebar.view(atColumn: 0, row: row, makeIfNecessary: true)?.accessibilityValue() as? String
     }
 
     private static func pumpMainRunLoop(for duration: TimeInterval) {

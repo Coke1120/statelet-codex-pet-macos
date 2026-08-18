@@ -589,65 +589,41 @@ final class PetPlayerView: NSView {
         }
 
         let minimumContrast = increaseContrast ? 7.0 : 4.5
-        let requestedContrast = contrastRatio(
-            foreground: requestedTextColor,
-            background: backgroundColor
+        var textColor = StateletContrast.readableForeground(
+            requested: requestedTextColor,
+            background: backgroundColor,
+            minimumContrast: minimumContrast
         )
-        var textColor: NSColor
-        var resolvedContrast: Double
-        if requestedContrast >= minimumContrast {
-            textColor = requestedTextColor
-            resolvedContrast = requestedContrast
-        } else {
-            let blackContrast = contrastRatio(foreground: .black, background: backgroundColor)
-            let whiteContrast = contrastRatio(foreground: .white, background: backgroundColor)
-            if blackContrast >= whiteContrast {
-                textColor = .black
-                resolvedContrast = blackContrast
-            } else {
-                textColor = .white
-                resolvedContrast = whiteContrast
-            }
-        }
-        if resolvedContrast < minimumContrast {
+        if StateletContrast.contrastRatio(foreground: textColor, background: backgroundColor) < minimumContrast {
             backgroundColor = .black
             textColor = .white
-            resolvedContrast = 21
         }
 
-        let backgroundOpacity: Double
+        let minimumSafeOpacity = StateletContrast.minimumSafeOpacity(
+            foreground: textColor,
+            background: backgroundColor,
+            minimumContrast: minimumContrast
+        )
+        let requestedOpacity: Double
         if reduceTransparency {
-            backgroundOpacity = 1
+            requestedOpacity = 1
         } else if increaseContrast {
-            backgroundOpacity = max(configuration.dialogueBackgroundOpacity, 0.92)
+            requestedOpacity = max(configuration.dialogueBackgroundOpacity, 0.92)
         } else {
-            backgroundOpacity = configuration.dialogueBackgroundOpacity
+            requestedOpacity = configuration.dialogueBackgroundOpacity
         }
+        let backgroundOpacity = max(requestedOpacity, minimumSafeOpacity)
+        let resolvedContrast = StateletContrast.worstCaseContrast(
+            foreground: textColor,
+            background: backgroundColor,
+            opacity: backgroundOpacity
+        )
         return DialogueBubbleResolvedAppearance(
             backgroundColor: backgroundColor,
             textColor: textColor,
             backgroundOpacity: backgroundOpacity,
             contrastRatio: resolvedContrast
         )
-    }
-
-    private static func contrastRatio(foreground: NSColor, background: NSColor) -> Double {
-        let lighter = max(relativeLuminance(foreground), relativeLuminance(background))
-        let darker = min(relativeLuminance(foreground), relativeLuminance(background))
-        return (lighter + 0.05) / (darker + 0.05)
-    }
-
-    private static func relativeLuminance(_ color: NSColor) -> Double {
-        guard let color = color.usingColorSpace(.sRGB) else { return 0 }
-        func linearized(_ component: CGFloat) -> Double {
-            let value = Double(component)
-            return value <= 0.04045
-                ? value / 12.92
-                : pow((value + 0.055) / 1.055, 2.4)
-        }
-        return 0.2126 * linearized(color.redComponent)
-            + 0.7152 * linearized(color.greenComponent)
-            + 0.0722 * linearized(color.blueComponent)
     }
 
     func updateStateBadge(state: PetState, publisherStatus: PublisherBadgeVisualStatus) {

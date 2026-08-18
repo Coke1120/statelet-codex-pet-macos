@@ -131,6 +131,21 @@ public struct PetAppearanceConfiguration: Codable, Equatable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        let dialogueBackgroundColor = Self.decodeDialogueColor(
+            from: container,
+            key: .dialogueBackgroundColor,
+            default: Self.defaultDialogueBackgroundColor
+        )
+        let dialogueTextColor = Self.decodeDialogueColor(
+            from: container,
+            key: .dialogueTextColor,
+            default: Self.defaultDialogueTextColor
+        )
+        let dialogueBackgroundOpacity = Self.decodeDialogueOpacity(from: container)
+        let dialogueContrastMode = (try? container.decode(
+            DialogueContrastMode.self,
+            forKey: .dialogueContrastMode
+        )) ?? .automatic
         try self.init(
             backgroundEnabled: try container.decodeIfPresent(Bool.self, forKey: .backgroundEnabled) ?? true,
             backgroundColor: try container.decodeIfPresent(String.self, forKey: .backgroundColor) ?? Self.defaultBackgroundColor,
@@ -147,11 +162,33 @@ public struct PetAppearanceConfiguration: Codable, Equatable, Sendable {
             showFPS: try container.decodeIfPresent(Bool.self, forKey: .showFPS) ?? true,
             fpsColor: try container.decodeIfPresent(String.self, forKey: .fpsColor) ?? Self.defaultFPSColor,
             fpsLabelSize: try container.decodeIfPresent(StateLabelSize.self, forKey: .fpsLabelSize) ?? .small,
-            dialogueBackgroundColor: try container.decodeIfPresent(String.self, forKey: .dialogueBackgroundColor) ?? Self.defaultDialogueBackgroundColor,
-            dialogueTextColor: try container.decodeIfPresent(String.self, forKey: .dialogueTextColor) ?? Self.defaultDialogueTextColor,
-            dialogueBackgroundOpacity: try container.decodeIfPresent(Double.self, forKey: .dialogueBackgroundOpacity) ?? 0.88,
-            dialogueContrastMode: try container.decodeIfPresent(DialogueContrastMode.self, forKey: .dialogueContrastMode) ?? .automatic
+            dialogueBackgroundColor: dialogueBackgroundColor,
+            dialogueTextColor: dialogueTextColor,
+            dialogueBackgroundOpacity: dialogueBackgroundOpacity,
+            dialogueContrastMode: dialogueContrastMode
         )
+    }
+
+    private static func decodeDialogueColor(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        key: CodingKeys,
+        default defaultColor: String
+    ) -> String {
+        guard let value = try? container.decode(String.self, forKey: key),
+              let normalized = try? normalizedColor(value, name: key.stringValue) else {
+            return defaultColor
+        }
+        return normalized
+    }
+
+    private static func decodeDialogueOpacity(
+        from container: KeyedDecodingContainer<CodingKeys>
+    ) -> Double {
+        guard let value = try? container.decode(Double.self, forKey: .dialogueBackgroundOpacity),
+              value.isFinite, (0...1).contains(value) else {
+            return 0.88
+        }
+        return value
     }
 
     public func replacing(

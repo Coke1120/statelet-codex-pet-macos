@@ -191,6 +191,27 @@ final class SessionActivityTests: XCTestCase {
             NSRect(origin: clamped, size: NSSize(width: 230, height: 150))
                 .intersection(NSRect(x: 0, y: 0, width: 800, height: 600)).width >= 48
         )
+
+        let secondaryDisplay = NSRect(x: 1_000, y: 0, width: 1_000, height: 800)
+        let secondaryOrigin = NSPoint(x: 1_120, y: 180)
+        XCTAssertEqual(
+            SessionActivityPanelPositionStore.clamped(
+                origin: secondaryOrigin,
+                size: NSSize(width: 230, height: 150),
+                to: [NSRect(x: 0, y: 0, width: 800, height: 600), secondaryDisplay]
+            ),
+            secondaryOrigin
+        )
+        let afterDisplayRemoval = SessionActivityPanelPositionStore.clamped(
+            origin: secondaryOrigin,
+            size: NSSize(width: 230, height: 150),
+            to: [NSRect(x: 0, y: 0, width: 800, height: 600)]
+        )
+        XCTAssertGreaterThanOrEqual(
+            NSRect(origin: afterDisplayRemoval, size: NSSize(width: 230, height: 150))
+                .intersection(NSRect(x: 0, y: 0, width: 800, height: 600)).width,
+            48
+        )
     }
 
     @MainActor
@@ -228,6 +249,73 @@ final class SessionActivityTests: XCTestCase {
         )
         XCTAssertGreaterThanOrEqual(increased.contrastRatio, 7)
         XCTAssertGreaterThanOrEqual(increased.opacity, 0.96)
+    }
+
+    @MainActor
+    func testActivityContrastClampsZeroOpacityAndSemanticRowsToReadableColors() throws {
+        let appearance = try SessionActivityPanelAppearance(
+            backgroundColor: "#20242A",
+            opacity: 0,
+            automaticContrast: true
+        )
+        let resolved = SessionActivityView.resolveAppearance(
+            appearance: appearance,
+            systemBackgroundColor: .windowBackgroundColor,
+            systemTextColor: .labelColor,
+            secondaryTextColor: .secondaryLabelColor,
+            reduceTransparency: false,
+            increaseContrast: false
+        )
+        XCTAssertGreaterThan(resolved.opacity, 0)
+        XCTAssertGreaterThanOrEqual(resolved.contrastRatio, 4.5)
+
+        let view = SessionActivityView(
+            frame: NSRect(x: 0, y: 0, width: 230, height: 150),
+            clock: { Date(timeIntervalSince1970: 100) }
+        )
+        view.applyAppearance(appearance)
+        let active = try item(
+            "a",
+            state: .running,
+            event: .userPromptSubmit,
+            terminal: false,
+            eventAt: 90
+        )
+        view.update(
+            snapshot: try SessionActivitySnapshot(emittedAt: 100, active: [active]),
+            acknowledgedIDs: []
+        )
+        view.layoutSubtreeIfNeeded()
+        let rowLabel = try XCTUnwrap(
+            allDescendants(of: view).compactMap { $0 as? NSTextField }.first {
+                $0.accessibilityLabel()?.contains("Active running") == true
+            }
+        )
+        let rowColor = try XCTUnwrap(rowLabel.textColor)
+        XCTAssertGreaterThanOrEqual(
+            StateletContrast.worstCaseContrast(
+                foreground: rowColor,
+                background: resolved.backgroundColor,
+                opacity: resolved.opacity
+            ),
+            4.5
+        )
+
+        for (secondary, background) in [
+            (NSColor(calibratedWhite: 0, alpha: 0.5), NSColor.white),
+            (NSColor(calibratedWhite: 1, alpha: 0.5), NSColor.black),
+        ] {
+            let opaque = StateletContrast.readableForeground(
+                requested: secondary,
+                background: background,
+                minimumContrast: 4.5
+            )
+            XCTAssertGreaterThanOrEqual(opaque.alphaComponent, 0.999)
+            XCTAssertGreaterThanOrEqual(
+                StateletContrast.contrastRatio(foreground: opaque, background: background),
+                4.5
+            )
+        }
     }
 
     @MainActor

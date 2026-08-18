@@ -51,6 +51,136 @@ extension NSColor {
     }
 }
 
+enum StateletContrast {
+    static func readableForeground(
+        requested: NSColor,
+        background: NSColor,
+        minimumContrast: Double,
+        fallback: NSColor? = nil
+    ) -> NSColor {
+        if requested.alphaComponent >= 0.999,
+           contrastRatio(foreground: requested, background: background) >= minimumContrast {
+            return requested
+        }
+        let blackContrast = contrastRatio(foreground: .black, background: background)
+        let whiteContrast = contrastRatio(foreground: .white, background: background)
+        if max(blackContrast, whiteContrast) >= minimumContrast {
+            return blackContrast >= whiteContrast ? .black : .white
+        }
+        return fallback ?? (blackContrast >= whiteContrast ? .black : .white)
+    }
+
+    static func contrastRatio(foreground: NSColor, background: NSColor) -> Double {
+        let resolvedForeground = composited(foreground, over: background, opacity: foreground.alphaComponent)
+        let lighter = max(relativeLuminance(resolvedForeground), relativeLuminance(background))
+        let darker = min(relativeLuminance(resolvedForeground), relativeLuminance(background))
+        return (lighter + 0.05) / (darker + 0.05)
+    }
+
+    static func worstCaseContrast(
+        foreground: NSColor,
+        background: NSColor,
+        opacity: Double
+    ) -> Double {
+        guard foreground.alphaComponent >= 0.999,
+              let foreground = foreground.usingColorSpace(.sRGB) else {
+            return 1
+        }
+        let darkBackground = composited(background, over: .black, opacity: opacity)
+        let lightBackground = composited(background, over: .white, opacity: opacity)
+        let foregroundLuminance = relativeLuminance(foreground)
+        let lowerBackgroundLuminance = min(
+            relativeLuminance(darkBackground),
+            relativeLuminance(lightBackground)
+        )
+        let upperBackgroundLuminance = max(
+            relativeLuminance(darkBackground),
+            relativeLuminance(lightBackground)
+        )
+        if foregroundLuminance < lowerBackgroundLuminance {
+            return ratio(foregroundLuminance, lowerBackgroundLuminance)
+        }
+        if foregroundLuminance > upperBackgroundLuminance {
+            return ratio(foregroundLuminance, upperBackgroundLuminance)
+        }
+        return 1
+    }
+
+    static func minimumSafeOpacity(
+        foreground: NSColor,
+        background: NSColor,
+        minimumContrast: Double
+    ) -> Double {
+        guard worstCaseContrast(
+            foreground: foreground,
+            background: background,
+            opacity: 1
+        ) >= minimumContrast else {
+            return 1
+        }
+        if worstCaseContrast(
+            foreground: foreground,
+            background: background,
+            opacity: 0
+        ) >= minimumContrast {
+            return 0
+        }
+
+        var lower = 0.0
+        var upper = 1.0
+        for _ in 0..<32 {
+            let midpoint = (lower + upper) / 2
+            if worstCaseContrast(
+                foreground: foreground,
+                background: background,
+                opacity: midpoint
+            ) >= minimumContrast {
+                upper = midpoint
+            } else {
+                lower = midpoint
+            }
+        }
+        return upper
+    }
+
+    private static func composited(
+        _ foreground: NSColor,
+        over background: NSColor,
+        opacity: Double
+    ) -> NSColor {
+        guard let foreground = foreground.usingColorSpace(.sRGB),
+              let background = background.usingColorSpace(.sRGB) else {
+            return background
+        }
+        let alpha = CGFloat(max(0, min(opacity, 1)))
+        return NSColor(
+            srgbRed: foreground.redComponent * alpha + background.redComponent * (1 - alpha),
+            green: foreground.greenComponent * alpha + background.greenComponent * (1 - alpha),
+            blue: foreground.blueComponent * alpha + background.blueComponent * (1 - alpha),
+            alpha: 1
+        )
+    }
+
+    private static func ratio(_ lhs: Double, _ rhs: Double) -> Double {
+        let lighter = max(lhs, rhs)
+        let darker = min(lhs, rhs)
+        return (lighter + 0.05) / (darker + 0.05)
+    }
+
+    private static func relativeLuminance(_ color: NSColor) -> Double {
+        guard let color = color.usingColorSpace(.sRGB) else { return 0 }
+        func linearized(_ component: CGFloat) -> Double {
+            let value = Double(component)
+            return value <= 0.04045
+                ? value / 12.92
+                : pow((value + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * linearized(color.redComponent)
+            + 0.7152 * linearized(color.greenComponent)
+            + 0.0722 * linearized(color.blueComponent)
+    }
+}
+
 final class PetStateBadgeView: NSView {
     private let symbolView = NSImageView()
     private let stateLabel = NSTextField(labelWithString: "Idle")

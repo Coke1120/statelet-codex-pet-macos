@@ -117,9 +117,17 @@ enum SessionActivityPanelPositionStore {
         size: NSSize,
         to visibleFrame: NSRect
     ) -> NSPoint {
+        clamped(origin: origin, size: size, to: [visibleFrame])
+    }
+
+    static func clamped(
+        origin: NSPoint,
+        size: NSSize,
+        to visibleFrames: [NSRect]
+    ) -> NSPoint {
         WindowFramePolicy.clamped(
             NSRect(origin: origin, size: size),
-            to: [visibleFrame],
+            to: visibleFrames,
             minimumVisible: 48
         ).origin
     }
@@ -291,33 +299,48 @@ final class SessionActivityView: NSView {
         let requestedPrimary = systemTextColor
         let requestedSecondary = secondaryTextColor
 
-        var primaryTextColor = readableForeground(
+        var primaryTextColor = StateletContrast.readableForeground(
             requested: requestedPrimary,
             background: backgroundColor,
             minimumContrast: minimumContrast
         )
-        if contrastRatio(foreground: primaryTextColor, background: backgroundColor) < minimumContrast {
-            let blackContrast = contrastRatio(foreground: .black, background: backgroundColor)
-            let whiteContrast = contrastRatio(foreground: .white, background: backgroundColor)
+        if StateletContrast.contrastRatio(foreground: primaryTextColor, background: backgroundColor) < minimumContrast {
+            let blackContrast = StateletContrast.contrastRatio(foreground: .black, background: backgroundColor)
+            let whiteContrast = StateletContrast.contrastRatio(foreground: .white, background: backgroundColor)
             let useBlackBackground = whiteContrast >= blackContrast
             backgroundColor = useBlackBackground ? .black : .white
             primaryTextColor = useBlackBackground ? .white : .black
         }
-        let resolvedContrast = contrastRatio(foreground: primaryTextColor, background: backgroundColor)
-        let secondaryTextColor = readableForeground(
+        let minimumSafeOpacity = StateletContrast.minimumSafeOpacity(
+            foreground: primaryTextColor,
+            background: backgroundColor,
+            minimumContrast: minimumContrast
+        )
+        let opacity = reduceTransparency || increaseContrast
+            ? max(appearance.opacity, 0.96)
+            : appearance.opacity
+        let resolvedOpacity = max(opacity, minimumSafeOpacity)
+        let secondaryCandidate = StateletContrast.readableForeground(
             requested: requestedSecondary,
             background: backgroundColor,
             minimumContrast: minimumContrast,
             fallback: primaryTextColor
         )
-        let opacity = reduceTransparency || increaseContrast
-            ? max(appearance.opacity, 0.96)
-            : appearance.opacity
+        let secondaryTextColor = StateletContrast.worstCaseContrast(
+            foreground: secondaryCandidate,
+            background: backgroundColor,
+            opacity: resolvedOpacity
+        ) >= minimumContrast ? secondaryCandidate : primaryTextColor
+        let resolvedContrast = StateletContrast.worstCaseContrast(
+            foreground: primaryTextColor,
+            background: backgroundColor,
+            opacity: resolvedOpacity
+        )
         return SessionActivityPanelResolvedAppearance(
             backgroundColor: backgroundColor,
             primaryTextColor: primaryTextColor,
             secondaryTextColor: secondaryTextColor,
-            opacity: opacity,
+            opacity: resolvedOpacity,
             contrastRatio: resolvedContrast
         )
     }
@@ -433,9 +456,7 @@ final class SessionActivityView: NSView {
     private func addActiveRow(_ item: SessionActivityItem, ordinal: Int) {
         let label = NSTextField(labelWithString: "\(item.state.rawValue.capitalized) · \(item.category.displayName) #\(ordinal) · \(relativeAge(item.startedAt))")
         label.font = .systemFont(ofSize: 13, weight: .medium)
-        label.textColor = useSemanticColors
-            ? item.state.sessionActivityColor
-            : resolvedAppearance.primaryTextColor
+        label.textColor = resolvedActivityColor(item.state.sessionActivityColor)
         label.lineBreakMode = .byTruncatingTail
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         label.setAccessibilityElement(true)
@@ -445,7 +466,7 @@ final class SessionActivityView: NSView {
         label.setAccessibilityHelp(
             "Informational only. No supported Codex Desktop activation contract is available."
         )
-        let dotColor = useSemanticColors ? item.state.sessionActivityColor : resolvedAppearance.primaryTextColor
+        let dotColor = resolvedActivityColor(item.state.sessionActivityColor)
         let row = NSStackView(views: [activityDot(color: dotColor), label])
         row.orientation = .horizontal
         row.alignment = .centerY
@@ -457,7 +478,7 @@ final class SessionActivityView: NSView {
         let completionTime = item.completedAt ?? item.eventAt
         let label = NSTextField(labelWithString: "Completed · \(item.category.displayName) #\(ordinal) · \(relativeAge(completionTime)) · Unread")
         label.font = .systemFont(ofSize: 13, weight: .medium)
-        label.textColor = useSemanticColors ? .systemGreen : resolvedAppearance.primaryTextColor
+        label.textColor = resolvedActivityColor(.systemGreen)
         label.lineBreakMode = .byTruncatingTail
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         label.setAccessibilityElement(true)
@@ -474,7 +495,7 @@ final class SessionActivityView: NSView {
         acknowledge.setAccessibilityLabel("Mark completed session as read")
         acknowledge.identifier = NSUserInterfaceItemIdentifier(item.id)
 
-        let dotColor: NSColor = useSemanticColors ? .systemGreen : resolvedAppearance.primaryTextColor
+        let dotColor = resolvedActivityColor(.systemGreen)
         let row = NSStackView(views: [activityDot(color: dotColor), label, acknowledge])
         row.orientation = .horizontal
         row.alignment = .centerY
@@ -512,45 +533,22 @@ final class SessionActivityView: NSView {
         return "\(Int(seconds / 86_400))d ago"
     }
 
-    private var useSemanticColors: Bool {
-        panelAppearance.automaticContrast
-            && !NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
-    }
-
-    private static func readableForeground(
-        requested: NSColor,
-        background: NSColor,
-        minimumContrast: Double,
-        fallback: NSColor? = nil
-    ) -> NSColor {
-        guard contrastRatio(foreground: requested, background: background) < minimumContrast else {
-            return requested
+    private func resolvedActivityColor(_ requested: NSColor) -> NSColor {
+        guard panelAppearance.automaticContrast else {
+            return resolvedAppearance.primaryTextColor
         }
-        let blackContrast = contrastRatio(foreground: .black, background: background)
-        let whiteContrast = contrastRatio(foreground: .white, background: background)
-        if max(blackContrast, whiteContrast) >= minimumContrast {
-            return blackContrast >= whiteContrast ? .black : .white
-        }
-        return fallback ?? (blackContrast >= whiteContrast ? .black : .white)
-    }
-
-    private static func contrastRatio(foreground: NSColor, background: NSColor) -> Double {
-        let lighter = max(relativeLuminance(foreground), relativeLuminance(background))
-        let darker = min(relativeLuminance(foreground), relativeLuminance(background))
-        return (lighter + 0.05) / (darker + 0.05)
-    }
-
-    private static func relativeLuminance(_ color: NSColor) -> Double {
-        guard let color = color.usingColorSpace(.sRGB) else { return 0 }
-        func linearized(_ component: CGFloat) -> Double {
-            let value = Double(component)
-            return value <= 0.04045
-                ? value / 12.92
-                : pow((value + 0.055) / 1.055, 2.4)
-        }
-        return 0.2126 * linearized(color.redComponent)
-            + 0.7152 * linearized(color.greenComponent)
-            + 0.0722 * linearized(color.blueComponent)
+        let minimumContrast = NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast ? 7.0 : 4.5
+        let candidate = StateletContrast.readableForeground(
+            requested: requested,
+            background: resolvedAppearance.backgroundColor,
+            minimumContrast: minimumContrast,
+            fallback: resolvedAppearance.primaryTextColor
+        )
+        return StateletContrast.worstCaseContrast(
+            foreground: candidate,
+            background: resolvedAppearance.backgroundColor,
+            opacity: resolvedAppearance.opacity
+        ) >= minimumContrast ? candidate : resolvedAppearance.primaryTextColor
     }
 
     @objc private func markAsRead(_ sender: NSButton) {

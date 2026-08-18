@@ -87,6 +87,57 @@ final class PetPlayerDialogueLayoutTests: XCTestCase {
     }
 
     @MainActor
+    func testDialogueContrastRemainsSafeWhenConfiguredOpacityIsZero() throws {
+        let light = PetPlayerView.resolveDialogueAppearance(
+            configuration: try PetAppearanceConfiguration(
+                dialogueBackgroundColor: "#FFFFFF",
+                dialogueTextColor: "#FFFFFF",
+                dialogueBackgroundOpacity: 0,
+                dialogueContrastMode: .custom
+            ),
+            systemBackgroundColor: .black,
+            systemTextColor: .white,
+            reduceTransparency: false,
+            increaseContrast: false
+        )
+        XCTAssertGreaterThan(light.backgroundOpacity, 0)
+        XCTAssertGreaterThanOrEqual(light.contrastRatio, 4.5)
+
+        let dark = PetPlayerView.resolveDialogueAppearance(
+            configuration: try PetAppearanceConfiguration(
+                dialogueBackgroundColor: "#20242A",
+                dialogueTextColor: "#FFFFFF",
+                dialogueBackgroundOpacity: 0,
+                dialogueContrastMode: .custom
+            ),
+            systemBackgroundColor: .white,
+            systemTextColor: .black,
+            reduceTransparency: false,
+            increaseContrast: false
+        )
+        XCTAssertGreaterThan(dark.backgroundOpacity, 0)
+        XCTAssertGreaterThanOrEqual(dark.contrastRatio, 4.5)
+    }
+
+    @MainActor
+    func testDialogueMidToneForegroundIsSafeAgainstArbitraryUnderlay() throws {
+        let resolved = PetPlayerView.resolveDialogueAppearance(
+            configuration: try PetAppearanceConfiguration(
+                dialogueBackgroundColor: "#000000",
+                dialogueTextColor: "#757575",
+                dialogueBackgroundOpacity: 0,
+                dialogueContrastMode: .custom
+            ),
+            systemBackgroundColor: .white,
+            systemTextColor: .black,
+            reduceTransparency: false,
+            increaseContrast: false
+        )
+        XCTAssertGreaterThan(resolved.backgroundOpacity, 0.8)
+        XCTAssertGreaterThanOrEqual(resolved.contrastRatio, 4.5)
+    }
+
+    @MainActor
     func testDialogueBubbleAvoidsOverlaysWithTopLeftStateLabel() throws {
         try assertDialogueBubbleAvoidsOverlays(stateLabelPosition: .topLeft)
     }

@@ -1400,10 +1400,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         sessionActivityScrollContainer.setScrollable(layout.scrollable)
         let targetFrame: NSRect
         if let origin = sessionActivityUserOrigin {
+            let availableFrames = NSScreen.screens.map(\.visibleFrame)
             let clampedOrigin = SessionActivityPanelPositionStore.clamped(
                 origin: origin,
                 size: layout.frame.size,
-                to: visibleFrame
+                to: availableFrames.isEmpty ? [visibleFrame] : availableFrames
             )
             if clampedOrigin != origin {
                 sessionActivityUserOrigin = clampedOrigin

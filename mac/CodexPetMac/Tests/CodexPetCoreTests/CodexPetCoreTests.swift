@@ -712,10 +712,17 @@ final class CodexPetCoreTests: XCTestCase {
     }
 
     func testMalformedAppearanceFailsClosedToReadableDefaultsWithoutDroppingMap() throws {
-        let json = ##"{"version":1,"window":{"appearance":{"dialogue_background_color":"#FFFFFF","dialogue_text_color":"#FFFFFF","dialogue_background_opacity":99,"dialogue_contrast_mode":"custom"}},"states":{"idle":{"path":"idle.mov"}}}"##.data(using: .utf8)!
+        let json = ##"{"version":1,"window":{"appearance":{"background_color":"#ABCDEF","background_opacity":0.61,"border_width":4,"show_fps":false,"dialogue_background_color":"#FFFFFF","dialogue_text_color":"#FFFFFF","dialogue_background_opacity":99,"dialogue_contrast_mode":"custom"}},"states":{"idle":{"path":"idle.mov"}}}"##.data(using: .utf8)!
         let map = try JSONDecoder.codexPet.decode(MediaMap.self, from: json)
         XCTAssertEqual(map.entry(for: .idle)?.path, "idle.mov")
-        XCTAssertEqual(map.window.appearance, try PetAppearanceConfiguration())
+        XCTAssertEqual(map.window.appearance.backgroundColor, "#ABCDEF")
+        XCTAssertEqual(map.window.appearance.backgroundOpacity, 0.61)
+        XCTAssertEqual(map.window.appearance.borderWidth, 4)
+        XCTAssertFalse(map.window.appearance.showFPS)
+        XCTAssertEqual(map.window.appearance.dialogueBackgroundColor, "#FFFFFF")
+        XCTAssertEqual(map.window.appearance.dialogueTextColor, "#FFFFFF")
+        XCTAssertEqual(map.window.appearance.dialogueBackgroundOpacity, 0.88)
+        XCTAssertEqual(map.window.appearance.dialogueContrastMode, .custom)
     }
 
     func testPetAppearanceDecodesDefaultsNormalizesAndRoundTrips() throws {
