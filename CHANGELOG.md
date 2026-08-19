@@ -5,6 +5,43 @@ versioning for the public source release.
 
 ## Unreleased
 
+## [1.8.6] - 2026-08-19
+
+### Added
+
+- Expanded session-activity rows can show a bounded, sanitized Codex thread
+  title while preserving the generic lifecycle label when no title is available.
+- A separate owner-only `activity-titles-v1.json` sidecar maps opaque activity
+  hashes to display titles without storing technical thread identifiers.
+
+### Changed
+
+- The optional local Codex App Server bridge requests `thread/read` with
+  `includeTurns: false`, accepts only `thread.name`, and discards previews,
+  turns, items, paths, and other response fields.
+- Title resolution is time-, count-, output-, and size-bounded with cached
+  success/null results, categorical failure backoff, and fail-soft diagnostics.
+- Optional target/title sidecar write failures retry on a real activity change
+  or the normal heartbeat instead of self-triggering a directory-event loop.
+
+### Fixed
+
+- App Server subprocesses are terminated and reaped deterministically across
+  success, timeout, malformed output, EOF, and backpressure paths.
+- Snapshot timestamp and opaque-ID validation prevent stale, duplicated,
+  symlinked, or malformed private titles from replacing accepted popup content.
+
+### Distribution notes
+
+- No thread title, technical thread identifier, conversation preview, turn,
+  prompt, transcript, character media, voice data, or other private runtime data
+  is bundled in the release.
+- Title resolution remains experimental and optional; lifecycle aggregation and
+  **Open in Codex** continue to work independently when it is unavailable.
+- The package remains ad-hoc signed for owner-authorized personal updates. It is
+  not Developer ID signed, notarized, or presented as a public Apple-authorized
+  binary.
+
 ## [1.8.5] - 2026-08-19
 
 ### Added
@@ -303,6 +340,7 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
+[1.8.6]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.6
 [1.8.5]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.5
 [1.8.4]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.4
 [1.8.3]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.3

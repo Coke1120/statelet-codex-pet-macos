@@ -1,7 +1,7 @@
 # Deploy Statelet on macOS
 
 This guide covers building, installing, upgrading, starting automatically, and
-uninstalling Statelet 1.8.5 (build 19) on macOS 13 or newer.
+uninstalling Statelet 1.8.6 (build 20) on macOS 13 or newer.
 
 Releases through 1.8.4 were source-only. The 1.8.5 tagged release adds an
 ad-hoc-signed personal-update ZIP, manifest, and signature. The maintained
