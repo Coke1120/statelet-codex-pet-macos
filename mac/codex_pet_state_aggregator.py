@@ -12,6 +12,7 @@ import signal
 import stat
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 from pathlib import Path
@@ -106,6 +107,7 @@ DEFAULT_POLL_INTERVAL = 0.25
 # churn while an idle companion runs all day.
 DEFAULT_HEARTBEAT_INTERVAL = 60.0
 OPTIONAL_ACTIVITY_DIAGNOSTIC_INTERVAL = 60.0
+TITLE_RESOLUTION_REFRESH_INTERVAL = 60.0
 DEFAULT_FORCE_DURATION = 30.0
 MAX_FORCE_DURATION = 300.0
 TTL_DEADLINE_EPSILON = 0.001
@@ -1204,13 +1206,230 @@ def next_wake_timeout(
     monotonic_time: float,
     force_deadline: Optional[float],
     source_expiry_at: Optional[float],
+    title_refresh_at: Optional[float] = None,
 ) -> float:
     deadlines = [max(0.0, publisher.next_heartbeat_at - monotonic_time)]
     if force_deadline is not None and force_deadline > monotonic_time:
         deadlines.append(force_deadline - monotonic_time)
     if source_expiry_at is not None:
         deadlines.append(max(0.0, source_expiry_at - wall_time))
+    if title_refresh_at is not None:
+        deadlines.append(max(0.0, title_refresh_at - monotonic_time))
     return min(deadlines)
+
+
+def resolve_activity_titles(
+    title_resolver: object,
+    target_snapshot: Dict[str, object],
+    monotonic_time: float,
+) -> Tuple[Dict[str, object], Optional[str]]:
+    """Resolve one bounded target snapshot without exposing adapter failures."""
+    thread_ids = [
+        item["thread_id"]
+        for item in target_snapshot.get("targets", [])
+        if isinstance(item, dict) and isinstance(item.get("thread_id"), str)
+    ]
+    try:
+        resolved_titles: Dict[str, str] = {}
+        resolver_error = None
+        # The resolver intentionally bounds each App Server exchange. Chunk
+        # the bounded 128-row projection while reusing the same cache and
+        # backoff-owning instance.
+        for offset in range(0, len(thread_ids), 64):
+            chunk_titles, chunk_error = title_resolver.resolve(
+                thread_ids[offset : offset + 64],
+                monotonic_time=monotonic_time,
+            )
+            if chunk_error is not None:
+                resolver_error = chunk_error
+                break
+            if not isinstance(chunk_titles, dict):
+                resolver_error = "protocol_error"
+                break
+            resolved_titles.update(chunk_titles)
+        if resolver_error is None:
+            return (activity_title_snapshot(target_snapshot, resolved_titles), None)
+        return (
+            {"titles": []},
+            resolver_error
+            if resolver_error in ("unavailable", "timeout", "protocol_error")
+            else "protocol_error",
+        )
+    except OSError:
+        return ({"titles": []}, "unavailable")
+    except (UnicodeError, TypeError, ValueError, AttributeError):
+        return ({"titles": []}, "protocol_error")
+    except Exception:
+        # The App Server bridge is optional. Unknown adapter failures remain
+        # categorical and cannot stop lifecycle or activation-target
+        # publication.
+        return ({"titles": []}, "protocol_error")
+
+
+def title_projection_failure(
+    resolution_failure: Optional[str],
+    write_failure: Optional[str],
+) -> Optional[str]:
+    """Combine independent resolver and sidecar-writer health states."""
+    return resolution_failure or write_failure
+
+
+class AsyncTitleResolution:
+    """Keep one latest title request off the authoritative aggregation loop."""
+
+    def __init__(
+        self,
+        title_resolver: object,
+        wake: Callable[[], None],
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.title_resolver = title_resolver
+        self.wake = wake
+        self.clock = clock
+        self.condition = threading.Condition()
+        self.stopped = False
+        self.generation = 0
+        self.desired_fingerprint: Optional[Tuple[Tuple[str, str], ...]] = None
+        self.in_flight_generation: Optional[int] = None
+        self.next_refresh_at = 0.0
+        self.pending: Optional[
+            Tuple[int, Tuple[Tuple[str, str], ...], Dict[str, object], float]
+        ] = None
+        self.completed: Optional[
+            Tuple[
+                int,
+                Tuple[Tuple[str, str], ...],
+                Dict[str, object],
+                Optional[str],
+            ]
+        ] = None
+        self.worker = threading.Thread(
+            target=self._work,
+            name="statelet-title-resolver",
+            daemon=True,
+        )
+        self.worker.start()
+
+    @staticmethod
+    def _request_snapshot(
+        target_snapshot: Dict[str, object],
+    ) -> Tuple[Tuple[Tuple[str, str], ...], Dict[str, object]]:
+        targets = [
+            {"id": item["id"], "thread_id": item["thread_id"]}
+            for item in target_snapshot.get("targets", [])
+            if isinstance(item, dict)
+            and isinstance(item.get("id"), str)
+            and isinstance(item.get("thread_id"), str)
+        ]
+        fingerprint = tuple((item["id"], item["thread_id"]) for item in targets)
+        return (fingerprint, {"targets": targets})
+
+    def request(
+        self,
+        target_snapshot: Dict[str, object],
+        monotonic_time: float,
+    ) -> Tuple[Dict[str, object], Optional[str], bool]:
+        fingerprint, request_snapshot = self._request_snapshot(target_snapshot)
+        with self.condition:
+            if fingerprint != self.desired_fingerprint:
+                self.generation += 1
+                self.desired_fingerprint = fingerprint
+                self.in_flight_generation = self.generation
+                self.completed = None
+                self.pending = (
+                    self.generation,
+                    fingerprint,
+                    request_snapshot,
+                    monotonic_time,
+                )
+                self.condition.notify()
+            elif (
+                self.completed is not None
+                and self.in_flight_generation is None
+                and monotonic_time >= self.next_refresh_at
+            ):
+                self.generation += 1
+                self.in_flight_generation = self.generation
+                self.pending = (
+                    self.generation,
+                    fingerprint,
+                    request_snapshot,
+                    monotonic_time,
+                )
+                self.condition.notify()
+            if (
+                self.completed is not None
+                and self.completed[1] == fingerprint
+            ):
+                return (self.completed[2], self.completed[3], False)
+        return ({"titles": []}, None, True)
+
+    def _work(self) -> None:
+        while True:
+            with self.condition:
+                while self.pending is None and not self.stopped:
+                    self.condition.wait()
+                if self.stopped:
+                    return
+                request = self.pending
+                self.pending = None
+            if request is None:
+                continue
+            generation, fingerprint, target_snapshot, monotonic_time = request
+            title_snapshot, title_error = resolve_activity_titles(
+                self.title_resolver,
+                target_snapshot,
+                monotonic_time,
+            )
+            with self.condition:
+                if self.stopped:
+                    return
+                if (
+                    generation != self.generation
+                    or fingerprint != self.desired_fingerprint
+                ):
+                    continue
+                self.completed = (
+                    generation,
+                    fingerprint,
+                    title_snapshot,
+                    title_error,
+                )
+                self.in_flight_generation = None
+                self.next_refresh_at = (
+                    self.clock() + TITLE_RESOLUTION_REFRESH_INTERVAL
+                )
+            try:
+                self.wake()
+            except OSError:
+                return
+
+    def next_refresh_deadline(self) -> Optional[float]:
+        with self.condition:
+            if (
+                self.stopped
+                or self.completed is None
+                or self.in_flight_generation is not None
+            ):
+                return None
+            return self.next_refresh_at
+
+    def close(self) -> None:
+        with self.condition:
+            self.stopped = True
+            self.in_flight_generation = None
+            self.pending = None
+            self.completed = None
+            self.condition.notify()
+        close_resolver = getattr(self.title_resolver, "close", None)
+        if callable(close_resolver):
+            close_resolver()
+        self.worker.join(timeout=0.75)
+        if self.worker.is_alive():
+            force_close_resolver = getattr(self.title_resolver, "force_close", None)
+            if callable(force_close_resolver):
+                force_close_resolver()
+            self.worker.join(timeout=0.75)
 
 
 def run(
@@ -1255,6 +1474,18 @@ def run(
     )
     active_waiter = waiter or DirectoryEventWaiter(state_dir, poll)
     owns_waiter = waiter is None
+    wake_title_waiter = getattr(active_waiter, "wake", lambda: None)
+    async_title_resolution = (
+        None
+        if once
+        else AsyncTitleResolution(
+            active_title_resolver,
+            wake_title_waiter,
+            monotonic_clock,
+        )
+    )
+    title_resolution_failure: Optional[str] = None
+    title_write_failure: Optional[str] = None
     try:
         while not should_stop():
             active_waiter.prepare()
@@ -1326,56 +1557,27 @@ def run(
                     target_health.failure("invalid_projection", monotonic_time)
                 title_snapshot: Dict[str, object] = {"titles": []}
                 title_resolution_error: Optional[str] = None
+                title_resolution_pending = False
                 if target_snapshot is not None:
-                    thread_ids = [
-                        item["thread_id"]
-                        for item in target_snapshot.get("targets", [])
-                        if isinstance(item, dict)
-                        and isinstance(item.get("thread_id"), str)
-                    ]
-                    try:
-                        resolved_titles: Dict[str, str] = {}
-                        resolver_error = None
-                        # The resolver intentionally bounds each App Server
-                        # exchange. Chunk the bounded 128-row projection while
-                        # reusing the same cache/backoff-owning instance.
-                        for offset in range(0, len(thread_ids), 64):
-                            chunk_titles, chunk_error = active_title_resolver.resolve(
-                                thread_ids[offset : offset + 64],
-                                monotonic_time=monotonic_time,
-                            )
-                            if chunk_error is not None:
-                                resolver_error = chunk_error
-                                break
-                            if not isinstance(chunk_titles, dict):
-                                resolver_error = "protocol_error"
-                                break
-                            resolved_titles.update(chunk_titles)
-                        if resolver_error is None:
-                            title_snapshot = activity_title_snapshot(
+                    if async_title_resolution is None:
+                        title_snapshot, title_resolution_error = (
+                            resolve_activity_titles(
+                                active_title_resolver,
                                 target_snapshot,
-                                resolved_titles,
+                                monotonic_time,
                             )
-                        else:
-                            title_resolution_error = (
-                                resolver_error
-                                if resolver_error
-                                in ("unavailable", "timeout", "protocol_error")
-                                else "protocol_error"
-                            )
-                    except OSError:
-                        title_resolution_error = "unavailable"
-                    except UnicodeError:
-                        title_resolution_error = "protocol_error"
-                    except (TypeError, ValueError, AttributeError):
-                        title_resolution_error = "protocol_error"
-                    except Exception:
-                        # The App Server bridge is optional. Unknown adapter
-                        # failures remain categorical and cannot stop lifecycle
-                        # or activation-target publication.
-                        title_resolution_error = "protocol_error"
-                    if title_resolution_error is not None:
-                        title_health.failure(title_resolution_error, monotonic_time)
+                        )
+                    else:
+                        (
+                            title_snapshot,
+                            title_resolution_error,
+                            title_resolution_pending,
+                        ) = async_title_resolution.request(
+                            target_snapshot,
+                            monotonic_time,
+                        )
+                    if not title_resolution_pending:
+                        title_resolution_failure = title_resolution_error
                 activity_publisher.publish_if_due(
                     activity_snapshot,
                     wall_time,
@@ -1391,13 +1593,19 @@ def run(
                         monotonic_time,
                     )
                 if activity_publisher.last_title_write_status == "success":
-                    if title_resolution_error is None:
-                        title_health.recovery()
+                    title_write_failure = None
                 elif activity_publisher.last_title_write_status is not None:
-                    title_health.failure(
-                        activity_publisher.last_title_write_status,
-                        monotonic_time,
+                    title_write_failure = (
+                        activity_publisher.last_title_write_status
                     )
+                title_failure = title_projection_failure(
+                    title_resolution_failure,
+                    title_write_failure,
+                )
+                if title_failure is None:
+                    title_health.recovery()
+                else:
+                    title_health.failure(title_failure, monotonic_time)
                 activity_health.recovery()
             except OSError:
                 activity_health.failure("io_error", monotonic_time)
@@ -1413,9 +1621,16 @@ def run(
                 monotonic_time,
                 force_deadline if forced else None,
                 source_expiry_at,
+                (
+                    async_title_resolution.next_refresh_deadline()
+                    if async_title_resolution is not None
+                    else None
+                ),
             )
             active_waiter.wait(timeout)
     finally:
+        if async_title_resolution is not None:
+            async_title_resolution.close()
         if owns_waiter:
             active_waiter.close()
     return 0

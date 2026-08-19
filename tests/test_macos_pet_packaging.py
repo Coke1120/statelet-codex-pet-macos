@@ -24,6 +24,9 @@ UNINSTALL_SCRIPT = PACKAGE / "scripts" / "uninstall.sh"
 ALPHA_COORDINATOR = PACKAGE / "Sources" / "CodexPetMac" / "AlphaConversion.swift"
 STATELET_IDENTITY = PACKAGE / "Sources" / "CodexPetMac" / "StateletIdentity.swift"
 PET_APP_DELEGATE = PACKAGE / "Sources" / "CodexPetMac" / "PetAppDelegate.swift"
+APP_SERVER_TITLE_RESOLVER = (
+    PACKAGE / "Sources" / "CodexPetMac" / "CodexAppServerTitleResolver.swift"
+)
 PET_PANEL = PACKAGE / "Sources" / "CodexPetMac" / "PetPanel.swift"
 PET_PLAYER = PACKAGE / "Sources" / "CodexPetMac" / "PetPlayer.swift"
 ANIMATION_LIBRARY = PACKAGE / "Sources" / "CodexPetMac" / "AnimationLibraryView.swift"
@@ -443,6 +446,20 @@ esac
         install_source = INSTALL_SCRIPT.read_text(encoding="utf-8")
         self.assertIn('app_bundle="$package_dir/dist/Statelet.app"', install_source)
         self.assertIn('app_dest="$applications_dir/Statelet.app"', install_source)
+
+    def test_signed_app_contains_the_private_title_fallback(self) -> None:
+        delegate = PET_APP_DELEGATE.read_text(encoding="utf-8")
+        resolver = APP_SERVER_TITLE_RESOLVER.read_text(encoding="utf-8")
+        self.assertIn("private let codexAppServerTitleResolver = CodexAppServerTitleResolver()", delegate)
+        self.assertIn("sessionActivityView.renderedItemIDs", delegate)
+        self.assertIn("sessionActivityPanel.isVisible", delegate)
+        self.assertIn("visibleTargets", delegate)
+        self.assertIn("sessionActivityResolvedTitleStore.combined", delegate)
+        self.assertIn("await titleResolver.shutdown()", delegate)
+        self.assertIn('process.arguments = ["app-server"]', resolver)
+        self.assertIn("SecCodeCopyGuestWithAttributes", resolver)
+        self.assertIn('"method": "thread/read"', resolver)
+        self.assertIn('"includeTurns": false', resolver)
 
     def test_readmes_use_statelet_as_the_product_name(self) -> None:
         for readme in (ROOT / "README.md", PACKAGE / "README.md"):

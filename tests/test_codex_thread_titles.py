@@ -8,6 +8,7 @@ import os
 import signal
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -291,6 +292,53 @@ class CodexThreadTitleResolverTests(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
 
+    def test_close_terminates_and_reaps_the_active_child(self) -> None:
+        pid_path = self.base / "close-pid"
+        resolver = CodexThreadTitleResolver(self.executable, timeout=5.0)
+        outcome: list[tuple[dict[str, str], Optional[str]]] = []
+
+        def resolve_in_background() -> None:
+            outcome.append(
+                self.resolve(
+                    ["one"],
+                    resolver=resolver,
+                    STATELET_FAKE_MODE="timeout",
+                    STATELET_FAKE_PID=str(pid_path),
+                )
+            )
+
+        worker = threading.Thread(target=resolve_in_background)
+        worker.start()
+        deadline = time.monotonic() + 5.0
+        pid: Optional[int] = None
+        while pid is None and time.monotonic() < deadline:
+            try:
+                raw_pid = pid_path.read_text(encoding="utf-8").strip()
+                pid = int(raw_pid) if raw_pid else None
+            except (OSError, ValueError):
+                pid = None
+            if pid is not None:
+                break
+            time.sleep(0.01)
+        try:
+            self.assertIsNotNone(pid)
+            resolver.close()
+            worker.join(1.0)
+            if worker.is_alive():
+                resolver.force_close()
+                worker.join(1.0)
+        finally:
+            if worker.is_alive():
+                resolver.force_close()
+                worker.join(1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(outcome, [({}, "unavailable")])
+        if pid is None:
+            self.fail("fake App Server did not publish a PID")
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
     def test_success_and_null_results_are_cached_then_refreshed_after_ttl(self) -> None:
         resolver = CodexThreadTitleResolver(
             self.executable, timeout=5.0, cache_ttl=60, failure_backoff=0.25
@@ -341,6 +389,23 @@ class CodexThreadTitleResolverTests(unittest.TestCase):
         self.assertEqual(second, ({}, "unavailable"))
         self.assertEqual(third, ({"one": "Recovered"}, None))
         self.assertEqual(self.launches(), 2)
+
+    def test_cache_purges_departed_expired_titles_and_stays_bounded(self) -> None:
+        resolver = CodexThreadTitleResolver(self.executable, cache_ttl=60)
+        resolver._cache = {
+            "expired": (9.0, "Private expired title"),
+            **{
+                "thread-{:03d}".format(index): (100.0 + index, "Title {}".format(index))
+                for index in range(140)
+            },
+        }
+
+        self.assertEqual(resolver.resolve([], monotonic_time=10.0), ({}, None))
+
+        self.assertNotIn("expired", resolver._cache)
+        self.assertLessEqual(len(resolver._cache), 128)
+        self.assertNotIn("thread-000", resolver._cache)
+        self.assertIn("thread-139", resolver._cache)
 
     def test_invalid_thread_ids_fail_before_launch(self) -> None:
         resolver = CodexThreadTitleResolver(self.executable)

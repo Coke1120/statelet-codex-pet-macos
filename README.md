@@ -86,18 +86,23 @@ remains identifier-free. A verified ChatGPT desktop handler can then open the
 matching local chat through the documented `codex://threads/<thread-id>` link;
 legacy or unmapped rows remain informational.
 
-For a mapped active or completed row, the aggregator can invoke the local Codex
+For a mapped active or completed row, the signed app can invoke the local Codex
 App Server and issue `thread/read` with `includeTurns: false`. Statelet accepts
-only the bounded, sanitized `thread.name` value. It discards and never persists
-response previews, turns, or items. Accepted titles are stored separately in
-`sessions/activity-titles-v1.json`, keyed by the same opaque activity hash; the
-file is restricted to the current account with mode `0600`. The public
-`activity-v1.json` and activation-target schema remain title-free and unchanged.
+only the bounded, sanitized `thread.name` value for currently visible rows. It
+discards response previews, turns, and items and retains accepted app-side
+titles only in bounded memory. A source-installed publisher can additionally
+write accepted titles to `sessions/activity-titles-v1.json`, keyed by the same
+opaque activity hash and restricted to the current account with mode `0600`.
+The public `activity-v1.json` and activation-target schema remain title-free and
+unchanged.
 
 The App Server integration is experimental and fail-soft. If Codex or a title
 is unavailable, the row keeps its generic lifecycle label. Title resolution
 does not affect lifecycle aggregation or **Open in Codex**, which continues to
-use only the independently validated activation target.
+use only the independently validated activation target. Before sending a
+private thread identifier, the app verifies that the exact launched Codex
+process carries OpenAI's Developer ID Team ID; unsigned or replaced executables
+are rejected.
 
 See [the lifecycle and media reference](docs/MACOS_COMPANION.md) for freshness,
 heartbeat, playlist, and filesystem contracts. Developers can use the
@@ -318,9 +323,10 @@ Statelet is designed for local operation:
   directories, account information, and credentials.
 - Optional session titles are resolved locally through the experimental Codex
   App Server using `thread/read` with `includeTurns: false`. Statelet accepts
-  only `thread.name`, stores it in the owner-only mode-`0600`
-  `activity-titles-v1.json` sidecar, and does not persist response previews,
-  turns, or items.
+  only `thread.name`; the signed app keeps resolved titles in bounded memory,
+  while a source-installed publisher may store them in the owner-only
+  mode-`0600` `activity-titles-v1.json` sidecar. Neither path persists response
+  previews, turns, or items.
 - The installer restricts managed support directories to the current account;
   imported media and state files receive restrictive local permissions.
 - Logs remain under `~/Library/Application Support/Statelet/logs/`.

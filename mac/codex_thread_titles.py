@@ -9,6 +9,7 @@ import select
 import signal
 import stat
 import subprocess
+import threading
 import time
 import unicodedata
 from pathlib import Path
@@ -20,6 +21,7 @@ MAX_THREAD_TITLE_BYTES = 256
 
 _MAX_THREAD_ID_SCALARS = 512
 _MAX_THREAD_IDS_PER_RESOLVE = 64
+_MAX_CACHE_ENTRIES = 128
 _MAX_STDOUT_BYTES = 1024 * 1024
 _READ_CHUNK_BYTES = 16 * 1024
 
@@ -72,6 +74,9 @@ class CodexThreadTitleResolver:
         self._cache: dict[str, tuple[float, Optional[str]]] = {}
         self._retry_after = 0.0
         self._last_failure: Optional[str] = None
+        self._process_lock = threading.Lock()
+        self._active_process: Optional[subprocess.Popen[bytes]] = None
+        self._closed = False
 
     def resolve(
         self,
@@ -79,9 +84,13 @@ class CodexThreadTitleResolver:
         monotonic_time: Optional[float] = None,
     ) -> tuple[dict[str, str], Optional[str]]:
         now = self._clock() if monotonic_time is None else float(monotonic_time)
+        with self._process_lock:
+            if self._closed:
+                return {}, "unavailable"
         requested = self._validate_thread_ids(thread_ids)
         if requested is None:
             return {}, "protocol_error"
+        self._trim_cache(now)
 
         titles: dict[str, str] = {}
         missing: list[str] = []
@@ -116,6 +125,7 @@ class CodexThreadTitleResolver:
             self._cache[thread_id] = (expires_at, title)
             if title is not None:
                 titles[thread_id] = title
+        self._trim_cache(now)
         self._retry_after = 0.0
         self._last_failure = None
         return titles, None
@@ -123,6 +133,20 @@ class CodexThreadTitleResolver:
     def _record_failure(self, now: float, failure: str) -> None:
         self._retry_after = now + self._failure_backoff
         self._last_failure = failure
+
+    def _trim_cache(self, now: float) -> None:
+        for thread_id, (expires_at, _) in list(self._cache.items()):
+            if expires_at <= now:
+                self._cache.pop(thread_id, None)
+        overflow = len(self._cache) - _MAX_CACHE_ENTRIES
+        if overflow <= 0:
+            return
+        oldest = sorted(
+            self._cache,
+            key=lambda thread_id: (self._cache[thread_id][0], thread_id),
+        )
+        for thread_id in oldest[:overflow]:
+            self._cache.pop(thread_id, None)
 
     @staticmethod
     def _validate_thread_ids(thread_ids: Iterable[str]) -> Optional[list[str]]:
@@ -187,6 +211,13 @@ class CodexThreadTitleResolver:
         except OSError as error:
             raise _ResolutionFailure("unavailable") from error
 
+        with self._process_lock:
+            if self._closed:
+                self._signal_process(process, signal.SIGTERM)
+                self._reap(process)
+                raise _ResolutionFailure("unavailable")
+            self._active_process = process
+
         deadline = self._clock() + self._timeout
         buffer = bytearray()
         total_stdout = 0
@@ -238,6 +269,35 @@ class CodexThreadTitleResolver:
             return resolved
         finally:
             self._reap(process)
+            with self._process_lock:
+                if self._active_process is process:
+                    self._active_process = None
+
+    def close(self) -> None:
+        with self._process_lock:
+            self._closed = True
+            process = self._active_process
+        if process is not None:
+            self._signal_process(process, signal.SIGTERM)
+
+    def force_close(self) -> None:
+        with self._process_lock:
+            self._closed = True
+            process = self._active_process
+        if process is not None:
+            self._signal_process(process, signal.SIGKILL)
+
+    @staticmethod
+    def _signal_process(process: subprocess.Popen[bytes], process_signal: int) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, process_signal)
+        except OSError:
+            try:
+                os.kill(process.pid, process_signal)
+            except OSError:
+                pass
 
     @staticmethod
     def _send(process: subprocess.Popen[bytes], message: dict[str, object]) -> None:

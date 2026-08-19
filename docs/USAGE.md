@@ -90,13 +90,17 @@ The optional raw technical thread mapping stays local in the separate owner-only
 
 To resolve a title, Statelet invokes the local Codex App Server and sends
 `thread/read` with `includeTurns: false`. It accepts only `thread.name`; response
-previews, turns, and items are discarded and never persisted. Accepted titles
-are keyed by the opaque activity hash in the separate owner-only mode-`0600`
+previews, turns, and items are discarded and never persisted. The signed app
+resolves only currently visible rows and keeps accepted titles in bounded
+memory. A source-installed publisher may additionally key them by opaque
+activity hash in the separate owner-only mode-`0600`
 `activity-titles-v1.json` sidecar. Neither `activity-v1.json` nor the activation
 target schema contains a title. This App Server integration is experimental and
 fail-soft: a missing or unavailable title leaves the generic label in place,
 and **Open in Codex** continues to depend only on its validated activation
-target.
+target. Before sending a private thread identifier, the app validates the exact
+launched Codex process against OpenAI's Developer ID Team ID; unsigned or
+replaced executables are rejected.
 
 The popup can be moved by dragging its background whenever click-through is
 disabled. Statelet remembers that position, clamps it back onto a visible
@@ -782,11 +786,11 @@ Statelet's lifecycle records do not include prompts, tool output, transcripts,
 or working directories. Logs, animation media, voice models, reference audio,
 dialogue, and generated speech remain local. The application does not send
 telemetry or upload crashes; the optional voice adapter permits only loopback
-HTTP. Optional user-facing session titles stay local in the owner-only
-mode-`0600` `activity-titles-v1.json` sidecar; Codex App Server previews, turns,
-and items are not persisted. Review any diagnostic excerpt before sharing it,
-and never publish private media, models, speech, reports, credentials, or
-complete local logs.
+HTTP. Optional user-facing session titles stay local in bounded app memory or
+the owner-only mode-`0600` `activity-titles-v1.json` sidecar; Codex App Server
+previews, turns, and items are not persisted. Review any diagnostic excerpt
+before sharing it, and never publish private media, models, speech, reports,
+credentials, or complete local logs.
 
 Statelet is an independent community project and is not affiliated with or
 endorsed by OpenAI.

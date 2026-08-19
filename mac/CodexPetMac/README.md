@@ -468,8 +468,10 @@ position. Rows with a fresh owner-only target expose **Open in Codex** through
 OpenAI's documented `codex://threads/<thread-id>` link; legacy or unverified
 targets remain informational, and opening never marks a completed row as read.
 Rows can also show a bounded, sanitized user-facing session title resolved
-locally through the experimental Codex App Server. Missing titles fall back to
-the generic lifecycle label and do not affect **Open in Codex**.
+locally through the experimental Codex App Server. The signed app resolves only
+the six currently visible rows and keeps results in bounded memory; an optional
+source-installed publisher sidecar can supply the same titles. Missing titles
+fall back to the generic lifecycle label and do not affect **Open in Codex**.
 
 The installer preserves `media-map.json`, `global-transitions.json`,
 `character-library.json`, hidden per-character maps/assets, and user media on
@@ -568,18 +570,22 @@ The separate owner-only activation sidecar contains only the opaque hash and a
 bounded technical thread identifier needed for the supported desktop deep link.
 It is optional, freshness-matched to the public sidecar, and never changes
 lifecycle aggregation.
-For eligible rows, the aggregator invokes the local Codex App Server and issues
-`thread/read` with `includeTurns: false`. It accepts only the bounded, sanitized
-`thread.name` field and discards response previews, turns, and items without
-persisting them. Accepted values are written to the owner-only mode-`0600`
-`activity-titles-v1.json` sidecar. The public `activity-v1.json` and activation
-target schema remain title-free and unchanged.
+For eligible visible rows, the signed app invokes the local Codex App Server and
+issues `thread/read` with `includeTurns: false`. It accepts only the bounded,
+sanitized `thread.name` field, discards response previews, turns, and items, and
+keeps accepted values in a bounded in-memory cache. A source-installed
+aggregator may also resolve titles on a background worker and write accepted
+values to the owner-only mode-`0600` `activity-titles-v1.json` sidecar. Slow or
+unavailable title requests never delay authoritative lifecycle aggregation. The
+public `activity-v1.json` and activation-target schema remain title-free and
+unchanged.
 
 The App Server integration is experimental and fail-soft. An unavailable Codex
 binary, App Server error, missing title, or rejected title leaves the existing
 generic label in place. Title resolution neither changes aggregation nor gates
 **Open in Codex**, which continues to use only the independently validated
-activation target.
+activation target. The app validates the exact launched process against
+OpenAI's Developer ID Team ID before it sends any private thread identifier.
 `UserPromptSubmit` and subagent events map to Running; `PermissionRequest` maps
 to Waiting; compact events map to Review; and tool events map to Review for
 test, lint, typecheck, or review work and Running otherwise. `SessionStart`,

@@ -13,6 +13,9 @@ versioning for the public source release.
   title while preserving the generic lifecycle label when no title is available.
 - A separate owner-only `activity-titles-v1.json` sidecar maps opaque activity
   hashes to display titles without storing technical thread identifiers.
+- The signed app contains its own bounded title resolver, so app-only updates
+  can fill missing visible-row titles in memory without requiring a source
+  reinstall or a newer external publisher.
 
 ### Changed
 
@@ -21,6 +24,9 @@ versioning for the public source release.
   turns, items, paths, and other response fields.
 - Title resolution is time-, count-, output-, and size-bounded with cached
   success/null results, categorical failure backoff, and fail-soft diagnostics.
+- The standalone publisher resolves optional title sidecars on a background
+  worker; slow or unavailable App Server requests cannot delay authoritative
+  lifecycle aggregation.
 - Optional target/title sidecar write failures retry on a real activity change
   or the normal heartbeat instead of self-triggering a directory-event loop.
 
@@ -30,6 +36,11 @@ versioning for the public source release.
   success, timeout, malformed output, EOF, and backpressure paths.
 - Snapshot timestamp and opaque-ID validation prevent stale, duplicated,
   symlinked, or malformed private titles from replacing accepted popup content.
+- The app validates the exact launched Codex process against OpenAI's Developer
+  ID Team ID before sending any private thread identifier.
+- Expired title entries are purged globally and both resolver caches are capped
+  at 128 entries; the app resolves at most the six rows the expanded popup can
+  display.
 
 ### Distribution notes
 

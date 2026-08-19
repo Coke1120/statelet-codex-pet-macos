@@ -496,6 +496,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private let lifecycleStateReader = LifecycleStateFileReader()
     private let sessionActivityReader = SessionActivityFileReader()
     private let codexDesktopActivator = CodexDesktopActivator()
+    private let codexAppServerTitleResolver = CodexAppServerTitleResolver()
     private var characterCountRefreshGeneration: UInt64 = 0
     private var panel: PetPanel!
     private var player: PetPlayerController!
@@ -527,6 +528,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var sessionActivitySnapshot: SessionActivitySnapshot?
     private var sessionActivityTargets: [String: String] = [:]
     private var sessionActivityTitles: [String: String] = [:]
+    private var sessionActivityResolvedTitleStore = SessionActivityResolvedTitleStore()
+    private var sessionActivityTitleResolutionTask: Task<Void, Never>?
+    private var sessionActivityTitleResolutionGeneration: UInt64 = 0
     private var lastAcceptedSessionActivitySnapshot: SessionActivitySnapshot?
     private var sessionActivityAcknowledgementHistory: [String] = []
     private var sessionActivityExpandedByUser = false
@@ -852,6 +856,16 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         transientStateReadRetry = nil
         sessionActivityReadRetry?.cancel()
         sessionActivityReadRetry = nil
+        sessionActivityTitleResolutionGeneration &+= 1
+        let titleResolverShutdown = DispatchSemaphore(value: 0)
+        let titleResolver = codexAppServerTitleResolver
+        Task.detached(priority: .userInitiated) {
+            await titleResolver.shutdown()
+            titleResolverShutdown.signal()
+        }
+        _ = titleResolverShutdown.wait(timeout: .now() + 2)
+        sessionActivityTitleResolutionTask?.cancel()
+        sessionActivityTitleResolutionTask = nil
         pendingLifecycleTransitionAttestationTask?.cancel()
         pendingLifecycleTransitionAttestationTask = nil
         pendingLifecycleTransitionAttestation = nil
@@ -1306,16 +1320,21 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 application: application,
                 currentlyAcceptedTitles: sessionActivityTitles
             )
+            sessionActivityResolvedTitleStore.retain(for: sessionActivityTargets)
             if application.acknowledgementHistory != sessionActivityAcknowledgementHistory {
                 sessionActivityAcknowledgementHistory = application.acknowledgementHistory
                 persistSessionActivityAcknowledgements()
             }
             refreshSessionActivityPresentation()
         case .missing, .corrupt:
+            sessionActivityTitleResolutionGeneration &+= 1
+            sessionActivityTitleResolutionTask?.cancel()
+            sessionActivityTitleResolutionTask = nil
             guard retryAttempt < 2 else {
                 sessionActivitySnapshot = nil
                 sessionActivityTargets = [:]
                 sessionActivityTitles = [:]
+                sessionActivityResolvedTitleStore.removeAll()
                 refreshSessionActivityPresentation()
                 return
             }
@@ -1371,7 +1390,51 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         _ = codexDesktopActivator.open(threadID: threadID)
     }
 
-    private func refreshSessionActivityPresentation() {
+    private func scheduleSessionActivityTitleResolution() {
+        sessionActivityTitleResolutionGeneration &+= 1
+        let generation = sessionActivityTitleResolutionGeneration
+        sessionActivityTitleResolutionTask?.cancel()
+        sessionActivityTitleResolutionTask = nil
+        guard let expectedEmittedAt = sessionActivitySnapshot?.emittedAt,
+              let sessionActivityView,
+              let sessionActivityPanel,
+              sessionActivityLayoutAvailable,
+              !sessionActivityView.isHidden,
+              sessionActivityPanel.isVisible else { return }
+        let visibleIDs = Set(sessionActivityView.renderedItemIDs)
+        guard !visibleIDs.isEmpty else { return }
+        let visibleTargets = sessionActivityTargets.filter { visibleIDs.contains($0.key) }
+        let expectedTargets = sessionActivityResolvedTitleStore.unresolvedTargets(
+            activityThreads: visibleTargets,
+            suppliedTitles: sessionActivityTitles
+        )
+        guard !expectedTargets.isEmpty else { return }
+        let resolver = codexAppServerTitleResolver
+        sessionActivityTitleResolutionTask = Task { [weak self] in
+            let resolved = await resolver.resolve(activityThreads: expectedTargets)
+            guard !Task.isCancelled else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      self.sessionActivityTitleResolutionGeneration == generation,
+                      self.sessionActivitySnapshot?.emittedAt == expectedEmittedAt else {
+                    return
+                }
+                self.sessionActivityResolvedTitleStore.adopt(
+                    resolved,
+                    expectedThreads: expectedTargets,
+                    currentThreads: self.sessionActivityTargets
+                )
+                self.sessionActivityTitleResolutionTask = nil
+                self.refreshSessionActivityPresentation(
+                    rescheduleTitleResolution: false
+                )
+            }
+        }
+    }
+
+    private func refreshSessionActivityPresentation(
+        rescheduleTitleResolution: Bool = true
+    ) {
         guard let sessionActivityView, let sessionActivityPanel else { return }
         let openableIDs = Set(sessionActivityTargets.compactMap { id, threadID in
             codexDesktopActivator.canOpen(threadID: threadID) ? id : nil
@@ -1380,28 +1443,40 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             snapshot: sessionActivitySnapshot,
             acknowledgedIDs: Set(sessionActivityAcknowledgementHistory),
             openableIDs: openableIDs,
-            titles: sessionActivityTitles
+            titles: sessionActivityResolvedTitleStore.combined(with: sessionActivityTitles)
         )
         if sessionActivityView.isHidden {
             sessionActivityExpandedByUser = false
             sessionActivityLayoutAvailable = true
             sessionActivityPanel.orderOut(nil)
         } else {
-            positionSessionActivityPanel(restoreVisibility: false)
-            guard sessionActivityLayoutAvailable else {
+            positionSessionActivityPanel(
+                restoreVisibility: false,
+                rescheduleTitleResolution: false
+            )
+            if !sessionActivityLayoutAvailable {
                 sessionActivityPanel.orderOut(nil)
+                if rescheduleTitleResolution {
+                    scheduleSessionActivityTitleResolution()
+                }
                 return
             }
             orderSessionActivityPanelVisible()
+        }
+        if rescheduleTitleResolution {
+            scheduleSessionActivityTitleResolution()
         }
     }
 
     private func positionSessionActivityPanel(
         display: Bool = false,
-        restoreVisibility: Bool = true
+        restoreVisibility: Bool = true,
+        rescheduleTitleResolution: Bool = true
     ) {
         guard let panel, let sessionActivityPanel, let sessionActivityView,
               !sessionActivityView.isHidden else { return }
+        let previousRenderedItemIDs = sessionActivityView.renderedItemIDs
+        let wasLayoutAvailable = sessionActivityLayoutAvailable
         let visibleFrame = panel.screen?.visibleFrame
             ?? NSScreen.main?.visibleFrame
             ?? panel.frame
@@ -1428,6 +1503,10 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         sessionActivityLayoutAvailable = layout.available
         guard layout.available else {
             sessionActivityPanel.orderOut(nil)
+            if rescheduleTitleResolution,
+               wasLayoutAvailable || !previousRenderedItemIDs.isEmpty {
+                scheduleSessionActivityTitleResolution()
+            }
             return
         }
         sessionActivityView.setCompactOverride(layout.compact)
@@ -1455,8 +1534,13 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
            SessionActivityPanelVisibilityPolicy.shouldOrderFront(
                wasAvailable: wasAvailable,
                isAvailable: layout.available
-           ) {
+        ) {
             orderSessionActivityPanelVisible()
+        }
+        if rescheduleTitleResolution,
+           wasLayoutAvailable != sessionActivityLayoutAvailable
+            || previousRenderedItemIDs != sessionActivityView.renderedItemIDs {
+            scheduleSessionActivityTitleResolution()
         }
     }
 
