@@ -273,6 +273,79 @@ final class CodexAppServerTitleResolverTests: XCTestCase {
         XCTAssertEqual(result, ["thread-null": .missing])
     }
 
+    func testProcessRunnerTreatsExactThreadNotLoadedErrorAsMissingAndContinuesBatch() async throws {
+        let script = try makePythonExecutable("""
+        import json,sys
+        json.loads(sys.stdin.readline()); print(json.dumps({'id':1,'result':{}}),flush=True)
+        json.loads(sys.stdin.readline()); first=json.loads(sys.stdin.readline())
+        print(json.dumps({'id':2,'error':{'code':-32600,'message':'thread not loaded: '+first['params']['threadId']}}),flush=True)
+        second=json.loads(sys.stdin.readline())
+        print(json.dumps({'id':3,'result':{'thread':{'id':second['params']['threadId'],'name':'Loaded title'}}}),flush=True)
+        """)
+        let result = try await CodexAppServerProcessRunner.run(
+            executable: script,
+            threadIDs: ["stale-thread", "loaded-thread"],
+            timeout: 1.5,
+            maximumOutputBytes: 1_048_576
+        )
+        XCTAssertEqual(result, [
+            "stale-thread": .missing,
+            "loaded-thread": .title("Loaded title"),
+        ])
+    }
+
+    func testProcessRunnerRejectsNearMatchThreadNotLoadedErrorsAndMismatchedResponseID() async throws {
+        let invalidResponses = [
+            "{'id':2,'error':{'code':-32601,'message':'thread not loaded: expected'}}",
+            "{'id':2,'error':{'code':-32600.5,'message':'thread not loaded: expected'}}",
+            "{'id':2,'error':{'code':-32600,'message':'thread not loaded: different'}}",
+            "{'id':2,'error':{'code':-32600,'message':'thread not loaded: expected','detail':'extra'}}",
+            "{'id':2,'error':{'code':-32600,'message':'thread not loaded: expected'},'result':{}}",
+            "{'id':2.5,'error':{'code':-32600,'message':'thread not loaded: expected'}}",
+            "{'id':999,'error':{'code':-32600,'message':'thread not loaded: expected'}}",
+        ]
+
+        for invalidResponse in invalidResponses {
+            let script = try makePythonExecutable("""
+            import json,sys
+            json.loads(sys.stdin.readline()); print(json.dumps({'id':1,'result':{}}),flush=True)
+            json.loads(sys.stdin.readline()); json.loads(sys.stdin.readline())
+            print(json.dumps(\(invalidResponse)),flush=True)
+            """)
+            do {
+                _ = try await CodexAppServerProcessRunner.run(
+                    executable: script,
+                    threadIDs: ["expected"],
+                    timeout: 1,
+                    maximumOutputBytes: 1_048_576
+                )
+                XCTFail("expected protocol violation for \(invalidResponse)")
+            } catch CodexAppServerResolutionFailure.protocolViolation {
+                // Expected: only the exact stale-thread error is recoverable.
+            } catch {
+                XCTFail("expected protocol violation, got \(error)")
+            }
+        }
+
+        let booleanInitializeID = try makePythonExecutable("""
+        import json,sys
+        json.loads(sys.stdin.readline()); print(json.dumps({'id':True,'result':{}}),flush=True)
+        """)
+        do {
+            _ = try await CodexAppServerProcessRunner.run(
+                executable: booleanInitializeID,
+                threadIDs: ["expected"],
+                timeout: 1,
+                maximumOutputBytes: 1_048_576
+            )
+            XCTFail("expected protocol violation for a Boolean response ID")
+        } catch CodexAppServerResolutionFailure.protocolViolation {
+            // Expected: JSON-RPC identifiers must be exact non-Boolean numbers.
+        } catch {
+            XCTFail("expected protocol violation, got \(error)")
+        }
+    }
+
     func testProcessRunnerRejectsMismatchedMalformedAndOversizedResponses() async throws {
         let mismatched = try makePythonExecutable("""
         import json,sys

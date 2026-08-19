@@ -459,6 +459,10 @@ enum CodexAppServerProcessRunner {
                 "params": ["threadId": threadID, "includeTurns": false],
             ], to: stdin.fileHandleForWriting)
             let message = try response(id: requestID, drain: drain, deadline: deadline, control: control)
+            if isThreadNotLoaded(message, requestedThreadID: threadID) {
+                result[threadID] = .missing
+                continue
+            }
             guard message["error"] == nil,
                   let responseResult = message["result"] as? [String: Any],
                   let thread = responseResult["thread"] as? [String: Any],
@@ -475,6 +479,20 @@ enum CodexAppServerProcessRunner {
             }
         }
         return result
+    }
+
+    private static func isThreadNotLoaded(
+        _ message: [String: Any],
+        requestedThreadID: String
+    ) -> Bool {
+        guard message["result"] == nil,
+              let error = message["error"] as? [String: Any],
+              Set(error.keys) == Set(["code", "message"]),
+              (error["code"] as? NSNumber)?.compare(NSNumber(value: -32600)) == .orderedSame,
+              error["message"] as? String == "thread not loaded: \(requestedThreadID)" else {
+            return false
+        }
+        return true
     }
 
     private static func send(_ object: [String: Any], to handle: FileHandle) throws {
@@ -501,7 +519,9 @@ enum CodexAppServerProcessRunner {
                 throw CodexAppServerResolutionFailure.protocolViolation
             }
             if message["id"] == nil { continue }
-            guard (message["id"] as? NSNumber)?.intValue == id else {
+            guard let responseID = message["id"] as? NSNumber,
+                  CFGetTypeID(responseID) != CFBooleanGetTypeID(),
+                  responseID.compare(NSNumber(value: id)) == .orderedSame else {
                 throw CodexAppServerResolutionFailure.protocolViolation
             }
             return message

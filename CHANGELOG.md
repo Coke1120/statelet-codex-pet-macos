@@ -5,6 +5,21 @@ versioning for the public source release.
 
 ## Unreleased
 
+## [1.8.8] - 2026-08-19
+
+### Fixed
+
+- A displayed row whose Codex thread is no longer loaded no longer aborts task
+  title hydration for other valid rows. Statelet accepts only the exact bounded
+  App Server `thread not loaded` response as a missing title and continues the
+  batch; malformed, mismatched, or unrelated protocol errors still fail closed.
+
+### Distribution notes
+
+- Version 1.8.8 supersedes 1.8.7 after live mixed loaded/unloaded task targets
+  exposed this compatibility edge case. The title remains memory-only, and a
+  missing title does not disable **Open in Codex** or change lifecycle state.
+
 ## [1.8.7] - 2026-08-19
 
 ### Changed
@@ -340,6 +355,7 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
+[1.8.8]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.8
 [1.8.7]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.7
 [1.8.5]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.5
 [1.8.4]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.4
