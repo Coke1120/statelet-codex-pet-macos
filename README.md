@@ -61,7 +61,7 @@ Codex lifecycle hooks
   -> local multi-session state aggregator
      waiting > review > running > idle
   -> current_state.json
-  -> activity-v1.json + private activity-targets-v1.json
+  -> activity-v1.json + private target/title sidecars
   -> Statelet AppKit panels
   -> AVFoundation player
 ```
@@ -85,6 +85,19 @@ hash-to-thread mapping in the separate owner-only
 remains identifier-free. A verified ChatGPT desktop handler can then open the
 matching local chat through the documented `codex://threads/<thread-id>` link;
 legacy or unmapped rows remain informational.
+
+For a mapped active or completed row, the aggregator can invoke the local Codex
+App Server and issue `thread/read` with `includeTurns: false`. Statelet accepts
+only the bounded, sanitized `thread.name` value. It discards and never persists
+response previews, turns, or items. Accepted titles are stored separately in
+`sessions/activity-titles-v1.json`, keyed by the same opaque activity hash; the
+file is restricted to the current account with mode `0600`. The public
+`activity-v1.json` and activation-target schema remain title-free and unchanged.
+
+The App Server integration is experimental and fail-soft. If Codex or a title
+is unavailable, the row keeps its generic lifecycle label. Title resolution
+does not affect lifecycle aggregation or **Open in Codex**, which continues to
+use only the independently validated activation target.
 
 See [the lifecycle and media reference](docs/MACOS_COMPANION.md) for freshness,
 heartbeat, playlist, and filesystem contracts. Developers can use the
@@ -303,6 +316,11 @@ Statelet is designed for local operation:
   conversion dependencies.
 - Lifecycle files exclude prompts, tool output, transcript paths, working
   directories, account information, and credentials.
+- Optional session titles are resolved locally through the experimental Codex
+  App Server using `thread/read` with `includeTurns: false`. Statelet accepts
+  only `thread.name`, stores it in the owner-only mode-`0600`
+  `activity-titles-v1.json` sidecar, and does not persist response previews,
+  turns, or items.
 - The installer restricts managed support directories to the current account;
   imported media and state files receive restrictive local permissions.
 - Logs remain under `~/Library/Application Support/Statelet/logs/`.

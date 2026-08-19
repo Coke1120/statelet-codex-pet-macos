@@ -33,6 +33,7 @@ HOOK_RECORD_NAME = re.compile(r"^[0-9a-f]{24}\.json$")
 TARGET_RECORD_NAME = re.compile(r"^[0-9a-f]{24}\.target\.json$")
 SESSION_ACTIVITY_FILENAME = "activity-v1.json"
 SESSION_ACTIVITY_TARGETS_FILENAME = "activity-targets-v1.json"
+SESSION_ACTIVITY_TITLES_FILENAME = "activity-titles-v1.json"
 HOOK_RECORD_KEYS = frozenset(("version", "state", "event", "updated_at"))
 HOOK_RECORD_V2_KEYS = frozenset(
     ("version", "state", "event", "event_at", "updated_at", "terminal", "rejections", "causal")

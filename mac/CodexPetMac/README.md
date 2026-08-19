@@ -467,6 +467,9 @@ activity popup is draggable when click-through is disabled and remembers its
 position. Rows with a fresh owner-only target expose **Open in Codex** through
 OpenAI's documented `codex://threads/<thread-id>` link; legacy or unverified
 targets remain informational, and opening never marks a completed row as read.
+Rows can also show a bounded, sanitized user-facing session title resolved
+locally through the experimental Codex App Server. Missing titles fall back to
+the generic lifecycle label and do not affect **Open in Codex**.
 
 The installer preserves `media-map.json`, `global-transitions.json`,
 `character-library.json`, hidden per-character maps/assets, and user media on
@@ -525,6 +528,16 @@ continues to contain no raw session identifiers:
 ~/Library/Application Support/Statelet/sessions/activity-targets-v1.json
 ```
 
+Optional user-facing session titles use a second private sidecar:
+
+```text
+~/Library/Application Support/Statelet/sessions/activity-titles-v1.json
+```
+
+The aggregator creates this file with owner-only mode `0600` permissions. It is
+keyed by the same opaque activity hash as `activity-v1.json`; it never contains
+the technical thread identifier.
+
 The complete serial-free state path is:
 
 ```text
@@ -532,7 +545,7 @@ Codex lifecycle hooks
   -> per-session JSON in Application Support
   -> board-independent priority aggregator
   -> runtime/current_state.json
-  -> sessions/activity-v1.json + private activity-targets-v1.json
+  -> sessions/activity-v1.json + private target/title sidecars
   -> Swift file watchers
   -> requested lifecycle badge, activity rail, and animation
 ```
@@ -555,6 +568,18 @@ The separate owner-only activation sidecar contains only the opaque hash and a
 bounded technical thread identifier needed for the supported desktop deep link.
 It is optional, freshness-matched to the public sidecar, and never changes
 lifecycle aggregation.
+For eligible rows, the aggregator invokes the local Codex App Server and issues
+`thread/read` with `includeTurns: false`. It accepts only the bounded, sanitized
+`thread.name` field and discards response previews, turns, and items without
+persisting them. Accepted values are written to the owner-only mode-`0600`
+`activity-titles-v1.json` sidecar. The public `activity-v1.json` and activation
+target schema remain title-free and unchanged.
+
+The App Server integration is experimental and fail-soft. An unavailable Codex
+binary, App Server error, missing title, or rejected title leaves the existing
+generic label in place. Title resolution neither changes aggregation nor gates
+**Open in Codex**, which continues to use only the independently validated
+activation target.
 `UserPromptSubmit` and subagent events map to Running; `PermissionRequest` maps
 to Waiting; compact events map to Review; and tool events map to Review for
 test, lint, typecheck, or review work and Running otherwise. `SessionStart`,

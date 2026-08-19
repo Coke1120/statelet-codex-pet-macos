@@ -1490,6 +1490,7 @@ struct WatchdogHarness {
                 "statelet_hook.py",
                 "statelet_state.py",
                 "statelet_state_aggregator.py",
+                "statelet_thread_titles.py",
             },
         )
         self.assertNotIn("codex_pet_daemon.py", installed_names)

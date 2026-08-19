@@ -195,6 +195,35 @@ final class StorageLifecycleHardeningTests: XCTestCase {
         )
     }
 
+    func testSessionActivityTitleReaderAcceptsMatchingOwnerFileAndRejectsSymlink() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let activityURL = root.appendingPathComponent("activity-v1.json")
+        let id = String(repeating: "a", count: 24)
+        let item = try SessionActivityItem(
+            id: id,
+            state: .running,
+            event: .userPromptSubmit,
+            eventAt: 10,
+            terminal: false
+        )
+        let snapshot = try SessionActivitySnapshot(emittedAt: 11, active: [item])
+        let titleURL = root.appendingPathComponent("activity-titles-v1.json")
+        let payload = #"{"version":1,"schema_version":1,"emitted_at":11,"titles":[{"id":"aaaaaaaaaaaaaaaaaaaaaaaa","title":"Repair tool execution"}]}"#
+        try Data(payload.utf8).write(to: titleURL)
+        XCTAssertEqual(
+            SessionActivityFileReader.loadTitles(for: activityURL, activity: snapshot),
+            [id: "Repair tool execution"]
+        )
+
+        let realURL = root.appendingPathComponent("titles-real.json")
+        try FileManager.default.moveItem(at: titleURL, to: realURL)
+        try FileManager.default.createSymbolicLink(at: titleURL, withDestinationURL: realURL)
+        XCTAssertTrue(
+            SessionActivityFileReader.loadTitles(for: activityURL, activity: snapshot).isEmpty
+        )
+    }
+
     func testSessionActivityTargetReaderDegradesInvalidTargetsWithoutRejectingActivity() throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -213,6 +242,34 @@ final class StorageLifecycleHardeningTests: XCTestCase {
         )
         XCTAssertTrue(
             SessionActivityFileReader.loadTargets(for: activityURL, activity: snapshot).isEmpty
+        )
+        XCTAssertEqual(SessionActivityFileReader.load(activityURL), .snapshot(snapshot))
+    }
+
+    func testInvalidTitleSidecarDoesNotBreakTargetsOrActivity() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let activityURL = root.appendingPathComponent("activity-v1.json")
+        let id = String(repeating: "a", count: 24)
+        let activityPayload = #"{"version":1,"schema_version":1,"emitted_at":11,"active":[{"id":"aaaaaaaaaaaaaaaaaaaaaaaa","state":"running","event":"UserPromptSubmit","event_at":10,"started_at":10,"completed_at":null,"category":"codex","terminal":false}],"completed":[]}"#
+        let targetPayload = #"{"version":1,"schema_version":1,"emitted_at":11,"targets":[{"id":"aaaaaaaaaaaaaaaaaaaaaaaa","thread_id":"thread-1"}]}"#
+        try Data(activityPayload.utf8).write(to: activityURL)
+        try Data(targetPayload.utf8).write(
+            to: root.appendingPathComponent("activity-targets-v1.json")
+        )
+        try Data("not json".utf8).write(
+            to: root.appendingPathComponent("activity-titles-v1.json")
+        )
+        guard case let .snapshot(snapshot) = SessionActivityFileReader.load(activityURL) else {
+            return XCTFail("valid activity did not load")
+        }
+
+        XCTAssertEqual(
+            SessionActivityFileReader.loadTargets(for: activityURL, activity: snapshot),
+            [id: "thread-1"]
+        )
+        XCTAssertTrue(
+            SessionActivityFileReader.loadTitles(for: activityURL, activity: snapshot).isEmpty
         )
         XCTAssertEqual(SessionActivityFileReader.load(activityURL), .snapshot(snapshot))
     }

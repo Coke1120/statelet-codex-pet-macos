@@ -186,6 +186,113 @@ final class SessionActivityTests: XCTestCase {
         XCTAssertNotNil(buttons.first { $0.title == "Mark as read" })
     }
 
+    @MainActor
+    func testExpandedRowsShowPrivateTitlesWithoutChangingActionsOrCompactCounts() throws {
+        let active = try item(
+            "a",
+            state: .running,
+            event: .userPromptSubmit,
+            terminal: false,
+            eventAt: 90
+        )
+        let completed = try item(
+            "b",
+            state: .idle,
+            event: .sessionEnd,
+            terminal: true,
+            eventAt: 91
+        )
+        let view = SessionActivityView(
+            frame: NSRect(x: 0, y: 0, width: 360, height: 180),
+            clock: { Date(timeIntervalSince1970: 100) }
+        )
+        var opened: String?
+        var acknowledged: String?
+        view.onOpen = { opened = $0 }
+        view.onAcknowledge = { acknowledged = $0 }
+        view.update(
+            snapshot: try SessionActivitySnapshot(
+                emittedAt: 100,
+                active: [active],
+                completed: [completed]
+            ),
+            acknowledgedIDs: [],
+            openableIDs: [active.id, completed.id],
+            titles: [
+                active.id: "Repair tool execution",
+                completed.id: "Verify release signing",
+            ]
+        )
+        view.layoutSubtreeIfNeeded()
+
+        let labels = allDescendants(of: view).compactMap { $0 as? NSTextField }
+        let activeLabel = try XCTUnwrap(labels.first {
+            $0.stringValue.hasPrefix("Repair tool execution · Running")
+        })
+        XCTAssertEqual(
+            activeLabel.accessibilityLabel(),
+            "Repair tool execution, active running session 1"
+        )
+        XCTAssertEqual(activeLabel.lineBreakMode, .byTruncatingTail)
+
+        let completedLabel = try XCTUnwrap(labels.first {
+            $0.stringValue.hasPrefix("Verify release signing · Completed")
+        })
+        XCTAssertEqual(
+            completedLabel.accessibilityLabel(),
+            "Verify release signing, completed unread session 1"
+        )
+        XCTAssertTrue(completedLabel.stringValue.contains("Unread"))
+
+        let buttons = allDescendants(of: view).compactMap { $0 as? NSButton }
+        let openButtons = buttons.filter { $0.title == "Open in Codex" }
+        XCTAssertEqual(openButtons.count, 2)
+        openButtons[0].performClick(nil)
+        XCTAssertTrue([active.id, completed.id].contains(opened))
+        XCTAssertNil(acknowledged)
+        try XCTUnwrap(buttons.first { $0.title == "Mark as read" }).performClick(nil)
+        XCTAssertEqual(acknowledged, completed.id)
+
+        view.setCompactOverride(true)
+        let compactText = allDescendants(of: view).compactMap { ($0 as? NSTextField)?.stringValue }
+        XCTAssertFalse(compactText.contains { $0.contains("Repair tool execution") })
+        XCTAssertFalse(compactText.contains { $0.contains("Verify release signing") })
+        XCTAssertNotNil(allDescendants(of: view).compactMap { $0 as? NSButton }.first {
+            $0.title == "Running · 1"
+        })
+        XCTAssertNotNil(allDescendants(of: view).compactMap { $0 as? NSButton }.first {
+            $0.title == "Completed · 1"
+        })
+    }
+
+    @MainActor
+    func testMissingPrivateTitlePreservesGenericRowContract() throws {
+        let active = try item(
+            "a",
+            state: .running,
+            event: .userPromptSubmit,
+            terminal: false,
+            eventAt: 90
+        )
+        let view = SessionActivityView(
+            frame: NSRect(x: 0, y: 0, width: 230, height: 150),
+            clock: { Date(timeIntervalSince1970: 100) }
+        )
+        view.update(
+            snapshot: try SessionActivitySnapshot(emittedAt: 100, active: [active]),
+            acknowledgedIDs: [],
+            titles: [:]
+        )
+        view.layoutSubtreeIfNeeded()
+
+        let rowLabel = try XCTUnwrap(
+            allDescendants(of: view).compactMap { $0 as? NSTextField }.first {
+                $0.accessibilityLabel() == "Active running session 1"
+            }
+        )
+        XCTAssertEqual(rowLabel.stringValue, "Running · Codex #1 · just now")
+    }
+
     func testCodexDesktopActivationPolicyEncodesAndFailsClosed() throws {
         let appURL = URL(fileURLWithPath: "/Applications/Codex.app")
         var opened: (URL, URL)?
@@ -248,6 +355,60 @@ final class SessionActivityTests: XCTestCase {
         XCTAssertTrue(unknown.validated(for: snapshot).isEmpty)
     }
 
+    func testTitleValidationRequiresExactSnapshotKnownUniqueIDsAndSafeText() throws {
+        let active = try item(
+            "a",
+            state: .running,
+            event: .userPromptSubmit,
+            terminal: false,
+            eventAt: 90
+        )
+        let snapshot = try SessionActivitySnapshot(emittedAt: 100, active: [active])
+        let valid = SessionActivityTitles(
+            version: 1,
+            schemaVersion: 1,
+            emittedAt: 100,
+            titles: [.init(id: active.id, title: "修復 tool execution 🐾")]
+        )
+        XCTAssertEqual(
+            valid.validated(for: snapshot),
+            [active.id: "修復 tool execution 🐾"]
+        )
+
+        let stale = SessionActivityTitles(
+            version: 1,
+            schemaVersion: 1,
+            emittedAt: 99,
+            titles: valid.titles
+        )
+        XCTAssertTrue(stale.validated(for: snapshot).isEmpty)
+
+        let unknown = SessionActivityTitles(
+            version: 1,
+            schemaVersion: 1,
+            emittedAt: 100,
+            titles: [.init(id: String(repeating: "b", count: 24), title: "Unknown")]
+        )
+        XCTAssertTrue(unknown.validated(for: snapshot).isEmpty)
+
+        for unsafe in [
+            " leading",
+            "trailing ",
+            "two\nlines",
+            "bidi\u{202E}override",
+            String(repeating: "a", count: SessionActivityTitles.maximumTitleScalars + 1),
+            String(repeating: "界", count: SessionActivityTitles.maximumTitleBytes),
+        ] {
+            let invalid = SessionActivityTitles(
+                version: 1,
+                schemaVersion: 1,
+                emittedAt: 100,
+                titles: [.init(id: active.id, title: unsafe)]
+            )
+            XCTAssertTrue(invalid.validated(for: snapshot).isEmpty, unsafe)
+        }
+    }
+
     func testRejectedEqualTimestampConflictCannotReplaceAcceptedTargets() throws {
         let identifier = String(repeating: "a", count: 24)
         let accepted = try SessionActivitySnapshot(
@@ -291,6 +452,14 @@ final class SessionActivityTests: XCTestCase {
                 currentlyAcceptedTargets: [identifier: "accepted-thread"]
             ),
             [identifier: "accepted-thread"]
+        )
+        XCTAssertEqual(
+            SessionActivityTitleAdoptionPolicy.apply(
+                incomingTitles: [identifier: "Wrong title"],
+                application: application,
+                currentlyAcceptedTitles: [identifier: "Accepted title"]
+            ),
+            [identifier: "Accepted title"]
         )
     }
 
@@ -686,6 +855,50 @@ final class SessionActivityTests: XCTestCase {
         releaseFirst.signal()
         wait(for: [newestDelivered], timeout: 1)
         XCTAssertEqual(state.values, [101])
+    }
+
+    @MainActor
+    func testPrivateMetadataReaderSuppressesOlderCombinedCallback() throws {
+        let firstStarted = expectation(description: "first private metadata read started")
+        let newestDelivered = expectation(description: "newest private metadata read delivered")
+        let releaseFirst = DispatchSemaphore(value: 0)
+        let state = ActivityReaderState()
+        let older = try SessionActivitySnapshot(emittedAt: 100)
+        let newer = try SessionActivitySnapshot(emittedAt: 101)
+        let reader = SessionActivityFileReader(
+            loader: { _ in
+                if state.nextCall() == 1 {
+                    firstStarted.fulfill()
+                    releaseFirst.wait()
+                    return .snapshot(older)
+                }
+                return .snapshot(newer)
+            },
+            targetLoader: { _, snapshot in
+                ["target": "thread-\(Int(snapshot.emittedAt))"]
+            },
+            titleLoader: { _, snapshot in
+                ["target": "Title \(Int(snapshot.emittedAt))"]
+            }
+        )
+        let url = URL(fileURLWithPath: "/tmp/activity-v1.json")
+        reader.readWithPrivateMetadata(url) { result, _, _ in
+            if case let .snapshot(snapshot) = result {
+                XCTFail("stale combined callback delivered for \(snapshot.emittedAt)")
+            }
+        }
+        wait(for: [firstStarted], timeout: 1)
+        reader.readWithPrivateMetadata(url) { result, targets, titles in
+            guard case let .snapshot(snapshot) = result else {
+                return XCTFail("newest private metadata snapshot was not delivered")
+            }
+            XCTAssertEqual(snapshot.emittedAt, 101)
+            XCTAssertEqual(targets, ["target": "thread-101"])
+            XCTAssertEqual(titles, ["target": "Title 101"])
+            newestDelivered.fulfill()
+        }
+        releaseFirst.signal()
+        wait(for: [newestDelivered], timeout: 1)
     }
 
     func testRejectedSnapshotNeverPrunesAcknowledgements() throws {

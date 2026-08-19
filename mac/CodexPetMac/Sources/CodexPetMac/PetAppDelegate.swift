@@ -526,6 +526,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var sessionActivityReadRetry: DispatchWorkItem?
     private var sessionActivitySnapshot: SessionActivitySnapshot?
     private var sessionActivityTargets: [String: String] = [:]
+    private var sessionActivityTitles: [String: String] = [:]
     private var lastAcceptedSessionActivitySnapshot: SessionActivitySnapshot?
     private var sessionActivityAcknowledgementHistory: [String] = []
     private var sessionActivityExpandedByUser = false
@@ -1264,10 +1265,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             sessionActivityReadRetry?.cancel()
             sessionActivityReadRetry = nil
         }
-        sessionActivityReader.readWithTargets(url) { [weak self] result, targets in
+        sessionActivityReader.readWithPrivateMetadata(url) { [weak self] result, targets, titles in
             self?.applySessionActivityReadResult(
                 result,
                 targets: targets,
+                titles: titles,
                 from: url,
                 retryAttempt: retryAttempt
             )
@@ -1277,6 +1279,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private func applySessionActivityReadResult(
         _ result: SessionActivityReadResult,
         targets: [String: String],
+        titles: [String: String],
         from url: URL,
         retryAttempt: Int
     ) {
@@ -1298,6 +1301,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 application: application,
                 currentlyAcceptedTargets: sessionActivityTargets
             )
+            sessionActivityTitles = SessionActivityTitleAdoptionPolicy.apply(
+                incomingTitles: titles,
+                application: application,
+                currentlyAcceptedTitles: sessionActivityTitles
+            )
             if application.acknowledgementHistory != sessionActivityAcknowledgementHistory {
                 sessionActivityAcknowledgementHistory = application.acknowledgementHistory
                 persistSessionActivityAcknowledgements()
@@ -1307,6 +1315,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             guard retryAttempt < 2 else {
                 sessionActivitySnapshot = nil
                 sessionActivityTargets = [:]
+                sessionActivityTitles = [:]
                 refreshSessionActivityPresentation()
                 return
             }
@@ -1370,7 +1379,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         sessionActivityView.update(
             snapshot: sessionActivitySnapshot,
             acknowledgedIDs: Set(sessionActivityAcknowledgementHistory),
-            openableIDs: openableIDs
+            openableIDs: openableIDs,
+            titles: sessionActivityTitles
         )
         if sessionActivityView.isHidden {
             sessionActivityExpandedByUser = false

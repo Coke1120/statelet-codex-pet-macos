@@ -791,6 +791,142 @@ class PublisherTests(unittest.TestCase):
                 [{"id": identifier, "thread_id": "thread:private"}],
             )
 
+    def test_private_titles_publish_exact_bounded_schema_without_public_leakage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "sessions"
+            output = state_dir / state.SESSION_ACTIVITY_FILENAME
+            identifier = "a" * 24
+            snapshot = {
+                "active": [{
+                    "id": identifier,
+                    "state": "running",
+                    "event": "UserPromptSubmit",
+                    "event_at": 100.0,
+                    "started_at": 100.0,
+                    "completed_at": None,
+                    "category": "codex",
+                    "terminal": False,
+                }],
+                "completed": [],
+            }
+            targets = {"targets": [{"id": identifier, "thread_id": "thread:secret"}]}
+            titles = {"titles": [{"id": identifier, "title": "Fix tool execution"}]}
+            publisher = aggregator.SessionActivityPublisher(output, heartbeat=60.0)
+
+            publisher.publish_if_due(snapshot, 123.0, 10.0, targets, titles)
+
+            public = json.loads(output.read_text(encoding="utf-8"))
+            private = json.loads(
+                output.with_name(state.SESSION_ACTIVITY_TITLES_FILENAME).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                private,
+                {
+                    "version": 1,
+                    "schema_version": 1,
+                    "emitted_at": 123.0,
+                    "titles": [{"id": identifier, "title": "Fix tool execution"}],
+                },
+            )
+            self.assertEqual(stat.S_IMODE(output.with_name(state.SESSION_ACTIVITY_TITLES_FILENAME).stat().st_mode), 0o600)
+            self.assertEqual(public["emitted_at"], private["emitted_at"])
+            self.assertNotIn("Fix tool execution", json.dumps(public))
+            self.assertNotIn("thread:secret", json.dumps(private))
+            for sentinel in ("preview", "prompt", "turns", "responses", "/Users/private"):
+                self.assertNotIn(sentinel, json.dumps(private))
+
+    def test_title_projection_sanitizes_and_writer_rejects_invalid_titles(self) -> None:
+        identifier = "a" * 24
+        targets = {"targets": [{"id": identifier, "thread_id": "thread:one"}]}
+        self.assertEqual(
+            aggregator.activity_title_snapshot(
+                targets,
+                {"thread:one": "  Fix\n\u200btool\t execution  "},
+            ),
+            {"titles": [{"id": identifier, "title": "Fixtool execution"}]},
+        )
+        self.assertEqual(
+            aggregator.activity_title_snapshot(targets, {"thread:one": "x" * 121}),
+            {"titles": []},
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(ValueError):
+                aggregator.atomic_write_activity_titles(
+                    Path(temporary) / state.SESSION_ACTIVITY_TITLES_FILENAME,
+                    {"titles": [{"id": identifier, "title": "bad\nname"}]},
+                    100.0,
+                )
+
+    def test_resolver_success_null_and_failure_are_fail_soft(self) -> None:
+        class Resolver:
+            def __init__(self, result):
+                self.result = result
+                self.calls = []
+
+            def resolve(self, thread_ids, monotonic_time=None):
+                self.calls.append((list(thread_ids), monotonic_time))
+                return self.result
+
+        for result, expected_titles, expected_diagnostic in (
+            (({"thread:private": "Named task"}, None), [{"id": "a" * 24, "title": "Named task"}], []),
+            (({}, None), [], []),
+            (({"thread:private": "must be discarded"}, "timeout"), [], [
+                "Statelet session activity sidecar component=session_titles status=degraded reason=timeout"
+            ]),
+        ):
+            with self.subTest(result=result), tempfile.TemporaryDirectory() as temporary:
+                state_dir = Path(temporary) / "sessions"
+                output = Path(temporary) / "runtime" / "current_state.json"
+                state_dir.mkdir()
+                identifier = "a" * 24
+                write_v2_record(record_path(state_dir, "a"), "running", "UserPromptSubmit", 100.0)
+                write_target_record(state_dir / f"{identifier}.target.json", identifier, "thread:private", 100.0)
+                diagnostics = []
+                resolver = Resolver(result)
+
+                aggregator.run(
+                    state_dir, output, 0.25, 60.0, 900.0, True, False, None, 30.0,
+                    lambda: False,
+                    waiter=ScriptedWaiter(FakeClock()),
+                    wall_clock=lambda: 100.0,
+                    monotonic_clock=lambda: 10.0,
+                    activity_diagnostic=diagnostics.append,
+                    title_resolver=resolver,
+                )
+
+                titles = json.loads((state_dir / state.SESSION_ACTIVITY_TITLES_FILENAME).read_text(encoding="utf-8"))
+                targets = json.loads((state_dir / state.SESSION_ACTIVITY_TARGETS_FILENAME).read_text(encoding="utf-8"))
+                self.assertEqual(titles["titles"], expected_titles)
+                self.assertEqual(targets["targets"], [{"id": identifier, "thread_id": "thread:private"}])
+                self.assertEqual(diagnostics, expected_diagnostic)
+                self.assertEqual(resolver.calls, [(["thread:private"], 10.0)])
+
+    def test_title_only_change_republishes_activity_commit_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "sessions" / state.SESSION_ACTIVITY_FILENAME
+            identifier = "a" * 24
+            snapshot = {"active": [], "completed": []}
+            targets = {"targets": [{"id": identifier, "thread_id": "thread:private"}]}
+            publisher = aggregator.SessionActivityPublisher(output, heartbeat=60.0)
+
+            first = publisher.publish_if_due(snapshot, 100.0, 10.0, targets, {"titles": []})
+            second = publisher.publish_if_due(
+                snapshot,
+                101.0,
+                11.0,
+                targets,
+                {"titles": [{"id": identifier, "title": "Fresh title"}]},
+            )
+
+            self.assertIsNotNone(first)
+            self.assertIsNotNone(second)
+            self.assertEqual(second["emitted_at"], 101.0)
+            title_record = json.loads(output.with_name(state.SESSION_ACTIVITY_TITLES_FILENAME).read_text(encoding="utf-8"))
+            self.assertEqual(title_record["emitted_at"], 101.0)
+            self.assertEqual(title_record["titles"][0]["title"], "Fresh title")
+
     def test_target_write_failure_does_not_block_activity_or_current_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state_dir = Path(temporary) / "sessions"
@@ -1156,19 +1292,23 @@ class PublisherTests(unittest.TestCase):
                     ],
                 )
 
-                retried = publisher.publish_if_due(snapshot, 101.0, 11.0, targets)
+                suppressed = publisher.publish_if_due(snapshot, 101.0, 11.0, targets)
+                self.assertIsNone(suppressed)
+                self.assertEqual(target_write_attempts, 1)
+                self.assertIsNone(publisher.last_target_write_status)
+                retried = publisher.publish_if_due(snapshot, 160.0, 70.0, targets)
                 self.assertEqual(publisher.last_target_write_status, "success")
                 health.recovery()
 
             self.assertIsNotNone(first)
             self.assertIsNotNone(retried)
-            self.assertEqual(retried["emitted_at"], 101.0)
+            self.assertEqual(retried["emitted_at"], 160.0)
             target_record = json.loads(
                 output.with_name(
                     state.SESSION_ACTIVITY_TARGETS_FILENAME
                 ).read_text(encoding="utf-8")
             )
-            self.assertEqual(target_record["emitted_at"], 101.0)
+            self.assertEqual(target_record["emitted_at"], 160.0)
             self.assertEqual(
                 messages,
                 [
@@ -1200,6 +1340,65 @@ class PublisherTests(unittest.TestCase):
                 "status=degraded reason=encoding_error",
             ],
         )
+
+    def test_session_title_write_failure_retries_recovers_and_is_rate_limited(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "sessions" / state.SESSION_ACTIVITY_FILENAME
+            identifier = "a" * 24
+            publisher = aggregator.SessionActivityPublisher(output, heartbeat=60.0)
+            messages = []
+            health = aggregator.OptionalActivityDiagnostic(
+                messages.append,
+                interval=60.0,
+                component="session_titles",
+            )
+            titles = {"titles": [{"id": identifier, "title": "Private name"}]}
+            original_write = aggregator.atomic_write_activity_titles
+            attempts = 0
+
+            def fail_once(*args, **kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise OSError("/Users/private title write")
+                return original_write(*args, **kwargs)
+
+            with mock.patch.object(aggregator, "atomic_write_activity_titles", side_effect=fail_once):
+                publisher.publish_if_due({"active": [], "completed": []}, 100.0, 10.0, None, titles)
+                health.failure(publisher.last_title_write_status, 10.0)
+                health.failure("protocol_error", 20.0)
+                suppressed = publisher.publish_if_due(
+                    {"active": [], "completed": []},
+                    101.0,
+                    11.0,
+                    None,
+                    titles,
+                )
+                self.assertIsNone(suppressed)
+                self.assertEqual(attempts, 1)
+                self.assertIsNone(publisher.last_title_write_status)
+                retried = publisher.publish_if_due(
+                    {"active": [], "completed": []},
+                    160.0,
+                    70.0,
+                    None,
+                    titles,
+                )
+                self.assertEqual(publisher.last_title_write_status, "success")
+                health.recovery()
+
+            self.assertIsNotNone(retried)
+            self.assertEqual(attempts, 2)
+            self.assertEqual(
+                messages,
+                [
+                    "Statelet session activity sidecar component=session_titles status=degraded reason=io_error",
+                    "Statelet session activity sidecar component=session_titles status=recovered",
+                ],
+            )
+            self.assertNotIn("/Users/", json.dumps(messages))
+            record = json.loads(output.with_name(state.SESSION_ACTIVITY_TITLES_FILENAME).read_text(encoding="utf-8"))
+            self.assertEqual(record["emitted_at"], 160.0)
 
     def test_shared_current_state_fixture_matches_python_publisher(self) -> None:
         fixture_path = ROOT / "mac" / "contracts" / "current_state-v1.example.json"

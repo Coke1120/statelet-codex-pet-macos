@@ -183,6 +183,7 @@ final class SessionActivityView: NSView {
     private var snapshot: SessionActivitySnapshot?
     private var acknowledgedIDs: Set<String> = []
     private var openableIDs: Set<String> = []
+    private var titles: [String: String] = [:]
     private var compactOverride: Bool?
     private var panelAppearance = try! SessionActivityPanelAppearance()
     private var resolvedAppearance = SessionActivityPanelResolvedAppearance(
@@ -256,11 +257,13 @@ final class SessionActivityView: NSView {
     func update(
         snapshot: SessionActivitySnapshot?,
         acknowledgedIDs: Set<String>,
-        openableIDs: Set<String> = []
+        openableIDs: Set<String> = [],
+        titles: [String: String] = [:]
     ) {
         self.snapshot = snapshot
         self.acknowledgedIDs = acknowledgedIDs
         self.openableIDs = openableIDs
+        self.titles = titles
         rebuild()
     }
 
@@ -463,14 +466,25 @@ final class SessionActivityView: NSView {
     }
 
     private func addActiveRow(_ item: SessionActivityItem, ordinal: Int) {
-        let label = NSTextField(labelWithString: "\(item.state.rawValue.capitalized) · \(item.category.displayName) #\(ordinal) · \(relativeAge(item.startedAt))")
+        let title = titles[item.id]
+        let genericText = "\(item.state.rawValue.capitalized) · \(item.category.displayName) #\(ordinal) · \(relativeAge(item.startedAt))"
+        let label = NSTextField(
+            labelWithString: title.map {
+                "\($0) · \(item.state.rawValue.capitalized) · \(item.category.displayName) · \(relativeAge(item.startedAt))"
+            } ?? genericText
+        )
         label.font = .systemFont(ofSize: 13, weight: .medium)
         label.textColor = resolvedActivityColor(item.state.sessionActivityColor)
         label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
+        label.widthAnchor.constraint(lessThanOrEqualToConstant: 320).isActive = true
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         label.setAccessibilityElement(true)
         label.setAccessibilityRole(.staticText)
-        label.setAccessibilityLabel("Active \(item.state.rawValue) session \(ordinal)")
+        label.setAccessibilityLabel(
+            title.map { "\($0), active \(item.state.rawValue) session \(ordinal)" }
+                ?? "Active \(item.state.rawValue) session \(ordinal)"
+        )
         label.setAccessibilityValue("\(item.category.displayName), started \(relativeAge(item.startedAt))")
         label.setAccessibilityHelp(
             openableIDs.contains(item.id)
@@ -491,14 +505,25 @@ final class SessionActivityView: NSView {
 
     private func addCompletedRow(_ item: SessionActivityItem, ordinal: Int) {
         let completionTime = item.completedAt ?? item.eventAt
-        let label = NSTextField(labelWithString: "Completed · \(item.category.displayName) #\(ordinal) · \(relativeAge(completionTime)) · Unread")
+        let title = titles[item.id]
+        let genericText = "Completed · \(item.category.displayName) #\(ordinal) · \(relativeAge(completionTime)) · Unread"
+        let label = NSTextField(
+            labelWithString: title.map {
+                "\($0) · Completed · \(item.category.displayName) · \(relativeAge(completionTime)) · Unread"
+            } ?? genericText
+        )
         label.font = .systemFont(ofSize: 13, weight: .medium)
         label.textColor = resolvedActivityColor(.systemGreen)
         label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
+        label.widthAnchor.constraint(lessThanOrEqualToConstant: 320).isActive = true
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         label.setAccessibilityElement(true)
         label.setAccessibilityRole(.staticText)
-        label.setAccessibilityLabel("Completed unread session \(ordinal)")
+        label.setAccessibilityLabel(
+            title.map { "\($0), completed unread session \(ordinal)" }
+                ?? "Completed unread session \(ordinal)"
+        )
         label.setAccessibilityValue("\(item.category.displayName), completed \(relativeAge(completionTime))")
         label.setAccessibilityHelp(
             openableIDs.contains(item.id)
