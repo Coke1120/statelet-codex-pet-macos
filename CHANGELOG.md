@@ -5,7 +5,7 @@ versioning for the public source release.
 
 ## Unreleased
 
-## [1.8.8] - 2026-08-19
+## [1.8.9] - 2026-08-19
 
 ### Fixed
 
@@ -23,14 +23,30 @@ versioning for the public source release.
 
 ### Distribution notes
 
-- Version 1.8.8 supersedes 1.8.7 with the exact-process, shutdown, and
-  rendered-row hardening above; title text remains memory-only.
+- Version 1.8.9 supersedes 1.8.8 with the exact-process, shutdown, and
+  rendered-row hardening above while retaining 1.8.8's unloaded-thread
+  compatibility behavior; title text remains memory-only.
 - No task title, technical thread identifier, conversation preview, turn,
   prompt, transcript, character media, voice data, or other private runtime
   data is bundled or persisted by title hydration.
 - The package remains ad-hoc signed for owner-authorized personal updates. It
   is not Developer ID signed, notarized, or presented as an Apple-authorized
   public binary.
+
+## [1.8.8] - 2026-08-19
+
+### Fixed
+
+- A displayed row whose Codex thread is no longer loaded no longer aborts task
+  title hydration for other valid rows. Statelet accepts only the exact bounded
+  App Server `thread not loaded` response as a missing title and continues the
+  batch; malformed, mismatched, or unrelated protocol errors still fail closed.
+
+### Distribution notes
+
+- Version 1.8.8 supersedes 1.8.7 after live mixed loaded/unloaded task targets
+  exposed this compatibility edge case. The title remains memory-only, and a
+  missing title does not disable **Open in Codex** or change lifecycle state.
 
 ## [1.8.7] - 2026-08-19
 
@@ -367,6 +383,7 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
+[1.8.9]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.9
 [1.8.8]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.8
 [1.8.7]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.7
 [1.8.5]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.5
