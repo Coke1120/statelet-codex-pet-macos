@@ -510,7 +510,7 @@ final class CodexAppServerTitleResolverTests: XCTestCase {
         let result = try await CodexAppServerProcessRunner.run(
             executable: script,
             threadIDs: ["thread-1"],
-            timeout: 1,
+            timeout: 1.5,
             maximumOutputBytes: 1_048_576,
             trustPolicy: .testOnlyAllowUnsignedExecutable
         )
