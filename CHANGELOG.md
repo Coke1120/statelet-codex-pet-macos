@@ -5,6 +5,43 @@ versioning for the public source release.
 
 ## Unreleased
 
+## [1.8.5] - 2026-08-19
+
+### Added
+
+- Owner-authorized personal update packages with a pinned Ed25519 manifest
+  signature, immutable repository and `main` commit binding, and exactly one
+  app ZIP plus its manifest and signature on tagged releases.
+- Privacy-safe **Open in Codex** actions for supported pinned session targets;
+  private target details remain outside the public activity feed.
+
+### Changed
+
+- Settings now uses a native unified Tahoe titlebar, full-height source-list
+  sidebar, real toolbar reset item, semantic material cards, and consistent
+  page headers while retaining macOS 13 compatibility.
+- Settings destinations are grouped as App, Pet Content, Create Media, and
+  Support, with stable persisted IDs, monochrome system symbols, and clearer
+  names for Dialogue & Voice and Source Requirements.
+- Sidebar rows and section cards rely on native AppKit selection and grouping
+  semantics so keyboard and assistive navigation avoid duplicate announcements.
+
+### Fixed
+
+- Lifecycle records now retain bounded private correlation fences so delayed
+  or conflicting callbacks cannot silently replace newer turn and tool phases.
+
+### Distribution notes
+
+- No character, animation, voice model, reference audio, session record, or
+  other private runtime data is bundled.
+- Version 1.8.5 is the first workflow-produced personal update package. An
+  existing 1.8.4 or earlier install requires this one manual bootstrap update;
+  later signed releases can install at a verified safe restart boundary.
+- The package is ad-hoc signed for owner-authorized personal updates. It is not
+  Developer ID signed, notarized, or presented as an Apple-authorized public
+  binary.
+
 ## [1.8.4] - 2026-08-18
 
 ### Added
@@ -266,6 +303,7 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
+[1.8.5]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.5
 [1.8.4]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.4
 [1.8.3]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.3
 [1.8.2]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.2

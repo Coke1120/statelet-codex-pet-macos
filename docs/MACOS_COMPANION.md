@@ -1,7 +1,7 @@
 # Statelet lifecycle and media reference
 
-This reference documents the internal contracts behind Statelet 1.8.4 (build
-18), the native Codex lifecycle companion for macOS. Start with
+This reference documents the internal contracts behind Statelet 1.8.5 (build
+19), the native Codex lifecycle companion for macOS. Start with
 [Deployment](DEPLOYMENT.md) for installation or [Using Statelet](USAGE.md) for
 daily operation.
 
@@ -15,10 +15,10 @@ state file.
 No animation media is bundled. MP4, MOV, poster, and report files remain
 user-supplied local content.
 
-Statelet 1.8.4 is source-only. `build_app.sh` creates an ad-hoc-signed app for
-personal local use; future update tags may attach that package for installs
-that already pin the repository key, but it is not Developer ID signed or
-notarized.
+Statelet 1.8.5 is the first tag with a workflow-produced, ad-hoc-signed personal
+update package. Existing 1.8.4 or earlier installs require one manual bootstrap
+update before later tags can install at a safe restart boundary. The package is
+not Developer ID signed or notarized.
 Owner-authorized updates use a pinned Ed25519 repository key plus a signed
 GitHub release manifest; this is Statelet's personal-update authority, not a
 replacement for Developer ID and notarization in public distribution.
@@ -249,7 +249,7 @@ Imported files live under:
 ```
 
 Downloads and Finder paths are import sources only; `Statelet.app` remains
-media-free. Settings → Help and Settings → General show this managed location
+media-free. Settings → Help & Updates and Settings → General show this managed location
 and offer an explicit Finder action without relocating or deleting an external
 source.
 

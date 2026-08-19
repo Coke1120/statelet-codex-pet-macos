@@ -1,11 +1,12 @@
 # Deploy Statelet on macOS
 
 This guide covers building, installing, upgrading, starting automatically, and
-uninstalling Statelet 1.8.4 (build 18) on macOS 13 or newer.
+uninstalling Statelet 1.8.5 (build 19) on macOS 13 or newer.
 
-The first public release is source-only. The maintained build script produces
-an ad-hoc-signed `.app` for personal local use. It does not produce a DMG,
-Developer ID signature, notarization ticket, or App Store package.
+Releases through 1.8.4 were source-only. The 1.8.5 tagged release adds an
+ad-hoc-signed personal-update ZIP, manifest, and signature. The maintained
+build script still does not produce a DMG, Developer ID signature, notarization
+ticket, or App Store package.
 
 The in-app updater uses a separate repository authority for personal installs.
 Statelet pins the project's Ed25519 release public key and immutable GitHub
@@ -148,11 +149,11 @@ bash mac/CodexPetMac/scripts/install.sh --no-player-launch-agent
 open "$HOME/Applications/Statelet.app"
 ```
 
-After a normal installation, use **Settings → Diagnostics → Start Statelet when
+After a normal installation, use **Settings → General → Start Statelet when
 I log in** to control future logins. Turning it off does not quit the current
 process. Managed upgrades preserve that preference.
 
-Use **Repair Startup…** only when Diagnostics reports a missing or stale managed
+Use **Repair Startup…** only when Diagnostics & Repair reports a missing or stale managed
 player startup item. Repair validates the installed app and changes only the
 `statelet-v2`-marked player LaunchAgent. It does not edit Codex hooks or the
 state aggregator.
@@ -350,9 +351,9 @@ ZIP, then retains its existing file hash, bundle identity, version,
 architecture, minimum-macOS, transactional journal, backup, and rollback
 checks. The package's ad-hoc code signature must also be internally valid.
 
-The currently installed v1.8.4 build predates this pinned-key trust path. The
-first build containing it must therefore be installed manually; subsequent
-workflow-produced releases can update that build at the next safe restart.
+Version 1.8.5 is the first build containing this pinned-key trust path. An
+existing v1.8.4 or earlier build must therefore install 1.8.5 manually;
+subsequent workflow-produced releases can update it at the next safe restart.
 Rotating or losing the private key likewise requires a manually installed
 bootstrap build unless a prior authorized release ships an overlapping key.
 
@@ -374,8 +375,9 @@ binary. Before promoting a Statelet binary for ordinary public installation:
 8. complete a rights review for every bundled visual asset.
 
 A DMG is only an optional presentation container. It does not replace signing
-or notarization. Statelet 1.8.4 therefore published source only; later personal
-update assets remain distinct from a supported public binary distribution.
+or notarization. Releases through Statelet 1.8.4 therefore published source
+only; 1.8.5 and later personal update assets remain distinct from a supported
+public binary distribution.
 
 ## Release verification
 

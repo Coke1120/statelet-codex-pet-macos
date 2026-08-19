@@ -4,7 +4,7 @@ Statelet is a personal-local Codex lifecycle companion for macOS 13 or newer.
 It is an AppKit accessory application: the transparent panel can be moved by dragging
 its body and resized from any border or corner without taking keyboard focus,
 AVFoundation owns exactly one decoder, and the menu-bar item keeps click-through
-recoverable. The current app version is 1.8.4 (build 18). New builds and
+recoverable. The current app version is 1.8.5 (build 19). New builds and
 installations use
 `Statelet.app`, bundle identifier `com.coke1120.Statelet`, `CFBundleName` and
 executable `Statelet`, Application Support under
@@ -294,9 +294,9 @@ readiness honestly. It requires `ffmpeg`, `ffprobe`, Apple's `avconvert`, and a
 Python 3 executable with NumPy and Pillow; set `STATELET_ALPHA_PYTHON` before
 launch when the desired Python is not found automatically.
 
-Version 1.5.0 renames the former **Help** pane to **Prompts**. It includes
-copy-ready, vendor-neutral prompts for the four lifecycle states. The
-**Recommendation** pane defines the source target:
+Version 1.5.0 renamed the former **Help** pane to **Prompts**. The current
+**Prompt Generator** destination includes copy-ready, vendor-neutral prompts
+for the four lifecycle states. **Source Requirements** defines the source target:
 pixel-identical first and last frames; a completely uniform RGB `#00FF00` pure
 green background; and no white background, scene, floor, material texture,
 shadow, reflection, particles, text, logo, or watermark. It also requires a
@@ -305,7 +305,7 @@ framing. Google Omni or Grok Imagine, Minimax H3, Seedance 2.5, and LSX2.3 are
 listed only as user-provided generator examples, not endorsements or claims
 about availability, features, or output quality.
 
-The current **Help** pane is separate from **Prompts**. It collects first-run,
+The current **Help & Updates** destination is separate from **Prompt Generator**. It collects first-run,
 lifecycle, animation, voice/privacy, recovery, and diagnostics guidance and
 shows the installed version plus the privacy-safe update status. Automatic
 checks do not block the local app; verified installation waits for a safe
@@ -314,9 +314,10 @@ fail-closed until a release artifact carries the pinned Statelet repository
 signature. The signed manifest binds the immutable GitHub repository, `main`
 tag commit, version/build, package identity, size, and SHA-256 before download.
 A configured Developer ID team remains an additional Apple/Gatekeeper check,
-while owner-authorized personal updates may remain ad-hoc signed. The existing
-v1.8.4 app still requires one manual bootstrap install because it predates the
-pinned repository key.
+while owner-authorized personal updates may remain ad-hoc signed. Version 1.8.5
+is the first build containing the pinned repository key, so an existing v1.8.4
+or earlier app requires one manual bootstrap install before later signed tags
+can update themselves.
 
 Only convert character media you own or are authorized to use for the intended
 derivative and distribution scope. Keep private input, alpha masters, reports,
@@ -427,7 +428,7 @@ also right-click the pet to open the same context menu. When click-through is
 enabled, the pet intentionally ignores mouse events; the Statelet menu-bar icon is
 the recovery path.
 
-After installation, **Settings → Diagnostics → Start Statelet when I log in**
+After installation, **Settings → General → Start Statelet when I log in**
 controls future logins. Turning it off updates only the marked player startup
 item and leaves the current app open. A later managed installer upgrade
 preserves this choice.
@@ -460,7 +461,7 @@ media. Settings imports authorized media into:
 
 The Settings window presents its eight destinations in a persistent native
 sidebar. Settings → Appearance owns the dialogue-bubble contrast controls and
-the activity-popup background/opacity controls; Settings → General and Help
+the activity-popup background/opacity controls; Settings → General and Help & Updates
 show the same managed-media location with an **Open in Finder** action. The
 activity popup is draggable when click-through is disabled and remembers its
 position. Rows with a fresh owner-only target expose **Open in Codex** through
@@ -684,13 +685,13 @@ while a retimed clip labels the source rate as nominal. A Reduce Motion poster
 displays `Still`. Appearance-only changes update the window without restarting
 the active animation. The **General** pane controls size, always-on-top,
 full-screen Space behavior, position reset, click-through, Reduce Motion
-status, **Show App in Finder**, and Finder access to media, the map, and logs.
+status, **Show App in Finder**, and Finder access to media and the map.
 The menu-bar item remains the recovery path and can also reveal the media
 directory or quit the player.
 
-The **Diagnostics** pane builds a sanitized, copyable status report. It contains
-only app version/build and managed-bundle status; requested and last accepted
-live lifecycle state; publisher health/source/ages, publication and accepted
+The **Diagnostics & Repair** pane builds a sanitized, copyable status report.
+It contains only app version/build and managed-bundle status; requested and
+last accepted live lifecycle state; publisher health/source/ages, publication and accepted
 revisions, recovery status, latest accepted hook event/time, active-session
 count, and aggregate state; bounded rejection categories/counts; preview or
 fallback override status; playback mode and selected movie kind/extension;

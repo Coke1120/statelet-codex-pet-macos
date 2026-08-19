@@ -11,9 +11,10 @@ transparent desktop presence. It runs without a development board, keeps its
 runtime data on the Mac, and uses AppKit and AVFoundation rather than a browser
 runtime.
 
-Statelet 1.8.4 (build 18) requires macOS 13 or newer. That release remains
-source-only. Future tags may attach an ad-hoc-signed update package for existing
-personal installs; it is not a Developer ID-signed or notarized public binary.
+Statelet 1.8.5 (build 19) requires macOS 13 or newer. Its tagged release attaches
+an ad-hoc-signed package for owner-authorized personal updates; it is not a
+Developer ID-signed or notarized public binary. Existing 1.8.4 or earlier
+installs require one manual bootstrap update to 1.8.5.
 
 For personal installs, future tagged releases can use Statelet's pinned
 Ed25519 repository key: the maintained workflow signs a manifest binding the
@@ -48,7 +49,7 @@ an Apple-authorized public binary.
   posters, appearance controls, diagnostics, and recoverable media cleanup.
 - Supports an optional character-owned same-state transition for each lifecycle
   state, triggered only by automatic continuous `clip_end` rotation.
-- Includes a dedicated Settings → Help guide and privacy-safe in-app update checks.
+- Includes a dedicated Settings → Help & Updates guide and privacy-safe in-app update checks.
 - Runs the lifecycle publisher with the Python standard library; Python media
   packages are needed only for optional MP4 conversion.
 
@@ -248,7 +249,7 @@ appearance, resize, FPS, prompts, deletion, and recovery behavior.
 
 ## Dialogue and local voice
 
-The **Voice** Settings pane has separate **Dialogue** and **Voice Setup** pages.
+The **Dialogue & Voice** Settings pane has separate **Dialogue** and **Voice Setup** pages.
 Dialogue assigns every message and generated voice to Idle, Running, Waiting,
 or Review, and provides preview, retry, and regeneration controls. When a new
 lifecycle state is presented, Statelet shows its selected message on the pet
@@ -325,8 +326,9 @@ a public report.
 ## Limitations
 
 - macOS 13 or newer is the only supported runtime.
-- The first public release is source-only. The generated app is ad-hoc signed,
-  is not notarized, and is not offered as a public binary or DMG.
+- Releases through 1.8.4 were source-only. Version 1.8.5 adds an ad-hoc-signed
+  personal-update ZIP, manifest, and signature; it is not notarized or offered
+  as an Apple-authorized public binary or DMG.
 - No animation media is bundled; users supply authorized media.
 - No TTS runtime, model weights, reference recordings, dialogue, or generated
   speech is bundled. Voice generation requires either a user-managed local
@@ -354,8 +356,8 @@ Statelet uses one canonical identity for new builds and installations:
 | Application Support | `~/Library/Application Support/Statelet` |
 | LaunchAgents | `com.coke1120.statelet.state-aggregator`, `com.coke1120.statelet.mac-player` |
 | Managed marker | `statelet-v2` |
-| App version | `1.8.4` |
-| Build number | `18` |
+| App version | `1.8.5` |
+| Build number | `19` |
 
 ## Uninstall
 

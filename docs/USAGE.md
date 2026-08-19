@@ -107,7 +107,7 @@ The runtime media, media maps, conversion reports, and character libraries live
 there and remain playable if the original source is moved or removed. Statelet
 does not put user media inside the signed `Statelet.app` bundle, silently delete
 external sources, or publish private media in source, diagnostics, telemetry,
-or update artifacts. Settings → Help and Settings → General both expose the
+or update artifacts. Settings → Help & Updates and Settings → General both expose the
 managed location and an **Open in Finder** action.
 
 ## Move, resize, and interact
@@ -474,7 +474,7 @@ state-only removal. Removing the active or fixed entry selects from the
 remaining library. Removing the last entry removes that state mapping and uses
 the normal no-media fallback.
 
-Use **Settings → Diagnostics → Clean Unused Media…** to find recognized files
+Use **Settings → Diagnostics & Repair → Clean Unused Media…** to find recognized files
 inside the managed media directory that no character playlist references.
 Statelet loads every profile map before considering a file unused; a missing or
 invalid inactive map makes cleanup fail closed instead of risking shared media.
@@ -486,10 +486,10 @@ them.
 
 ## Dialogue and local voice
 
-Open **Settings → Voice**. Use **Voice Setup** to configure one local
+Open **Settings → Dialogue & Voice**. Use **Voice Setup** to configure one local
 GPT-SoVITS, Qwen3-TTS, or VoxCPM2 voice profile, then use **Dialogue** to enter
 text and manage generated lines.
-If no profile has been saved yet, Voice opens on Voice Setup; otherwise it opens
+If no profile has been saved yet, Dialogue & Voice opens on Voice Setup; otherwise it opens
 on Dialogue and remembers subsequent page changes while Settings remains open.
 
 1. Start GPT-SoVITS API v2 on this Mac. The default endpoint is
@@ -545,7 +545,7 @@ files remain protected until their replacements generate successfully.
 
 ### VoxCPM2 setup and recovery
 
-Select **VoxCPM2** in **Settings → Voice → Voice Setup** and complete the three
+Select **VoxCPM2** in **Settings → Dialogue & Voice → Voice Setup** and complete the three
 pickers: the complete trusted handover directory, one reference WAV, and the
 Python executable from the prepared VoxCPM2 environment. Import the entire
 folder; selecting only `model.safetensors` is not sufficient because the
@@ -597,10 +597,11 @@ cleanup record, reports the deferred cleanup, and retries it at next launch.
 
 ## Appearance, resizing, and FPS
 
-Settings uses a persistent native left sidebar for Animations, Voice,
-Appearance, General, Diagnostics, Help, Prompts, and Recommendation. Selecting
-a row swaps only the detail pane; the sidebar remains available while long
-content scrolls.
+Settings uses a persistent native left sidebar grouped as App, Pet Content,
+Create Media, and Support. Its destinations are General, Appearance,
+Animations, Dialogue & Voice, Prompt Generator, Source Requirements, Help &
+Updates, and Diagnostics & Repair. Selecting a row swaps only the detail pane;
+the sidebar remains available while long content scrolls.
 
 Open **Settings → Appearance** to configure:
 
@@ -623,7 +624,7 @@ rendered frames. Reduce Motion posters display `Still`.
 
 ## Help, updates, prompts and source recommendations
 
-**Settings → Help** is the local first-run and recovery guide. It explains the
+**Settings → Help & Updates** is the local first-run and recovery guide. It explains the
 four lifecycle states, animation and voice privacy boundaries, click-through
 recovery, and diagnostics. It also shows the installed version and update
 status. Statelet checks for releases automatically at launch and at most once
@@ -635,11 +636,12 @@ pinned Statelet repository release key, matches the immutable GitHub repository
 and `main` tag commit, and passes the manifest, bundle identity, architecture,
 macOS, checksum, code-signature-integrity, and transaction-journal checks. A
 configured Developer ID team adds Apple signature and Gatekeeper validation,
-but is not required for owner-authorized personal updates. The currently
-installed v1.8.4 build predates this trust path and needs one manual bootstrap
-install before later signed releases can install themselves.
+but is not required for owner-authorized personal updates. Version 1.8.5 is the
+first build containing this trust path, so an existing v1.8.4 or earlier install
+needs one manual bootstrap update before later signed releases can install
+themselves.
 
-**Settings → Prompts** provides copy-ready, vendor-neutral authoring prompts for
+**Settings → Prompt Generator** provides copy-ready, vendor-neutral authoring prompts for
 Idle, Running, Waiting, and Review. Replace the character placeholder with a
 description you own or are authorized to use.
 
@@ -667,7 +669,7 @@ Use one state-specific action:
 | Waiting | Calm expectant pose with a subtle toe tap or weight shift |
 | Review | Thoughtful in-place review gesture, such as hand to chin |
 
-The adjacent **Recommendation** pane repeats the exact green-background,
+The adjacent **Source Requirements** pane repeats the exact green-background,
 fixed-camera, clean-frame, and seamless-loop contract. Named generators are
 examples supplied by users, not endorsements, availability claims, or proof
 that a service can produce acceptable media.
@@ -678,7 +680,7 @@ change; verify them independently before uploading private or licensed artwork.
 
 ## Diagnostics and recovery
 
-Open **Settings → Diagnostics** and choose **Refresh**. The report includes:
+Open **Settings → Diagnostics & Repair** and choose **Refresh**. The report includes:
 
 - app version/build and managed installation status;
 - requested and last accepted live state, publisher health, publication ages
