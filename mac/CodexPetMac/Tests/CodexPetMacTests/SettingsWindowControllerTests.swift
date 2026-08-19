@@ -292,9 +292,8 @@ final class SettingsWindowControllerTests: XCTestCase {
         }
         XCTAssertTrue(cards.allSatisfy { Self.descendants(of: $0).count > 3 })
         XCTAssertFalse(
-            Self.descendants(of: window.contentView)
-                .compactMap { $0 as? NSVisualEffectView }
-                .contains { $0.material == .sidebar }
+            sidebarView is NSVisualEffectView,
+            "the native split item, rather than a custom material wrapper, should own the sidebar"
         )
     }
 
