@@ -5,6 +5,34 @@ private final class TopAlignedSettingsDocumentView: NSView {
     override var isFlipped: Bool { true }
 }
 
+private final class SettingsWindow: NSWindow {
+    var onWillApplySize: ((NSSize) -> Void)?
+
+    override func setContentSize(_ size: NSSize) {
+        onWillApplySize?(size)
+        super.setContentSize(size)
+    }
+
+    override func setFrame(_ frameRect: NSRect, display flag: Bool) {
+        onWillApplySize?(frameRect.size)
+        super.setFrame(frameRect, display: flag)
+    }
+
+    override func setFrame(_ frameRect: NSRect, display flag: Bool, animate animateFlag: Bool) {
+        onWillApplySize?(frameRect.size)
+        super.setFrame(frameRect, display: flag, animate: animateFlag)
+    }
+}
+
+private enum SettingsVisualMetrics {
+    static let pageTitleSize: CGFloat = 22
+    static let pageHeaderSpacing: CGFloat = 4
+    static let pageSectionSpacing: CGFloat = 16
+    static let cardCornerRadius: CGFloat = 14
+    static let cardInset: CGFloat = 16
+    static let cardContentSpacing: CGFloat = 10
+}
+
 private final class SessionActivityAppearancePreviewView: NSView {
     private let label = NSTextField(labelWithString: "Running · Tool #1 · just now")
 
@@ -105,6 +133,7 @@ private final class DialogueAppearancePreviewView: NSView {
 }
 
 private final class SettingsAnimationsPaneView: NSView {
+    weak var headerView: NSView?
     weak var statusView: NSView?
     weak var modeView: NSView?
     weak var libraryView: NSView?
@@ -112,14 +141,21 @@ private final class SettingsAnimationsPaneView: NSView {
 
     override func layout() {
         super.layout()
-        guard let statusView, let modeView, let libraryView, let footerView else { return }
+        guard let headerView, let statusView, let modeView, let libraryView, let footerView else { return }
 
+        let headerHeight: CGFloat = 50
         let statusHeight: CGFloat = 42
         let modeHeight: CGFloat = 24
         let footerHeight: CGFloat = 20
+        headerView.frame = NSRect(
+            x: 0,
+            y: max(0, bounds.height - headerHeight),
+            width: bounds.width,
+            height: headerHeight
+        )
         statusView.frame = NSRect(
             x: 0,
-            y: max(0, bounds.height - statusHeight),
+            y: max(0, headerView.frame.minY - SettingsVisualMetrics.pageSectionSpacing - statusHeight),
             width: bounds.width,
             height: statusHeight
         )
@@ -271,22 +307,95 @@ enum SettingsWindowSizeStore {
     }
 }
 
+private enum SettingsSection: String, CaseIterable {
+    case animations
+    case voice
+    case appearance
+    case general
+    case diagnostics
+    case help
+    case prompts
+    case recommendation
+
+    var legacyIndex: Int {
+        switch self {
+        case .animations: return 0
+        case .voice: return 1
+        case .appearance: return 2
+        case .general: return 3
+        case .diagnostics: return 4
+        case .help: return 5
+        case .prompts: return 6
+        case .recommendation: return 7
+        }
+    }
+
+    init?(legacyIndex: Int) {
+        guard let section = Self.allCases.first(where: { $0.legacyIndex == legacyIndex }) else {
+            return nil
+        }
+        self = section
+    }
+
+    var symbolName: String {
+        switch self {
+        case .general: return "gearshape"
+        case .appearance: return "paintbrush"
+        case .animations: return "film"
+        case .voice: return "waveform"
+        case .prompts: return "text.bubble"
+        case .recommendation: return "checklist"
+        case .help: return "questionmark.circle"
+        case .diagnostics: return "stethoscope"
+        }
+    }
+}
+
+private enum SettingsSidebarItem {
+    case group(String)
+    case section(SettingsSection, String)
+
+    var title: String {
+        switch self {
+        case let .group(title), let .section(_, title): return title
+        }
+    }
+
+    var section: SettingsSection? {
+        guard case let .section(section, _) = self else { return nil }
+        return section
+    }
+
+    var isGroup: Bool {
+        if case .group = self { return true }
+        return false
+    }
+}
+
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private static let defaultStateLabelCustomColor = "#007AFF"
     private static let preferredContentSize = NSSize(width: 760, height: 650)
     private static let minimumContentSize = NSSize(width: 700, height: 570)
     private static let screenMargin: CGFloat = 12
-    private static let sidebarWidth: CGFloat = 148
-    private static let selectedSectionDefaultsKey = "Statelet.Settings.selectedSection"
-    private static let sectionLabels = [
-        "Animations",
-        "Voice",
-        "Appearance",
-        "General",
-        "Diagnostics",
-        "Help",
-        "Prompts",
-        "Recommendation",
+    private static let sidebarWidth: CGFloat = 218
+    private static let selectedSectionIDDefaultsKey = "Statelet.Settings.selectedSectionID"
+    private static let legacySelectedSectionDefaultsKey = "Statelet.Settings.selectedSection"
+    private static let resetWindowSizeToolbarItemIdentifier = NSToolbarItem.Identifier(
+        "StateletSettingsResetWindowSize"
+    )
+    private static let sidebarItems: [SettingsSidebarItem] = [
+        .group("App"),
+        .section(.general, "General"),
+        .section(.appearance, "Appearance"),
+        .group("Pet Content"),
+        .section(.animations, "Animations"),
+        .section(.voice, "Dialogue & Voice"),
+        .group("Create Media"),
+        .section(.prompts, "Prompt Generator"),
+        .section(.recommendation, "Source Requirements"),
+        .group("Support"),
+        .section(.help, "Help & Updates"),
+        .section(.diagnostics, "Diagnostics & Repair"),
     ]
 
     var onImportMP4: ((PetState) -> Void)?
@@ -357,10 +466,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     var onTransitionModeChange: ((TransitionLibraryScope, SettingsTransitionRoute, MediaPlaybackMode) -> Void)?
     var onSetFixedTransition: ((TransitionLibraryScope, SettingsTransitionRoute, String) -> Void)?
 
-    private let sidebar = NSVisualEffectView()
+    private let splitViewController = NSSplitViewController()
+    private let sidebarViewController = NSViewController()
+    private let detailViewController = NSViewController()
+    private let sidebar = NSView()
+    private let detailView = NSView()
     private let sidebarScrollView = NSScrollView()
     private let sidebarTableView = NSTableView()
-    private let sidebarDivider = NSBox()
     private let paneHost = NSView()
     private let animationsPane = SettingsAnimationsPaneView()
     private let dialogueVoiceView = DialogueVoiceSettingsView()
@@ -404,7 +516,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let stateLabelColorWell = NSColorWell()
     private let stateLabelPositionPopup = NSPopUpButton()
     private let stateLabelSizePopup = NSPopUpButton()
-    private let resetSettingsWindowSizeButton = NSButton(title: "Reset Window Size", target: nil, action: nil)
     private let fpsEnabledCheckbox = NSButton(checkboxWithTitle: "Show video FPS", target: nil, action: nil)
     private let fpsColorWell = NSColorWell()
     private let fpsSizePopup = NSPopUpButton()
@@ -455,10 +566,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private var displayedAnimationLibraryConstraints: [NSLayoutConstraint] = []
     private var minimumPaneWidthConstraint: NSLayoutConstraint?
     private var minimumPaneHeightConstraint: NSLayoutConstraint?
+    private var windowContentWidthConstraint: NSLayoutConstraint?
+    private var windowContentHeightConstraint: NSLayoutConstraint?
+    private var isRefreshingSidebarSelection = false
     private var hasShownWindow = false
     private let defaults: UserDefaults
     private var sessionActivityAppearance = try! SessionActivityPanelAppearance()
-    private var selectedSectionIndex = 0
+    private var selectedSection: SettingsSection = .general
     private var usePreferredSizeOnFirstShow = true
     private var aspectRatio = 1.5
     private let stateLabelPositions: [StateLabelPosition] = [.topLeft, .topRight, .bottomLeft, .bottomRight]
@@ -468,52 +582,44 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         self.defaults = defaults
         let restoredSize = SettingsWindowSizeStore.restored(from: defaults)
         usePreferredSizeOnFirstShow = restoredSize == nil
-        let window = NSWindow(
+        let toolbar = NSToolbar(identifier: NSToolbar.Identifier("StateletSettingsToolbar"))
+        toolbar.allowsUserCustomization = false
+        toolbar.autosavesConfiguration = false
+        toolbar.displayMode = .iconOnly
+        toolbar.sizeMode = .regular
+        toolbar.showsBaselineSeparator = false
+        let window = SettingsWindow(
             contentRect: NSRect(origin: .zero, size: restoredSize ?? Self.preferredContentSize),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         window.title = "Statelet Settings"
+        window.toolbarStyle = .unified
+        window.titlebarAppearsTransparent = true
+        window.tabbingMode = .disallowed
         window.contentMinSize = Self.minimumContentSize
         window.isReleasedWhenClosed = false
         window.center()
         super.init(window: window)
         window.delegate = self
-        if defaults.object(forKey: Self.selectedSectionDefaultsKey) != nil {
-            let restoredSection = defaults.integer(forKey: Self.selectedSectionDefaultsKey)
-            if Self.sectionLabels.indices.contains(restoredSection) {
-                selectedSectionIndex = restoredSection
-            }
+        toolbar.delegate = self
+        window.toolbar = toolbar
+        if let storedID = defaults.string(forKey: Self.selectedSectionIDDefaultsKey),
+           let restoredSection = SettingsSection(rawValue: storedID) {
+            selectedSection = restoredSection
+        } else if defaults.object(forKey: Self.legacySelectedSectionDefaultsKey) != nil,
+                  let restoredSection = SettingsSection(
+                      legacyIndex: defaults.integer(forKey: Self.legacySelectedSectionDefaultsKey)
+                  ) {
+            selectedSection = restoredSection
         }
         buildInterface()
-        configureWindowActions()
         fitWindowToVisibleScreen(usePreferredSize: false)
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    private func configureWindowActions() {
-        resetSettingsWindowSizeButton.target = self
-        resetSettingsWindowSizeButton.action = #selector(resetSettingsWindowSize)
-        resetSettingsWindowSizeButton.controlSize = .small
-        resetSettingsWindowSizeButton.bezelStyle = .texturedRounded
-        resetSettingsWindowSizeButton.setAccessibilityLabel("Reset Settings Window Size")
-        resetSettingsWindowSizeButton.setAccessibilityHelp(
-            "Restore the default Settings window size without changing the pet window."
-        )
-        resetSettingsWindowSizeButton.toolTip = "Restore the default Settings window size"
-
-        let accessory = NSTitlebarAccessoryViewController()
-        accessory.layoutAttribute = .right
-        let accessoryView = NSView(frame: NSRect(x: 0, y: 0, width: 132, height: 22))
-        resetSettingsWindowSizeButton.frame = accessoryView.bounds
-        resetSettingsWindowSizeButton.autoresizingMask = [.width, .height]
-        accessoryView.addSubview(resetSettingsWindowSizeButton)
-        accessory.view = accessoryView
-        window?.addTitlebarAccessoryViewController(accessory)
-    }
 
     func show() {
         NSApp.activate(ignoringOtherApps: true)
@@ -694,12 +800,24 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func buildInterface() {
-        guard let contentView = window?.contentView else { return }
-        let initialSectionIndex = selectedSectionIndex
-        sidebar.translatesAutoresizingMaskIntoConstraints = false
-        sidebar.material = .sidebar
-        sidebar.blendingMode = .behindWindow
-        sidebar.state = .followsWindowActiveState
+        guard let window else { return }
+        let initialSection = selectedSection
+        let requestedContentSize = window.contentView?.bounds.size ?? window.contentLayoutRect.size
+
+        sidebarViewController.view = sidebar
+        detailViewController.view = detailView
+        splitViewController.splitView.isVertical = true
+        splitViewController.splitView.dividerStyle = .thin
+        splitViewController.splitView.setAccessibilityLabel("Settings sidebar and detail")
+        let sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebarViewController)
+        sidebarItem.canCollapse = false
+        sidebarItem.minimumThickness = Self.sidebarWidth
+        sidebarItem.maximumThickness = Self.sidebarWidth
+        let detailItem = NSSplitViewItem(viewController: detailViewController)
+        splitViewController.addSplitViewItem(sidebarItem)
+        splitViewController.addSplitViewItem(detailItem)
+        updateSplitPreferredContentSizes(for: requestedContentSize)
+
         sidebar.setAccessibilityElement(false)
         sidebarScrollView.translatesAutoresizingMaskIntoConstraints = false
         sidebarScrollView.documentView = sidebarTableView
@@ -724,8 +842,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         sidebarColumn.resizingMask = .autoresizingMask
         sidebarTableView.addTableColumn(sidebarColumn)
         sidebar.addSubview(sidebarScrollView)
-        sidebarDivider.translatesAutoresizingMaskIntoConstraints = false
-        sidebarDivider.boxType = .separator
         paneHost.translatesAutoresizingMaskIntoConstraints = false
         animationsPane.translatesAutoresizingMaskIntoConstraints = false
         dialogueVoiceView.translatesAutoresizingMaskIntoConstraints = false
@@ -747,32 +863,22 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         ] {
             pane.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         }
-        contentView.addSubview(sidebar)
-        contentView.addSubview(sidebarDivider)
-        contentView.addSubview(paneHost)
-        let minimumPaneWidth = paneHost.widthAnchor.constraint(greaterThanOrEqualToConstant: 495)
-        let minimumPaneHeight = paneHost.heightAnchor.constraint(greaterThanOrEqualToConstant: 534)
+        detailView.addSubview(paneHost)
+        let minimumPaneWidth = paneHost.widthAnchor.constraint(greaterThanOrEqualToConstant: 438)
+        let minimumPaneHeight = paneHost.heightAnchor.constraint(greaterThanOrEqualToConstant: 470)
         minimumPaneWidthConstraint = minimumPaneWidth
         minimumPaneHeightConstraint = minimumPaneHeight
         NSLayoutConstraint.activate([
             minimumPaneWidth,
             minimumPaneHeight,
-            sidebar.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
-            sidebar.topAnchor.constraint(equalTo: contentView.topAnchor),
-            sidebar.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
-            sidebar.widthAnchor.constraint(equalToConstant: Self.sidebarWidth),
             sidebarScrollView.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 8),
             sidebarScrollView.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -8),
-            sidebarScrollView.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 16),
-            sidebarScrollView.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor, constant: -12),
-            sidebarDivider.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
-            sidebarDivider.widthAnchor.constraint(equalToConstant: 1),
-            sidebarDivider.topAnchor.constraint(equalTo: contentView.topAnchor),
-            sidebarDivider.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
-            paneHost.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 18),
-            paneHost.leadingAnchor.constraint(equalTo: sidebarDivider.trailingAnchor, constant: 16),
-            paneHost.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
-            paneHost.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -18),
+            sidebarScrollView.topAnchor.constraint(equalTo: sidebar.safeAreaLayoutGuide.topAnchor, constant: 16),
+            sidebarScrollView.bottomAnchor.constraint(equalTo: sidebar.safeAreaLayoutGuide.bottomAnchor, constant: -12),
+            paneHost.topAnchor.constraint(equalTo: detailView.safeAreaLayoutGuide.topAnchor, constant: 18),
+            paneHost.leadingAnchor.constraint(equalTo: detailView.safeAreaLayoutGuide.leadingAnchor, constant: 16),
+            paneHost.trailingAnchor.constraint(equalTo: detailView.safeAreaLayoutGuide.trailingAnchor, constant: -20),
+            paneHost.bottomAnchor.constraint(equalTo: detailView.safeAreaLayoutGuide.bottomAnchor, constant: -18),
         ])
         buildAnimationsPane()
         configureDialogueVoicePane()
@@ -783,11 +889,34 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         buildPromptsPane()
         buildRecommendationPane()
         sidebarTableView.reloadData()
-        sidebarTableView.selectRowIndexes(IndexSet(integer: initialSectionIndex), byExtendingSelection: false)
+        if let initialRow = Self.sidebarRow(for: initialSection) {
+            sidebarTableView.selectRowIndexes(IndexSet(integer: initialRow), byExtendingSelection: false)
+        }
         changePane()
+        splitViewController.preferredContentSize = requestedContentSize
+        let splitRootView = splitViewController.view
+        guard let contentView = window.contentView else { return }
+        splitRootView.frame = contentView.bounds
+        splitRootView.autoresizingMask = [.width, .height]
+        contentView.addSubview(splitRootView)
+        let windowContentWidth = contentView.widthAnchor.constraint(equalToConstant: requestedContentSize.width)
+        let windowContentHeight = contentView.heightAnchor.constraint(equalToConstant: requestedContentSize.height)
+        windowContentWidthConstraint = windowContentWidth
+        windowContentHeightConstraint = windowContentHeight
+        NSLayoutConstraint.activate([windowContentWidth, windowContentHeight])
+        (window as? SettingsWindow)?.onWillApplySize = { [weak self] size in
+            guard let self else { return }
+            updateWindowSizingPreferences(for: size)
+        }
+        window.setContentSize(requestedContentSize)
     }
 
     private func buildAnimationsPane() {
+        let header = makePageHeader(
+            title: "Animations",
+            subtitle: "Manage pet state animations, lifecycle transitions, and imported media."
+        )
+        header.translatesAutoresizingMaskIntoConstraints = true
         publisherLabel.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .medium)
         publisherLabel.translatesAutoresizingMaskIntoConstraints = false
         let statusBox = NSBox()
@@ -993,10 +1122,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         toolsRow.widthAnchor.constraint(equalTo: footer.widthAnchor).isActive = true
         activityRow.widthAnchor.constraint(equalTo: footer.widthAnchor).isActive = true
 
+        animationsPane.addSubview(header)
         animationsPane.addSubview(statusBox)
         animationsPane.addSubview(animationsMode)
         animationsPane.addSubview(animationLibraryHost)
         animationsPane.addSubview(footer)
+        animationsPane.headerView = header
         animationsPane.statusView = statusBox
         animationsPane.modeView = animationsMode
         animationsPane.libraryView = animationLibraryHost
@@ -1279,6 +1410,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         let reset = NSButton(title: "Reset Appearance", target: self, action: #selector(resetAppearance))
         reset.controlSize = .small
+        let header = makePageHeader(
+            title: "Appearance",
+            subtitle: "Tune the pet surface, status labels, dialogue, and activity popup with system-aware contrast."
+        )
         let surfaceRow = NSStackView(views: [surfaceBox, borderBox])
         surfaceRow.orientation = .vertical
         surfaceRow.alignment = .leading
@@ -1287,17 +1422,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         overlayRow.orientation = .vertical
         overlayRow.alignment = .leading
         overlayRow.spacing = 12
-        let stack = NSStackView(views: [surfaceRow, overlayRow, dialogueBox, activityBox, reset])
+        let stack = NSStackView(views: [header, surfaceRow, overlayRow, dialogueBox, activityBox, reset])
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 12
+        stack.spacing = SettingsVisualMetrics.pageSectionSpacing
         let (_, documentView) = makeScrollablePane(for: appearancePane)
         documentView.addSubview(stack)
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: documentView.topAnchor),
             stack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor),
+            header.widthAnchor.constraint(equalTo: stack.widthAnchor),
             surfaceRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
             surfaceBox.widthAnchor.constraint(equalTo: surfaceRow.widthAnchor),
             borderBox.widthAnchor.constraint(equalTo: surfaceRow.widthAnchor),
@@ -1311,6 +1447,16 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func buildGeneralPane() {
+        launchAtLoginCheckbox.target = self
+        launchAtLoginCheckbox.action = #selector(launchAtLoginChanged)
+        launchAtLoginLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        launchAtLoginLabel.textColor = .secondaryLabelColor
+        let startupStack = NSStackView(views: [launchAtLoginCheckbox, launchAtLoginLabel])
+        startupStack.orientation = .vertical
+        startupStack.alignment = .leading
+        startupStack.spacing = 5
+        let startupBox = makeSection(title: "Startup", content: startupStack)
+
         let sizeTitle = NSTextField(labelWithString: "Pet size")
         sizeTitle.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
         sizeSlider.target = self
@@ -1361,15 +1507,19 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         motionStack.orientation = .vertical
         motionStack.alignment = .leading
         motionStack.spacing = 10
-        let motionBox = makeSection(title: "Motion", content: motionStack)
+        let motionBox = makeSection(title: "Motion and Accessibility", content: motionStack)
 
         let revealMedia = NSButton(title: "Show Media Folder", target: self, action: #selector(revealMediaFolder))
         let revealMap = NSButton(title: "Show Media Map", target: self, action: #selector(revealMap))
-        let revealLogs = NSButton(title: "Show Logs Folder", target: self, action: #selector(revealLogs))
         let revealApp = NSButton(title: "Show App in Finder", target: self, action: #selector(revealApp))
-        let localButtons = NSStackView(views: [revealApp, revealMedia, revealMap, revealLogs])
-        localButtons.orientation = .horizontal
-        localButtons.spacing = 8
+        let localButtons = NSGridView(views: [
+            [revealApp, revealMedia],
+            [revealMap, NSView()],
+        ])
+        localButtons.rowSpacing = 8
+        localButtons.columnSpacing = 8
+        localButtons.column(at: 0).xPlacement = .leading
+        localButtons.column(at: 1).xPlacement = .leading
         let launchHelp = NSTextField(wrappingLabelWithString: "Open Statelet from Finder → Home → Applications. The installed app starts at login and intentionally uses the menu bar instead of a Dock icon.")
         launchHelp.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         launchHelp.textColor = .secondaryLabelColor
@@ -1384,17 +1534,23 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         localStack.spacing = 9
         let localBox = makeSection(title: "App and Local Data", content: localStack)
 
-        let stack = NSStackView(views: [petWindowBox, motionBox, localBox])
+        let header = makePageHeader(
+            title: "General",
+            subtitle: "Control startup, window behavior, accessibility, and Statelet's local files."
+        )
+        let stack = NSStackView(views: [header, startupBox, petWindowBox, motionBox, localBox])
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 14
+        stack.spacing = SettingsVisualMetrics.pageSectionSpacing
         let (_, documentView) = makeScrollablePane(for: generalPane)
         documentView.addSubview(stack)
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: documentView.topAnchor),
             stack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor),
+            header.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            startupBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
             petWindowBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
             motionBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
             localBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
@@ -1403,20 +1559,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func buildDiagnosticsPane() {
-        let title = NSTextField(labelWithString: "Diagnostics and Repair")
-        title.font = .systemFont(ofSize: 18, weight: .semibold)
-        let introduction = NSTextField(wrappingLabelWithString: "Review the local lifecycle publisher, media library, conversion tools, and startup installation without exposing prompt or session content.")
-        introduction.textColor = .secondaryLabelColor
-
-        launchAtLoginCheckbox.target = self
-        launchAtLoginCheckbox.action = #selector(launchAtLoginChanged)
-        launchAtLoginLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-        launchAtLoginLabel.textColor = .secondaryLabelColor
-        let loginStack = NSStackView(views: [launchAtLoginCheckbox, launchAtLoginLabel])
-        loginStack.orientation = .vertical
-        loginStack.alignment = .leading
-        loginStack.spacing = 5
-        let loginBox = makeSection(title: "Startup", content: loginStack)
+        let header = makePageHeader(
+            title: "Diagnostics & Repair",
+            subtitle: "Review local health and repair startup without exposing prompt or session content."
+        )
 
         diagnosticsTextView.isEditable = false
         diagnosticsTextView.isSelectable = true
@@ -1447,26 +1593,25 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         repairButton.isEnabled = false
         let revealLogs = NSButton(title: "Reveal Logs", target: self, action: #selector(revealLogs))
         let clean = NSButton(title: "Clean Unused Media…", target: self, action: #selector(cleanUnusedMedia))
-        let controls = NSStackView(views: [refresh, copy, repairButton, revealLogs, clean])
-        controls.orientation = .horizontal
-        controls.alignment = .centerY
-        controls.spacing = 8
+        let controls = NSGridView(views: [
+            [refresh, copy, repairButton],
+            [revealLogs, clean, NSView()],
+        ])
+        controls.rowSpacing = 8
+        controls.columnSpacing = 8
+        for column in 0 ..< controls.numberOfColumns {
+            controls.column(at: column).xPlacement = .leading
+        }
 
-        for view in [title, introduction, loginBox, scroll, controls] {
+        for view in [header, scroll, controls] {
             view.translatesAutoresizingMaskIntoConstraints = false
             diagnosticsPane.addSubview(view)
         }
         NSLayoutConstraint.activate([
-            title.topAnchor.constraint(equalTo: diagnosticsPane.topAnchor, constant: 4),
-            title.leadingAnchor.constraint(equalTo: diagnosticsPane.leadingAnchor),
-            title.trailingAnchor.constraint(equalTo: diagnosticsPane.trailingAnchor),
-            introduction.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 8),
-            introduction.leadingAnchor.constraint(equalTo: diagnosticsPane.leadingAnchor),
-            introduction.trailingAnchor.constraint(equalTo: diagnosticsPane.trailingAnchor),
-            loginBox.topAnchor.constraint(equalTo: introduction.bottomAnchor, constant: 12),
-            loginBox.leadingAnchor.constraint(equalTo: diagnosticsPane.leadingAnchor),
-            loginBox.trailingAnchor.constraint(equalTo: diagnosticsPane.trailingAnchor),
-            scroll.topAnchor.constraint(equalTo: loginBox.bottomAnchor, constant: 12),
+            header.topAnchor.constraint(equalTo: diagnosticsPane.topAnchor, constant: 4),
+            header.leadingAnchor.constraint(equalTo: diagnosticsPane.leadingAnchor),
+            header.trailingAnchor.constraint(equalTo: diagnosticsPane.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: header.bottomAnchor, constant: SettingsVisualMetrics.pageSectionSpacing),
             scroll.leadingAnchor.constraint(equalTo: diagnosticsPane.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: diagnosticsPane.trailingAnchor),
             scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 260),
@@ -1478,10 +1623,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func buildHelpPane() {
-        let title = NSTextField(labelWithString: "Using Statelet")
-        title.font = .systemFont(ofSize: 18, weight: .semibold)
-        let introduction = NSTextField(wrappingLabelWithString: "Statelet is a local-first Codex companion. This guide keeps the supported workflow, recovery paths and privacy boundary in one place.")
-        introduction.textColor = .secondaryLabelColor
+        let header = makePageHeader(
+            title: "Help & Updates",
+            subtitle: "The supported workflow, recovery paths, updates, and privacy boundary in one place."
+        )
 
         let quickStart = makeSection(
             title: "First launch",
@@ -1517,7 +1662,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         )
         let recovery = makeSection(
             title: "Recovery and diagnostics",
-            content: NSTextField(wrappingLabelWithString: "Use Diagnostics → Refresh when startup, conversion or lifecycle data looks stale. Repair Startup only touches Statelet-managed LaunchAgents. The app keeps the current media and settings when a conversion, update check or installation step fails.")
+            content: NSTextField(wrappingLabelWithString: "Use Diagnostics & Repair → Refresh when startup, conversion or lifecycle data looks stale. Repair Startup only touches Statelet-managed LaunchAgents. The app keeps the current media and settings when a conversion, update check or installation step fails.")
         )
 
         let docsButton = NSButton(title: "Open Usage Guide", target: self, action: #selector(openUsageGuide))
@@ -1573,8 +1718,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let updateBox = makeSection(title: "Updates", content: updateStack)
 
         let stack = NSStackView(views: [
-            title,
-            introduction,
+            header,
             quickStart,
             lifecycle,
             media,
@@ -1587,8 +1731,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 14
-        for view in [quickStart, lifecycle, media, managedMedia, accessibility, recovery, updateBox] {
+        stack.spacing = SettingsVisualMetrics.pageSectionSpacing
+        for view in [header, quickStart, lifecycle, media, managedMedia, accessibility, recovery, updateBox] {
             view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
 
@@ -1603,10 +1747,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func buildPromptsPane() {
-        let title = NSTextField(labelWithString: "Generate conversion-friendly animation")
-        title.font = .systemFont(ofSize: 18, weight: .semibold)
-        let introduction = NSTextField(wrappingLabelWithString: "Use these copy-ready prompts with an authorized video generator. Replace [CHARACTER DESCRIPTION] with your character, and only use media you own or are authorized to use.")
-        introduction.textColor = .secondaryLabelColor
+        let header = makePageHeader(
+            title: "Prompt Generator",
+            subtitle: "Create a state-specific animation prompt for authorized media, then verify the source before importing it."
+        )
 
         helpStatePopup.addItems(withTitles: PetState.allCases.map(\.displayName))
         helpStatePopup.target = self
@@ -1648,19 +1792,16 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         checklist.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         checklist.textColor = .secondaryLabelColor
 
-        for view in [title, introduction, promptControls, checklist] {
+        for view in [header, promptControls, checklist] {
             view.translatesAutoresizingMaskIntoConstraints = false
             promptsPane.addSubview(view)
         }
         promptsPane.addSubview(scroll)
         NSLayoutConstraint.activate([
-            title.topAnchor.constraint(equalTo: promptsPane.topAnchor, constant: 4),
-            title.leadingAnchor.constraint(equalTo: promptsPane.leadingAnchor),
-            title.trailingAnchor.constraint(equalTo: promptsPane.trailingAnchor),
-            introduction.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 8),
-            introduction.leadingAnchor.constraint(equalTo: promptsPane.leadingAnchor),
-            introduction.trailingAnchor.constraint(equalTo: promptsPane.trailingAnchor),
-            promptControls.topAnchor.constraint(equalTo: introduction.bottomAnchor, constant: 14),
+            header.topAnchor.constraint(equalTo: promptsPane.topAnchor, constant: 4),
+            header.leadingAnchor.constraint(equalTo: promptsPane.leadingAnchor),
+            header.trailingAnchor.constraint(equalTo: promptsPane.trailingAnchor),
+            promptControls.topAnchor.constraint(equalTo: header.bottomAnchor, constant: SettingsVisualMetrics.pageSectionSpacing),
             promptControls.leadingAnchor.constraint(equalTo: promptsPane.leadingAnchor),
             scroll.topAnchor.constraint(equalTo: promptControls.bottomAnchor, constant: 10),
             scroll.leadingAnchor.constraint(equalTo: promptsPane.leadingAnchor),
@@ -1675,11 +1816,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func buildRecommendationPane() {
-        let title = NSTextField(labelWithString: "Animation Source Recommendations")
-        title.font = .systemFont(ofSize: 18, weight: .semibold)
-
-        let introduction = NSTextField(wrappingLabelWithString: "Generate clean source footage before importing it into Statelet. These requirements make transparency conversion and continuous playback more reliable.")
-        introduction.textColor = .secondaryLabelColor
+        let header = makePageHeader(
+            title: "Source Requirements",
+            subtitle: "Prepare clean source footage for reliable transparency conversion and continuous playback."
+        )
 
         let loopGuidance = NSTextField(wrappingLabelWithString: "Seamless loop: the first and last frames should be pixel-identical. Match the character's pose, position, expression, lighting, and motion direction exactly so playback has no jump, pause, cross-fade, or restart.")
         let loopBox = makeSection(title: "Loop", content: loopGuidance)
@@ -1694,17 +1834,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         toolsGuidance.textColor = .secondaryLabelColor
         let toolsBox = makeSection(title: "Generator Examples", content: toolsGuidance)
 
-        let stack = NSStackView(views: [title, introduction, loopBox, backgroundBox, framingBox, toolsBox])
+        let stack = NSStackView(views: [header, loopBox, backgroundBox, framingBox, toolsBox])
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 14
+        stack.spacing = SettingsVisualMetrics.pageSectionSpacing
         let (_, documentView) = makeScrollablePane(for: recommendationPane)
         documentView.addSubview(stack)
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: documentView.topAnchor, constant: 4),
             stack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor),
+            header.widthAnchor.constraint(equalTo: stack.widthAnchor),
             loopBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
             backgroundBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
             framingBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
@@ -1713,22 +1854,81 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         ])
     }
 
-    private func makeSection(title: String, content: NSView) -> NSBox {
-        let box = NSBox()
-        box.title = title
-        box.titlePosition = .atTop
-        box.boxType = .primary
-        content.translatesAutoresizingMaskIntoConstraints = false
-        box.contentView?.addSubview(content)
-        if let container = box.contentView {
-            NSLayoutConstraint.activate([
-                content.topAnchor.constraint(equalTo: container.topAnchor, constant: 12),
-                content.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
-                content.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
-                content.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12),
-            ])
+    private func makePageHeader(title: String, subtitle: String) -> NSStackView {
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.identifier = NSUserInterfaceItemIdentifier("SettingsPageTitle")
+        titleLabel.font = .systemFont(
+            ofSize: SettingsVisualMetrics.pageTitleSize,
+            weight: .semibold
+        )
+        titleLabel.textColor = .labelColor
+        titleLabel.lineBreakMode = .byWordWrapping
+        titleLabel.maximumNumberOfLines = 2
+        titleLabel.setAccessibilityLabel(title)
+#if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            titleLabel.setAccessibilityRole(.headingRole)
         }
-        return box
+#endif
+        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let subtitleLabel = NSTextField(wrappingLabelWithString: subtitle)
+        subtitleLabel.font = .systemFont(ofSize: NSFont.systemFontSize)
+        subtitleLabel.textColor = .secondaryLabelColor
+        subtitleLabel.maximumNumberOfLines = 2
+        subtitleLabel.setAccessibilityLabel(subtitle)
+        subtitleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let header = NSStackView(views: [titleLabel, subtitleLabel])
+        header.orientation = .vertical
+        header.alignment = .leading
+        header.spacing = SettingsVisualMetrics.pageHeaderSpacing
+        header.setAccessibilityElement(false)
+        header.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        titleLabel.widthAnchor.constraint(equalTo: header.widthAnchor).isActive = true
+        subtitleLabel.widthAnchor.constraint(equalTo: header.widthAnchor).isActive = true
+        return header
+    }
+
+    private func makeSection(title: String, content: NSView) -> NSVisualEffectView {
+        let card = NSVisualEffectView()
+        card.identifier = NSUserInterfaceItemIdentifier("SettingsSectionCard")
+        card.material = .contentBackground
+        card.blendingMode = .withinWindow
+        card.state = .followsWindowActiveState
+        card.wantsLayer = true
+        card.layer?.cornerCurve = .continuous
+        card.layer?.cornerRadius = SettingsVisualMetrics.cardCornerRadius
+        card.layer?.masksToBounds = true
+        card.setAccessibilityElement(true)
+        card.setAccessibilityRole(.group)
+        card.setAccessibilityLabel(title)
+        card.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
+        titleLabel.textColor = .labelColor
+        titleLabel.setAccessibilityElement(false)
+        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        content.translatesAutoresizingMaskIntoConstraints = false
+        content.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let cardStack = NSStackView(views: [titleLabel, content])
+        cardStack.translatesAutoresizingMaskIntoConstraints = false
+        cardStack.orientation = .vertical
+        cardStack.alignment = .leading
+        cardStack.spacing = SettingsVisualMetrics.cardContentSpacing
+        cardStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        card.addSubview(cardStack)
+        NSLayoutConstraint.activate([
+            cardStack.topAnchor.constraint(equalTo: card.topAnchor, constant: SettingsVisualMetrics.cardInset),
+            cardStack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: SettingsVisualMetrics.cardInset),
+            cardStack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -SettingsVisualMetrics.cardInset),
+            cardStack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -SettingsVisualMetrics.cardInset),
+            titleLabel.widthAnchor.constraint(equalTo: cardStack.widthAnchor),
+            content.widthAnchor.constraint(equalTo: cardStack.widthAnchor),
+        ])
+        return card
     }
 
     private func makeScrollablePane(for pane: NSView) -> (scroll: NSScrollView, document: NSView) {
@@ -2144,31 +2344,51 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowDidResize(_ notification: Notification) {
+        if let size = window?.contentView?.bounds.size, size.width > 0, size.height > 0 {
+            updateSplitPreferredContentSizes(for: size)
+        }
         persistSettingsWindowSize()
+    }
+
+    func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
+        updateWindowSizingPreferences(for: frameSize)
+        return frameSize
     }
 
     func windowDidChangeScreen(_ notification: Notification) {
         fitWindowToVisibleScreen(usePreferredSize: false)
     }
 
+    private static func sidebarRow(for section: SettingsSection) -> Int? {
+        sidebarItems.firstIndex { $0.section == section }
+    }
+
+    private static func section(atSidebarRow row: Int) -> SettingsSection? {
+        guard sidebarItems.indices.contains(row) else { return nil }
+        return sidebarItems[row].section
+    }
+
+    private func pane(for section: SettingsSection) -> NSView {
+        switch section {
+        case .animations: return animationsPane
+        case .voice: return dialogueVoiceView
+        case .appearance: return appearancePane
+        case .general: return generalPane
+        case .diagnostics: return diagnosticsPane
+        case .help: return helpPane
+        case .prompts: return promptsPane
+        case .recommendation: return recommendationPane
+        }
+    }
+
     private func changePane() {
-        let panes = [
-            animationsPane,
-            dialogueVoiceView,
-            appearancePane,
-            generalPane,
-            diagnosticsPane,
-            helpPane,
-            promptsPane,
-            recommendationPane,
-        ]
-        let requestedIndex = sidebarTableView.selectedRow
-        let index = panes.indices.contains(requestedIndex) ? requestedIndex : selectedSectionIndex
-        selectedSectionIndex = index
-        defaults.set(index, forKey: Self.selectedSectionDefaultsKey)
-        let selectedPane = panes[index]
+        let requestedSection = Self.section(atSidebarRow: sidebarTableView.selectedRow)
+        let section = requestedSection ?? selectedSection
+        selectedSection = section
+        defaults.set(section.rawValue, forKey: Self.selectedSectionIDDefaultsKey)
+        defaults.set(section.legacyIndex, forKey: Self.legacySelectedSectionDefaultsKey)
+        let selectedPane = pane(for: section)
         guard displayedPane !== selectedPane else { return }
-        let preservedContentSize = window?.contentLayoutRect.size
 
         NSLayoutConstraint.deactivate(displayedPaneConstraints)
         displayedPaneConstraints.removeAll()
@@ -2182,10 +2402,24 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         ]
         NSLayoutConstraint.activate(displayedPaneConstraints)
         displayedPane = selectedPane
-        if let preservedContentSize {
-            window?.contentView?.layoutSubtreeIfNeeded()
-            window?.setContentSize(preservedContentSize)
-        }
+    }
+
+    private func updateSplitPreferredContentSizes(for size: NSSize) {
+        splitViewController.preferredContentSize = size
+        sidebarViewController.preferredContentSize = NSSize(
+            width: Self.sidebarWidth,
+            height: size.height
+        )
+        detailViewController.preferredContentSize = NSSize(
+            width: max(0, size.width - Self.sidebarWidth - splitViewController.splitView.dividerThickness),
+            height: size.height
+        )
+    }
+
+    private func updateWindowSizingPreferences(for size: NSSize) {
+        windowContentWidthConstraint?.constant = size.width
+        windowContentHeightConstraint?.constant = size.height
+        updateSplitPreferredContentSizes(for: size)
     }
 
     private func fitWindowToVisibleScreen(usePreferredSize: Bool) {
@@ -2199,15 +2433,33 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             width: min(Self.minimumContentSize.width, maximumContentSize.width),
             height: min(Self.minimumContentSize.height, maximumContentSize.height)
         )
+        let detailInsets = detailView.safeAreaInsets
         minimumPaneWidthConstraint?.constant = max(
             0,
-            effectiveMinimumSize.width - Self.sidebarWidth - 1 - 36
+            min(
+                468,
+                effectiveMinimumSize.width
+                    - Self.sidebarWidth
+                    - splitViewController.splitView.dividerThickness
+                    - detailInsets.left
+                    - detailInsets.right
+                    - 36
+            )
         )
-        minimumPaneHeightConstraint?.constant = max(0, effectiveMinimumSize.height - 36)
+        minimumPaneHeightConstraint?.constant = max(
+            0,
+            min(
+                470,
+                effectiveMinimumSize.height
+                    - detailInsets.top
+                    - detailInsets.bottom
+                    - 36
+            )
+        )
         window.contentMinSize = effectiveMinimumSize
         window.contentMaxSize = maximumContentSize
 
-        let currentSize = window.contentLayoutRect.size
+        let currentSize = window.contentView?.bounds.size ?? window.contentLayoutRect.size
         let requestedSize = usePreferredSize ? Self.preferredContentSize : currentSize
         let targetSize = NSSize(
             width: min(max(requestedSize.width, effectiveMinimumSize.width), maximumContentSize.width),
@@ -2231,8 +2483,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func persistSettingsWindowSize() {
-        guard let window else { return }
-        SettingsWindowSizeStore.persist(window.contentLayoutRect.size, to: defaults)
+        guard let size = window?.contentView?.bounds.size else { return }
+        SettingsWindowSizeStore.persist(size, to: defaults)
     }
 
     @objc private func helpStateChanged() { updateHelpPrompt() }
@@ -2531,14 +2783,48 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 }
 
+extension SettingsWindowController: NSToolbarDelegate {
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [.flexibleSpace, Self.resetWindowSizeToolbarItemIdentifier]
+    }
+
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [.flexibleSpace, Self.resetWindowSizeToolbarItemIdentifier]
+    }
+
+    func toolbar(
+        _ toolbar: NSToolbar,
+        itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
+        willBeInsertedIntoToolbar flag: Bool
+    ) -> NSToolbarItem? {
+        guard itemIdentifier == Self.resetWindowSizeToolbarItemIdentifier else { return nil }
+        let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+        item.label = "Reset Window Size"
+        item.paletteLabel = "Reset Window Size"
+        item.toolTip = "Restore the default Settings window size"
+        item.image = NSImage(
+            systemSymbolName: "arrow.counterclockwise",
+            accessibilityDescription: "Reset Settings Window Size"
+        )
+        item.target = self
+        item.action = #selector(resetSettingsWindowSize)
+        item.visibilityPriority = .high
+        item.isBordered = true
+        return item
+    }
+}
+
 extension SettingsWindowController: NSTableViewDataSource, NSTableViewDelegate {
     func numberOfRows(in tableView: NSTableView) -> Int {
-        Self.sectionLabels.count
+        Self.sidebarItems.count
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        guard Self.sectionLabels.indices.contains(row) else { return nil }
-        let identifier = NSUserInterfaceItemIdentifier("SettingsSidebarCell")
+        guard Self.sidebarItems.indices.contains(row) else { return nil }
+        let item = Self.sidebarItems[row]
+        let identifier = NSUserInterfaceItemIdentifier(
+            item.isGroup ? "SettingsSidebarGroupCell" : "SettingsSidebarCell"
+        )
         let cell: NSTableCellView
         if let reusedCell = tableView.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView {
             cell = reusedCell
@@ -2550,25 +2836,74 @@ extension SettingsWindowController: NSTableViewDataSource, NSTableViewDelegate {
             label.lineBreakMode = .byTruncatingTail
             cell.textField = label
             cell.addSubview(label)
-            NSLayoutConstraint.activate([
-                label.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
-                label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
-                label.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-            ])
+            if item.isGroup {
+                NSLayoutConstraint.activate([
+                    label.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
+                    label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
+                    label.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                ])
+            } else {
+                let imageView = NSImageView()
+                imageView.translatesAutoresizingMaskIntoConstraints = false
+                imageView.imageScaling = .scaleProportionallyDown
+                imageView.contentTintColor = .secondaryLabelColor
+                imageView.setAccessibilityElement(false)
+                cell.imageView = imageView
+                cell.addSubview(imageView)
+                NSLayoutConstraint.activate([
+                    imageView.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
+                    imageView.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                    imageView.widthAnchor.constraint(equalToConstant: 16),
+                    imageView.heightAnchor.constraint(equalToConstant: 16),
+                    label.leadingAnchor.constraint(equalTo: imageView.trailingAnchor, constant: 8),
+                    label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
+                    label.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                ])
+            }
         }
-        let label = Self.sectionLabels[row]
-        cell.textField?.stringValue = label
-        cell.textField?.setAccessibilityLabel(label)
-        cell.setAccessibilityElement(true)
-        cell.setAccessibilityRole(.staticText)
-        cell.setAccessibilityLabel(label)
-        cell.setAccessibilityValue(row == sidebarTableView.selectedRow ? "Selected" : "Not selected")
+        cell.textField?.stringValue = item.title
+        cell.textField?.setAccessibilityLabel(item.title)
+        if item.isGroup {
+            cell.textField?.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
+            cell.textField?.textColor = .secondaryLabelColor
+            cell.textField?.setAccessibilityElement(false)
+            cell.setAccessibilityElement(true)
+            cell.setAccessibilityRole(.group)
+            cell.setAccessibilityLabel(item.title)
+            cell.setAccessibilityValue(nil)
+        } else {
+            cell.textField?.font = .systemFont(ofSize: NSFont.systemFontSize)
+            cell.textField?.textColor = .labelColor
+            cell.setAccessibilityElement(false)
+            cell.imageView?.image = item.section.flatMap {
+                NSImage(systemSymbolName: $0.symbolName, accessibilityDescription: nil)
+            }
+        }
         return cell
     }
 
+    func tableView(_ tableView: NSTableView, isGroupRow row: Int) -> Bool {
+        Self.sidebarItems.indices.contains(row) && Self.sidebarItems[row].isGroup
+    }
+
+    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
+        Self.section(atSidebarRow: row) != nil
+    }
+
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        Self.sidebarItems.indices.contains(row) && Self.sidebarItems[row].isGroup ? 24 : 32
+    }
+
     func tableViewSelectionDidChange(_ notification: Notification) {
-        let rows = IndexSet(integersIn: 0 ..< Self.sectionLabels.count)
-        sidebarTableView.reloadData(forRowIndexes: rows, columnIndexes: IndexSet(integer: 0))
+        guard !isRefreshingSidebarSelection else { return }
+        guard Self.section(atSidebarRow: sidebarTableView.selectedRow) != nil else {
+            isRefreshingSidebarSelection = true
+            if let selectedRow = Self.sidebarRow(for: selectedSection) {
+                sidebarTableView.selectRowIndexes(IndexSet(integer: selectedRow), byExtendingSelection: false)
+            }
+            isRefreshingSidebarSelection = false
+            return
+        }
         changePane()
     }
 }

@@ -482,8 +482,13 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         activityLabel.isHidden = true
         activityLabel.setAccessibilityLabel("Dialogue voice activity")
 
+        let header = makePageHeader(
+            title: "Dialogue & Voice",
+            subtitle: "Write lifecycle dialogue, configure private local voices, and control playback."
+        )
         let voiceSectionPickerRow = centeredRow(voiceSectionControl)
         let contentStack = NSStackView(views: [
+            header,
             voiceSectionPickerRow,
             dialoguePage,
             voiceSetupPage,
@@ -493,12 +498,14 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         contentStack.orientation = .vertical
         contentStack.alignment = .width
         contentStack.spacing = 8
+        contentStack.setCustomSpacing(16, after: header)
         documentView.addSubview(contentStack)
         NSLayoutConstraint.activate([
             contentStack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor, constant: 4),
             contentStack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor, constant: -8),
             contentStack.topAnchor.constraint(equalTo: documentView.topAnchor, constant: 2),
             contentStack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor, constant: -8),
+            header.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             voiceSectionPickerRow.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             dialoguePage.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             voiceSetupPage.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
@@ -733,6 +740,39 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         label.alignment = .right
         label.setContentHuggingPriority(.required, for: .horizontal)
         return label
+    }
+
+    private func makePageHeader(title: String, subtitle: String) -> NSStackView {
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.identifier = NSUserInterfaceItemIdentifier("SettingsPageTitle")
+        titleLabel.font = .systemFont(ofSize: 22, weight: .semibold)
+        titleLabel.textColor = .labelColor
+        titleLabel.lineBreakMode = .byWordWrapping
+        titleLabel.maximumNumberOfLines = 2
+        titleLabel.setAccessibilityLabel(title)
+#if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            titleLabel.setAccessibilityRole(.headingRole)
+        }
+#endif
+        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let subtitleLabel = NSTextField(wrappingLabelWithString: subtitle)
+        subtitleLabel.font = .systemFont(ofSize: NSFont.systemFontSize)
+        subtitleLabel.textColor = .secondaryLabelColor
+        subtitleLabel.maximumNumberOfLines = 2
+        subtitleLabel.setAccessibilityLabel(subtitle)
+        subtitleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let header = NSStackView(views: [titleLabel, subtitleLabel])
+        header.orientation = .vertical
+        header.alignment = .leading
+        header.spacing = 4
+        header.setAccessibilityElement(false)
+        header.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        titleLabel.widthAnchor.constraint(equalTo: header.widthAnchor).isActive = true
+        subtitleLabel.widthAnchor.constraint(equalTo: header.widthAnchor).isActive = true
+        return header
     }
 
     private func sectionTitle(_ text: String) -> NSTextField {

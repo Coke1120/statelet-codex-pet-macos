@@ -52,21 +52,36 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
 
     def test_voice_help_and_prompts_are_distinct_accessible_settings_panes(self) -> None:
         sidebar_match = re.search(
-            r"private\s+static\s+let\s+sectionLabels\s*=\s*\[(?P<labels>[^]]+)\]",
+            r"private\s+static\s+let\s+sidebarItems[^=]*=\s*\[(?P<items>[\s\S]*?)\n\s*\]",
             self.settings,
         )
-        self.assertIsNotNone(sidebar_match, "Settings sidebar labels were not found")
-        labels = re.findall(r'"([^"]+)"', sidebar_match.group("labels"))
-        self.assertEqual(len(labels), 8)
-        self.assertEqual(labels[1], "Voice")
-        self.assertEqual(labels[5], "Help")
-        self.assertEqual(labels[6], "Prompts")
+        self.assertIsNotNone(sidebar_match, "Settings sidebar taxonomy was not found")
+        items = sidebar_match.group("items")
+        self.assertEqual(
+            re.findall(r'\.group\("([^"]+)"\)', items),
+            ["App", "Pet Content", "Create Media", "Support"],
+        )
+        self.assertEqual(
+            re.findall(r'\.section\(\.\w+,\s*"([^"]+)"\)', items),
+            [
+                "General",
+                "Appearance",
+                "Animations",
+                "Dialogue & Voice",
+                "Prompt Generator",
+                "Source Requirements",
+                "Help & Updates",
+                "Diagnostics & Repair",
+            ],
+        )
         self.assertIn('sidebarTableView.setAccessibilityLabel("Settings navigation")', self.settings)
         self.assertIn("sidebarTableView.delegate = self", self.settings)
         self.assertIn("sidebarTableView.dataSource = self", self.settings)
+        self.assertIn("func tableView(_ tableView: NSTableView, isGroupRow row: Int)", self.settings)
+        self.assertIn("func tableView(_ tableView: NSTableView, shouldSelectRow row: Int)", self.settings)
         self.assertNotIn('tabs.setAccessibilityLabel("Settings section")', self.settings)
         self.assertIn("dialogueVoiceView,", self.settings)
-        self.assertIn("let selectedPane = panes[index]", self.settings)
+        self.assertIn("let selectedPane = pane(for: section)", self.settings)
         self.assertIn("paneHost.addSubview(selectedPane)", self.settings)
 
         required_accessibility_labels = {

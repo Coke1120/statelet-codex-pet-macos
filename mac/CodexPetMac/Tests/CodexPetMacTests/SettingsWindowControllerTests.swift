@@ -48,28 +48,32 @@ final class SettingsWindowControllerTests: XCTestCase {
             Self.pumpMainRunLoop(for: 0.05)
         }
 
-        XCTAssertEqual(window.contentLayoutRect.width, 720, accuracy: 1)
-        XCTAssertEqual(window.contentLayoutRect.height, 580, accuracy: 1)
+        XCTAssertEqual(Self.contentSize(of: window).width, 720, accuracy: 1)
+        XCTAssertEqual(Self.contentSize(of: window).height, 580, accuracy: 1)
 
         window.setContentSize(NSSize(width: 740, height: 600))
         Self.pumpMainRunLoop(for: 0.05)
         let resized = try XCTUnwrap(SettingsWindowSizeStore.restored(from: defaults))
-        XCTAssertEqual(resized.width, window.contentLayoutRect.width, accuracy: 1)
-        XCTAssertEqual(resized.height, window.contentLayoutRect.height, accuracy: 1)
+        XCTAssertEqual(resized.width, Self.contentSize(of: window).width, accuracy: 1)
+        XCTAssertEqual(resized.height, Self.contentSize(of: window).height, accuracy: 1)
 
-        let resetButton = try XCTUnwrap(
-            controller.window?.titlebarAccessoryViewControllers
-                .flatMap { Self.descendants(of: $0.view) }
-                .compactMap { $0 as? NSButton }
-                .first { $0.accessibilityLabel() == "Reset Settings Window Size" }
+        let toolbar = try XCTUnwrap(window.toolbar)
+        let resetItem = try XCTUnwrap(
+            toolbar.items.first {
+                $0.itemIdentifier.rawValue == "StateletSettingsResetWindowSize"
+            }
         )
-        resetButton.performClick(nil)
+        XCTAssertEqual(resetItem.label, "Reset Window Size")
+        XCTAssertEqual(resetItem.toolTip, "Restore the default Settings window size")
+        XCTAssertNotNil(resetItem.image)
+        XCTAssertTrue(window.titlebarAccessoryViewControllers.isEmpty)
+        XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(resetItem.action), to: resetItem.target, from: resetItem))
         Self.pumpMainRunLoop(for: 0.05)
-        XCTAssertEqual(window.contentLayoutRect.width, min(760, window.contentMaxSize.width), accuracy: 1)
-        XCTAssertEqual(window.contentLayoutRect.height, min(650, window.contentMaxSize.height), accuracy: 1)
+        XCTAssertEqual(Self.contentSize(of: window).width, min(760, window.contentMaxSize.width), accuracy: 1)
+        XCTAssertEqual(Self.contentSize(of: window).height, min(650, window.contentMaxSize.height), accuracy: 1)
         let resetSize = try XCTUnwrap(SettingsWindowSizeStore.restored(from: defaults))
-        XCTAssertEqual(resetSize.width, window.contentLayoutRect.width, accuracy: 1)
-        XCTAssertEqual(resetSize.height, window.contentLayoutRect.height, accuracy: 1)
+        XCTAssertEqual(resetSize.width, Self.contentSize(of: window).width, accuracy: 1)
+        XCTAssertEqual(resetSize.height, Self.contentSize(of: window).height, accuracy: 1)
     }
 
     func testSettingsSidebarProvidesOrderedAccessibleKeyboardNavigationAndPersistsSelection() throws {
@@ -87,15 +91,23 @@ final class SettingsWindowControllerTests: XCTestCase {
 
         let sidebar = try Self.settingsSidebar(in: window)
         let expectedLabels = [
-            "Animations",
-            "Voice",
-            "Appearance",
+            "App",
             "General",
-            "Diagnostics",
-            "Help",
-            "Prompts",
-            "Recommendation",
+            "Appearance",
+            "Pet Content",
+            "Animations",
+            "Dialogue & Voice",
+            "Create Media",
+            "Prompt Generator",
+            "Source Requirements",
+            "Support",
+            "Help & Updates",
+            "Diagnostics & Repair",
         ]
+        let groupRows = [0, 3, 6, 9]
+        let destinationLabels = expectedLabels.enumerated().compactMap { index, label in
+            groupRows.contains(index) ? nil : label
+        }
         XCTAssertEqual(sidebar.numberOfRows, expectedLabels.count)
         XCTAssertEqual(
             (0 ..< sidebar.numberOfRows).map { Self.sidebarLabel(in: sidebar, row: $0) },
@@ -103,16 +115,42 @@ final class SettingsWindowControllerTests: XCTestCase {
         )
         XCTAssertEqual(sidebar.accessibilityLabel(), "Settings navigation")
         XCTAssertEqual(sidebar.accessibilityRole(), .list)
-        XCTAssertEqual(sidebar.selectedRow, 0)
+        XCTAssertEqual(sidebar.selectedRow, 1)
+        for row in groupRows {
+            XCTAssertTrue(sidebar.delegate?.tableView?(sidebar, isGroupRow: row) ?? false)
+            XCTAssertFalse(sidebar.delegate?.tableView?(sidebar, shouldSelectRow: row) ?? true)
+            XCTAssertEqual(sidebar.view(atColumn: 0, row: row, makeIfNecessary: true)?.accessibilityRole(), .group)
+        }
         XCTAssertFalse(
             Self.descendants(of: window.contentView).compactMap { $0 as? NSSegmentedControl }.contains {
                 $0.accessibilityLabel() == "Settings section"
             }
         )
-        XCTAssertGreaterThanOrEqual(sidebar.enclosingScrollView?.frame.width ?? 0, 125)
-        XCTAssertLessThanOrEqual(sidebar.enclosingScrollView?.frame.width ?? .greatestFiniteMagnitude, 160)
-        XCTAssertEqual(window.contentLayoutRect.width, 700, accuracy: 1)
-        XCTAssertEqual(window.contentLayoutRect.height, 570, accuracy: 1)
+        let splitViewController = try XCTUnwrap(
+            Self.descendants(of: window.contentView)
+                .compactMap { $0.nextResponder as? NSSplitViewController }
+                .first
+        )
+        XCTAssertEqual(
+            splitViewController.splitViewItems.first?.viewController.view.frame.width ?? 0,
+            218,
+            accuracy: 1
+        )
+        XCTAssertGreaterThanOrEqual(sidebar.enclosingScrollView?.frame.width ?? 0, 200)
+        XCTAssertLessThanOrEqual(sidebar.enclosingScrollView?.frame.width ?? .greatestFiniteMagnitude, 210)
+        for label in destinationLabels {
+            let row = try Self.sidebarRow(in: sidebar, label: label)
+            let cell = try XCTUnwrap(sidebar.view(atColumn: 0, row: row, makeIfNecessary: true))
+            let labelView = try XCTUnwrap(Self.sidebarLabelView(in: sidebar, row: row))
+            XCTAssertGreaterThanOrEqual(labelView.frame.width + 0.5, labelView.intrinsicContentSize.width, label)
+            XCTAssertFalse(cell.isAccessibilityElement(), "native table rows should own destination selection semantics")
+            XCTAssertNotNil(
+                (cell as? NSTableCellView)?.imageView?.image,
+                "destination \(label) should use a monochrome system symbol"
+            )
+        }
+        XCTAssertEqual(Self.contentSize(of: window).width, 700, accuracy: 1)
+        XCTAssertEqual(Self.contentSize(of: window).height, 570, accuracy: 1)
 
         XCTAssertTrue(window.makeFirstResponder(sidebar))
         let downArrow = try XCTUnwrap(NSEvent.keyEvent(
@@ -129,16 +167,17 @@ final class SettingsWindowControllerTests: XCTestCase {
         ))
         sidebar.keyDown(with: downArrow)
         Self.pumpMainRunLoop(for: 0.05)
-        XCTAssertEqual(sidebar.selectedRow, 1)
-        XCTAssertEqual(Self.sidebarSelectionValue(in: sidebar, row: 0), "Not selected")
-        XCTAssertEqual(Self.sidebarSelectionValue(in: sidebar, row: 1), "Selected")
-
-        sidebar.selectRowIndexes(IndexSet(integer: 6), byExtendingSelection: false)
-        Self.pumpMainRunLoop(for: 0.05)
-        XCTAssertEqual(sidebar.selectedRowIndexes, IndexSet(integer: 6))
+        XCTAssertEqual(sidebar.selectedRow, 2)
         XCTAssertEqual(sidebar.accessibilitySelectedRows()?.count, 1)
-        XCTAssertEqual(Self.sidebarSelectionValue(in: sidebar, row: 1), "Not selected")
-        XCTAssertEqual(Self.sidebarSelectionValue(in: sidebar, row: 6), "Selected")
+
+        sidebar.keyDown(with: downArrow)
+        Self.pumpMainRunLoop(for: 0.05)
+        XCTAssertEqual(sidebar.selectedRow, 4, "keyboard navigation should skip the Pet Content group heading")
+
+        let promptRow = try Self.selectSidebar(in: sidebar, label: "Prompt Generator")
+        XCTAssertEqual(sidebar.selectedRowIndexes, IndexSet(integer: promptRow))
+        XCTAssertEqual(sidebar.accessibilitySelectedRows()?.count, 1)
+        XCTAssertEqual(defaults.string(forKey: "Statelet.Settings.selectedSectionID"), "prompts")
         XCTAssertEqual(defaults.integer(forKey: "Statelet.Settings.selectedSection"), 6)
         window.close()
         Self.pumpMainRunLoop(for: 0.05)
@@ -151,7 +190,168 @@ final class SettingsWindowControllerTests: XCTestCase {
             restoredWindow.close()
             Self.pumpMainRunLoop(for: 0.05)
         }
-        XCTAssertEqual(try Self.settingsSidebar(in: restoredWindow).selectedRow, 6)
+        let restoredSidebar = try Self.settingsSidebar(in: restoredWindow)
+        XCTAssertEqual(restoredSidebar.selectedRow, try Self.sidebarRow(in: restoredSidebar, label: "Prompt Generator"))
+    }
+
+    func testSettingsSidebarMigratesLegacySelectionWithoutChangingItsDestination() throws {
+        let suiteName = "statelet-settings-sidebar-legacy-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        defaults.set(0, forKey: "Statelet.Settings.selectedSection")
+
+        let controller = SettingsWindowController(defaults: defaults)
+        let window = try XCTUnwrap(controller.window)
+        controller.show()
+        Self.pumpMainRunLoop(for: 0.1)
+        defer {
+            window.close()
+            Self.pumpMainRunLoop(for: 0.05)
+        }
+
+        let sidebar = try Self.settingsSidebar(in: window)
+        XCTAssertEqual(sidebar.selectedRow, try Self.sidebarRow(in: sidebar, label: "Animations"))
+        XCTAssertEqual(defaults.string(forKey: "Statelet.Settings.selectedSectionID"), "animations")
+    }
+
+    func testSettingsUsesUnifiedTitlebarAndModernStaticPageSurfaces() throws {
+        let controller = SettingsWindowController()
+        let window = try XCTUnwrap(controller.window)
+        controller.show()
+        Self.pumpMainRunLoop(for: 0.1)
+        defer {
+            window.close()
+            Self.pumpMainRunLoop(for: 0.05)
+        }
+
+        let toolbar = try XCTUnwrap(window.toolbar)
+        XCTAssertEqual(window.toolbarStyle, .unified)
+        XCTAssertTrue(toolbar.isVisible)
+        XCTAssertTrue(window.styleMask.contains(.fullSizeContentView))
+        XCTAssertTrue(window.titlebarAppearsTransparent)
+        let resetItem = try XCTUnwrap(toolbar.items.first {
+            $0.itemIdentifier.rawValue == "StateletSettingsResetWindowSize"
+        })
+        XCTAssertEqual(resetItem.label, "Reset Window Size")
+        XCTAssertNotNil(resetItem.image)
+        XCTAssertTrue(window.titlebarAccessoryViewControllers.isEmpty)
+
+        let sidebar = try Self.settingsSidebar(in: window)
+        try Self.selectSidebar(in: sidebar, label: "General")
+
+        let pageTitle = try XCTUnwrap(
+            Self.descendants(of: window.contentView)
+                .compactMap { $0 as? NSTextField }
+                .first { $0.identifier?.rawValue == "SettingsPageTitle" }
+        )
+        XCTAssertEqual(pageTitle.stringValue, "General")
+        XCTAssertEqual(pageTitle.accessibilityLabel(), "General")
+        XCTAssertGreaterThanOrEqual(pageTitle.font?.pointSize ?? 0, 20)
+#if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            XCTAssertEqual(pageTitle.accessibilityRole(), .headingRole)
+        }
+#endif
+
+        let splitViewController = try XCTUnwrap(
+            Self.descendants(of: window.contentView)
+                .compactMap { $0.nextResponder as? NSSplitViewController }
+                .first
+        )
+        XCTAssertEqual(splitViewController.splitViewItems.count, 2)
+        XCTAssertEqual(splitViewController.splitViewItems.first?.behavior, .sidebar)
+        XCTAssertEqual(splitViewController.splitViewItems.first?.allowsFullHeightLayout, true)
+        let sidebarView = try XCTUnwrap(splitViewController.splitViewItems.first?.viewController.view)
+        XCTAssertGreaterThan(sidebarView.safeAreaInsets.top, 0)
+        XCTAssertGreaterThan(
+            sidebarView.frame.maxY,
+            splitViewController.splitView.bounds.maxY - splitViewController.splitView.safeAreaInsets.top
+        )
+
+        let cards = Self.descendants(of: window.contentView)
+            .compactMap { $0 as? NSVisualEffectView }
+            .filter { $0.identifier?.rawValue == "SettingsSectionCard" }
+        XCTAssertEqual(cards.count, 4)
+        XCTAssertTrue(cards.allSatisfy { $0.material == .contentBackground })
+        XCTAssertTrue(cards.allSatisfy { $0.blendingMode == .withinWindow })
+        XCTAssertTrue(cards.allSatisfy { ($0.layer?.cornerRadius ?? 0) >= 12 })
+        XCTAssertTrue(cards.allSatisfy { $0.accessibilityRole() == .group })
+        XCTAssertEqual(
+            Set(cards.compactMap { $0.accessibilityLabel() }),
+            Set(["Startup", "Pet Window", "Motion and Accessibility", "App and Local Data"])
+        )
+        for card in cards {
+            let title = try XCTUnwrap(
+                Self.descendants(of: card).compactMap { $0 as? NSTextField }.first {
+                    $0.stringValue == card.accessibilityLabel()
+                }
+            )
+            XCTAssertFalse(title.isAccessibilityElement(), "the group label should be announced once by its card")
+        }
+        XCTAssertTrue(cards.allSatisfy { Self.descendants(of: $0).count > 3 })
+        XCTAssertFalse(
+            Self.descendants(of: window.contentView)
+                .compactMap { $0 as? NSVisualEffectView }
+                .contains { $0.material == .sidebar }
+        )
+    }
+
+    func testAnimationsAndDialogueVoiceUseConsistentPageHeaders() throws {
+        let controller = SettingsWindowController()
+        let window = try XCTUnwrap(controller.window)
+        controller.show()
+        Self.pumpMainRunLoop(for: 0.1)
+        defer {
+            window.close()
+            Self.pumpMainRunLoop(for: 0.05)
+        }
+
+        let sidebar = try Self.settingsSidebar(in: window)
+        for title in ["Animations", "Dialogue & Voice"] {
+            try Self.selectSidebar(in: sidebar, label: title)
+            let pageTitle = try XCTUnwrap(
+                Self.descendants(of: window.contentView).compactMap { $0 as? NSTextField }.first {
+                    $0.identifier?.rawValue == "SettingsPageTitle"
+                },
+                "missing page header for \(title)"
+            )
+            XCTAssertEqual(pageTitle.stringValue, title)
+            XCTAssertEqual(pageTitle.accessibilityLabel(), title)
+            XCTAssertGreaterThanOrEqual(pageTitle.font?.pointSize ?? 0, 20)
+        }
+    }
+
+    func testSettingsContentClassificationPlacesPreferencesUnderAppAndRepairsUnderSupport() throws {
+        let controller = SettingsWindowController()
+        let window = try XCTUnwrap(controller.window)
+        controller.show()
+        Self.pumpMainRunLoop(for: 0.1)
+        defer {
+            window.close()
+            Self.pumpMainRunLoop(for: 0.05)
+        }
+
+        let sidebar = try Self.settingsSidebar(in: window)
+        try Self.selectSidebar(in: sidebar, label: "General")
+        XCTAssertTrue(Self.descendants(of: window.contentView).compactMap { $0 as? NSButton }.contains {
+            $0.title == "Start Statelet when I log in"
+        })
+        XCTAssertFalse(Self.descendants(of: window.contentView).compactMap { $0 as? NSButton }.contains {
+            $0.title == "Reveal Logs"
+        })
+
+        try Self.selectSidebar(in: sidebar, label: "Diagnostics & Repair")
+        XCTAssertFalse(Self.descendants(of: window.contentView).compactMap { $0 as? NSButton }.contains {
+            $0.title == "Start Statelet when I log in"
+        })
+        XCTAssertTrue(Self.descendants(of: window.contentView).compactMap { $0 as? NSButton }.contains {
+            $0.title == "Reveal Logs"
+        })
+        XCTAssertTrue(Self.descendants(of: window.contentView).compactMap { $0 as? NSTextField }.contains {
+            $0.stringValue == "Diagnostics & Repair"
+        })
     }
 
     @MainActor
@@ -174,8 +374,7 @@ final class SettingsWindowControllerTests: XCTestCase {
         }
 
         let sidebar = try Self.settingsSidebar(in: window)
-        sidebar.selectRowIndexes(IndexSet(integer: 2), byExtendingSelection: false)
-        Self.pumpMainRunLoop(for: 0.05)
+        try Self.selectSidebar(in: sidebar, label: "Appearance")
 
         let labels = Self.descendants(of: window.contentView)
             .compactMap { $0.accessibilityLabel() }
@@ -192,8 +391,7 @@ final class SettingsWindowControllerTests: XCTestCase {
         ] {
             XCTAssertTrue(labels.contains(label), "missing \(label)")
         }
-        sidebar.selectRowIndexes(IndexSet(integer: 5), byExtendingSelection: false)
-        Self.pumpMainRunLoop(for: 0.05)
+        try Self.selectSidebar(in: sidebar, label: "Help & Updates")
         XCTAssertTrue(Self.descendants(of: window.contentView).compactMap { $0 as? NSTextField }.contains {
             $0.stringValue.contains("Managed media location")
         })
@@ -220,9 +418,8 @@ final class SettingsWindowControllerTests: XCTestCase {
         }
 
         let sidebar = try Self.settingsSidebar(in: window)
-        for section in [2, 3, 5, 6] {
-            sidebar.selectRowIndexes(IndexSet(integer: section), byExtendingSelection: false)
-            Self.pumpMainRunLoop(for: 0.05)
+        for section in ["Appearance", "General", "Help & Updates", "Prompt Generator", "Source Requirements"] {
+            try Self.selectSidebar(in: sidebar, label: section)
             let scrollView = try XCTUnwrap(
                 Self.descendants(of: window.contentView).compactMap { $0 as? NSScrollView }.first {
                     $0.accessibilityLabel() == "Settings pane scroll area"
@@ -234,7 +431,7 @@ final class SettingsWindowControllerTests: XCTestCase {
                 documentView.isFlipped,
                 "section \(section) should open at the top of its scrollable content"
             )
-            if section == 5 {
+            if section == "Help & Updates" {
                 XCTAssertGreaterThan(
                     documentView.frame.height,
                     scrollView.contentView.bounds.height,
@@ -255,15 +452,16 @@ final class SettingsWindowControllerTests: XCTestCase {
         }
 
         let sidebar = try Self.settingsSidebar(in: window)
-        XCTAssertEqual(sidebar.numberOfRows, 8)
-        XCTAssertEqual(Self.sidebarLabel(in: sidebar, row: 5), "Help")
-        XCTAssertEqual(Self.sidebarLabel(in: sidebar, row: 6), "Prompts")
+        XCTAssertEqual(sidebar.numberOfRows, 12)
+        XCTAssertLessThan(
+            try Self.sidebarRow(in: sidebar, label: "Prompt Generator"),
+            try Self.sidebarRow(in: sidebar, label: "Help & Updates")
+        )
 
-        sidebar.selectRowIndexes(IndexSet(integer: 5), byExtendingSelection: false)
-        Self.pumpMainRunLoop(for: 0.05)
+        try Self.selectSidebar(in: sidebar, label: "Help & Updates")
         XCTAssertNotNil(
             Self.descendants(of: window.contentView).compactMap { $0 as? NSTextField }.first {
-                $0.stringValue == "Using Statelet"
+                $0.stringValue == "Help & Updates"
             }
         )
         XCTAssertNotNil(
@@ -310,11 +508,10 @@ final class SettingsWindowControllerTests: XCTestCase {
         XCTAssertEqual(updateControls.count, 4)
         XCTAssertTrue(updateControls.allSatisfy { !$0.isEnabled })
 
-        sidebar.selectRowIndexes(IndexSet(integer: 6), byExtendingSelection: false)
-        Self.pumpMainRunLoop(for: 0.05)
+        try Self.selectSidebar(in: sidebar, label: "Prompt Generator")
         XCTAssertNotNil(
             Self.descendants(of: window.contentView).compactMap { $0 as? NSTextField }.first {
-                $0.stringValue == "Generate conversion-friendly animation"
+                $0.stringValue == "Prompt Generator"
             }
         )
     }
@@ -336,8 +533,7 @@ final class SettingsWindowControllerTests: XCTestCase {
         }
 
         let sidebar = try Self.settingsSidebar(in: window)
-        sidebar.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
-        Self.pumpMainRunLoop(for: 0.05)
+        try Self.selectSidebar(in: sidebar, label: "Animations")
         let animationModes = try XCTUnwrap(
             Self.descendants(of: window.contentView).compactMap { $0 as? NSSegmentedControl }.first {
                 $0.accessibilityLabel() == "Animation library mode"
@@ -371,14 +567,33 @@ final class SettingsWindowControllerTests: XCTestCase {
         Self.pumpMainRunLoop(for: 0.05)
         XCTAssertEqual(transitionScope.accessibilityValue() as? String, "Global")
 
-        for section in 0 ..< sidebar.numberOfRows {
-            sidebar.selectRowIndexes(IndexSet(integer: section), byExtendingSelection: false)
-            Self.pumpMainRunLoop(for: 0.05)
+        let requestedFrameSize = NSSize(width: 720, height: 600)
+        window.setFrame(
+            NSRect(origin: window.frame.origin, size: requestedFrameSize),
+            display: false
+        )
+        Self.pumpMainRunLoop(for: 0.05)
+        XCTAssertEqual(window.frame.width, requestedFrameSize.width, accuracy: 1)
+        XCTAssertEqual(window.frame.height, requestedFrameSize.height, accuracy: 1)
+        XCTAssertEqual(Self.contentSize(of: window).width, requestedFrameSize.width, accuracy: 1)
+        XCTAssertEqual(Self.contentSize(of: window).height, requestedFrameSize.height, accuracy: 1)
 
-            XCTAssertGreaterThanOrEqual(window.contentLayoutRect.width, 700, "section \(section)")
-            XCTAssertLessThanOrEqual(window.contentLayoutRect.width, 800, "section \(section)")
-            XCTAssertGreaterThanOrEqual(window.contentLayoutRect.height, 570, "section \(section)")
-            XCTAssertLessThanOrEqual(window.contentLayoutRect.height, 650, "section \(section)")
+        for section in [
+            "General",
+            "Appearance",
+            "Animations",
+            "Dialogue & Voice",
+            "Prompt Generator",
+            "Source Requirements",
+            "Help & Updates",
+            "Diagnostics & Repair",
+        ] {
+            try Self.selectSidebar(in: sidebar, label: section)
+
+            XCTAssertEqual(window.frame.width, requestedFrameSize.width, accuracy: 1, "section \(section)")
+            XCTAssertEqual(window.frame.height, requestedFrameSize.height, accuracy: 1, "section \(section)")
+            XCTAssertEqual(Self.contentSize(of: window).width, requestedFrameSize.width, accuracy: 1, "section \(section)")
+            XCTAssertEqual(Self.contentSize(of: window).height, requestedFrameSize.height, accuracy: 1, "section \(section)")
             if let visibleFrame = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame {
                 XCTAssertLessThanOrEqual(window.frame.width, visibleFrame.width, "section \(section)")
                 XCTAssertLessThanOrEqual(window.frame.height, visibleFrame.height, "section \(section)")
@@ -416,8 +631,7 @@ final class SettingsWindowControllerTests: XCTestCase {
         }
 
         let sidebar = try Self.settingsSidebar(in: window)
-        sidebar.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
-        Self.pumpMainRunLoop(for: 0.05)
+        try Self.selectSidebar(in: sidebar, label: "Animations")
         let animationModes = try XCTUnwrap(
             Self.descendants(of: window.contentView).compactMap { $0 as? NSSegmentedControl }.first {
                 $0.accessibilityLabel() == "Animation library mode"
@@ -510,12 +724,31 @@ final class SettingsWindowControllerTests: XCTestCase {
     }
 
     private static func sidebarLabel(in sidebar: NSTableView, row: Int) -> String? {
-        guard let cell = sidebar.view(atColumn: 0, row: row, makeIfNecessary: true) else { return nil }
-        return descendants(of: cell).compactMap { $0 as? NSTextField }.first?.stringValue
+        sidebarLabelView(in: sidebar, row: row)?.stringValue
     }
 
-    private static func sidebarSelectionValue(in sidebar: NSTableView, row: Int) -> String? {
-        sidebar.view(atColumn: 0, row: row, makeIfNecessary: true)?.accessibilityValue() as? String
+    private static func sidebarLabelView(in sidebar: NSTableView, row: Int) -> NSTextField? {
+        guard let cell = sidebar.view(atColumn: 0, row: row, makeIfNecessary: true) else { return nil }
+        return descendants(of: cell).compactMap { $0 as? NSTextField }.first
+    }
+
+    private static func sidebarRow(in sidebar: NSTableView, label: String) throws -> Int {
+        try XCTUnwrap(
+            (0 ..< sidebar.numberOfRows).first { sidebarLabel(in: sidebar, row: $0) == label },
+            "missing sidebar destination \(label)"
+        )
+    }
+
+    @discardableResult
+    private static func selectSidebar(in sidebar: NSTableView, label: String) throws -> Int {
+        let row = try sidebarRow(in: sidebar, label: label)
+        sidebar.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        pumpMainRunLoop(for: 0.05)
+        return row
+    }
+
+    private static func contentSize(of window: NSWindow) -> NSSize {
+        window.contentView?.bounds.size ?? window.contentLayoutRect.size
     }
 
     private static func pumpMainRunLoop(for duration: TimeInterval) {
