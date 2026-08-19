@@ -41,6 +41,7 @@ final class SettingsWindowControllerTests: XCTestCase {
         SettingsWindowSizeStore.persist(NSSize(width: 720, height: 580), to: defaults)
         let controller = SettingsWindowController(defaults: defaults)
         let window = try XCTUnwrap(controller.window)
+        XCTAssertTrue(window.styleMask.contains(.resizable))
         controller.show()
         Self.pumpMainRunLoop(for: 0.1)
         defer {
@@ -69,11 +70,73 @@ final class SettingsWindowControllerTests: XCTestCase {
         XCTAssertTrue(window.titlebarAccessoryViewControllers.isEmpty)
         XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(resetItem.action), to: resetItem.target, from: resetItem))
         Self.pumpMainRunLoop(for: 0.05)
-        XCTAssertEqual(Self.contentSize(of: window).width, min(760, window.contentMaxSize.width), accuracy: 1)
+        XCTAssertEqual(Self.contentSize(of: window).width, min(1_000, window.contentMaxSize.width), accuracy: 1)
         XCTAssertEqual(Self.contentSize(of: window).height, min(650, window.contentMaxSize.height), accuracy: 1)
         let resetSize = try XCTUnwrap(SettingsWindowSizeStore.restored(from: defaults))
         XCTAssertEqual(resetSize.width, Self.contentSize(of: window).width, accuracy: 1)
         XCTAssertEqual(resetSize.height, Self.contentSize(of: window).height, accuracy: 1)
+    }
+
+    func testFreshSettingsWindowUsesWiderDefaultAndPreservesCustomResize() throws {
+        let suiteName = "statelet-settings-wider-default-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        let controller = SettingsWindowController(defaults: defaults)
+        let window = try XCTUnwrap(controller.window)
+        controller.show()
+        defer {
+            window.close()
+            Self.pumpMainRunLoop(for: 0.05)
+        }
+
+        XCTAssertTrue(window.styleMask.contains(.resizable))
+        XCTAssertEqual(Self.contentSize(of: window).width, min(1_000, window.contentMaxSize.width), accuracy: 1)
+        XCTAssertEqual(Self.contentSize(of: window).height, min(650, window.contentMaxSize.height), accuracy: 1)
+
+        let customSize = NSSize(width: 820, height: 610)
+        window.setContentSize(customSize)
+        Self.pumpMainRunLoop(for: 0.1)
+        XCTAssertEqual(Self.contentSize(of: window).width, customSize.width, accuracy: 1)
+        XCTAssertEqual(Self.contentSize(of: window).height, customSize.height, accuracy: 1)
+        let persisted = try XCTUnwrap(SettingsWindowSizeStore.restored(from: defaults))
+        XCTAssertEqual(persisted.width, customSize.width, accuracy: 1)
+        XCTAssertEqual(persisted.height, customSize.height, accuracy: 1)
+    }
+
+    func testLegacyDefaultSizeMigratesOnceWithoutOverridingLaterUserResize() throws {
+        let suiteName = "statelet-settings-wider-default-migration-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        SettingsWindowSizeStore.persist(NSSize(width: 760, height: 650), to: defaults)
+        let migratedController = SettingsWindowController(defaults: defaults)
+        let migratedWindow = try XCTUnwrap(migratedController.window)
+        migratedController.show()
+        Self.pumpMainRunLoop(for: 0.1)
+        XCTAssertEqual(Self.contentSize(of: migratedWindow).width, min(1_000, migratedWindow.contentMaxSize.width), accuracy: 1)
+        XCTAssertEqual(Self.contentSize(of: migratedWindow).height, min(650, migratedWindow.contentMaxSize.height), accuracy: 1)
+
+        let laterUserSize = NSSize(width: 760, height: 650)
+        migratedWindow.setContentSize(laterUserSize)
+        Self.pumpMainRunLoop(for: 0.05)
+        migratedWindow.close()
+        Self.pumpMainRunLoop(for: 0.05)
+
+        let restoredController = SettingsWindowController(defaults: defaults)
+        let restoredWindow = try XCTUnwrap(restoredController.window)
+        restoredController.show()
+        Self.pumpMainRunLoop(for: 0.1)
+        defer {
+            restoredWindow.close()
+            Self.pumpMainRunLoop(for: 0.05)
+        }
+        XCTAssertEqual(Self.contentSize(of: restoredWindow).width, laterUserSize.width, accuracy: 1)
+        XCTAssertEqual(Self.contentSize(of: restoredWindow).height, laterUserSize.height, accuracy: 1)
     }
 
     func testSettingsSidebarProvidesOrderedAccessibleKeyboardNavigationAndPersistsSelection() throws {
@@ -320,6 +383,104 @@ final class SettingsWindowControllerTests: XCTestCase {
             XCTAssertEqual(pageTitle.accessibilityLabel(), title)
             XCTAssertGreaterThanOrEqual(pageTitle.font?.pointSize ?? 0, 20)
         }
+    }
+
+    func testSelectingDialogueVoiceKeepsTheNativeSidebarInPlace() throws {
+        let suiteName = "statelet-settings-dialogue-sidebar-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        let profile = try GPTSoVITSVoiceProfile(
+            name: "Test Voice",
+            apiBaseURL: try XCTUnwrap(URL(string: "http://127.0.0.1:9880")),
+            gptWeightRelativePath: "voice/assets/gpt/test.ckpt",
+            sovitsWeightRelativePath: "voice/assets/sovits/test.pth",
+            referenceAudioRelativePath: "voice/assets/reference/test.wav",
+            referenceText: "Reference text",
+            promptLanguage: "ja",
+            defaultTextLanguage: "ja",
+            inputFingerprint: String(repeating: "a", count: 64)
+        )
+        let lines = try (0 ..< 20).map { index in
+            try DialogueLine(
+                state: PetState.allCases[index % PetState.allCases.count],
+                text: "Dialogue line \(index)",
+                textLanguage: "ja"
+            )
+        }
+        let library = try DialogueVoiceLibrary(profile: profile, lines: lines)
+        let controller = SettingsWindowController(defaults: defaults)
+        controller.update(
+            dialogueVoice: DialogueVoiceCoordinatorSnapshot(
+                library: library,
+                draft: DialogueVoiceProfileDraft(
+                    name: profile.name,
+                    apiBaseURL: profile.apiBaseURL.absoluteString,
+                    promptLanguage: profile.promptLanguage,
+                    defaultTextLanguage: profile.defaultTextLanguage,
+                    referenceText: profile.referenceText
+                ),
+                importedAssets: DialogueVoiceImportedAssets(profile: profile),
+                activityMessage: nil
+            )
+        )
+        let window = try XCTUnwrap(controller.window)
+        controller.show()
+        Self.pumpMainRunLoop(for: 0.1)
+        defer {
+            window.close()
+            Self.pumpMainRunLoop(for: 0.05)
+        }
+
+        let sidebar = try Self.settingsSidebar(in: window)
+        let splitViewController = try XCTUnwrap(
+            Self.descendants(of: window.contentView)
+                .compactMap { $0.nextResponder as? NSSplitViewController }
+                .first
+        )
+        XCTAssertEqual(splitViewController.splitViewItems.count, 2)
+        XCTAssertEqual(
+            Self.descendants(of: window.contentView).compactMap { $0 as? NSTableView }.filter {
+                $0.accessibilityLabel() == "Settings navigation"
+            }.count,
+            1
+        )
+
+        try Self.selectSidebar(in: sidebar, label: "Help & Updates")
+        window.contentView?.layoutSubtreeIfNeeded()
+        let sidebarView = try XCTUnwrap(splitViewController.splitViewItems.first?.viewController.view)
+        let detailView = try XCTUnwrap(splitViewController.splitViewItems.last?.viewController.view)
+        let sidebarFrameBefore = sidebarView.frame
+        let detailFrameBefore = detailView.frame
+        let navigationFrameBefore = try XCTUnwrap(sidebar.enclosingScrollView).frame
+        let windowFrameBefore = window.frame
+        let contentSizeBefore = Self.contentSize(of: window)
+        let splitFrameBefore = splitViewController.splitView.frame
+
+        try Self.selectSidebar(in: sidebar, label: "Dialogue & Voice")
+        window.contentView?.layoutSubtreeIfNeeded()
+        XCTAssertEqual(splitViewController.splitView.frame.minX, splitFrameBefore.minX, accuracy: 1)
+        XCTAssertEqual(splitViewController.splitView.frame.width, splitFrameBefore.width, accuracy: 1)
+        XCTAssertEqual(sidebarView.frame.minX, sidebarFrameBefore.minX, accuracy: 1)
+        XCTAssertEqual(sidebarView.frame.width, sidebarFrameBefore.width, accuracy: 1)
+        XCTAssertEqual(detailView.frame.minX, detailFrameBefore.minX, accuracy: 1)
+        XCTAssertEqual(detailView.frame.width, detailFrameBefore.width, accuracy: 1)
+        XCTAssertEqual(window.frame.width, windowFrameBefore.width, accuracy: 1)
+        XCTAssertEqual(window.frame.height, windowFrameBefore.height, accuracy: 1)
+        XCTAssertEqual(Self.contentSize(of: window).width, contentSizeBefore.width, accuracy: 1)
+        XCTAssertEqual(Self.contentSize(of: window).height, contentSizeBefore.height, accuracy: 1)
+        XCTAssertEqual(
+            try XCTUnwrap(sidebar.enclosingScrollView).frame.minX,
+            navigationFrameBefore.minX,
+            accuracy: 1
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(sidebar.enclosingScrollView).frame.width,
+            navigationFrameBefore.width,
+            accuracy: 1
+        )
     }
 
     func testSettingsContentClassificationPlacesPreferencesUnderAppAndRepairsUnderSupport() throws {

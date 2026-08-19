@@ -374,10 +374,12 @@ private enum SettingsSidebarItem {
 
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private static let defaultStateLabelCustomColor = "#007AFF"
-    private static let preferredContentSize = NSSize(width: 760, height: 650)
+    private static let preferredContentSize = NSSize(width: 1_000, height: 650)
+    private static let legacyPreferredContentSize = NSSize(width: 760, height: 650)
     private static let minimumContentSize = NSSize(width: 700, height: 570)
     private static let screenMargin: CGFloat = 12
     private static let sidebarWidth: CGFloat = 218
+    private static let widerDefaultMigrationKey = "Statelet.settingsWindowUsesWiderDefault.v1"
     private static let selectedSectionIDDefaultsKey = "Statelet.Settings.selectedSectionID"
     private static let legacySelectedSectionDefaultsKey = "Statelet.Settings.selectedSection"
     private static let resetWindowSizeToolbarItemIdentifier = NSToolbarItem.Identifier(
@@ -580,7 +582,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        let restoredSize = SettingsWindowSizeStore.restored(from: defaults)
+        let storedSize = SettingsWindowSizeStore.restored(from: defaults)
+        let shouldMigrateLegacyDefault = defaults.object(forKey: Self.widerDefaultMigrationKey) == nil
+            && storedSize.map(Self.isLegacyPreferredContentSize) == true
+        let restoredSize = shouldMigrateLegacyDefault ? nil : storedSize
         usePreferredSizeOnFirstShow = restoredSize == nil
         let toolbar = NSToolbar(identifier: NSToolbar.Identifier("StateletSettingsToolbar"))
         toolbar.allowsUserCustomization = false
@@ -616,6 +621,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         }
         buildInterface()
         fitWindowToVisibleScreen(usePreferredSize: false)
+        defaults.set(true, forKey: Self.widerDefaultMigrationKey)
     }
 
     @available(*, unavailable)
@@ -631,7 +637,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let shouldUsePreferredSize = !hasShownWindow && usePreferredSizeOnFirstShow
         fitWindowToVisibleScreen(usePreferredSize: shouldUsePreferredSize)
         DispatchQueue.main.async { [weak self] in
-            self?.fitWindowToVisibleScreen(usePreferredSize: shouldUsePreferredSize)
+            self?.fitWindowToVisibleScreen(usePreferredSize: false)
         }
         hasShownWindow = true
     }
@@ -896,6 +902,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         splitViewController.preferredContentSize = requestedContentSize
         let splitRootView = splitViewController.view
         guard let contentView = window.contentView else { return }
+        NSLayoutConstraint.activate([
+            splitViewController.splitView.leadingAnchor.constraint(equalTo: splitRootView.leadingAnchor),
+            splitViewController.splitView.trailingAnchor.constraint(equalTo: splitRootView.trailingAnchor),
+            splitViewController.splitView.topAnchor.constraint(equalTo: splitRootView.topAnchor),
+            splitViewController.splitView.bottomAnchor.constraint(equalTo: splitRootView.bottomAnchor),
+        ])
         splitRootView.frame = contentView.bounds
         splitRootView.autoresizingMask = [.width, .height]
         contentView.addSubview(splitRootView)
@@ -2420,6 +2432,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         windowContentWidthConstraint?.constant = size.width
         windowContentHeightConstraint?.constant = size.height
         updateSplitPreferredContentSizes(for: size)
+    }
+
+    private static func isLegacyPreferredContentSize(_ size: NSSize) -> Bool {
+        abs(size.width - legacyPreferredContentSize.width) <= 1
+            && abs(size.height - legacyPreferredContentSize.height) <= 1
     }
 
     private func fitWindowToVisibleScreen(usePreferredSize: Bool) {
