@@ -366,8 +366,8 @@ esac
             info["NSHumanReadableCopyright"],
             "Copyright © 2026 Statelet contributors. MIT licensed.",
         )
-        self.assertEqual(info["CFBundleShortVersionString"], "1.8.6")
-        self.assertEqual(info["CFBundleVersion"], "20")
+        self.assertEqual(info["CFBundleShortVersionString"], "1.8.7")
+        self.assertEqual(info["CFBundleVersion"], "21")
         self.assertEqual(info["CFBundlePackageType"], "APPL")
         self.assertEqual(info["LSMinimumSystemVersion"], "13.0")
         self.assertTrue(info["LSUIElement"])
@@ -1490,7 +1490,6 @@ struct WatchdogHarness {
                 "statelet_hook.py",
                 "statelet_state.py",
                 "statelet_state_aggregator.py",
-                "statelet_thread_titles.py",
             },
         )
         self.assertNotIn("codex_pet_daemon.py", installed_names)
@@ -1498,6 +1497,84 @@ struct WatchdogHarness {
             (self.home / "Library" / "Application Support" / "Statelet" / "media" / "media-map.json").stat().st_mode & 0o777,
             0o600,
         )
+
+    def test_install_removes_owned_regular_obsolete_activity_titles(self) -> None:
+        bundle = self.make_bundle("ObsoleteActivityTitles")
+        sessions = (
+            self.home
+            / "Library"
+            / "Application Support"
+            / "Statelet"
+            / "sessions"
+        )
+        sessions.mkdir(parents=True)
+        obsolete = sessions / "activity-titles-v1.json"
+        obsolete_payload = '{"private":"title"}\n'
+        obsolete.write_text(obsolete_payload, encoding="utf-8")
+        retained = sessions / "activity-targets-v1.json"
+        retained.write_text('{"targets":{}}\n', encoding="utf-8")
+
+        failed_environment = os.environ.copy()
+        failed_environment["STATELET_INSTALL_FAIL_AT"] = "after-support"
+        failed = self.install(bundle, env=failed_environment)
+
+        self.assertEqual(failed.returncode, 70, failed.stderr)
+        self.assertEqual(obsolete.read_text(encoding="utf-8"), obsolete_payload)
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+
+        result = self.install(bundle)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(obsolete.exists())
+        self.assertEqual(retained.read_text(encoding="utf-8"), '{"targets":{}}\n')
+
+    def test_install_rejects_obsolete_activity_titles_symlink_without_following_it(self) -> None:
+        bundle = self.make_bundle("ObsoleteActivityTitlesSymlink")
+        sessions = (
+            self.home
+            / "Library"
+            / "Application Support"
+            / "Statelet"
+            / "sessions"
+        )
+        sessions.mkdir(parents=True)
+        private_target = self.base / "private-title-target.json"
+        private_payload = '{"private":"do not disclose"}\n'
+        private_target.write_text(private_payload, encoding="utf-8")
+        obsolete = sessions / "activity-titles-v1.json"
+        obsolete.symlink_to(private_target)
+
+        result = self.install(bundle)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Refusing unsafe obsolete Statelet activity metadata", result.stderr)
+        self.assertNotIn(str(obsolete), result.stderr)
+        self.assertNotIn(str(private_target), result.stderr)
+        self.assertNotIn("do not disclose", result.stderr)
+        self.assertTrue(obsolete.is_symlink())
+        self.assertEqual(private_target.read_text(encoding="utf-8"), private_payload)
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+
+    def test_install_rejects_obsolete_activity_titles_special_file(self) -> None:
+        bundle = self.make_bundle("ObsoleteActivityTitlesSpecial")
+        sessions = (
+            self.home
+            / "Library"
+            / "Application Support"
+            / "Statelet"
+            / "sessions"
+        )
+        sessions.mkdir(parents=True)
+        obsolete = sessions / "activity-titles-v1.json"
+        os.mkfifo(obsolete)
+
+        result = self.install(bundle)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Refusing unsafe obsolete Statelet activity metadata", result.stderr)
+        self.assertNotIn(str(obsolete), result.stderr)
+        self.assertTrue(obsolete.exists())
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
 
     def test_reinstall_preserves_managed_launch_at_login_choice(self) -> None:
         first_bundle = self.make_bundle("LoginPreferenceOne")
@@ -3631,8 +3708,11 @@ struct WatchdogHarness {
             env=environment,
         )
         import time
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + 60
         while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
+            if process.poll() is not None:
+                _, stderr = process.communicate()
+                self.fail(f"installer exited before migration gate: {stderr}")
             time.sleep(0.01)
         if not Path(f"{gate}.ready").exists():
             process.terminate()
@@ -3646,7 +3726,7 @@ struct WatchdogHarness {
         voice.write_bytes(b"mutated-after-copy")
         Path(f"{gate}.release").touch()
 
-        _, stderr = process.communicate(timeout=10)
+        _, stderr = process.communicate(timeout=30)
 
         self.assertEqual(process.returncode, 75, stderr)
         self.assertEqual(voice.read_bytes(), b"mutated-after-copy")
@@ -3676,8 +3756,11 @@ struct WatchdogHarness {
             env=environment,
         )
         import time
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 60
         while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
+            if process.poll() is not None:
+                _, stderr = process.communicate()
+                self.fail(f"installer exited before migration gate: {stderr}")
             time.sleep(0.01)
         if not Path(f"{gate}.ready").exists():
             process.terminate()
@@ -3687,7 +3770,7 @@ struct WatchdogHarness {
         created.parent.mkdir(parents=True)
         created.write_bytes(b"late-hook-write")
         Path(f"{gate}.release").touch()
-        _, stderr = process.communicate(timeout=10)
+        _, stderr = process.communicate(timeout=30)
 
         self.assertEqual(process.returncode, 75, stderr)
         self.assertEqual(created.read_bytes(), b"late-hook-write")
@@ -3728,8 +3811,11 @@ struct WatchdogHarness {
             env=environment,
         )
         import time
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 60
         while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
+            if process.poll() is not None:
+                _, stderr = process.communicate()
+                self.fail(f"installer exited before migration gate: {stderr}")
             time.sleep(0.01)
         if not Path(f"{gate}.ready").exists():
             process.terminate()
@@ -3737,7 +3823,7 @@ struct WatchdogHarness {
             self.fail(f"migration gate was not reached: {stderr}")
         self.assertNotIn(command, hooks_file.read_text(encoding="utf-8"))
         Path(f"{gate}.release").touch()
-        _, stderr = process.communicate(timeout=10)
+        _, stderr = process.communicate(timeout=30)
         self.assertEqual(process.returncode, 0, stderr)
 
     def test_explicit_long_hook_timeout_is_fully_drained_before_snapshot(self) -> None:

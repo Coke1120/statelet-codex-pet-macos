@@ -1,7 +1,7 @@
 # Statelet lifecycle and media reference
 
-This reference documents the internal contracts behind Statelet 1.8.6 (build
-20), the native Codex lifecycle companion for macOS. Start with
+This reference documents the internal contracts behind Statelet 1.8.7 (build
+21), the native Codex lifecycle companion for macOS. Start with
 [Deployment](DEPLOYMENT.md) for installation or [Using Statelet](USAGE.md) for
 daily operation.
 
@@ -264,9 +264,20 @@ moves only still-unreferenced recognized files to Trash.
 
 ## Privacy and process boundary
 
-The application and state publisher make no runtime network requests, collect
-no telemetry, and upload no crash reports. Optional package installation may use
-the network through the user's package manager.
+The state publisher and local App Server title lookup make no network requests.
+Statelet collects no telemetry and uploads no crash reports. Update checks and
+owner-authorized package downloads contact the pinned GitHub repository;
+optional package installation may also use the network through the user's
+package manager.
+
+For rows with a validated private activation target, the signed app can query
+the local Codex App Server with `thread/read` and `includeTurns: false`. It
+accepts only a bounded, sanitized `thread.name`, holds it in memory, and
+discards previews, turns, and items. Title lookup never changes lifecycle state
+or activation eligibility; resolved titles are not written to sidecars,
+preferences, or logs.
+Only transition-based categorical lookup health is logged; raw errors, thread
+identifiers, titles, paths, and response content are excluded.
 
 Statelet is not sandboxed. The installer manages files in the current account's
 Application Support and LaunchAgents directories and merges commands into

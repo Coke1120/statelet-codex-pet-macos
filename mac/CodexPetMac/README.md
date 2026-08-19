@@ -4,7 +4,7 @@ Statelet is a personal-local Codex lifecycle companion for macOS 13 or newer.
 It is an AppKit accessory application: the transparent panel can be moved by dragging
 its body and resized from any border or corner without taking keyboard focus,
 AVFoundation owns exactly one decoder, and the menu-bar item keeps click-through
-recoverable. The current app version is 1.8.6 (build 20). New builds and
+recoverable. The current app version is 1.8.7 (build 21). New builds and
 installations use
 `Statelet.app`, bundle identifier `com.coke1120.Statelet`, `CFBundleName` and
 executable `Statelet`, Application Support under
@@ -467,9 +467,9 @@ activity popup is draggable when click-through is disabled and remembers its
 position. Rows with a fresh owner-only target expose **Open in Codex** through
 OpenAI's documented `codex://threads/<thread-id>` link; legacy or unverified
 targets remain informational, and opening never marks a completed row as read.
-Rows can also show a bounded, sanitized user-facing session title resolved
-locally through the experimental Codex App Server. Missing titles fall back to
-the generic lifecycle label and do not affect **Open in Codex**.
+Rows can also show a bounded, sanitized user-facing task title resolved in
+memory through the experimental local Codex App Server. Missing titles keep the
+generic lifecycle label and do not affect **Open in Codex**.
 
 The installer preserves `media-map.json`, `global-transitions.json`,
 `character-library.json`, hidden per-character maps/assets, and user media on
@@ -528,16 +528,6 @@ continues to contain no raw session identifiers:
 ~/Library/Application Support/Statelet/sessions/activity-targets-v1.json
 ```
 
-Optional user-facing session titles use a second private sidecar:
-
-```text
-~/Library/Application Support/Statelet/sessions/activity-titles-v1.json
-```
-
-The aggregator creates this file with owner-only mode `0600` permissions. It is
-keyed by the same opaque activity hash as `activity-v1.json`; it never contains
-the technical thread identifier.
-
 The complete serial-free state path is:
 
 ```text
@@ -545,7 +535,7 @@ Codex lifecycle hooks
   -> per-session JSON in Application Support
   -> board-independent priority aggregator
   -> runtime/current_state.json
-  -> sessions/activity-v1.json + private target/title sidecars
+  -> sessions/activity-v1.json + private activity-targets-v1.json
   -> Swift file watchers
   -> requested lifecycle badge, activity rail, and animation
 ```
@@ -568,12 +558,11 @@ The separate owner-only activation sidecar contains only the opaque hash and a
 bounded technical thread identifier needed for the supported desktop deep link.
 It is optional, freshness-matched to the public sidecar, and never changes
 lifecycle aggregation.
-For eligible rows, the aggregator invokes the local Codex App Server and issues
-`thread/read` with `includeTurns: false`. It accepts only the bounded, sanitized
-`thread.name` field and discards response previews, turns, and items without
-persisting them. Accepted values are written to the owner-only mode-`0600`
-`activity-titles-v1.json` sidecar. The public `activity-v1.json` and activation
-target schema remain title-free and unchanged.
+For eligible rows, the signed app issues `thread/read` with
+`includeTurns: false` to the local Codex App Server. It accepts only the
+bounded, sanitized `thread.name` field, discards previews, turns, and items, and
+keeps accepted titles in memory only. Nothing is added to `activity-v1.json`,
+`activity-targets-v1.json`, preferences, or diagnostics.
 
 The App Server integration is experimental and fail-soft. An unavailable Codex
 binary, App Server error, missing title, or rejected title leaves the existing

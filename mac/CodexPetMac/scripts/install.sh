@@ -146,6 +146,66 @@ for candidate in candidates:
 PY
 }
 
+classify_obsolete_activity_titles() {
+  "$python_bin" - "$home_dir" <<'PY'
+import errno, os, stat, sys
+
+owner = os.getuid()
+directory_flags = os.O_RDONLY | os.O_DIRECTORY
+if hasattr(os, "O_CLOEXEC"):
+    directory_flags |= os.O_CLOEXEC
+if hasattr(os, "O_NOFOLLOW"):
+    directory_flags |= os.O_NOFOLLOW
+
+def open_owned_directory(parent_fd, name):
+    try:
+        descriptor = os.open(name, directory_flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise SystemExit(2)
+    status = os.fstat(descriptor)
+    if not stat.S_ISDIR(status.st_mode) or status.st_uid != owner:
+        os.close(descriptor)
+        raise SystemExit(2)
+    return descriptor
+
+try:
+    current = os.open(sys.argv[1], directory_flags)
+except OSError:
+    raise SystemExit(2)
+try:
+    home_status = os.fstat(current)
+    if not stat.S_ISDIR(home_status.st_mode) or home_status.st_uid != owner:
+        raise SystemExit(2)
+    for component in ("Library", "Application Support", "Statelet", "sessions"):
+        next_directory = open_owned_directory(current, component)
+        if next_directory is None:
+            print("absent")
+            raise SystemExit(0)
+        os.close(current)
+        current = next_directory
+    try:
+        status = os.stat("activity-titles-v1.json", dir_fd=current, follow_symlinks=False)
+    except FileNotFoundError:
+        print("absent")
+        raise SystemExit(0)
+    except OSError as error:
+        if error.errno == errno.ENOENT:
+            print("absent")
+            raise SystemExit(0)
+        raise SystemExit(2)
+    if not stat.S_ISREG(status.st_mode) or status.st_uid != owner:
+        raise SystemExit(2)
+    print("regular")
+finally:
+    try:
+        os.close(current)
+    except NameError:
+        pass
+PY
+}
+
 if ! validate_support_roots; then
   printf 'Refusing unsafe Statelet support directory layout.\n' >&2
   exit 1
@@ -1183,7 +1243,7 @@ elif command == "recover":
     support = args[-1]
     allowed_support = {
         os.path.join(support, relative)
-        for relative in ("media", "voice", "characters", "sessions", "alpha-runtime", "runtime/current_state.json", "media/media-map.json", ".legacy-migration-v1.json")
+        for relative in ("media", "voice", "characters", "sessions", "sessions/activity-titles-v1.json", "alpha-runtime", "runtime/current_state.json", "media/media-map.json", ".legacy-migration-v1.json")
     }
     allowed_exact.update(allowed_support)
     if data["state"] in {"files-committed", "committed"}:
@@ -1465,10 +1525,9 @@ mkdir -p "$stage_component/python"
 install -m 0644 "$repo_root/mac/codex_pet_state.py" "$stage_component/python/statelet_state.py"
 install -m 0755 "$repo_root/mac/codex_pet_state_aggregator.py" "$stage_component/python/statelet_state_aggregator.py"
 install -m 0755 "$repo_root/mac/codex_pet_hook.py" "$stage_component/python/statelet_hook.py"
-install -m 0644 "$repo_root/mac/codex_thread_titles.py" "$stage_component/python/statelet_thread_titles.py"
 printf '%s\n' "$managed_marker" > "$stage_component/MANAGED_BY_STATELET"
 chmod 0644 "$stage_component/MANAGED_BY_STATELET"
-PYTHONDONTWRITEBYTECODE=1 "$python_bin" -m py_compile "$stage_component/python/statelet_state.py" "$stage_component/python/statelet_state_aggregator.py" "$stage_component/python/statelet_hook.py" "$stage_component/python/statelet_thread_titles.py"
+PYTHONDONTWRITEBYTECODE=1 "$python_bin" -m py_compile "$stage_component/python/statelet_state.py" "$stage_component/python/statelet_state_aggregator.py" "$stage_component/python/statelet_hook.py"
 rm -rf "$stage_component/python/__pycache__"
 
 stage_hooks="$stage_root/hooks.json"
@@ -1595,6 +1654,18 @@ backup_target "$component_dir" component
 # bounded to 10 seconds. The final post-publication digest check remains
 # authoritative if a process outlives that contract.
 [[ "$hook_drain_seconds" == "0.0" ]] || /bin/sleep "$hook_drain_seconds"
+
+# An unpublished interim build persisted thread titles beside the activity
+# records. Remove that file only after managed writers are quiesced and only
+# through the journal, so a later installation rollback restores it.
+if obsolete_activity_titles_status="$(classify_obsolete_activity_titles)"; then
+  if [[ "$obsolete_activity_titles_status" == "regular" ]]; then
+    backup_target "$support_dir/sessions/activity-titles-v1.json" obsolete/activity-titles-v1.json
+  fi
+else
+  printf 'Refusing unsafe obsolete Statelet activity metadata.\n' >&2
+  exit 1
+fi
 
 migration_relatives=()
 migration_digests=()
@@ -1771,6 +1842,7 @@ journal_command files-commit \
   "$hooks_file" "$applications_dir" "$home_dir/Library" "$home_dir/Library/Application Support" \
   "$support_dir" "$launch_agents_dir" "$home_dir/.codex" "$media_dir" "$runtime_dir" "$logs_dir" \
   "$support_dir/media" "$support_dir/voice" "$support_dir/characters" "$support_dir/sessions" \
+  "$support_dir/sessions/activity-titles-v1.json" \
   "$support_dir/alpha-runtime" "$support_dir/runtime/current_state.json" "$support_dir/media/media-map.json" \
   "$support_dir/.legacy-migration-v1.json" "$support_dir"
 if [[ "${STATELET_INSTALL_CRASH_AT:-}" == "after-files-commit" ]]; then kill -KILL $$; fi
@@ -1800,6 +1872,7 @@ journal_command commit \
   "$hooks_file" "$applications_dir" "$home_dir/Library" "$home_dir/Library/Application Support" \
   "$support_dir" "$launch_agents_dir" "$home_dir/.codex" "$media_dir" "$runtime_dir" "$logs_dir" \
   "$support_dir/media" "$support_dir/voice" "$support_dir/characters" "$support_dir/sessions" \
+  "$support_dir/sessions/activity-titles-v1.json" \
   "$support_dir/alpha-runtime" "$support_dir/runtime/current_state.json" "$support_dir/media/media-map.json" \
   "$support_dir/.legacy-migration-v1.json" "$support_dir"
 committed=1

@@ -5,41 +5,41 @@ versioning for the public source release.
 
 ## Unreleased
 
-## [1.8.6] - 2026-08-19
-
-### Added
-
-- Expanded session-activity rows can show a bounded, sanitized Codex thread
-  title while preserving the generic lifecycle label when no title is available.
-- A separate owner-only `activity-titles-v1.json` sidecar maps opaque activity
-  hashes to display titles without storing technical thread identifiers.
+## [1.8.7] - 2026-08-19
 
 ### Changed
 
-- The optional local Codex App Server bridge requests `thread/read` with
-  `includeTurns: false`, accepts only `thread.name`, and discards previews,
-  turns, items, paths, and other response fields.
-- Title resolution is time-, count-, output-, and size-bounded with cached
-  success/null results, categorical failure backoff, and fail-soft diagnostics.
-- Optional target/title sidecar write failures retry on a real activity change
-  or the normal heartbeat instead of self-triggering a directory-event loop.
+- Codex task-title hydration now ships inside the signed Swift application and
+  stays memory-only, so an in-app update from 1.8.5 receives the complete
+  feature without another source-installer bootstrap.
+- The app requests only `thread/read` with `includeTurns: false`, accepts a
+  bounded sanitized `thread.name`, and discards previews, turns, items, and
+  other response fields.
 
 ### Fixed
 
-- App Server subprocesses are terminated and reaped deterministically across
-  success, timeout, malformed output, EOF, and backpressure paths.
-- Snapshot timestamp and opaque-ID validation prevent stale, duplicated,
-  symlinked, or malformed private titles from replacing accepted popup content.
+- Title lookup timeouts, malformed or oversized responses, subprocess
+  backpressure, and stale asynchronous completions fail soft without disabling
+  **Open in Codex**, changing lifecycle state, or replacing a newer task title.
+- Transition-only lookup health reports fixed categories without retaining raw
+  errors, identifiers, titles, paths, or response content.
+- Duplicate activity rows targeting one Codex thread share one cached lookup
+  while retaining their independent lifecycle and acknowledgement state.
+- The source installer journals and removes the obsolete owner-regular title
+  sidecar left by the unpublished 1.8.6 candidate; unsafe path types fail
+  closed without being followed.
 
 ### Distribution notes
 
-- No thread title, technical thread identifier, conversation preview, turn,
+- Version 1.8.7 supersedes the unpublished 1.8.6 release candidate, whose signed
+  release job was cancelled before publication because that implementation
+  still depended on external lifecycle components not delivered by app-only
+  updates.
+- No task title, technical thread identifier, conversation preview, turn,
   prompt, transcript, character media, voice data, or other private runtime data
-  is bundled in the release.
-- Title resolution remains experimental and optional; lifecycle aggregation and
-  **Open in Codex** continue to work independently when it is unavailable.
+  is bundled or persisted by title hydration.
 - The package remains ad-hoc signed for owner-authorized personal updates. It is
-  not Developer ID signed, notarized, or presented as a public Apple-authorized
+  not Developer ID signed, notarized, or presented as an Apple-authorized public
   binary.
 
 ## [1.8.5] - 2026-08-19
@@ -340,7 +340,7 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
-[1.8.6]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.6
+[1.8.7]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.7
 [1.8.5]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.5
 [1.8.4]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.4
 [1.8.3]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.3

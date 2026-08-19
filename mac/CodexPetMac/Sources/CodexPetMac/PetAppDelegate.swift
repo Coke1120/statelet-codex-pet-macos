@@ -467,6 +467,60 @@ private enum StatusMenuTag: Int {
     case character = 9
 }
 
+enum SessionActivityTitleHydrationPolicy {
+    static func eligibleTargets(
+        snapshot: SessionActivitySnapshot?,
+        targets: [String: String],
+        acknowledgedIDs: Set<String>
+    ) -> [String: String] {
+        guard let snapshot else { return [:] }
+        let displayState = SessionActivityPresentation.displayState(
+            snapshot: snapshot,
+            acknowledgedIDs: acknowledgedIDs,
+            compact: false
+        )
+        let displayedIDs = Set((displayState.active + displayState.completed).map(\.id))
+        return targets.filter { displayedIDs.contains($0.key) }
+    }
+
+    static func retainingTitles(
+        _ titles: [String: String],
+        previousTargets: [String: String],
+        currentTargets: [String: String],
+        snapshot: SessionActivitySnapshot?,
+        acknowledgedIDs: Set<String>
+    ) -> [String: String] {
+        let eligible = eligibleTargets(
+            snapshot: snapshot,
+            targets: currentTargets,
+            acknowledgedIDs: acknowledgedIDs
+        )
+        return titles.filter { activityID, _ in
+            guard let currentThreadID = eligible[activityID] else { return false }
+            return previousTargets[activityID] == currentThreadID
+        }
+    }
+
+    static func adopting(
+        resolvedTitles: [String: String],
+        requestedTargets: [String: String],
+        currentTargets: [String: String],
+        snapshot: SessionActivitySnapshot?,
+        acknowledgedIDs: Set<String>,
+        requestGeneration: UInt64,
+        currentGeneration: UInt64
+    ) -> [String: String]? {
+        guard requestGeneration == currentGeneration else { return nil }
+        let eligible = eligibleTargets(
+            snapshot: snapshot,
+            targets: currentTargets,
+            acknowledgedIDs: acknowledgedIDs
+        )
+        guard eligible == requestedTargets else { return nil }
+        return resolvedTitles.filter { eligible[$0.key] != nil }
+    }
+}
+
 final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @unchecked Sendable {
     private static let healthCheckIntervalSeconds = 30
     private static let positionSaveDebounceMilliseconds = 300
@@ -496,6 +550,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private let lifecycleStateReader = LifecycleStateFileReader()
     private let sessionActivityReader = SessionActivityFileReader()
     private let codexDesktopActivator = CodexDesktopActivator()
+    private let codexAppServerTitleResolver = CodexAppServerTitleResolver()
     private var characterCountRefreshGeneration: UInt64 = 0
     private var panel: PetPanel!
     private var player: PetPlayerController!
@@ -527,6 +582,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var sessionActivitySnapshot: SessionActivitySnapshot?
     private var sessionActivityTargets: [String: String] = [:]
     private var sessionActivityTitles: [String: String] = [:]
+    private var sessionActivityTitleHydrationGeneration: UInt64 = 0
+    private var sessionActivityTitleHydrationTask: Task<Void, Never>?
     private var lastAcceptedSessionActivitySnapshot: SessionActivitySnapshot?
     private var sessionActivityAcknowledgementHistory: [String] = []
     private var sessionActivityExpandedByUser = false
@@ -852,6 +909,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         transientStateReadRetry = nil
         sessionActivityReadRetry?.cancel()
         sessionActivityReadRetry = nil
+        invalidateSessionActivityTitleHydration()
         pendingLifecycleTransitionAttestationTask?.cancel()
         pendingLifecycleTransitionAttestationTask = nil
         pendingLifecycleTransitionAttestation = nil
@@ -1264,12 +1322,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         if retryAttempt == 0 {
             sessionActivityReadRetry?.cancel()
             sessionActivityReadRetry = nil
+            invalidateSessionActivityTitleHydration()
         }
-        sessionActivityReader.readWithPrivateMetadata(url) { [weak self] result, targets, titles in
+        sessionActivityReader.readWithTargets(url) { [weak self] result, targets in
             self?.applySessionActivityReadResult(
                 result,
                 targets: targets,
-                titles: titles,
                 from: url,
                 retryAttempt: retryAttempt
             )
@@ -1279,7 +1337,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private func applySessionActivityReadResult(
         _ result: SessionActivityReadResult,
         targets: [String: String],
-        titles: [String: String],
         from url: URL,
         retryAttempt: Int
     ) {
@@ -1296,23 +1353,21 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             )
             lastAcceptedSessionActivitySnapshot = application.lastAcceptedSnapshot
             sessionActivitySnapshot = application.displayedSnapshot
+            let previousTargets = sessionActivityTargets
             sessionActivityTargets = SessionActivityTargetAdoptionPolicy.apply(
                 incomingTargets: targets,
                 application: application,
                 currentlyAcceptedTargets: sessionActivityTargets
             )
-            sessionActivityTitles = SessionActivityTitleAdoptionPolicy.apply(
-                incomingTitles: titles,
-                application: application,
-                currentlyAcceptedTitles: sessionActivityTitles
-            )
             if application.acknowledgementHistory != sessionActivityAcknowledgementHistory {
                 sessionActivityAcknowledgementHistory = application.acknowledgementHistory
                 persistSessionActivityAcknowledgements()
             }
+            scheduleSessionActivityTitleHydration(previousTargets: previousTargets)
             refreshSessionActivityPresentation()
         case .missing, .corrupt:
             guard retryAttempt < 2 else {
+                invalidateSessionActivityTitleHydration()
                 sessionActivitySnapshot = nil
                 sessionActivityTargets = [:]
                 sessionActivityTitles = [:]
@@ -1363,12 +1418,57 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             in: sessionActivityAcknowledgementHistory
         )
         persistSessionActivityAcknowledgements()
+        scheduleSessionActivityTitleHydration(previousTargets: sessionActivityTargets)
         refreshSessionActivityPresentation()
     }
 
     private func openSessionActivity(_ id: String) {
         guard let threadID = sessionActivityTargets[id] else { return }
         _ = codexDesktopActivator.open(threadID: threadID)
+    }
+
+    private func invalidateSessionActivityTitleHydration() {
+        sessionActivityTitleHydrationGeneration &+= 1
+        sessionActivityTitleHydrationTask?.cancel()
+        sessionActivityTitleHydrationTask = nil
+    }
+
+    private func scheduleSessionActivityTitleHydration(
+        previousTargets: [String: String]
+    ) {
+        invalidateSessionActivityTitleHydration()
+        sessionActivityTitles = SessionActivityTitleHydrationPolicy.retainingTitles(
+            sessionActivityTitles,
+            previousTargets: previousTargets,
+            currentTargets: sessionActivityTargets,
+            snapshot: sessionActivitySnapshot,
+            acknowledgedIDs: Set(sessionActivityAcknowledgementHistory)
+        )
+        let requestedTargets = SessionActivityTitleHydrationPolicy.eligibleTargets(
+            snapshot: sessionActivitySnapshot,
+            targets: sessionActivityTargets,
+            acknowledgedIDs: Set(sessionActivityAcknowledgementHistory)
+        )
+        guard !requestedTargets.isEmpty else { return }
+
+        let requestGeneration = sessionActivityTitleHydrationGeneration
+        let resolver = codexAppServerTitleResolver
+        sessionActivityTitleHydrationTask = Task { @MainActor [weak self] in
+            let resolvedTitles = await resolver.resolve(activityThreads: requestedTargets)
+            guard !Task.isCancelled, let self else { return }
+            guard let adoptedTitles = SessionActivityTitleHydrationPolicy.adopting(
+                resolvedTitles: resolvedTitles,
+                requestedTargets: requestedTargets,
+                currentTargets: self.sessionActivityTargets,
+                snapshot: self.sessionActivitySnapshot,
+                acknowledgedIDs: Set(self.sessionActivityAcknowledgementHistory),
+                requestGeneration: requestGeneration,
+                currentGeneration: self.sessionActivityTitleHydrationGeneration
+            ) else { return }
+            self.sessionActivityTitles = adoptedTitles
+            self.sessionActivityTitleHydrationTask = nil
+            self.refreshSessionActivityPresentation()
+        }
     }
 
     private func refreshSessionActivityPresentation() {

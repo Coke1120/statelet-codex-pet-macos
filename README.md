@@ -11,7 +11,7 @@ transparent desktop presence. It runs without a development board, keeps its
 runtime data on the Mac, and uses AppKit and AVFoundation rather than a browser
 runtime.
 
-Statelet 1.8.6 (build 20) requires macOS 13 or newer. Its tagged release attaches
+Statelet 1.8.7 (build 21) requires macOS 13 or newer. Its tagged release attaches
 an ad-hoc-signed package for owner-authorized personal updates; it is not a
 Developer ID-signed or notarized public binary. Existing 1.8.4 or earlier
 installs require one manual bootstrap update to 1.8.5 or later.
@@ -32,7 +32,7 @@ an Apple-authorized public binary.
 - Aggregates several simultaneous Codex sessions with
   `waiting > review > running > idle` priority.
 - Shows active sessions and completed-unread sessions in a compact rail beside
-  the pet without exposing prompts or transcript content.
+  the pet without reading prompt, turn, or transcript fields.
 - Provides a movable, border-and-corner-resizable transparent AppKit panel.
 - Keeps recovery controls in the menu bar when the panel is click-through.
 - Keeps several named characters in one local library and switches each
@@ -61,7 +61,7 @@ Codex lifecycle hooks
   -> local multi-session state aggregator
      waiting > review > running > idle
   -> current_state.json
-  -> activity-v1.json + private target/title sidecars
+  -> activity-v1.json + private activity-targets-v1.json
   -> Statelet AppKit panels
   -> AVFoundation player
 ```
@@ -86,13 +86,17 @@ remains identifier-free. A verified ChatGPT desktop handler can then open the
 matching local chat through the documented `codex://threads/<thread-id>` link;
 legacy or unmapped rows remain informational.
 
-For a mapped active or completed row, the aggregator can invoke the local Codex
+For a mapped active or completed row, the signed app can invoke the local Codex
 App Server and issue `thread/read` with `includeTurns: false`. Statelet accepts
-only the bounded, sanitized `thread.name` value. It discards and never persists
-response previews, turns, or items. Accepted titles are stored separately in
-`sessions/activity-titles-v1.json`, keyed by the same opaque activity hash; the
-file is restricted to the current account with mode `0600`. The public
-`activity-v1.json` and activation-target schema remain title-free and unchanged.
+only the bounded, sanitized `thread.name` value. It discards response previews,
+turns, and items, keeps accepted titles only in memory, and never writes them to
+the activity sidecars, preferences, or diagnostics.
+Because `thread.name` is user-facing Codex text, it can contain wording selected
+or generated in Codex; Statelet bounds and normalizes it but does not infer or
+redact sensitive substrings.
+Lookup health logs contain only transition-based `healthy`, `unavailable`,
+`timeout`, or `protocol_violation` categories; they contain no raw error, thread
+identifier, title, path, or response content.
 
 The App Server integration is experimental and fail-soft. If Codex or a title
 is unavailable, the row keeps its generic lifecycle label. Title resolution
@@ -316,11 +320,9 @@ Statelet is designed for local operation:
   conversion dependencies.
 - Lifecycle files exclude prompts, tool output, transcript paths, working
   directories, account information, and credentials.
-- Optional session titles are resolved locally through the experimental Codex
-  App Server using `thread/read` with `includeTurns: false`. Statelet accepts
-  only `thread.name`, stores it in the owner-only mode-`0600`
-  `activity-titles-v1.json` sidecar, and does not persist response previews,
-  turns, or items.
+- Optional task titles are resolved locally by the signed app with
+  `thread/read` and `includeTurns: false`; only sanitized `thread.name` values
+  are retained in memory, while previews, turns, and items are discarded.
 - The installer restricts managed support directories to the current account;
   imported media and state files receive restrictive local permissions.
 - Logs remain under `~/Library/Application Support/Statelet/logs/`.
@@ -374,8 +376,8 @@ Statelet uses one canonical identity for new builds and installations:
 | Application Support | `~/Library/Application Support/Statelet` |
 | LaunchAgents | `com.coke1120.statelet.state-aggregator`, `com.coke1120.statelet.mac-player` |
 | Managed marker | `statelet-v2` |
-| App version | `1.8.6` |
-| Build number | `20` |
+| App version | `1.8.7` |
+| Build number | `21` |
 
 ## Uninstall
 

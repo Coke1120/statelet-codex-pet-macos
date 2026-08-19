@@ -355,7 +355,7 @@ final class SessionActivityTests: XCTestCase {
         XCTAssertTrue(unknown.validated(for: snapshot).isEmpty)
     }
 
-    func testTitleValidationRequiresExactSnapshotKnownUniqueIDsAndSafeText() throws {
+    func testTitleHydrationRejectsStaleCompletionAndClearsRemappedOrIneligibleRows() throws {
         let active = try item(
             "a",
             state: .running,
@@ -363,50 +363,124 @@ final class SessionActivityTests: XCTestCase {
             terminal: false,
             eventAt: 90
         )
-        let snapshot = try SessionActivitySnapshot(emittedAt: 100, active: [active])
-        let valid = SessionActivityTitles(
-            version: 1,
-            schemaVersion: 1,
+        let completed = try item(
+            "b",
+            state: .idle,
+            event: .sessionEnd,
+            terminal: true,
+            eventAt: 91
+        )
+        let stopped = try item(
+            "c",
+            state: .idle,
+            event: .stop,
+            terminal: true,
+            eventAt: 92
+        )
+        let snapshot = try SessionActivitySnapshot(
             emittedAt: 100,
-            titles: [.init(id: active.id, title: "修復 tool execution 🐾")]
+            active: [active],
+            completed: [completed, stopped]
+        )
+        let previousTargets = [
+            active.id: "thread-a",
+            completed.id: "thread-b",
+            stopped.id: "thread-c",
+        ]
+        let remappedTargets = [
+            active.id: "thread-new",
+            completed.id: "thread-b",
+            stopped.id: "thread-c",
+        ]
+
+        XCTAssertEqual(
+            SessionActivityTitleHydrationPolicy.retainingTitles(
+                [active.id: "Old active", completed.id: "Completed", stopped.id: "Stopped"],
+                previousTargets: previousTargets,
+                currentTargets: remappedTargets,
+                snapshot: snapshot,
+                acknowledgedIDs: []
+            ),
+            [completed.id: "Completed"]
+        )
+        let requested = SessionActivityTitleHydrationPolicy.eligibleTargets(
+            snapshot: snapshot,
+            targets: remappedTargets,
+            acknowledgedIDs: []
+        )
+        XCTAssertEqual(requested, [active.id: "thread-new", completed.id: "thread-b"])
+        XCTAssertNil(
+            SessionActivityTitleHydrationPolicy.adopting(
+                resolvedTitles: [active.id: "Stale title"],
+                requestedTargets: requested,
+                currentTargets: remappedTargets,
+                snapshot: snapshot,
+                acknowledgedIDs: [],
+                requestGeneration: 4,
+                currentGeneration: 5
+            )
+        )
+        XCTAssertNil(
+            SessionActivityTitleHydrationPolicy.adopting(
+                resolvedTitles: [active.id: "Wrong thread"],
+                requestedTargets: requested,
+                currentTargets: previousTargets,
+                snapshot: snapshot,
+                acknowledgedIDs: [],
+                requestGeneration: 5,
+                currentGeneration: 5
+            )
         )
         XCTAssertEqual(
-            valid.validated(for: snapshot),
-            [active.id: "修復 tool execution 🐾"]
+            SessionActivityTitleHydrationPolicy.adopting(
+                resolvedTitles: [:],
+                requestedTargets: requested,
+                currentTargets: remappedTargets,
+                snapshot: snapshot,
+                acknowledgedIDs: [],
+                requestGeneration: 5,
+                currentGeneration: 5
+            ),
+            [:]
         )
-
-        let stale = SessionActivityTitles(
-            version: 1,
-            schemaVersion: 1,
-            emittedAt: 99,
-            titles: valid.titles
+        XCTAssertEqual(
+            SessionActivityTitleHydrationPolicy.eligibleTargets(
+                snapshot: snapshot,
+                targets: remappedTargets,
+                acknowledgedIDs: [completed.id]
+            ),
+            [active.id: "thread-new"]
         )
-        XCTAssertTrue(stale.validated(for: snapshot).isEmpty)
+    }
 
-        let unknown = SessionActivityTitles(
-            version: 1,
-            schemaVersion: 1,
-            emittedAt: 100,
-            titles: [.init(id: String(repeating: "b", count: 24), title: "Unknown")]
-        )
-        XCTAssertTrue(unknown.validated(for: snapshot).isEmpty)
-
-        for unsafe in [
-            " leading",
-            "trailing ",
-            "two\nlines",
-            "bidi\u{202E}override",
-            String(repeating: "a", count: SessionActivityTitles.maximumTitleScalars + 1),
-            String(repeating: "界", count: SessionActivityTitles.maximumTitleBytes),
-        ] {
-            let invalid = SessionActivityTitles(
-                version: 1,
-                schemaVersion: 1,
-                emittedAt: 100,
-                titles: [.init(id: active.id, title: unsafe)]
-            )
-            XCTAssertTrue(invalid.validated(for: snapshot).isEmpty, unsafe)
+    func testTitleHydrationRequestsOnlyRowsRenderedByExpandedPresentation() throws {
+        let active = try (0..<4).map {
+            try item(String($0), state: .running, event: .userPromptSubmit, terminal: false, eventAt: Double($0))
         }
+        let completed = try (4..<8).map {
+            try item(String($0), state: .idle, event: .sessionEnd, terminal: true, eventAt: Double($0))
+        }
+        let snapshot = try SessionActivitySnapshot(
+            emittedAt: 100,
+            active: active,
+            completed: completed
+        )
+        let targets = Dictionary(uniqueKeysWithValues: (active + completed).map {
+            ($0.id, "thread-\($0.id)")
+        })
+
+        let eligible = SessionActivityTitleHydrationPolicy.eligibleTargets(
+            snapshot: snapshot,
+            targets: targets,
+            acknowledgedIDs: []
+        )
+        let display = SessionActivityPresentation.displayState(
+            snapshot: snapshot,
+            acknowledgedIDs: [],
+            compact: false
+        )
+        XCTAssertEqual(Set(eligible.keys), Set((display.active + display.completed).map(\.id)))
+        XCTAssertEqual(eligible.count, 6)
     }
 
     func testRejectedEqualTimestampConflictCannotReplaceAcceptedTargets() throws {
@@ -452,14 +526,6 @@ final class SessionActivityTests: XCTestCase {
                 currentlyAcceptedTargets: [identifier: "accepted-thread"]
             ),
             [identifier: "accepted-thread"]
-        )
-        XCTAssertEqual(
-            SessionActivityTitleAdoptionPolicy.apply(
-                incomingTitles: [identifier: "Wrong title"],
-                application: application,
-                currentlyAcceptedTitles: [identifier: "Accepted title"]
-            ),
-            [identifier: "Accepted title"]
         )
     }
 
@@ -855,50 +921,6 @@ final class SessionActivityTests: XCTestCase {
         releaseFirst.signal()
         wait(for: [newestDelivered], timeout: 1)
         XCTAssertEqual(state.values, [101])
-    }
-
-    @MainActor
-    func testPrivateMetadataReaderSuppressesOlderCombinedCallback() throws {
-        let firstStarted = expectation(description: "first private metadata read started")
-        let newestDelivered = expectation(description: "newest private metadata read delivered")
-        let releaseFirst = DispatchSemaphore(value: 0)
-        let state = ActivityReaderState()
-        let older = try SessionActivitySnapshot(emittedAt: 100)
-        let newer = try SessionActivitySnapshot(emittedAt: 101)
-        let reader = SessionActivityFileReader(
-            loader: { _ in
-                if state.nextCall() == 1 {
-                    firstStarted.fulfill()
-                    releaseFirst.wait()
-                    return .snapshot(older)
-                }
-                return .snapshot(newer)
-            },
-            targetLoader: { _, snapshot in
-                ["target": "thread-\(Int(snapshot.emittedAt))"]
-            },
-            titleLoader: { _, snapshot in
-                ["target": "Title \(Int(snapshot.emittedAt))"]
-            }
-        )
-        let url = URL(fileURLWithPath: "/tmp/activity-v1.json")
-        reader.readWithPrivateMetadata(url) { result, _, _ in
-            if case let .snapshot(snapshot) = result {
-                XCTFail("stale combined callback delivered for \(snapshot.emittedAt)")
-            }
-        }
-        wait(for: [firstStarted], timeout: 1)
-        reader.readWithPrivateMetadata(url) { result, targets, titles in
-            guard case let .snapshot(snapshot) = result else {
-                return XCTFail("newest private metadata snapshot was not delivered")
-            }
-            XCTAssertEqual(snapshot.emittedAt, 101)
-            XCTAssertEqual(targets, ["target": "thread-101"])
-            XCTAssertEqual(titles, ["target": "Title 101"])
-            newestDelivered.fulfill()
-        }
-        releaseFirst.signal()
-        wait(for: [newestDelivered], timeout: 1)
     }
 
     func testRejectedSnapshotNeverPrunesAcknowledgements() throws {

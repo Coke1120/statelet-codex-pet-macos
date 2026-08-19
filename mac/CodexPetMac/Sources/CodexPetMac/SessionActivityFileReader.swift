@@ -57,68 +57,6 @@ struct SessionActivityTargets: Codable, Equatable, Sendable {
     }
 }
 
-struct SessionActivityTitles: Codable, Equatable, Sendable {
-    static let version = 1
-    static let maximumTitles = SessionActivitySnapshot.maximumItemsPerGroup * 2
-    static let maximumTitleScalars = 120
-    static let maximumTitleBytes = 256
-
-    struct Title: Codable, Equatable, Sendable {
-        let id: String
-        let title: String
-    }
-
-    let version: Int
-    let schemaVersion: Int
-    let emittedAt: Double
-    let titles: [Title]
-
-    private enum CodingKeys: String, CodingKey {
-        case version
-        case schemaVersion = "schema_version"
-        case emittedAt = "emitted_at"
-        case titles
-    }
-
-    func validated(for activity: SessionActivitySnapshot) -> [String: String] {
-        guard version == Self.version,
-              schemaVersion == Self.version,
-              emittedAt.isFinite,
-              emittedAt == activity.emittedAt,
-              titles.count <= Self.maximumTitles else { return [:] }
-        let activityIDs = Set((activity.active + activity.completed).map(\.id))
-        var result: [String: String] = [:]
-        for entry in titles {
-            guard activityIDs.contains(entry.id),
-                  entry.id.count == SessionActivityItem.maximumIdentifierLength,
-                  entry.id.unicodeScalars.allSatisfy(
-                      String("0123456789abcdef").unicodeScalars.contains
-                  ),
-                  Self.isValidTitle(entry.title),
-                  result.updateValue(entry.title, forKey: entry.id) == nil else {
-                return [:]
-            }
-        }
-        return result
-    }
-
-    private static func isValidTitle(_ title: String) -> Bool {
-        guard !title.isEmpty,
-              title == title.trimmingCharacters(in: .whitespacesAndNewlines),
-              title == title.precomposedStringWithCanonicalMapping,
-              title.unicodeScalars.count <= maximumTitleScalars,
-              title.utf8.count <= maximumTitleBytes else { return false }
-        return title.unicodeScalars.allSatisfy { scalar in
-            switch scalar.properties.generalCategory {
-            case .control, .format, .lineSeparator, .paragraphSeparator:
-                return false
-            default:
-                return true
-            }
-        }
-    }
-}
-
 struct SessionActivityApplication: Equatable {
     let decision: SessionActivityAcceptanceDecision
     let lastAcceptedSnapshot: SessionActivitySnapshot?
@@ -140,22 +78,6 @@ enum SessionActivityTargetAdoptionPolicy {
             return incomingTargets
         case .rejectEqualTimestampConflict, .rejectRollback, .rejectStale, .rejectFutureSkew:
             return currentlyAcceptedTargets
-        }
-    }
-}
-
-enum SessionActivityTitleAdoptionPolicy {
-    static func apply(
-        incomingTitles: [String: String],
-        application: SessionActivityApplication,
-        currentlyAcceptedTitles: [String: String]
-    ) -> [String: String] {
-        guard application.displayedSnapshot != nil else { return [:] }
-        switch application.decision {
-        case .acceptInitial, .acceptNewer, .rejectDuplicate:
-            return incomingTitles
-        case .rejectEqualTimestampConflict, .rejectRollback, .rejectStale, .rejectFutureSkew:
-            return currentlyAcceptedTitles
         }
     }
 }
@@ -231,7 +153,6 @@ final class SessionActivityFileReader: @unchecked Sendable {
     private var generation: UInt64 = 0
     private let loader: @Sendable (URL) -> SessionActivityReadResult
     private let targetLoader: @Sendable (URL, SessionActivitySnapshot) -> [String: String]
-    private let titleLoader: @Sendable (URL, SessionActivitySnapshot) -> [String: String]
 
     init(
         loader: @escaping @Sendable (URL) -> SessionActivityReadResult = { url in
@@ -239,14 +160,10 @@ final class SessionActivityFileReader: @unchecked Sendable {
         },
         targetLoader: @escaping @Sendable (URL, SessionActivitySnapshot) -> [String: String] = { url, snapshot in
             SessionActivityFileReader.loadTargets(for: url, activity: snapshot)
-        },
-        titleLoader: @escaping @Sendable (URL, SessionActivitySnapshot) -> [String: String] = { url, snapshot in
-            SessionActivityFileReader.loadTitles(for: url, activity: snapshot)
         }
     ) {
         self.loader = loader
         self.targetLoader = targetLoader
-        self.titleLoader = titleLoader
     }
 
     func readWithTargets(
@@ -272,40 +189,6 @@ final class SessionActivityFileReader: @unchecked Sendable {
                 let current = self.generation == requestGeneration
                 self.lock.unlock()
                 if current { completion(result, targets) }
-            }
-        }
-    }
-
-    func readWithPrivateMetadata(
-        _ url: URL,
-        completion: @escaping @Sendable (
-            SessionActivityReadResult,
-            [String: String],
-            [String: String]
-        ) -> Void
-    ) {
-        lock.lock()
-        generation &+= 1
-        let requestGeneration = generation
-        lock.unlock()
-        queue.async { [weak self] in
-            guard let self else { return }
-            let result = self.loader(url)
-            let targets: [String: String]
-            let titles: [String: String]
-            if case let .snapshot(snapshot) = result {
-                targets = self.targetLoader(url, snapshot)
-                titles = self.titleLoader(url, snapshot)
-            } else {
-                targets = [:]
-                titles = [:]
-            }
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.lock.lock()
-                let current = self.generation == requestGeneration
-                self.lock.unlock()
-                if current { completion(result, targets, titles) }
             }
         }
     }
@@ -413,19 +296,6 @@ final class SessionActivityFileReader: @unchecked Sendable {
             return [:]
         }
         return targets.validated(for: activity)
-    }
-
-    static func loadTitles(
-        for activityURL: URL,
-        activity: SessionActivitySnapshot
-    ) -> [String: String] {
-        let titleURL = activityURL.deletingLastPathComponent()
-            .appendingPathComponent("activity-titles-v1.json")
-        guard case let .data(data) = loadBoundedData(titleURL),
-              let titles = try? JSONDecoder.codexPet.decode(SessionActivityTitles.self, from: data) else {
-            return [:]
-        }
-        return titles.validated(for: activity)
     }
 
     private enum BoundedDataResult {
