@@ -94,6 +94,9 @@ To resolve a title, the signed app invokes the local Codex App Server and sends
 `thread/read` with `includeTurns: false`. It accepts only `thread.name`;
 response previews, turns, and items are discarded. Accepted titles remain in
 memory only and are not written to activity files, preferences, or diagnostics.
+Statelet validates the exact launched Codex process against OpenAI's Developer
+ID Team ID before sending a private thread identifier, and requests titles only
+for rows actually rendered in the expanded popup.
 This integration is experimental and fail-soft: a missing or unavailable title
 leaves the generic label in place, while **Open in Codex** continues to depend
 only on its validated activation target.

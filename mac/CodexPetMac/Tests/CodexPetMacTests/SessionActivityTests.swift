@@ -104,12 +104,30 @@ final class SessionActivityTests: XCTestCase {
         XCTAssertTrue(view.displayState.compact)
         XCTAssertEqual(view.displayState.hiddenCompletedCount, 1)
         XCTAssertTrue(view.renderedItemIDs.isEmpty)
+        let targets = [completed.id: "thread-a"]
+        XCTAssertTrue(
+            SessionActivityTitleHydrationPolicy.eligibleTargets(
+                targets: targets,
+                renderedItemIDs: view.renderedItemIDs,
+                panelVisible: true,
+                layoutAvailable: true
+            ).isEmpty
+        )
         let pill = allDescendants(of: view).compactMap { $0 as? NSButton }.first {
             $0.title == "Completed · 1"
         }
         XCTAssertNotNil(pill)
         pill?.performClick(nil)
         XCTAssertFalse(view.displayState.compact)
+        XCTAssertEqual(
+            SessionActivityTitleHydrationPolicy.eligibleTargets(
+                targets: targets,
+                renderedItemIDs: view.renderedItemIDs,
+                panelVisible: true,
+                layoutAvailable: true
+            ),
+            targets
+        )
         let scrollContainer = SessionActivityScrollContainer(activityView: view)
         scrollContainer.frame = NSRect(x: 0, y: 0, width: 190, height: 44)
         scrollContainer.setScrollable(true)
@@ -266,6 +284,113 @@ final class SessionActivityTests: XCTestCase {
     }
 
     @MainActor
+    func testSoftEmptyTitleRefreshRetainsLongRenderedTitleLayoutAndActions() throws {
+        let completed = try item(
+            "a",
+            state: .idle,
+            event: .sessionEnd,
+            terminal: true,
+            eventAt: 90
+        )
+        let snapshot = try SessionActivitySnapshot(emittedAt: 100, completed: [completed])
+        let targets = [completed.id: "thread-a"]
+        let renderedIDs = [completed.id]
+        let longTitle = "Review the complete signed release verification evidence"
+        let accepted = try XCTUnwrap(
+            SessionActivityTitleHydrationPolicy.adopting(
+                resolvedTitles: [completed.id: longTitle],
+                retainedTitles: [:],
+                requestedTargets: targets,
+                currentTargets: targets,
+                expectedEmittedAt: snapshot.emittedAt,
+                currentEmittedAt: snapshot.emittedAt,
+                expectedRenderedItemIDs: renderedIDs,
+                currentRenderedItemIDs: renderedIDs,
+                panelVisible: true,
+                layoutAvailable: true,
+                requestGeneration: 1,
+                currentGeneration: 1
+            )
+        )
+
+        let view = SessionActivityView(
+            frame: NSRect(x: 0, y: 0, width: 230, height: 150),
+            clock: { Date(timeIntervalSince1970: 100) }
+        )
+        var opened: String?
+        var acknowledged: String?
+        view.onOpen = { opened = $0 }
+        view.onAcknowledge = { acknowledged = $0 }
+        view.update(
+            snapshot: snapshot,
+            acknowledgedIDs: [],
+            openableIDs: [completed.id],
+            titles: accepted
+        )
+        view.layoutSubtreeIfNeeded()
+        let acceptedFittingSize = view.fittingSize
+
+        let afterSoftEmpty = try XCTUnwrap(
+            SessionActivityTitleHydrationPolicy.adopting(
+                resolvedTitles: [:],
+                retainedTitles: accepted,
+                requestedTargets: targets,
+                currentTargets: targets,
+                expectedEmittedAt: snapshot.emittedAt,
+                currentEmittedAt: snapshot.emittedAt,
+                expectedRenderedItemIDs: renderedIDs,
+                currentRenderedItemIDs: renderedIDs,
+                panelVisible: true,
+                layoutAvailable: true,
+                requestGeneration: 2,
+                currentGeneration: 2
+            )
+        )
+        XCTAssertEqual(afterSoftEmpty, accepted)
+
+        view.update(
+            snapshot: snapshot,
+            acknowledgedIDs: [],
+            openableIDs: [completed.id],
+            titles: afterSoftEmpty
+        )
+        view.layoutSubtreeIfNeeded()
+        XCTAssertEqual(view.fittingSize, acceptedFittingSize)
+        XCTAssertTrue(allDescendants(of: view).compactMap { $0 as? NSTextField }.contains {
+            $0.stringValue.hasPrefix(longTitle)
+        })
+
+        let buttons = allDescendants(of: view).compactMap { $0 as? NSButton }
+        try XCTUnwrap(buttons.first { $0.title == "Open in Codex" }).performClick(nil)
+        XCTAssertEqual(opened, completed.id)
+        XCTAssertNil(acknowledged)
+        try XCTUnwrap(buttons.first { $0.title == "Mark as read" }).performClick(nil)
+        XCTAssertEqual(acknowledged, completed.id)
+
+        // A long accepted title can make the final layout choose compact mode.
+        // Once compact removes all rendered rows, the retention-only final pass
+        // must discard that title without triggering another lookup/reflow.
+        view.setCompactOverride(true)
+        XCTAssertTrue(view.renderedItemIDs.isEmpty)
+        let afterCompactReflow = SessionActivityTitleHydrationPolicy.retainingTitlesForFinalPresentation(
+            afterSoftEmpty,
+            currentTargets: targets,
+            renderedItemIDs: view.renderedItemIDs,
+            panelVisible: true,
+            layoutAvailable: true
+        )
+        XCTAssertTrue(afterCompactReflow.isEmpty)
+        view.update(
+            snapshot: snapshot,
+            acknowledgedIDs: [],
+            openableIDs: [completed.id],
+            titles: afterCompactReflow
+        )
+        XCTAssertTrue(view.displayState.compact)
+        XCTAssertTrue(view.renderedItemIDs.isEmpty)
+    }
+
+    @MainActor
     func testMissingPrivateTitlePreservesGenericRowContract() throws {
         let active = try item(
             "a",
@@ -355,7 +480,7 @@ final class SessionActivityTests: XCTestCase {
         XCTAssertTrue(unknown.validated(for: snapshot).isEmpty)
     }
 
-    func testTitleHydrationRejectsStaleCompletionAndClearsRemappedOrIneligibleRows() throws {
+    func testTitleHydrationRejectsStaleCompletionAndClearsRemappedOrUnrenderedRows() throws {
         let active = try item(
             "a",
             state: .running,
@@ -392,30 +517,36 @@ final class SessionActivityTests: XCTestCase {
             completed.id: "thread-b",
             stopped.id: "thread-c",
         ]
+        let renderedIDs = [active.id, completed.id]
 
         XCTAssertEqual(
             SessionActivityTitleHydrationPolicy.retainingTitles(
                 [active.id: "Old active", completed.id: "Completed", stopped.id: "Stopped"],
                 previousTargets: previousTargets,
                 currentTargets: remappedTargets,
-                snapshot: snapshot,
-                acknowledgedIDs: []
+                renderedItemIDs: renderedIDs
             ),
             [completed.id: "Completed"]
         )
         let requested = SessionActivityTitleHydrationPolicy.eligibleTargets(
-            snapshot: snapshot,
             targets: remappedTargets,
-            acknowledgedIDs: []
+            renderedItemIDs: renderedIDs,
+            panelVisible: true,
+            layoutAvailable: true
         )
         XCTAssertEqual(requested, [active.id: "thread-new", completed.id: "thread-b"])
         XCTAssertNil(
             SessionActivityTitleHydrationPolicy.adopting(
                 resolvedTitles: [active.id: "Stale title"],
+                retainedTitles: [completed.id: "Completed"],
                 requestedTargets: requested,
                 currentTargets: remappedTargets,
-                snapshot: snapshot,
-                acknowledgedIDs: [],
+                expectedEmittedAt: snapshot.emittedAt,
+                currentEmittedAt: snapshot.emittedAt,
+                expectedRenderedItemIDs: renderedIDs,
+                currentRenderedItemIDs: renderedIDs,
+                panelVisible: true,
+                layoutAvailable: true,
                 requestGeneration: 4,
                 currentGeneration: 5
             )
@@ -423,10 +554,47 @@ final class SessionActivityTests: XCTestCase {
         XCTAssertNil(
             SessionActivityTitleHydrationPolicy.adopting(
                 resolvedTitles: [active.id: "Wrong thread"],
+                retainedTitles: [completed.id: "Completed"],
                 requestedTargets: requested,
                 currentTargets: previousTargets,
-                snapshot: snapshot,
-                acknowledgedIDs: [],
+                expectedEmittedAt: snapshot.emittedAt,
+                currentEmittedAt: snapshot.emittedAt,
+                expectedRenderedItemIDs: renderedIDs,
+                currentRenderedItemIDs: renderedIDs,
+                panelVisible: true,
+                layoutAvailable: true,
+                requestGeneration: 5,
+                currentGeneration: 5
+            )
+        )
+        XCTAssertNil(
+            SessionActivityTitleHydrationPolicy.adopting(
+                resolvedTitles: [active.id: "Stale snapshot"],
+                retainedTitles: [completed.id: "Completed"],
+                requestedTargets: requested,
+                currentTargets: remappedTargets,
+                expectedEmittedAt: snapshot.emittedAt,
+                currentEmittedAt: snapshot.emittedAt + 1,
+                expectedRenderedItemIDs: renderedIDs,
+                currentRenderedItemIDs: renderedIDs,
+                panelVisible: true,
+                layoutAvailable: true,
+                requestGeneration: 5,
+                currentGeneration: 5
+            )
+        )
+        XCTAssertNil(
+            SessionActivityTitleHydrationPolicy.adopting(
+                resolvedTitles: [active.id: "Stale rendered set"],
+                retainedTitles: [completed.id: "Completed"],
+                requestedTargets: requested,
+                currentTargets: remappedTargets,
+                expectedEmittedAt: snapshot.emittedAt,
+                currentEmittedAt: snapshot.emittedAt,
+                expectedRenderedItemIDs: renderedIDs,
+                currentRenderedItemIDs: [completed.id],
+                panelVisible: true,
+                layoutAvailable: true,
                 requestGeneration: 5,
                 currentGeneration: 5
             )
@@ -434,22 +602,27 @@ final class SessionActivityTests: XCTestCase {
         XCTAssertEqual(
             SessionActivityTitleHydrationPolicy.adopting(
                 resolvedTitles: [:],
+                retainedTitles: [completed.id: "Completed"],
                 requestedTargets: requested,
                 currentTargets: remappedTargets,
-                snapshot: snapshot,
-                acknowledgedIDs: [],
+                expectedEmittedAt: snapshot.emittedAt,
+                currentEmittedAt: snapshot.emittedAt,
+                expectedRenderedItemIDs: renderedIDs,
+                currentRenderedItemIDs: renderedIDs,
+                panelVisible: true,
+                layoutAvailable: true,
                 requestGeneration: 5,
                 currentGeneration: 5
             ),
-            [:]
+            [completed.id: "Completed"]
         )
-        XCTAssertEqual(
+        XCTAssertTrue(
             SessionActivityTitleHydrationPolicy.eligibleTargets(
-                snapshot: snapshot,
                 targets: remappedTargets,
-                acknowledgedIDs: [completed.id]
-            ),
-            [active.id: "thread-new"]
+                renderedItemIDs: renderedIDs,
+                panelVisible: false,
+                layoutAvailable: true
+            ).isEmpty
         )
     }
 
@@ -469,18 +642,28 @@ final class SessionActivityTests: XCTestCase {
             ($0.id, "thread-\($0.id)")
         })
 
-        let eligible = SessionActivityTitleHydrationPolicy.eligibleTargets(
-            snapshot: snapshot,
-            targets: targets,
-            acknowledgedIDs: []
-        )
         let display = SessionActivityPresentation.displayState(
             snapshot: snapshot,
             acknowledgedIDs: [],
             compact: false
         )
-        XCTAssertEqual(Set(eligible.keys), Set((display.active + display.completed).map(\.id)))
+        let renderedIDs = (display.active + display.completed).map(\.id)
+        let eligible = SessionActivityTitleHydrationPolicy.eligibleTargets(
+            targets: targets,
+            renderedItemIDs: renderedIDs,
+            panelVisible: true,
+            layoutAvailable: true
+        )
+        XCTAssertEqual(Set(eligible.keys), Set(renderedIDs))
         XCTAssertEqual(eligible.count, 6)
+        XCTAssertTrue(
+            SessionActivityTitleHydrationPolicy.eligibleTargets(
+                targets: targets,
+                renderedItemIDs: [],
+                panelVisible: true,
+                layoutAvailable: true
+            ).isEmpty
+        )
     }
 
     func testRejectedEqualTimestampConflictCannotReplaceAcceptedTargets() throws {

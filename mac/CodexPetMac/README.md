@@ -4,7 +4,7 @@ Statelet is a personal-local Codex lifecycle companion for macOS 13 or newer.
 It is an AppKit accessory application: the transparent panel can be moved by dragging
 its body and resized from any border or corner without taking keyboard focus,
 AVFoundation owns exactly one decoder, and the menu-bar item keeps click-through
-recoverable. The current app version is 1.8.7 (build 21). New builds and
+recoverable. The current app version is 1.8.8 (build 22). New builds and
 installations use
 `Statelet.app`, bundle identifier `com.coke1120.Statelet`, `CFBundleName` and
 executable `Statelet`, Application Support under
@@ -563,6 +563,9 @@ For eligible rows, the signed app issues `thread/read` with
 bounded, sanitized `thread.name` field, discards previews, turns, and items, and
 keeps accepted titles in memory only. Nothing is added to `activity-v1.json`,
 `activity-targets-v1.json`, preferences, or diagnostics.
+Before sending a private thread identifier, Statelet validates the selected
+Codex executable and the exact launched process against OpenAI's Developer ID
+Team ID. Lookup is restricted to rows actually rendered in the expanded popup.
 
 The App Server integration is experimental and fail-soft. An unavailable Codex
 binary, App Server error, missing title, or rejected title leaves the existing

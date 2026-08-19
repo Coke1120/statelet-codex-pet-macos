@@ -1,7 +1,7 @@
 # Statelet lifecycle and media reference
 
-This reference documents the internal contracts behind Statelet 1.8.7 (build
-21), the native Codex lifecycle companion for macOS. Start with
+This reference documents the internal contracts behind Statelet 1.8.8 (build
+22), the native Codex lifecycle companion for macOS. Start with
 [Deployment](DEPLOYMENT.md) for installation or [Using Statelet](USAGE.md) for
 daily operation.
 
@@ -276,6 +276,9 @@ accepts only a bounded, sanitized `thread.name`, holds it in memory, and
 discards previews, turns, and items. Title lookup never changes lifecycle state
 or activation eligibility; resolved titles are not written to sidecars,
 preferences, or logs.
+The executable and exact launched process must satisfy OpenAI's Developer ID
+Team ID requirement before Statelet sends any private thread identifier. Only
+rows actually rendered in the expanded popup are eligible for lookup.
 Only transition-based categorical lookup health is logged; raw errors, thread
 identifiers, titles, paths, and response content are excluded.
 

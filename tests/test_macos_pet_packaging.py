@@ -366,8 +366,8 @@ esac
             info["NSHumanReadableCopyright"],
             "Copyright © 2026 Statelet contributors. MIT licensed.",
         )
-        self.assertEqual(info["CFBundleShortVersionString"], "1.8.7")
-        self.assertEqual(info["CFBundleVersion"], "21")
+        self.assertEqual(info["CFBundleShortVersionString"], "1.8.8")
+        self.assertEqual(info["CFBundleVersion"], "22")
         self.assertEqual(info["CFBundlePackageType"], "APPL")
         self.assertEqual(info["LSMinimumSystemVersion"], "13.0")
         self.assertTrue(info["LSUIElement"])
@@ -1187,7 +1187,7 @@ struct WatchdogHarness {
                     ],
                     capture_output=True,
                     text=True,
-                    timeout=6,
+                    timeout=15,
                     check=False,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)

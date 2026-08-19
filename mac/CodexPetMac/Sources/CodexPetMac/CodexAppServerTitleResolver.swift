@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import OSLog
+import Security
 
 /// Resolves the user-facing names of Codex threads without retaining thread
 /// previews, turns, items, stderr, or raw protocol failures.
@@ -20,6 +21,28 @@ actor CodexAppServerTitleResolver {
         let expiresAt: TimeInterval
     }
 
+    private enum AttemptOutcome: Sendable {
+        case success([String: CodexAppServerThreadName])
+        case failure(CodexAppServerResolutionFailure)
+        case cancelled
+    }
+
+    private struct AttemptWaiter {
+        let isExactRequest: Bool
+        let continuation: CheckedContinuation<AttemptOutcome, Never>
+    }
+
+    private struct InFlightAttempt {
+        let token: UInt64
+        let threadIDs: [String]
+        let task: Task<Void, Never>
+        var waiters: [UInt64: AttemptWaiter]
+    }
+
+    /// SessionActivityPresentation exposes at most three active and three
+    /// completed rows. Keep app-server work bounded to that visible surface.
+    private static let maximumActivityCount = 6
+
     private let executableLocator: ExecutableLocator
     private let clock: Clock
     private let runner: Runner
@@ -27,12 +50,16 @@ actor CodexAppServerTitleResolver {
     private let maximumOutputBytes: Int
     private let cacheTTL: TimeInterval
     private let failureBackoff: TimeInterval
+    private let maximumCacheEntries: Int
     private let healthReporter: HealthReporter
     private var cache: [String: CacheEntry] = [:]
     private var retryAfter: TimeInterval = 0
+    private var nextAttemptToken: UInt64 = 0
+    private var nextWaiterToken: UInt64 = 0
+    private var inFlightAttempt: InFlightAttempt?
+    private var activeAttemptTasks: [UInt64: Task<Void, Never>] = [:]
+    private var isShuttingDown = false
     private var lastReportedHealth: CodexAppServerTitleHealth?
-
-    static let maximumActivityCount = 128
 
     init() {
         self.executableLocator = { CodexAppServerExecutableDiscovery.locate() }
@@ -49,6 +76,7 @@ actor CodexAppServerTitleResolver {
         self.maximumOutputBytes = 1_048_576
         self.cacheTTL = 60
         self.failureBackoff = 60
+        self.maximumCacheEntries = 128
         self.healthReporter = { CodexAppServerTitleDiagnostics.report($0) }
     }
 
@@ -60,6 +88,7 @@ actor CodexAppServerTitleResolver {
         maximumOutputBytes: Int = 1_048_576,
         cacheTTL: TimeInterval = 60,
         failureBackoff: TimeInterval = 60,
+        maximumCacheEntries: Int = 128,
         healthReporter: @escaping HealthReporter = { _ in }
     ) {
         self.executableLocator = executableLocator
@@ -67,96 +96,74 @@ actor CodexAppServerTitleResolver {
         self.runner = runner
         self.timeout = max(0.05, timeout)
         self.maximumOutputBytes = max(1, maximumOutputBytes)
-        self.cacheTTL = max(0, cacheTTL)
-        self.failureBackoff = max(0, failureBackoff)
+        // A zero-duration cache or backoff would let the actor's completion
+        // loop immediately relaunch forever when an injected clock is stable.
+        self.cacheTTL = max(0.001, cacheTTL)
+        self.failureBackoff = max(0.001, failureBackoff)
+        self.maximumCacheEntries = max(1, maximumCacheEntries)
         self.healthReporter = healthReporter
     }
 
     /// Maps private activity IDs to sanitized thread titles. All failures are
-    /// deliberately soft: a stale cached title is returned when available,
-    /// otherwise that activity is omitted.
+    /// deliberately soft and omit any activity without a fresh cached title.
     func resolve(activityThreads: [String: String]) async -> [String: String] {
-        guard !activityThreads.isEmpty,
-              activityThreads.count <= Self.maximumActivityCount else {
-            cache.removeAll(keepingCapacity: false)
-            return [:]
-        }
+        guard !isShuttingDown,
+              !activityThreads.isEmpty,
+              activityThreads.count <= Self.maximumActivityCount else { return [:] }
         let validPairs = activityThreads.filter { Self.isValidThreadID($0.value) }
-        guard !validPairs.isEmpty else {
-            cache.removeAll(keepingCapacity: false)
-            return [:]
-        }
+        guard !validPairs.isEmpty else { return [:] }
 
-        let now = clock()
-        let currentThreadIDs = Set(validPairs.values)
-        cache = cache.filter { currentThreadIDs.contains($0.key) }
-        let uniqueThreadIDs = Array(currentThreadIDs).sorted()
-        var names: [String: CachedName] = [:]
-        var missing: [String] = []
-        for threadID in uniqueThreadIDs {
-            if let entry = cache[threadID], entry.expiresAt > now {
-                names[threadID] = entry.value
-            } else {
-                missing.append(threadID)
-            }
-        }
+        let uniqueThreadIDs = Array(Set(validPairs.values)).sorted()
+        var names = cachedNames(for: uniqueThreadIDs, now: clock())
+        while names.count < uniqueThreadIDs.count {
+            guard !isShuttingDown, !Task.isCancelled else { break }
+            let missing = uniqueThreadIDs.filter { names[$0] == nil }
+            let now = clock()
+            guard now >= retryAfter else { break }
 
-        if !missing.isEmpty, now >= retryAfter {
-            if let executable = executableLocator() {
-                do {
-                    let resolved = try await runner(executable, missing, timeout, maximumOutputBytes)
-                    guard Set(resolved.keys) == Set(missing) else {
-                        throw CodexAppServerResolutionFailure.protocolViolation
-                    }
-                    for threadID in missing {
-                        let value: CachedName
-                        switch resolved[threadID] {
-                        case let .title(rawTitle):
-                            value = Self.sanitize(rawTitle).map(CachedName.title) ?? .missing
-                        case .missing:
-                            value = .missing
-                        case nil:
-                            throw CodexAppServerResolutionFailure.protocolViolation
-                        }
-                        cache[threadID] = CacheEntry(value: value, expiresAt: now + cacheTTL)
-                        names[threadID] = value
-                    }
-                    retryAfter = 0
-                    reportHealth(.healthy)
-                } catch CodexAppServerResolutionFailure.cancelled {
-                    for threadID in missing {
-                        if let stale = cache[threadID]?.value { names[threadID] = stale }
-                    }
-                } catch is CancellationError {
-                    for threadID in missing {
-                        if let stale = cache[threadID]?.value { names[threadID] = stale }
-                    }
-                } catch let failure as CodexAppServerResolutionFailure {
-                    retryAfter = now + failureBackoff
-                    if let health = CodexAppServerTitleHealth(failure: failure) {
-                        reportHealth(health)
-                    }
-                    for threadID in missing {
-                        if let stale = cache[threadID]?.value { names[threadID] = stale }
-                    }
-                } catch {
-                    retryAfter = now + failureBackoff
-                    reportHealth(.protocolViolation)
-                    for threadID in missing {
-                        if let stale = cache[threadID]?.value { names[threadID] = stale }
-                    }
-                }
+            if let attempt = inFlightAttempt {
+                let outcome = await waitForAttempt(
+                    token: attempt.token,
+                    isExactRequest: attempt.threadIDs == missing
+                )
+                if case .cancelled = outcome, Task.isCancelled { break }
             } else {
-                retryAfter = now + failureBackoff
-                reportHealth(.unavailable)
-                for threadID in missing {
-                    if let stale = cache[threadID]?.value { names[threadID] = stale }
+                guard let executable = executableLocator() else {
+                    retryAfter = now + failureBackoff
+                    reportHealth(.unavailable)
+                    break
                 }
+                nextAttemptToken &+= 1
+                let token = nextAttemptToken
+                let runner = self.runner
+                let timeout = self.timeout
+                let maximumOutputBytes = self.maximumOutputBytes
+                let task = Task<Void, Never> { [weak self] in
+                    let outcome: AttemptOutcome
+                    do {
+                        outcome = .success(try await runner(executable, missing, timeout, maximumOutputBytes))
+                    } catch is CancellationError {
+                        outcome = .cancelled
+                    } catch CodexAppServerResolutionFailure.cancelled {
+                        outcome = .cancelled
+                    } catch let failure as CodexAppServerResolutionFailure {
+                        outcome = .failure(failure)
+                    } catch {
+                        outcome = .failure(.unavailable)
+                    }
+                    await self?.completeAttempt(token: token, outcome: outcome)
+                }
+                inFlightAttempt = InFlightAttempt(
+                    token: token,
+                    threadIDs: missing,
+                    task: task,
+                    waiters: [:]
+                )
+                activeAttemptTasks[token] = task
+                let outcome = await waitForAttempt(token: token, isExactRequest: true)
+                if case .cancelled = outcome, Task.isCancelled { break }
             }
-        } else {
-            for threadID in missing {
-                if let stale = cache[threadID]?.value { names[threadID] = stale }
-            }
+            names = cachedNames(for: uniqueThreadIDs, now: clock())
         }
 
         return validPairs.reduce(into: [:]) { result, pair in
@@ -164,10 +171,149 @@ actor CodexAppServerTitleResolver {
         }
     }
 
+    /// Permanently stops resolution and does not return until every launched
+    /// app-server runner has completed its process-reaping cleanup.
+    func shutdown() async {
+        isShuttingDown = true
+        if let attempt = inFlightAttempt {
+            inFlightAttempt = nil
+            for waiter in attempt.waiters.values {
+                waiter.continuation.resume(returning: .cancelled)
+            }
+        }
+        let tasks = Array(activeAttemptTasks.values)
+        for task in tasks { task.cancel() }
+        for task in tasks { await task.value }
+    }
+
+    func cachedEntryCountForTesting() -> Int { cache.count }
+
+    func inFlightWaiterCountsForTesting() -> (exact: Int, observers: Int) {
+        guard let attempt = inFlightAttempt else { return (0, 0) }
+        let exact = attempt.waiters.values.filter(\.isExactRequest).count
+        return (exact, attempt.waiters.count - exact)
+    }
+
+    private func cachedNames(for threadIDs: [String], now: TimeInterval) -> [String: CachedName] {
+        cache = cache.filter { $0.value.expiresAt > now }
+        return threadIDs.reduce(into: [:]) { result, threadID in
+            if let entry = cache[threadID] { result[threadID] = entry.value }
+        }
+    }
+
+    private func waitForAttempt(token: UInt64, isExactRequest: Bool) async -> AttemptOutcome {
+        nextWaiterToken &+= 1
+        let waiterToken = nextWaiterToken
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard var attempt = inFlightAttempt,
+                      attempt.token == token else {
+                    continuation.resume(returning: .cancelled)
+                    return
+                }
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: .cancelled)
+                    if isExactRequest,
+                       !attempt.waiters.values.contains(where: \.isExactRequest) {
+                        inFlightAttempt = nil
+                        attempt.task.cancel()
+                        for observer in attempt.waiters.values {
+                            observer.continuation.resume(returning: .cancelled)
+                        }
+                    }
+                    return
+                }
+                attempt.waiters[waiterToken] = AttemptWaiter(
+                    isExactRequest: isExactRequest,
+                    continuation: continuation
+                )
+                inFlightAttempt = attempt
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter(token: token, waiterToken: waiterToken) }
+        }
+    }
+
+    private func cancelWaiter(token: UInt64, waiterToken: UInt64) {
+        guard var attempt = inFlightAttempt,
+              attempt.token == token,
+              let waiter = attempt.waiters.removeValue(forKey: waiterToken) else { return }
+        waiter.continuation.resume(returning: .cancelled)
+        let hasExactWaiter = attempt.waiters.values.contains(where: \.isExactRequest)
+        guard waiter.isExactRequest, !hasExactWaiter else {
+            inFlightAttempt = attempt
+            return
+        }
+        inFlightAttempt = nil
+        attempt.task.cancel()
+        for observer in attempt.waiters.values {
+            observer.continuation.resume(returning: .cancelled)
+        }
+    }
+
+    private func completeAttempt(token: UInt64, outcome: AttemptOutcome) {
+        activeAttemptTasks.removeValue(forKey: token)
+        guard let attempt = inFlightAttempt, attempt.token == token else { return }
+        inFlightAttempt = nil
+        apply(outcome, threadIDs: attempt.threadIDs)
+        for waiter in attempt.waiters.values {
+            waiter.continuation.resume(returning: outcome)
+        }
+    }
+
+    private func apply(_ outcome: AttemptOutcome, threadIDs: [String]) {
+        let completedAt = clock()
+        switch outcome {
+        case let .success(resolved):
+            guard Set(resolved.keys) == Set(threadIDs) else {
+                retryAfter = completedAt + failureBackoff
+                reportHealth(.protocolViolation)
+                return
+            }
+            var values: [String: CachedName] = [:]
+            for threadID in threadIDs {
+                switch resolved[threadID] {
+                case let .title(rawTitle):
+                    values[threadID] = Self.sanitize(rawTitle).map(CachedName.title) ?? .missing
+                case .missing:
+                    values[threadID] = .missing
+                case nil:
+                    retryAfter = completedAt + failureBackoff
+                    reportHealth(.protocolViolation)
+                    return
+                }
+            }
+            for (threadID, value) in values {
+                cache[threadID] = CacheEntry(value: value, expiresAt: completedAt + cacheTTL)
+            }
+            trimCache()
+            retryAfter = 0
+            reportHealth(.healthy)
+        case let .failure(failure):
+            retryAfter = completedAt + failureBackoff
+            if let health = CodexAppServerTitleHealth(failure: failure) {
+                reportHealth(health)
+            }
+        case .cancelled:
+            break
+        }
+    }
+
     private func reportHealth(_ health: CodexAppServerTitleHealth) {
         guard health != lastReportedHealth else { return }
         lastReportedHealth = health
         healthReporter(health)
+    }
+
+    private func trimCache() {
+        let overflow = cache.count - maximumCacheEntries
+        guard overflow > 0 else { return }
+        let oldestKeys = cache.keys.sorted { lhs, rhs in
+            let left = cache[lhs]!.expiresAt
+            let right = cache[rhs]!.expiresAt
+            return left == right ? lhs < rhs : left < right
+        }
+        for key in oldestKeys.prefix(overflow) { cache.removeValue(forKey: key) }
     }
 
     static func sanitize(_ value: String) -> String? {
@@ -208,7 +354,7 @@ enum CodexAppServerThreadName: Equatable, Sendable {
     case missing
 }
 
-enum CodexAppServerResolutionFailure: Error {
+enum CodexAppServerResolutionFailure: Error, Equatable, Sendable {
     case unavailable
     case timeout
     case protocolViolation
@@ -247,6 +393,8 @@ private enum CodexAppServerTitleDiagnostics {
 }
 
 enum CodexAppServerExecutableDiscovery {
+    static let trustedTeamIdentifier = "2DC432GLL2"
+
     static func locate(
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
         fileManager: FileManager = .default
@@ -257,10 +405,16 @@ enum CodexAppServerExecutableDiscovery {
             URL(fileURLWithPath: "/opt/homebrew/bin/codex"),
             URL(fileURLWithPath: "/usr/local/bin/codex"),
         ]
-        return candidates.first { isTrustedExecutable($0, fileManager: fileManager) }
+        return candidates.first {
+            isTrustedExecutable($0, policy: .openAISigned, fileManager: fileManager)
+        }
     }
 
-    static func isTrustedExecutable(_ candidate: URL, fileManager: FileManager = .default) -> Bool {
+    static func isTrustedExecutable(
+        _ candidate: URL,
+        policy: CodexAppServerExecutableTrustPolicy = .openAISigned,
+        fileManager: FileManager = .default
+    ) -> Bool {
         let resolved = candidate.resolvingSymlinksInPath()
         var status = stat()
         guard lstat(resolved.path, &status) == 0,
@@ -268,8 +422,72 @@ enum CodexAppServerExecutableDiscovery {
               status.st_uid == 0 || status.st_uid == getuid(),
               (status.st_mode & 0o022) == 0,
               fileManager.isExecutableFile(atPath: resolved.path) else { return false }
+        guard policy == .openAISigned else { return true }
+
+        var code: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(resolved as CFURL, [], &code) == errSecSuccess,
+              let code else { return false }
+        return isValidOpenAIStaticCode(code)
+    }
+
+    static func isTrustedRunningProcess(
+        _ process: Process,
+        policy: CodexAppServerExecutableTrustPolicy = .openAISigned
+    ) -> Bool {
+        guard policy == .openAISigned else { return true }
+        let attributes = [
+            kSecGuestAttributePid as String: NSNumber(value: process.processIdentifier),
+        ] as CFDictionary
+        var code: SecCode?
+        guard SecCodeCopyGuestWithAttributes(nil, attributes, [], &code) == errSecSuccess,
+              let code,
+              let requirement = openAIRequirement(),
+              SecCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), requirement) == errSecSuccess else {
+            return false
+        }
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess,
+              let staticCode else { return false }
+        return hasTrustedTeamIdentifier(staticCode)
+    }
+
+    private static func openAIRequirement() -> SecRequirement? {
+        var requirement: SecRequirement?
+        let requirementText = "anchor apple generic and certificate leaf[subject.OU] = \"\(trustedTeamIdentifier)\""
+        guard SecRequirementCreateWithString(requirementText as CFString, [], &requirement) == errSecSuccess else {
+            return nil
+        }
+        return requirement
+    }
+
+    private static func isValidOpenAIStaticCode(_ code: SecStaticCode) -> Bool {
+        guard let requirement = openAIRequirement(),
+              SecStaticCodeCheckValidity(
+                code,
+                SecCSFlags(rawValue: kSecCSStrictValidate | kSecCSCheckAllArchitectures),
+                requirement
+              ) == errSecSuccess else { return false }
+        return hasTrustedTeamIdentifier(code)
+    }
+
+    private static func hasTrustedTeamIdentifier(_ code: SecStaticCode) -> Bool {
+        var signingInformation: CFDictionary?
+        guard SecCodeCopySigningInformation(
+            code,
+            SecCSFlags(rawValue: kSecCSSigningInformation),
+            &signingInformation
+        ) == errSecSuccess,
+              let information = signingInformation as? [String: Any],
+              information[kSecCodeInfoTeamIdentifier as String] as? String == trustedTeamIdentifier,
+              let certificates = information[kSecCodeInfoCertificates as String] as? [SecCertificate],
+              !certificates.isEmpty else { return false }
         return true
     }
+}
+
+enum CodexAppServerExecutableTrustPolicy: Sendable {
+    case openAISigned
+    case testOnlyAllowUnsignedExecutable
 }
 
 private final class CodexAppServerProcessControl: @unchecked Sendable {
@@ -360,11 +578,19 @@ private final class CodexAppServerLineDrain: @unchecked Sendable {
 }
 
 enum CodexAppServerProcessRunner {
+    typealias PrelaunchHook = @Sendable (URL) throws -> Void
+    typealias RunningProcessValidator = @Sendable (Process, CodexAppServerExecutableTrustPolicy) -> Bool
+
     static func run(
         executable: URL,
         threadIDs: [String],
         timeout: TimeInterval,
-        maximumOutputBytes: Int
+        maximumOutputBytes: Int,
+        trustPolicy: CodexAppServerExecutableTrustPolicy = .openAISigned,
+        prelaunchHook: @escaping PrelaunchHook = { _ in },
+        runningProcessValidator: @escaping RunningProcessValidator = {
+            CodexAppServerExecutableDiscovery.isTrustedRunningProcess($0, policy: $1)
+        }
     ) async throws -> [String: CodexAppServerThreadName] {
         let control = CodexAppServerProcessControl()
         return try await withTaskCancellationHandler {
@@ -374,6 +600,9 @@ enum CodexAppServerProcessRunner {
                     threadIDs: threadIDs,
                     timeout: timeout,
                     maximumOutputBytes: maximumOutputBytes,
+                    trustPolicy: trustPolicy,
+                    prelaunchHook: prelaunchHook,
+                    runningProcessValidator: runningProcessValidator,
                     control: control
                 )
             }.value
@@ -387,9 +616,13 @@ enum CodexAppServerProcessRunner {
         threadIDs: [String],
         timeout: TimeInterval,
         maximumOutputBytes: Int,
+        trustPolicy: CodexAppServerExecutableTrustPolicy,
+        prelaunchHook: PrelaunchHook,
+        runningProcessValidator: RunningProcessValidator,
         control: CodexAppServerProcessControl
     ) throws -> [String: CodexAppServerThreadName] {
         if control.isCancelled { throw CodexAppServerResolutionFailure.cancelled }
+        let resolvedExecutable = executable.resolvingSymlinksInPath()
         let process = Process()
         let stdin = Pipe()
         let stdout = Pipe()
@@ -397,16 +630,44 @@ enum CodexAppServerProcessRunner {
         let drain = CodexAppServerLineDrain(maximumBytes: maximumOutputBytes)
         let readers = DispatchGroup()
 
-        process.executableURL = executable.resolvingSymlinksInPath()
+        process.executableURL = resolvedExecutable
         process.arguments = ["app-server"]
         process.standardInput = stdin
         process.standardOutput = stdout
         process.standardError = stderr
 
+        guard fcntl(stdin.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1) == 0 else {
+            throw CodexAppServerResolutionFailure.unavailable
+        }
+
+        guard !control.isCancelled else { throw CodexAppServerResolutionFailure.cancelled }
+        guard CodexAppServerExecutableDiscovery.isTrustedExecutable(
+            resolvedExecutable,
+            policy: trustPolicy
+        ) else { throw CodexAppServerResolutionFailure.unavailable }
+        do { try prelaunchHook(resolvedExecutable) } catch {
+            throw CodexAppServerResolutionFailure.unavailable
+        }
         do { try process.run() } catch { throw CodexAppServerResolutionFailure.unavailable }
         let pid = process.processIdentifier
         let ownsGroup = setpgid(pid, pid) == 0 || getpgid(pid) == pid
         control.install(process, ownsGroup: ownsGroup)
+
+        defer {
+            try? stdin.fileHandleForWriting.close()
+            control.terminate(signal: SIGTERM)
+            let grace = Date().addingTimeInterval(0.25)
+            while process.isRunning, Date() < grace { Thread.sleep(forTimeInterval: 0.01) }
+            if process.isRunning { control.terminate(signal: SIGKILL) }
+            process.waitUntilExit()
+            try? stdout.fileHandleForReading.close()
+            try? stderr.fileHandleForReading.close()
+            _ = readers.wait(timeout: .now() + 0.5)
+        }
+
+        guard runningProcessValidator(process, trustPolicy) else {
+            throw CodexAppServerResolutionFailure.unavailable
+        }
 
         readers.enter()
         DispatchQueue.global(qos: .utility).async {
@@ -424,18 +685,6 @@ enum CodexAppServerProcessRunner {
             let handle = stderr.fileHandleForReading
             while !handle.availableData.isEmpty {}
             readers.leave()
-        }
-
-        defer {
-            try? stdin.fileHandleForWriting.close()
-            control.terminate(signal: SIGTERM)
-            let grace = Date().addingTimeInterval(0.25)
-            while process.isRunning, Date() < grace { Thread.sleep(forTimeInterval: 0.01) }
-            if process.isRunning { control.terminate(signal: SIGKILL) }
-            process.waitUntilExit()
-            try? stdout.fileHandleForReading.close()
-            try? stderr.fileHandleForReading.close()
-            _ = readers.wait(timeout: .now() + 0.5)
         }
 
         let deadline = ProcessInfo.processInfo.systemUptime + timeout
@@ -501,7 +750,11 @@ enum CodexAppServerProcessRunner {
                 throw CodexAppServerResolutionFailure.protocolViolation
             }
             if message["id"] == nil { continue }
-            guard (message["id"] as? NSNumber)?.intValue == id else {
+            guard let number = message["id"] as? NSNumber,
+                  CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  number.doubleValue.isFinite,
+                  number.doubleValue == Double(id),
+                  number.intValue == id else {
                 throw CodexAppServerResolutionFailure.protocolViolation
             }
             return message

@@ -5,6 +5,33 @@ versioning for the public source release.
 
 ## Unreleased
 
+## [1.8.8] - 2026-08-19
+
+### Fixed
+
+- Statelet now validates both the on-disk Codex executable and the exact
+  launched process against OpenAI's Developer ID Team ID before sending a
+  private thread identifier.
+- Title hydration is limited to rows actually rendered in the expanded popup;
+  hidden, compact, unavailable, remapped, or stale rows cancel or reject their
+  lookup without changing lifecycle or **Open in Codex** behavior.
+- Resolver work now coalesces exact requests, globally expires and caps its
+  memory cache, ignores cancellation for failure backoff, and reaps every App
+  Server child during cancellation and app shutdown.
+- Strict response IDs, nullable or missing names, closed input pipes, oversized
+  output, and process replacement all fail soft without leaking private data.
+
+### Distribution notes
+
+- Version 1.8.8 supersedes 1.8.7 with the exact-process, shutdown, and
+  rendered-row hardening above; title text remains memory-only.
+- No task title, technical thread identifier, conversation preview, turn,
+  prompt, transcript, character media, voice data, or other private runtime
+  data is bundled or persisted by title hydration.
+- The package remains ad-hoc signed for owner-authorized personal updates. It
+  is not Developer ID signed, notarized, or presented as an Apple-authorized
+  public binary.
+
 ## [1.8.7] - 2026-08-19
 
 ### Changed
@@ -340,6 +367,7 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
+[1.8.8]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.8
 [1.8.7]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.7
 [1.8.5]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.5
 [1.8.4]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.4

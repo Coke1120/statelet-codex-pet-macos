@@ -469,55 +469,75 @@ private enum StatusMenuTag: Int {
 
 enum SessionActivityTitleHydrationPolicy {
     static func eligibleTargets(
-        snapshot: SessionActivitySnapshot?,
         targets: [String: String],
-        acknowledgedIDs: Set<String>
+        renderedItemIDs: [String],
+        panelVisible: Bool,
+        layoutAvailable: Bool
     ) -> [String: String] {
-        guard let snapshot else { return [:] }
-        let displayState = SessionActivityPresentation.displayState(
-            snapshot: snapshot,
-            acknowledgedIDs: acknowledgedIDs,
-            compact: false
-        )
-        let displayedIDs = Set((displayState.active + displayState.completed).map(\.id))
-        return targets.filter { displayedIDs.contains($0.key) }
+        guard panelVisible, layoutAvailable, !renderedItemIDs.isEmpty else { return [:] }
+        let renderedIDs = Set(renderedItemIDs)
+        return targets.filter { renderedIDs.contains($0.key) }
     }
 
     static func retainingTitles(
         _ titles: [String: String],
         previousTargets: [String: String],
         currentTargets: [String: String],
-        snapshot: SessionActivitySnapshot?,
-        acknowledgedIDs: Set<String>
+        renderedItemIDs: [String]
     ) -> [String: String] {
-        let eligible = eligibleTargets(
-            snapshot: snapshot,
-            targets: currentTargets,
-            acknowledgedIDs: acknowledgedIDs
-        )
+        let renderedIDs = Set(renderedItemIDs)
         return titles.filter { activityID, _ in
-            guard let currentThreadID = eligible[activityID] else { return false }
+            guard renderedIDs.contains(activityID),
+                  let currentThreadID = currentTargets[activityID] else { return false }
             return previousTargets[activityID] == currentThreadID
         }
     }
 
+    static func retainingTitlesForFinalPresentation(
+        _ titles: [String: String],
+        currentTargets: [String: String],
+        renderedItemIDs: [String],
+        panelVisible: Bool,
+        layoutAvailable: Bool
+    ) -> [String: String] {
+        guard panelVisible, layoutAvailable else { return [:] }
+        return retainingTitles(
+            titles,
+            previousTargets: currentTargets,
+            currentTargets: currentTargets,
+            renderedItemIDs: renderedItemIDs
+        )
+    }
+
     static func adopting(
         resolvedTitles: [String: String],
+        retainedTitles: [String: String],
         requestedTargets: [String: String],
         currentTargets: [String: String],
-        snapshot: SessionActivitySnapshot?,
-        acknowledgedIDs: Set<String>,
+        expectedEmittedAt: TimeInterval,
+        currentEmittedAt: TimeInterval?,
+        expectedRenderedItemIDs: [String],
+        currentRenderedItemIDs: [String],
+        panelVisible: Bool,
+        layoutAvailable: Bool,
         requestGeneration: UInt64,
         currentGeneration: UInt64
     ) -> [String: String]? {
-        guard requestGeneration == currentGeneration else { return nil }
+        guard requestGeneration == currentGeneration,
+              currentEmittedAt == expectedEmittedAt,
+              currentRenderedItemIDs == expectedRenderedItemIDs else { return nil }
         let eligible = eligibleTargets(
-            snapshot: snapshot,
             targets: currentTargets,
-            acknowledgedIDs: acknowledgedIDs
+            renderedItemIDs: currentRenderedItemIDs,
+            panelVisible: panelVisible,
+            layoutAvailable: layoutAvailable
         )
         guard eligible == requestedTargets else { return nil }
-        return resolvedTitles.filter { eligible[$0.key] != nil }
+        let retained = retainedTitles.filter { eligible[$0.key] != nil }
+        let resolved = resolvedTitles.filter {
+            eligible[$0.key] != nil && !$0.value.isEmpty
+        }
+        return retained.merging(resolved) { _, replacement in replacement }
     }
 }
 
@@ -909,7 +929,16 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         transientStateReadRetry = nil
         sessionActivityReadRetry?.cancel()
         sessionActivityReadRetry = nil
-        invalidateSessionActivityTitleHydration()
+        sessionActivityTitleHydrationGeneration &+= 1
+        let titleResolverShutdown = DispatchSemaphore(value: 0)
+        let titleResolver = codexAppServerTitleResolver
+        Task.detached(priority: .userInitiated) {
+            await titleResolver.shutdown()
+            titleResolverShutdown.signal()
+        }
+        _ = titleResolverShutdown.wait(timeout: .now() + 2)
+        sessionActivityTitleHydrationTask?.cancel()
+        sessionActivityTitleHydrationTask = nil
         pendingLifecycleTransitionAttestationTask?.cancel()
         pendingLifecycleTransitionAttestationTask = nil
         pendingLifecycleTransitionAttestation = nil
@@ -1359,12 +1388,17 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 application: application,
                 currentlyAcceptedTargets: sessionActivityTargets
             )
+            sessionActivityTitles = SessionActivityTitleHydrationPolicy.retainingTitles(
+                sessionActivityTitles,
+                previousTargets: previousTargets,
+                currentTargets: sessionActivityTargets,
+                renderedItemIDs: Array(sessionActivityTargets.keys)
+            )
             if application.acknowledgementHistory != sessionActivityAcknowledgementHistory {
                 sessionActivityAcknowledgementHistory = application.acknowledgementHistory
                 persistSessionActivityAcknowledgements()
             }
-            scheduleSessionActivityTitleHydration(previousTargets: previousTargets)
-            refreshSessionActivityPresentation()
+            refreshSessionActivityPresentation(previousTargets: previousTargets)
         case .missing, .corrupt:
             guard retryAttempt < 2 else {
                 invalidateSessionActivityTitleHydration()
@@ -1418,8 +1452,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             in: sessionActivityAcknowledgementHistory
         )
         persistSessionActivityAcknowledgements()
-        scheduleSessionActivityTitleHydration(previousTargets: sessionActivityTargets)
-        refreshSessionActivityPresentation()
+        refreshSessionActivityPresentation(previousTargets: sessionActivityTargets)
     }
 
     private func openSessionActivity(_ id: String) {
@@ -1434,20 +1467,28 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func scheduleSessionActivityTitleHydration(
-        previousTargets: [String: String]
+        previousTargets _: [String: String]
     ) {
         invalidateSessionActivityTitleHydration()
-        sessionActivityTitles = SessionActivityTitleHydrationPolicy.retainingTitles(
+        guard let expectedEmittedAt = sessionActivitySnapshot?.emittedAt,
+              let sessionActivityView,
+              let sessionActivityPanel else {
+            sessionActivityTitles = [:]
+            return
+        }
+        let expectedRenderedItemIDs = sessionActivityView.renderedItemIDs
+        sessionActivityTitles = SessionActivityTitleHydrationPolicy.retainingTitlesForFinalPresentation(
             sessionActivityTitles,
-            previousTargets: previousTargets,
             currentTargets: sessionActivityTargets,
-            snapshot: sessionActivitySnapshot,
-            acknowledgedIDs: Set(sessionActivityAcknowledgementHistory)
+            renderedItemIDs: expectedRenderedItemIDs,
+            panelVisible: sessionActivityPanel.isVisible,
+            layoutAvailable: sessionActivityLayoutAvailable
         )
         let requestedTargets = SessionActivityTitleHydrationPolicy.eligibleTargets(
-            snapshot: sessionActivitySnapshot,
             targets: sessionActivityTargets,
-            acknowledgedIDs: Set(sessionActivityAcknowledgementHistory)
+            renderedItemIDs: expectedRenderedItemIDs,
+            panelVisible: sessionActivityPanel.isVisible,
+            layoutAvailable: sessionActivityLayoutAvailable
         )
         guard !requestedTargets.isEmpty else { return }
 
@@ -1458,20 +1499,28 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             guard !Task.isCancelled, let self else { return }
             guard let adoptedTitles = SessionActivityTitleHydrationPolicy.adopting(
                 resolvedTitles: resolvedTitles,
+                retainedTitles: self.sessionActivityTitles,
                 requestedTargets: requestedTargets,
                 currentTargets: self.sessionActivityTargets,
-                snapshot: self.sessionActivitySnapshot,
-                acknowledgedIDs: Set(self.sessionActivityAcknowledgementHistory),
+                expectedEmittedAt: expectedEmittedAt,
+                currentEmittedAt: self.sessionActivitySnapshot?.emittedAt,
+                expectedRenderedItemIDs: expectedRenderedItemIDs,
+                currentRenderedItemIDs: self.sessionActivityView.renderedItemIDs,
+                panelVisible: self.sessionActivityPanel.isVisible,
+                layoutAvailable: self.sessionActivityLayoutAvailable,
                 requestGeneration: requestGeneration,
                 currentGeneration: self.sessionActivityTitleHydrationGeneration
             ) else { return }
             self.sessionActivityTitles = adoptedTitles
             self.sessionActivityTitleHydrationTask = nil
-            self.refreshSessionActivityPresentation()
+            self.refreshSessionActivityPresentation(rescheduleTitleHydration: false)
         }
     }
 
-    private func refreshSessionActivityPresentation() {
+    private func refreshSessionActivityPresentation(
+        rescheduleTitleHydration: Bool = true,
+        previousTargets: [String: String]? = nil
+    ) {
         guard let sessionActivityView, let sessionActivityPanel else { return }
         let openableIDs = Set(sessionActivityTargets.compactMap { id, threadID in
             codexDesktopActivator.canOpen(threadID: threadID) ? id : nil
@@ -1486,22 +1535,66 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             sessionActivityExpandedByUser = false
             sessionActivityLayoutAvailable = true
             sessionActivityPanel.orderOut(nil)
+            pruneSessionActivityTitlesForFinalPresentation()
         } else {
-            positionSessionActivityPanel(restoreVisibility: false)
+            positionSessionActivityPanel(
+                restoreVisibility: false,
+                rescheduleTitleHydration: false
+            )
             guard sessionActivityLayoutAvailable else {
                 sessionActivityPanel.orderOut(nil)
+                pruneSessionActivityTitlesForFinalPresentation()
+                if rescheduleTitleHydration {
+                    scheduleSessionActivityTitleHydration(
+                        previousTargets: previousTargets ?? sessionActivityTargets
+                    )
+                }
                 return
             }
             orderSessionActivityPanelVisible()
+            pruneSessionActivityTitlesForFinalPresentation()
         }
+        if rescheduleTitleHydration {
+            scheduleSessionActivityTitleHydration(
+                previousTargets: previousTargets ?? sessionActivityTargets
+            )
+        }
+    }
+
+    /// Drops titles that a completed layout pass no longer renders. This is a
+    /// retention-only view update: it deliberately does not reposition the
+    /// panel or schedule another lookup, avoiding title-driven layout loops.
+    private func pruneSessionActivityTitlesForFinalPresentation() {
+        guard let sessionActivityView, let sessionActivityPanel else { return }
+        let retained = SessionActivityTitleHydrationPolicy.retainingTitlesForFinalPresentation(
+            sessionActivityTitles,
+            currentTargets: sessionActivityTargets,
+            renderedItemIDs: sessionActivityView.renderedItemIDs,
+            panelVisible: sessionActivityPanel.isVisible,
+            layoutAvailable: sessionActivityLayoutAvailable
+        )
+        guard retained != sessionActivityTitles else { return }
+        sessionActivityTitles = retained
+        let openableIDs = Set(sessionActivityTargets.compactMap { id, threadID in
+            codexDesktopActivator.canOpen(threadID: threadID) ? id : nil
+        })
+        sessionActivityView.update(
+            snapshot: sessionActivitySnapshot,
+            acknowledgedIDs: Set(sessionActivityAcknowledgementHistory),
+            openableIDs: openableIDs,
+            titles: retained
+        )
     }
 
     private func positionSessionActivityPanel(
         display: Bool = false,
-        restoreVisibility: Bool = true
+        restoreVisibility: Bool = true,
+        rescheduleTitleHydration: Bool = true
     ) {
         guard let panel, let sessionActivityPanel, let sessionActivityView,
               !sessionActivityView.isHidden else { return }
+        let previousRenderedItemIDs = sessionActivityView.renderedItemIDs
+        let wasLayoutAvailable = sessionActivityLayoutAvailable
         let visibleFrame = panel.screen?.visibleFrame
             ?? NSScreen.main?.visibleFrame
             ?? panel.frame
@@ -1528,6 +1621,10 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         sessionActivityLayoutAvailable = layout.available
         guard layout.available else {
             sessionActivityPanel.orderOut(nil)
+            if rescheduleTitleHydration,
+               wasLayoutAvailable || !previousRenderedItemIDs.isEmpty {
+                scheduleSessionActivityTitleHydration(previousTargets: sessionActivityTargets)
+            }
             return
         }
         sessionActivityView.setCompactOverride(layout.compact)
@@ -1555,8 +1652,13 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
            SessionActivityPanelVisibilityPolicy.shouldOrderFront(
                wasAvailable: wasAvailable,
                isAvailable: layout.available
-           ) {
+        ) {
             orderSessionActivityPanelVisible()
+        }
+        if rescheduleTitleHydration,
+           wasLayoutAvailable != sessionActivityLayoutAvailable
+            || previousRenderedItemIDs != sessionActivityView.renderedItemIDs {
+            scheduleSessionActivityTitleHydration(previousTargets: sessionActivityTargets)
         }
     }
 
@@ -1572,7 +1674,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
 
     private func expandSessionActivityPanel() {
         sessionActivityExpandedByUser = true
-        positionSessionActivityPanel(display: true)
+        // The compact pill expands the view before this callback, so capture-
+        // based layout change detection can no longer observe the old empty
+        // rendered set. Reposition without its implicit reschedule, then start
+        // exactly one lookup for the newly rendered rows.
+        positionSessionActivityPanel(display: true, rescheduleTitleHydration: false)
+        scheduleSessionActivityTitleHydration(previousTargets: sessionActivityTargets)
     }
 
     private func applySessionActivityAppearance(_ appearance: SessionActivityPanelAppearance) {

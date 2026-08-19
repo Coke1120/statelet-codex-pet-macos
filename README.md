@@ -11,7 +11,7 @@ transparent desktop presence. It runs without a development board, keeps its
 runtime data on the Mac, and uses AppKit and AVFoundation rather than a browser
 runtime.
 
-Statelet 1.8.7 (build 21) requires macOS 13 or newer. Its tagged release attaches
+Statelet 1.8.8 (build 22) requires macOS 13 or newer. Its tagged release attaches
 an ad-hoc-signed package for owner-authorized personal updates; it is not a
 Developer ID-signed or notarized public binary. Existing 1.8.4 or earlier
 installs require one manual bootstrap update to 1.8.5 or later.
@@ -91,6 +91,9 @@ App Server and issue `thread/read` with `includeTurns: false`. Statelet accepts
 only the bounded, sanitized `thread.name` value. It discards response previews,
 turns, and items, keeps accepted titles only in memory, and never writes them to
 the activity sidecars, preferences, or diagnostics.
+Before sending a private thread identifier, Statelet validates the selected
+Codex executable and the exact launched process against OpenAI's Developer ID
+Team ID. Lookup is limited to rows actually rendered in the expanded popup.
 Because `thread.name` is user-facing Codex text, it can contain wording selected
 or generated in Codex; Statelet bounds and normalizes it but does not infer or
 redact sensitive substrings.
@@ -376,8 +379,8 @@ Statelet uses one canonical identity for new builds and installations:
 | Application Support | `~/Library/Application Support/Statelet` |
 | LaunchAgents | `com.coke1120.statelet.state-aggregator`, `com.coke1120.statelet.mac-player` |
 | Managed marker | `statelet-v2` |
-| App version | `1.8.7` |
-| Build number | `21` |
+| App version | `1.8.8` |
+| Build number | `22` |
 
 ## Uninstall
 
