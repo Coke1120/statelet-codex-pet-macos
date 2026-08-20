@@ -69,7 +69,7 @@ private enum TransitionColumn {
     static let remove = NSUserInterfaceItemIdentifier("animation-library.transition.remove")
 }
 
-private struct SettingsTransitionRowModel {
+private struct SettingsTransitionRowModel: Equatable {
     let route: SettingsTransitionRoute
     let clip: SettingsTransitionClip?
     let position: Int
@@ -1026,6 +1026,16 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
 }
 
 final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDelegate {
+    private struct RowUpdateKey: Equatable {
+        let rows: [SettingsTransitionRowModel]
+        let previewPath: String?
+        let reduceMotion: Bool
+        let busy: Bool
+        let characterName: String
+        let scope: TransitionLibraryScope
+        let globalLegacyRouteCount: Int
+    }
+
     var onScopeChange: ((TransitionLibraryScope) -> Void)?
     var onMigrateLegacy: (() -> Void)?
     var onImportMP4: ((SettingsTransitionRoute) -> Void)?
@@ -1056,6 +1066,10 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
     private var busy = false
     private var scope: TransitionLibraryScope = .character
     private var globalLegacyRouteCount = 0
+    private var lastRowUpdateKey: RowUpdateKey?
+    private var rowReloadCount = 0
+
+    var rowReloadCountForTesting: Int { rowReloadCount }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1173,7 +1187,7 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
             routes = [.global]
         }
         let grouped = Dictionary(grouping: clips, by: \.route)
-        rows = routes.flatMap { route -> [SettingsTransitionRowModel] in
+        let incomingRows = routes.flatMap { route -> [SettingsTransitionRowModel] in
             let routeClips = (grouped[route] ?? []).sorted { $0.position < $1.position }
             guard !routeClips.isEmpty else {
                 let key: StateTransitionKey?
@@ -1225,7 +1239,23 @@ final class TransitionLibraryView: NSView, NSTableViewDataSource, NSTableViewDel
         tableView.setAccessibilityLabel(scope == .character
             ? "\(characterName) directional lifecycle transitions"
             : "Global lifecycle transition")
+        let rowUpdateKey = RowUpdateKey(
+            rows: incomingRows,
+            previewPath: previewPath,
+            reduceMotion: reduceMotion,
+            busy: busy,
+            characterName: characterName,
+            scope: scope,
+            globalLegacyRouteCount: globalLegacyRouteCount
+        )
+        guard LibraryRowRefreshPolicy.shouldRefresh(
+            previous: lastRowUpdateKey,
+            incoming: rowUpdateKey
+        ) else { return }
+        lastRowUpdateKey = rowUpdateKey
+        rows = incomingRows
         tableView.reloadData()
+        rowReloadCount += 1
     }
 
     private var canEditCurrentScope: Bool {

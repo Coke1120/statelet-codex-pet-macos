@@ -601,6 +601,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var sessionActivityReadRetry: DispatchWorkItem?
     private var sessionActivitySnapshot: SessionActivitySnapshot?
     private var sessionActivityTargets: [String: String] = [:]
+    private var sessionActivityOpenableIDs: Set<String> = []
+    private var sessionActivityOpenabilityRequest: [String: String] = [:]
+    private var sessionActivityOpenabilityGeneration: UInt64 = 0
+    private var sessionActivityOpenabilityTask: Task<Void, Never>?
+    private var sessionActivityOpenTask: Task<Void, Never>?
     private var sessionActivityTitles: [String: String] = [:]
     private var sessionActivityTitleHydrationGeneration: UInt64 = 0
     private var sessionActivityTitleHydrationTask: Task<Void, Never>?
@@ -647,6 +652,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var conversionProfile: AlphaConversionProfile = .fill
     private let launchAtLoginManager = LaunchAtLoginManager()
     private let diagnostics = PetDiagnostics()
+    private let diagnosticsQueue = DispatchQueue(
+        label: "com.coke1120.Statelet.diagnostics",
+        qos: .utility
+    )
+    private var diagnosticsRefreshGeneration: UInt64 = 0
     private let preferencesMigrationStatus: PreferencesMigration.Status
     private var cachedLaunchAtLoginStatus: LaunchAtLoginManager.Status?
     private var cachedDiagnosticsReport = "Open Diagnostics and choose Refresh to inspect this Mac."
@@ -929,6 +939,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         transientStateReadRetry = nil
         sessionActivityReadRetry?.cancel()
         sessionActivityReadRetry = nil
+        sessionActivityOpenabilityGeneration &+= 1
+        sessionActivityOpenabilityTask?.cancel()
+        sessionActivityOpenabilityTask = nil
+        sessionActivityOpenTask?.cancel()
+        sessionActivityOpenTask = nil
         sessionActivityTitleHydrationGeneration &+= 1
         let titleResolverShutdown = DispatchSemaphore(value: 0)
         let titleResolver = codexAppServerTitleResolver
@@ -1457,7 +1472,62 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
 
     private func openSessionActivity(_ id: String) {
         guard let threadID = sessionActivityTargets[id] else { return }
-        _ = codexDesktopActivator.open(threadID: threadID)
+        sessionActivityOpenTask?.cancel()
+        let activator = codexDesktopActivator
+        sessionActivityOpenTask = Task { @MainActor [weak self] in
+            let opened = await activator.open(threadID: threadID)
+            guard !Task.isCancelled, let self else { return }
+            self.sessionActivityOpenTask = nil
+            guard !opened, self.sessionActivityTargets[id] == threadID else { return }
+            self.sessionActivityOpenableIDs.remove(id)
+            self.sessionActivityOpenabilityRequest = [:]
+            self.refreshSessionActivityPresentation(rescheduleTitleHydration: false)
+        }
+    }
+
+    private func scheduleSessionActivityOpenabilityResolution() {
+        guard let sessionActivityView, let sessionActivityPanel else { return }
+        let renderedIDs = Set(sessionActivityView.renderedItemIDs)
+        let requestedTargets: [String: String]
+        if sessionActivityPanel.isVisible, sessionActivityLayoutAvailable, !renderedIDs.isEmpty {
+            requestedTargets = Dictionary(uniqueKeysWithValues: sessionActivityTargets.compactMap {
+                id, threadID in
+                renderedIDs.contains(id) ? (id, threadID) : nil
+            })
+        } else {
+            requestedTargets = [:]
+        }
+        if requestedTargets.isEmpty, sessionActivityOpenabilityRequest.isEmpty {
+            return
+        }
+        guard requestedTargets != sessionActivityOpenabilityRequest
+                || sessionActivityOpenabilityTask == nil else { return }
+
+        let previousRequest = sessionActivityOpenabilityRequest
+        sessionActivityOpenabilityRequest = requestedTargets
+        sessionActivityOpenableIDs = Set(sessionActivityOpenableIDs.filter { id in
+            previousRequest[id] == requestedTargets[id] && requestedTargets[id] != nil
+        })
+        sessionActivityOpenabilityGeneration &+= 1
+        let requestGeneration = sessionActivityOpenabilityGeneration
+        sessionActivityOpenabilityTask?.cancel()
+        sessionActivityOpenabilityTask = nil
+        guard !requestedTargets.isEmpty else { return }
+
+        let activator = codexDesktopActivator
+        sessionActivityOpenabilityTask = Task { @MainActor [weak self] in
+            let openableIDs = await activator.openableIDs(for: requestedTargets)
+            guard !Task.isCancelled, let self,
+                  self.sessionActivityOpenabilityGeneration == requestGeneration,
+                  self.sessionActivityOpenabilityRequest == requestedTargets else { return }
+            self.sessionActivityOpenabilityTask = nil
+            guard openableIDs != self.sessionActivityOpenableIDs else { return }
+            self.sessionActivityOpenableIDs = openableIDs
+            self.refreshSessionActivityPresentation(
+                rescheduleTitleHydration: false,
+                rescheduleOpenability: false
+            )
+        }
     }
 
     private func invalidateSessionActivityTitleHydration() {
@@ -1519,12 +1589,16 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
 
     private func refreshSessionActivityPresentation(
         rescheduleTitleHydration: Bool = true,
-        previousTargets: [String: String]? = nil
+        previousTargets: [String: String]? = nil,
+        rescheduleOpenability: Bool = true
     ) {
         guard let sessionActivityView, let sessionActivityPanel else { return }
-        let openableIDs = Set(sessionActivityTargets.compactMap { id, threadID in
-            codexDesktopActivator.canOpen(threadID: threadID) ? id : nil
-        })
+        defer {
+            if rescheduleOpenability {
+                scheduleSessionActivityOpenabilityResolution()
+            }
+        }
+        let openableIDs = sessionActivityOpenableIDs.intersection(sessionActivityTargets.keys)
         sessionActivityView.update(
             snapshot: sessionActivitySnapshot,
             acknowledgedIDs: Set(sessionActivityAcknowledgementHistory),
@@ -1575,9 +1649,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         )
         guard retained != sessionActivityTitles else { return }
         sessionActivityTitles = retained
-        let openableIDs = Set(sessionActivityTargets.compactMap { id, threadID in
-            codexDesktopActivator.canOpen(threadID: threadID) ? id : nil
-        })
+        let openableIDs = sessionActivityOpenableIDs.intersection(sessionActivityTargets.keys)
         sessionActivityView.update(
             snapshot: sessionActivitySnapshot,
             acknowledgedIDs: Set(sessionActivityAcknowledgementHistory),
@@ -1679,6 +1751,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         // rendered set. Reposition without its implicit reschedule, then start
         // exactly one lookup for the newly rendered rows.
         positionSessionActivityPanel(display: true, rescheduleTitleHydration: false)
+        scheduleSessionActivityOpenabilityResolution()
         scheduleSessionActivityTitleHydration(previousTargets: sessionActivityTargets)
     }
 
@@ -6727,8 +6800,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func refreshDiagnosticsSnapshot() {
-        let startup = launchAtLoginManager.status()
-        cachedLaunchAtLoginStatus = startup
         let now = Date().timeIntervalSince1970
         let observed = lastPublishedSnapshot
         let accepted = lastAcceptedPublishedSnapshot
@@ -6780,8 +6851,20 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             conversionFailureStage: lastConversionFailureDiagnostic?.stage,
             preferencesMigrationStatus: preferencesMigrationStatus
         )
-        cachedDiagnosticsReport = diagnostics.build(input: input)
-        refreshSettings()
+        diagnosticsRefreshGeneration &+= 1
+        let generation = diagnosticsRefreshGeneration
+        let launchAtLoginManager = launchAtLoginManager
+        let diagnostics = diagnostics
+        diagnosticsQueue.async { [weak self] in
+            let startup = launchAtLoginManager.status()
+            let report = diagnostics.build(input: input, startupStatus: startup)
+            DispatchQueue.main.async {
+                guard let self, self.diagnosticsRefreshGeneration == generation else { return }
+                self.cachedLaunchAtLoginStatus = startup
+                self.cachedDiagnosticsReport = report
+                self.refreshSettings()
+            }
+        }
     }
 
     private var diagnosticsPresentationStatus: String {

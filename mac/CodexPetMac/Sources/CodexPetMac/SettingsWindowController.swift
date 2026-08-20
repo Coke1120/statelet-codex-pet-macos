@@ -627,13 +627,23 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    deinit {
+        libraryRevisionTimer?.invalidate()
+    }
+
+    var isLibraryRevisionTimerActiveForTesting: Bool {
+        libraryRevisionTimer?.isValid == true
+    }
+
     func show() {
         NSApp.activate(ignoringOtherApps: true)
-        animationLibrary.invalidateRowCache()
-        refreshRows()
-        startLibraryRevisionTimer()
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
+        if selectedSection == .animations {
+            animationLibrary.invalidateRowCache()
+            refreshRows()
+        }
+        updateLibraryRevisionTimer()
         let shouldUsePreferredSize = !hasShownWindow && usePreferredSizeOnFirstShow
         fitWindowToVisibleScreen(usePreferredSize: shouldUsePreferredSize)
         DispatchQueue.main.async { [weak self] in
@@ -2095,11 +2105,15 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func refreshRows() {
-        guard let snapshot else { return }
+        guard selectedSection == .animations, window?.isVisible == true, let snapshot else { return }
         let globallyBusy: Bool
         switch activity {
         case .converting, .working, .applying, .characterWorking: globallyBusy = true
         case .idle, .succeeded, .failed, .characterSucceeded: globallyBusy = false
+        }
+        if animationsMode.selectedSegment == 1 {
+            refreshTransitionRows(snapshot: snapshot, globallyBusy: globallyBusy)
+            return
         }
         let counts = Dictionary(uniqueKeysWithValues: PetState.allCases.map {
             ($0, snapshot.mediaMap.playlist(for: $0)?.entries.count ?? 0)
@@ -2117,6 +2131,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             importEnabled: toolchainState.isReady,
             characterName: activeCharacterName
         )
+    }
+
+    private func refreshTransitionRows(snapshot: SettingsSnapshot, globallyBusy: Bool) {
         var transitionClips: [SettingsTransitionClip]
         let globalFallbackRoutes: Set<StateTransitionKey>
         let globalLegacyRouteCount: Int
@@ -2223,6 +2240,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         ]
         NSLayoutConstraint.activate(displayedAnimationLibraryConstraints)
         displayedAnimationLibrary = selectedLibrary
+        refreshRows()
     }
 
     private var activeCharacterName: String {
@@ -2349,10 +2367,22 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         libraryRevisionTimer = timer
     }
 
-    func windowWillClose(_ notification: Notification) {
-        persistSettingsWindowSize()
+    private func stopLibraryRevisionTimer() {
         libraryRevisionTimer?.invalidate()
         libraryRevisionTimer = nil
+    }
+
+    private func updateLibraryRevisionTimer() {
+        if window?.isVisible == true, selectedSection == .animations {
+            startLibraryRevisionTimer()
+        } else {
+            stopLibraryRevisionTimer()
+        }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        persistSettingsWindowSize()
+        stopLibraryRevisionTimer()
     }
 
     func windowDidResize(_ notification: Notification) {
@@ -2400,20 +2430,25 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         defaults.set(section.rawValue, forKey: Self.selectedSectionIDDefaultsKey)
         defaults.set(section.legacyIndex, forKey: Self.legacySelectedSectionDefaultsKey)
         let selectedPane = pane(for: section)
-        guard displayedPane !== selectedPane else { return }
-
-        NSLayoutConstraint.deactivate(displayedPaneConstraints)
-        displayedPaneConstraints.removeAll()
-        displayedPane?.removeFromSuperview()
-        paneHost.addSubview(selectedPane)
-        displayedPaneConstraints = [
-            selectedPane.leadingAnchor.constraint(equalTo: paneHost.leadingAnchor),
-            selectedPane.trailingAnchor.constraint(equalTo: paneHost.trailingAnchor),
-            selectedPane.topAnchor.constraint(equalTo: paneHost.topAnchor),
-            selectedPane.bottomAnchor.constraint(equalTo: paneHost.bottomAnchor),
-        ]
-        NSLayoutConstraint.activate(displayedPaneConstraints)
-        displayedPane = selectedPane
+        let paneChanged = displayedPane !== selectedPane
+        if paneChanged {
+            NSLayoutConstraint.deactivate(displayedPaneConstraints)
+            displayedPaneConstraints.removeAll()
+            displayedPane?.removeFromSuperview()
+            paneHost.addSubview(selectedPane)
+            displayedPaneConstraints = [
+                selectedPane.leadingAnchor.constraint(equalTo: paneHost.leadingAnchor),
+                selectedPane.trailingAnchor.constraint(equalTo: paneHost.trailingAnchor),
+                selectedPane.topAnchor.constraint(equalTo: paneHost.topAnchor),
+                selectedPane.bottomAnchor.constraint(equalTo: paneHost.bottomAnchor),
+            ]
+            NSLayoutConstraint.activate(displayedPaneConstraints)
+            displayedPane = selectedPane
+        }
+        if paneChanged, section == .animations {
+            refreshRows()
+        }
+        updateLibraryRevisionTimer()
     }
 
     private func updateSplitPreferredContentSizes(for size: NSSize) {

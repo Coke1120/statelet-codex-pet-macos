@@ -762,6 +762,96 @@ final class SettingsWindowControllerTests: XCTestCase {
         }
     }
 
+    func testLibraryRevisionTimerFollowsVisibleAnimationsPaneAcrossRepeatedSwitches() throws {
+        let suiteName = "statelet-settings-library-timer-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let controller = SettingsWindowController(defaults: defaults)
+        let window = try XCTUnwrap(controller.window)
+        XCTAssertFalse(controller.isLibraryRevisionTimerActiveForTesting)
+
+        controller.show()
+        Self.pumpMainRunLoop(for: 0.05)
+        XCTAssertFalse(controller.isLibraryRevisionTimerActiveForTesting)
+        let sidebar = try Self.settingsSidebar(in: window)
+
+        for _ in 0 ..< 3 {
+            try Self.selectSidebar(in: sidebar, label: "Animations")
+            XCTAssertTrue(controller.isLibraryRevisionTimerActiveForTesting)
+
+            try Self.selectSidebar(in: sidebar, label: "General")
+            XCTAssertFalse(controller.isLibraryRevisionTimerActiveForTesting)
+        }
+
+        try Self.selectSidebar(in: sidebar, label: "Animations")
+        XCTAssertTrue(controller.isLibraryRevisionTimerActiveForTesting)
+        window.close()
+        Self.pumpMainRunLoop(for: 0.05)
+        XCTAssertFalse(controller.isLibraryRevisionTimerActiveForTesting)
+    }
+
+    func testChangingAnimationModeRefreshesTransitionsAndUnchangedInputsSkipReload() throws {
+        let transitionLibrary = TransitionLibraryView()
+        transitionLibrary.update(
+            clips: [],
+            globalFallbackRoutes: [],
+            globalLegacyRouteCount: 0,
+            previewPath: nil,
+            reduceMotion: false,
+            busy: false,
+            characterName: "Default",
+            scope: .character
+        )
+        XCTAssertEqual(transitionLibrary.rowReloadCountForTesting, 1)
+
+        transitionLibrary.update(
+            clips: [],
+            globalFallbackRoutes: [],
+            globalLegacyRouteCount: 0,
+            previewPath: nil,
+            reduceMotion: false,
+            busy: false,
+            characterName: "Default",
+            scope: .character
+        )
+        XCTAssertEqual(transitionLibrary.rowReloadCountForTesting, 1)
+
+        let controller = SettingsWindowController()
+        let window = try XCTUnwrap(controller.window)
+        controller.update(snapshot: SettingsSnapshot(
+            mediaMap: try MediaMap(),
+            mediaMapURL: URL(fileURLWithPath: "/tmp/media-map.json"),
+            publisherSummary: "Test",
+            reduceMotion: false
+        ))
+        controller.show()
+        Self.pumpMainRunLoop(for: 0.05)
+        defer {
+            window.close()
+            Self.pumpMainRunLoop(for: 0.05)
+        }
+
+        let sidebar = try Self.settingsSidebar(in: window)
+        try Self.selectSidebar(in: sidebar, label: "Animations")
+        let animationModes = try XCTUnwrap(
+            Self.descendants(of: window.contentView).compactMap { $0 as? NSSegmentedControl }.first {
+                $0.accessibilityLabel() == "Animation library mode"
+            }
+        )
+        animationModes.selectedSegment = 1
+        NSApp.sendAction(animationModes.action!, to: animationModes.target, from: animationModes)
+        Self.pumpMainRunLoop(for: 0.05)
+
+        let transitions = try XCTUnwrap(
+            Self.descendants(of: window.contentView).compactMap { $0 as? NSTableView }.first {
+                $0.accessibilityLabel() == "Default directional lifecycle transitions"
+            }
+        )
+        XCTAssertEqual(transitions.numberOfRows, PetState.allCases.count * PetState.allCases.count)
+    }
+
     func testGlobalTransitionScopeShowsOneEditorAndDisablesEditsDuringLegacyResolution() throws {
         let route = try StateTransitionKey(from: .idle, to: .running)
         let universal = try StateMediaPlaylist(entries: [

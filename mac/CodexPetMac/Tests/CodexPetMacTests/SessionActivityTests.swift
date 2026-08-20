@@ -22,6 +22,30 @@ private final class ActivityReaderState: @unchecked Sendable {
     var values: [Double] { lock.withLock { delivered } }
 }
 
+private final class ActivationTrustProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var trusted = true
+    private var evaluations = 0
+    private var mainThreadEvaluations = 0
+
+    func setTrusted(_ value: Bool) {
+        lock.withLock { trusted = value }
+    }
+
+    func evaluate() -> Bool {
+        lock.withLock {
+            evaluations += 1
+            if Thread.isMainThread {
+                mainThreadEvaluations += 1
+            }
+            return trusted
+        }
+    }
+
+    var evaluationCount: Int { lock.withLock { evaluations } }
+    var mainThreadEvaluationCount: Int { lock.withLock { mainThreadEvaluations } }
+}
+
 final class SessionActivityTests: XCTestCase {
     private func item(
         _ hex: String,
@@ -418,28 +442,83 @@ final class SessionActivityTests: XCTestCase {
         XCTAssertEqual(rowLabel.stringValue, "Running · Codex #1 · just now")
     }
 
-    func testCodexDesktopActivationPolicyEncodesAndFailsClosed() throws {
-        let appURL = URL(fileURLWithPath: "/Applications/Codex.app")
+    @MainActor
+    func testCodexDesktopActivationPolicyCoalescesOffMainAndRevalidatesOpen() async throws {
+        let temporaryRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("statelet-codex-activation-\(UUID().uuidString)", isDirectory: true)
+        let appURL = temporaryRoot.appendingPathComponent("Codex.app", isDirectory: true)
+        let executableURL = appURL.appendingPathComponent("Contents/MacOS/Codex")
+        let infoURL = appURL.appendingPathComponent("Contents/Info.plist")
+        let codeResourcesURL = appURL.appendingPathComponent("Contents/_CodeSignature/CodeResources")
+        try FileManager.default.createDirectory(
+            at: executableURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: codeResourcesURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("executable".utf8).write(to: executableURL)
+        try Data("info".utf8).write(to: infoURL)
+        try Data("signature".utf8).write(to: codeResourcesURL)
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+        var currentIdentity = CodexDesktopApplicationIdentity(
+            bundleRevision: try XCTUnwrap(LocalFileRevision(url: appURL)),
+            executableRevision: try XCTUnwrap(LocalFileRevision(url: executableURL)),
+            infoRevision: try XCTUnwrap(LocalFileRevision(url: infoURL)),
+            codeResourcesRevision: try XCTUnwrap(LocalFileRevision(url: codeResourcesURL))
+        )
+
+        let trustProbe = ActivationTrustProbe()
+        var resolverCalls = 0
         var opened: (URL, URL)?
         let trusted = CodexDesktopActivator(
-            applicationResolver: { _ in appURL },
-            applicationTrustResolver: { _ in true },
+            applicationResolver: { _ in
+                resolverCalls += 1
+                return appURL
+            },
+            applicationTrustResolver: { _ in trustProbe.evaluate() },
+            applicationIdentityResolver: { _ in currentIdentity },
             opener: { opened = ($0, $1) }
         )
-        XCTAssertTrue(trusted.canOpen(threadID: "thread/with?reserved"))
-        XCTAssertTrue(trusted.open(threadID: "thread/with?reserved"))
+        let targets = Dictionary(uniqueKeysWithValues: (0 ..< 10).map {
+            ("activity-\($0)", "thread-\($0)")
+        })
+        let firstOpenableIDs = await trusted.openableIDs(for: targets)
+        XCTAssertEqual(firstOpenableIDs, Set(targets.keys))
+        XCTAssertEqual(resolverCalls, 1)
+        XCTAssertEqual(trustProbe.evaluationCount, 1)
+        XCTAssertEqual(trustProbe.mainThreadEvaluationCount, 0)
+
+        let cachedOpenableIDs = await trusted.openableIDs(for: targets)
+        XCTAssertEqual(cachedOpenableIDs, firstOpenableIDs)
+        XCTAssertEqual(trustProbe.evaluationCount, 1)
+
+        try Data("updated-signature".utf8).write(to: codeResourcesURL)
+        currentIdentity = CodexDesktopApplicationIdentity(
+            bundleRevision: try XCTUnwrap(LocalFileRevision(url: appURL)),
+            executableRevision: try XCTUnwrap(LocalFileRevision(url: executableURL)),
+            infoRevision: try XCTUnwrap(LocalFileRevision(url: infoURL)),
+            codeResourcesRevision: try XCTUnwrap(LocalFileRevision(url: codeResourcesURL))
+        )
+        let refreshedOpenableIDs = await trusted.openableIDs(for: targets)
+        XCTAssertEqual(refreshedOpenableIDs, firstOpenableIDs)
+        XCTAssertEqual(trustProbe.evaluationCount, 2, "A changed app identity must invalidate trust")
+
+        let didOpenTrustedTarget = await trusted.open(threadID: "thread/with?reserved")
+        XCTAssertTrue(didOpenTrustedTarget)
+        XCTAssertEqual(trustProbe.evaluationCount, 3, "Open must perform one fresh fail-closed validation")
         XCTAssertEqual(opened?.0.absoluteString, "codex://threads/thread%2Fwith%3Freserved")
         XCTAssertEqual(opened?.1, appURL)
 
-        var untrustedOpened = false
-        let untrusted = CodexDesktopActivator(
-            applicationResolver: { _ in appURL },
-            applicationTrustResolver: { _ in false },
-            opener: { _, _ in untrustedOpened = true }
-        )
-        XCTAssertFalse(untrusted.canOpen(threadID: "valid"))
-        XCTAssertFalse(untrusted.open(threadID: "valid"))
-        XCTAssertFalse(untrustedOpened)
+        trustProbe.setTrusted(false)
+        let didOpenUntrustedTarget = await trusted.open(threadID: "valid")
+        XCTAssertFalse(didOpenUntrustedTarget)
+        XCTAssertEqual(trustProbe.evaluationCount, 4)
+        XCTAssertEqual(opened?.0.absoluteString, "codex://threads/thread%2Fwith%3Freserved")
+
+        let invalidOpenableIDs = await trusted.openableIDs(for: ["invalid": "contains space"])
+        XCTAssertTrue(invalidOpenableIDs.isEmpty)
         XCTAssertEqual(CodexDesktopActivationPolicy.trustedBundleIdentifier, "com.openai.codex")
         XCTAssertEqual(CodexDesktopActivationPolicy.trustedTeamIdentifier, "2DC432GLL2")
         XCTAssertNil(CodexDesktopActivationPolicy.deepLink(for: "contains space"))

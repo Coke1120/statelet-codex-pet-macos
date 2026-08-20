@@ -5,6 +5,35 @@ versioning for the public source release.
 
 ## Unreleased
 
+## [1.8.11] - 2026-08-20
+
+### Changed
+
+- Codex Desktop trust evaluation for activity-popup links now runs off the main
+  thread, coalesces all rendered rows behind one application validation, and
+  caches the result only for the matching on-disk application identity.
+- Opening a Codex task still performs a fresh fail-closed trust check before
+  handing the deep link to the validated application.
+- Settings media polling now runs only while the Animations pane is visible
+  and refreshes only the selected animation library.
+
+### Fixed
+
+- Browsing Settings or refreshing the activity popup no longer beachballs
+  while Statelet repeatedly performs strict all-architecture validation of the
+  complete Codex Desktop application bundle.
+- Unchanged transition rows no longer reload their table, and launch-at-login
+  diagnostics no longer block the main thread while Settings is opening.
+
+### Distribution notes
+
+- Version 1.8.11 supersedes 1.8.10 with the responsiveness and bounded-refresh
+  fixes above; lifecycle, media, voice, activity privacy, and private runtime
+  storage contracts remain unchanged.
+- The package remains ad-hoc signed for owner-authorized personal updates. It
+  is not Developer ID signed, notarized, or presented as an Apple-authorized
+  public binary.
+
 ## [1.8.10] - 2026-08-20
 
 ### Changed
@@ -408,6 +437,7 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
+[1.8.11]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.11
 [1.8.10]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.10
 [1.8.9]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.9
 [1.8.8]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.8

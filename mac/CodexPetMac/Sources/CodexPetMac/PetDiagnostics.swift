@@ -104,8 +104,11 @@ struct PetDiagnostics {
 
     /// Creates a report safe to copy into an issue or support conversation.
     /// Absolute home paths and free-form caller text are never emitted.
-    func build(input: PetDiagnosticsInput) -> String {
-        let startup = launchAtLoginManager.status()
+    func build(
+        input: PetDiagnosticsInput,
+        startupStatus: LaunchAtLoginManager.Status? = nil
+    ) -> String {
+        let startup = startupStatus ?? launchAtLoginManager.status()
         let support = homeURL.appendingPathComponent(
             StateletIdentity.applicationSupportRelativePath,
             isDirectory: true
