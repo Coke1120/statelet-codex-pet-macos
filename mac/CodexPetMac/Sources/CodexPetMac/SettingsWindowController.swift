@@ -6,20 +6,20 @@ private final class TopAlignedSettingsDocumentView: NSView {
 }
 
 private final class SettingsWindow: NSWindow {
-    var onWillApplySize: ((NSSize) -> Void)?
+    var onWillApplyContentSize: ((NSSize) -> Void)?
 
     override func setContentSize(_ size: NSSize) {
-        onWillApplySize?(size)
+        onWillApplyContentSize?(size)
         super.setContentSize(size)
     }
 
     override func setFrame(_ frameRect: NSRect, display flag: Bool) {
-        onWillApplySize?(frameRect.size)
+        onWillApplyContentSize?(contentRect(forFrameRect: frameRect).size)
         super.setFrame(frameRect, display: flag)
     }
 
     override func setFrame(_ frameRect: NSRect, display flag: Bool, animate animateFlag: Bool) {
-        onWillApplySize?(frameRect.size)
+        onWillApplyContentSize?(contentRect(forFrameRect: frameRect).size)
         super.setFrame(frameRect, display: flag, animate: animateFlag)
     }
 }
@@ -374,12 +374,13 @@ private enum SettingsSidebarItem {
 
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private static let defaultStateLabelCustomColor = "#007AFF"
-    private static let preferredContentSize = NSSize(width: 1_000, height: 650)
+    private static let preferredContentSize = NSSize(width: 1_200, height: 650)
     private static let legacyPreferredContentSize = NSSize(width: 760, height: 650)
+    private static let previousPreferredContentSize = NSSize(width: 1_000, height: 650)
     private static let minimumContentSize = NSSize(width: 700, height: 570)
     private static let screenMargin: CGFloat = 12
     private static let sidebarWidth: CGFloat = 218
-    private static let widerDefaultMigrationKey = "Statelet.settingsWindowUsesWiderDefault.v1"
+    private static let widerDefaultMigrationKey = "Statelet.settingsWindowUsesWiderDefault.v2"
     private static let selectedSectionIDDefaultsKey = "Statelet.Settings.selectedSectionID"
     private static let legacySelectedSectionDefaultsKey = "Statelet.Settings.selectedSection"
     private static let resetWindowSizeToolbarItemIdentifier = NSToolbarItem.Identifier(
@@ -926,7 +927,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         windowContentWidthConstraint = windowContentWidth
         windowContentHeightConstraint = windowContentHeight
         NSLayoutConstraint.activate([windowContentWidth, windowContentHeight])
-        (window as? SettingsWindow)?.onWillApplySize = { [weak self] size in
+        (window as? SettingsWindow)?.onWillApplyContentSize = { [weak self] size in
             guard let self else { return }
             updateWindowSizingPreferences(for: size)
         }
@@ -2393,7 +2394,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
-        updateWindowSizingPreferences(for: frameSize)
+        let contentSize = sender.contentRect(forFrameRect: NSRect(origin: .zero, size: frameSize)).size
+        updateWindowSizingPreferences(for: contentSize)
         return frameSize
     }
 
@@ -2470,8 +2472,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private static func isLegacyPreferredContentSize(_ size: NSSize) -> Bool {
-        abs(size.width - legacyPreferredContentSize.width) <= 1
-            && abs(size.height - legacyPreferredContentSize.height) <= 1
+        [legacyPreferredContentSize, previousPreferredContentSize].contains { preferredSize in
+            abs(size.width - preferredSize.width) <= 1
+                && abs(size.height - preferredSize.height) <= 1
+        }
     }
 
     private func fitWindowToVisibleScreen(usePreferredSize: Bool) {

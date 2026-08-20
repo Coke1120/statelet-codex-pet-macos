@@ -70,7 +70,7 @@ final class SettingsWindowControllerTests: XCTestCase {
         XCTAssertTrue(window.titlebarAccessoryViewControllers.isEmpty)
         XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(resetItem.action), to: resetItem.target, from: resetItem))
         Self.pumpMainRunLoop(for: 0.05)
-        XCTAssertEqual(Self.contentSize(of: window).width, min(1_000, window.contentMaxSize.width), accuracy: 1)
+        XCTAssertEqual(Self.contentSize(of: window).width, min(1_200, window.contentMaxSize.width), accuracy: 1)
         XCTAssertEqual(Self.contentSize(of: window).height, min(650, window.contentMaxSize.height), accuracy: 1)
         let resetSize = try XCTUnwrap(SettingsWindowSizeStore.restored(from: defaults))
         XCTAssertEqual(resetSize.width, Self.contentSize(of: window).width, accuracy: 1)
@@ -93,7 +93,7 @@ final class SettingsWindowControllerTests: XCTestCase {
         }
 
         XCTAssertTrue(window.styleMask.contains(.resizable))
-        XCTAssertEqual(Self.contentSize(of: window).width, min(1_000, window.contentMaxSize.width), accuracy: 1)
+        XCTAssertEqual(Self.contentSize(of: window).width, min(1_200, window.contentMaxSize.width), accuracy: 1)
         XCTAssertEqual(Self.contentSize(of: window).height, min(650, window.contentMaxSize.height), accuracy: 1)
 
         let customSize = NSSize(width: 820, height: 610)
@@ -114,11 +114,12 @@ final class SettingsWindowControllerTests: XCTestCase {
         }
 
         SettingsWindowSizeStore.persist(NSSize(width: 760, height: 650), to: defaults)
+        defaults.set(true, forKey: "Statelet.settingsWindowUsesWiderDefault.v1")
         let migratedController = SettingsWindowController(defaults: defaults)
         let migratedWindow = try XCTUnwrap(migratedController.window)
         migratedController.show()
         Self.pumpMainRunLoop(for: 0.1)
-        XCTAssertEqual(Self.contentSize(of: migratedWindow).width, min(1_000, migratedWindow.contentMaxSize.width), accuracy: 1)
+        XCTAssertEqual(Self.contentSize(of: migratedWindow).width, min(1_200, migratedWindow.contentMaxSize.width), accuracy: 1)
         XCTAssertEqual(Self.contentSize(of: migratedWindow).height, min(650, migratedWindow.contentMaxSize.height), accuracy: 1)
 
         let laterUserSize = NSSize(width: 760, height: 650)
@@ -137,6 +138,48 @@ final class SettingsWindowControllerTests: XCTestCase {
         }
         XCTAssertEqual(Self.contentSize(of: restoredWindow).width, laterUserSize.width, accuracy: 1)
         XCTAssertEqual(Self.contentSize(of: restoredWindow).height, laterUserSize.height, accuracy: 1)
+    }
+
+    func testSettingsWindowFrameResizeUpdatesContentConstraintsAndPersistsSize() throws {
+        let suiteName = "statelet-settings-frame-resize-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        let controller = SettingsWindowController(defaults: defaults)
+        let window = try XCTUnwrap(controller.window)
+        controller.show()
+        Self.pumpMainRunLoop(for: 0.1)
+        defer {
+            window.close()
+            Self.pumpMainRunLoop(for: 0.05)
+        }
+
+        let initialFrame = window.frame
+        let requestedFrameSize = NSSize(
+            width: max(window.frame.width - 80, window.frame.width * 0.8),
+            height: max(window.frame.height - 20, window.frame.height * 0.8)
+        )
+        let acceptedFrameSize = controller.windowWillResize(window, to: requestedFrameSize)
+        XCTAssertEqual(acceptedFrameSize.width, requestedFrameSize.width, accuracy: 1)
+        XCTAssertEqual(acceptedFrameSize.height, requestedFrameSize.height, accuracy: 1)
+
+        window.setFrame(
+            NSRect(origin: initialFrame.origin, size: acceptedFrameSize),
+            display: false
+        )
+        Self.pumpMainRunLoop(for: 0.1)
+
+        XCTAssertEqual(window.frame.width, acceptedFrameSize.width, accuracy: 1)
+        XCTAssertEqual(window.frame.height, acceptedFrameSize.height, accuracy: 1)
+        let contentSize = Self.contentSize(of: window)
+        let laidOutContentSize = window.contentView?.bounds.size ?? .zero
+        XCTAssertEqual(contentSize.width, laidOutContentSize.width, accuracy: 1)
+        XCTAssertEqual(contentSize.height, laidOutContentSize.height, accuracy: 1)
+        let persisted = try XCTUnwrap(SettingsWindowSizeStore.restored(from: defaults))
+        XCTAssertEqual(persisted.width, contentSize.width, accuracy: 1)
+        XCTAssertEqual(persisted.height, contentSize.height, accuracy: 1)
     }
 
     func testSettingsSidebarProvidesOrderedAccessibleKeyboardNavigationAndPersistsSelection() throws {

@@ -3,7 +3,29 @@
 All notable changes to Statelet are documented here. Versions follow semantic
 versioning for the public source release.
 
-## Unreleased
+## [1.8.12] - 2026-08-20
+
+### Changed
+
+- Settings now opens at a wider 1200 × 650 point default, clamped to the
+  visible display. Existing 760 × 650 and 1000 × 650 legacy defaults migrate
+  once without overriding a custom user-resized dimension.
+
+### Fixed
+
+- Native Settings frame resizing now keeps the content constraints aligned
+  with the actual content rectangle, so edge and corner resizing remains
+  usable after the window has opened or moved between displays.
+
+### Distribution notes
+
+- Version 1.8.12 supersedes 1.8.11 with the Settings geometry and resize
+  fixes above; lifecycle, media, voice, activity privacy, and private runtime
+  storage contracts remain unchanged.
+
+- The package remains ad-hoc signed for owner-authorized personal updates. It
+  is not Developer ID signed, notarized, or presented as an Apple-authorized
+  public binary.
 
 ## [1.8.11] - 2026-08-20
 
@@ -440,6 +462,7 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
+[1.8.12]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.12
 [1.8.11]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.11
 [1.8.10]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.10
 [1.8.9]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.9
