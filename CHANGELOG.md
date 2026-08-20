@@ -24,6 +24,9 @@ versioning for the public source release.
   complete Codex Desktop application bundle.
 - Unchanged transition rows no longer reload their table, and launch-at-login
   diagnostics no longer block the main thread while Settings is opening.
+- Interrupted installations now allow up to five seconds for submitted
+  launchd transitions to settle before retaining the journal and failing
+  closed for a later recovery attempt.
 
 ### Distribution notes
 

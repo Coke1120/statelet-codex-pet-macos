@@ -1378,7 +1378,7 @@ elif command == "recover":
                 result = subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 if result.returncode != 0:
                     launch_failed = True
-                for _ in range(40):
+                for _ in range(100):
                     if subprocess.run(["launchctl", "print", f"{domain}/{label}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
                         break
                     time.sleep(0.05)
@@ -1400,7 +1400,7 @@ elif command == "recover":
                 if result.returncode != 0:
                     launch_failed = True
                     continue
-                for _ in range(40):
+                for _ in range(100):
                     if subprocess.run(["launchctl", "print", f"{domain}/{label}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
                         break
                     time.sleep(0.05)
@@ -1486,7 +1486,7 @@ desired_loaded=(1 "$install_player" 0 0)
 job_is_loaded() { launchctl print "gui/$(id -u)/$1" >/dev/null 2>&1; }
 wait_for_job_state() {
   local label="$1" expected="$2" attempts=0 consecutive=0 current
-  while [[ "$attempts" -lt 40 ]]; do
+  while [[ "$attempts" -lt 100 ]]; do
     if job_is_loaded "$label"; then current=1; else current=0; fi
     if [[ "$current" -eq "$expected" ]]; then consecutive=$((consecutive + 1)); [[ "$consecutive" -ge 3 ]] && return 0; else consecutive=0; fi
     attempts=$((attempts + 1)); /bin/sleep 0.05

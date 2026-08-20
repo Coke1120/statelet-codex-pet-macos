@@ -148,6 +148,7 @@ class MacPetPackagingTests(unittest.TestCase):
         fail_action: str = "",
         fail_label: str = "",
         delay_label: str = "",
+        delay_seconds: float = 0.15,
     ) -> tuple[dict[str, str], Path]:
         fake_bin = self.base / f"fake-bin-{len(list(self.base.glob('fake-bin-*')))}"
         fake_bin.mkdir()
@@ -179,9 +180,9 @@ case "$action" in
     fi
     if [[ "$label" == "$CODEX_PET_FAKE_DELAY_LABEL" ]]; then
       if [[ "$action" == "bootout" ]]; then
-        (/bin/sleep 0.15; rm -f "$CODEX_PET_FAKE_LAUNCH_STATE/$label") >/dev/null 2>&1 &
+        (/bin/sleep "$CODEX_PET_FAKE_DELAY_SECONDS"; rm -f "$CODEX_PET_FAKE_LAUNCH_STATE/$label") >/dev/null 2>&1 &
       else
-        (/bin/sleep 0.15; touch "$CODEX_PET_FAKE_LAUNCH_STATE/$label") >/dev/null 2>&1 &
+        (/bin/sleep "$CODEX_PET_FAKE_DELAY_SECONDS"; touch "$CODEX_PET_FAKE_LAUNCH_STATE/$label") >/dev/null 2>&1 &
       fi
       exit 0
     fi
@@ -236,6 +237,7 @@ esac
                 "CODEX_PET_FAKE_FAIL_ACTION": fail_action,
                 "CODEX_PET_FAKE_FAIL_LABEL": fail_label,
                 "CODEX_PET_FAKE_DELAY_LABEL": delay_label,
+                "CODEX_PET_FAKE_DELAY_SECONDS": str(delay_seconds),
             }
         )
         return environment, log
@@ -3297,7 +3299,11 @@ struct WatchdogHarness {
     def test_sigkill_after_delayed_bootout_submission_reconciles_pending_state(self) -> None:
         bundle = self.make_bundle("CrashAfterDelayedBootoutSubmit")
         aggregator = "com.coke1120.statelet.state-aggregator"
-        environment, _ = self.fake_launchctl_environment(aggregator, delay_label=aggregator)
+        environment, _ = self.fake_launchctl_environment(
+            aggregator,
+            delay_label=aggregator,
+            delay_seconds=2.5,
+        )
         launch_agents = self.home / "Library" / "LaunchAgents"
         launch_agents.mkdir(parents=True)
         (launch_agents / f"{aggregator}.plist").write_bytes(
