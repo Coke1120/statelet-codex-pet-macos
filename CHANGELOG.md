@@ -3,6 +3,32 @@
 All notable changes to Statelet are documented here. Versions follow semantic
 versioning for the public source release.
 
+## [1.8.13] - 2026-08-22
+
+### Added
+
+- The activity popup can now read a private, owner-controlled agent-source
+  preference and present Codex, Grok, or combined local session activity.
+
+### Fixed
+
+- Grok hook installation and recovery now preserve concurrent user edits,
+  publish atomically, validate descriptor-bound identities and permissions,
+  and fail closed when a safe reconciliation cannot be proven.
+- Provider-specific activity history is retained independently, so a busy
+  provider cannot delete another provider's still-valid sessions.
+- Grok rows remain informational and cannot inherit Codex Desktop open actions
+  or title-hydration state.
+
+### Distribution notes
+
+- Version 1.8.13 supersedes 1.8.12 with private Grok activity-source support
+  and hardened hook publication; existing private media, voice, models,
+  credentials, logs, and runtime data remain local and excluded from releases.
+- The package remains ad-hoc signed for owner-authorized personal updates. It
+  is not Developer ID signed, notarized, or presented as an Apple-authorized
+  public binary.
+
 ## [1.8.12] - 2026-08-20
 
 ### Changed
@@ -462,6 +488,7 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
+[1.8.13]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.13
 [1.8.12]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.12
 [1.8.11]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.11
 [1.8.10]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.10

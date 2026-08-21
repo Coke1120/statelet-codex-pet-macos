@@ -40,11 +40,14 @@ struct SessionActivityTargets: Codable, Equatable, Sendable {
               emittedAt.isFinite,
               emittedAt == activity.emittedAt,
               targets.count <= Self.maximumTargets else { return [:] }
-        let activityIDs = Set((activity.active + activity.completed).map(\.id))
+        let activityItems = Dictionary(
+            uniqueKeysWithValues: (activity.active + activity.completed).map { ($0.id, $0) }
+        )
         var result: [String: String] = [:]
         for target in targets {
-            guard activityIDs.contains(target.id),
-                  target.id.count == SessionActivityItem.maximumIdentifierLength,
+            guard let item = activityItems[target.id] else { return [:] }
+            guard item.provider == .codex else { continue }
+            guard target.id.count == SessionActivityItem.maximumIdentifierLength,
                   target.id.unicodeScalars.allSatisfy(
                       String("0123456789abcdef").unicodeScalars.contains
                   ),

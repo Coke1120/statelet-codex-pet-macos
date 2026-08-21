@@ -1,6 +1,6 @@
 # Use Statelet on macOS
 
-Statelet presents Codex lifecycle activity as a transparent animated companion.
+Statelet presents Codex and Grok Build lifecycle activity as a transparent animated companion.
 This guide covers first run, animation libraries, conversion, controls,
 appearance, diagnostics, troubleshooting, and local-data behavior.
 
@@ -21,19 +21,23 @@ No animation media is bundled. Add at least one Idle clip:
 4. Resolve any toolchain warning using the Setup Guide.
 5. Wait for conversion and verification to finish.
 
-Restart Codex once if Statelet was installed while Codex was already running.
+Restart Codex or Grok Build once if Statelet was installed while it was already running.
+
+In **Settings → General → Agent Source**, choose Combined (the default), Codex,
+or Grok. The choice changes the aggregate lifecycle and activity rail
+immediately without deleting the other provider's local records.
 
 ## Lifecycle behavior
 
 | State | Meaning |
 | --- | --- |
-| Idle | No active Codex turn |
+| Idle | No active turn from the selected agent source |
 | Running | A prompt, subagent, or ordinary tool task is active |
-| Waiting | Codex needs input or permission |
+| Waiting | The selected agent needs input or permission |
 | Review | Tests, lint, type checks, compaction, or review work are active |
 
-Several Codex sessions can be active at once. Statelet selects the highest
-priority state:
+Several selected Codex and Grok sessions can be active at once. Statelet selects
+the highest priority state:
 
 ```text
 waiting > review > running > idle
@@ -65,7 +69,7 @@ The badge reports:
 
 ### Session activity beside the pet
 
-When Codex activity exists, Statelet shows a compact rail beside the pet with
+When selected agent activity exists, Statelet shows a compact rail beside the pet with
 two groups: active sessions (Running, Waiting, or Review) and completed
 sessions whose result is still unread. The rail uses deterministic lifecycle
 priority/newest ordering, collapses to bounded count pills at compact sizes,
@@ -76,10 +80,13 @@ read** to acknowledge one; acknowledgements persist locally and are pruned with
 the bounded activity history. **Open in Codex** opens a mapped local chat only
 when the owner-only activation sidecar and the verified ChatGPT desktop URL
 handler agree on a supported target. Opening a chat does not mark it as read.
-Legacy, missing, malformed, or unverified targets remain informational. Labels
-are derived from safe lifecycle event categories and bounded start/completion
-times. When available, a bounded, sanitized Codex task title prefixes that
-generic label. Statelet does not read or display prompt, tool-output, preview,
+Legacy, missing, malformed, unverified, and Grok targets remain informational.
+Each row identifies its provider. **Open in Codex** and title hydration are
+available only to independently verified Codex targets; Grok IDs are never sent
+to the Codex Desktop activator or App Server. Labels are derived from safe
+lifecycle event categories and bounded start/completion times. When available,
+a bounded, sanitized Codex task title prefixes that generic label. Statelet does
+not read or display prompt, tool-output, preview,
 turn, item, transcript-path, or repository-path response fields. A user-facing
 `thread.name` can contain wording selected or generated in Codex; Statelet bounds
 and normalizes it but does not infer or redact sensitive substrings. The

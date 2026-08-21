@@ -89,6 +89,7 @@ class HookHardeningTests(unittest.TestCase):
         self.assertEqual(record["started_at"], 100.0)
         self.assertEqual(record["completed_at"], 120.0)
         self.assertEqual(record["category"], "codex")
+        self.assertEqual(record["provider"], "codex")
 
     def test_stop_ends_only_the_current_turn_without_completing_the_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

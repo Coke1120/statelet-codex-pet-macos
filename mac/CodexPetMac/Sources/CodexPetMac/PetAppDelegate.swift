@@ -552,6 +552,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private let logger = Logger(subsystem: StateletIdentity.bundleIdentifier, category: "app")
     private let freshnessPolicy = StateFreshnessPolicy.production
     private var options: LaunchOptions!
+    private var agentSourceMode: AgentSourceMode = .combined
+    private var agentSourceModeStore: AgentSourceModeStore!
     private var mediaMap = try! MediaMap()
     private var mediaMapURL: URL!
     private var configuredMediaMapURL: URL!
@@ -726,6 +728,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     func applicationDidFinishLaunching(_ notification: Notification) {
         conversionProfile = AlphaConversionProfile.restored()
         options = LaunchOptions.parse(arguments: CommandLine.arguments)
+        agentSourceModeStore = AgentSourceModeStore(sessionActivityURL: options.sessionActivityURL)
+        agentSourceMode = agentSourceModeStore.load()
         loadSessionActivityAcknowledgements()
         sessionActivityAppearance = SessionActivityPanelAppearanceStore.restored()
         sessionActivityUserOrigin = SessionActivityPanelPositionStore.restored()
@@ -3082,7 +3086,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
         menu.addItem(.separator())
         let followItem = NSMenuItem(
-            title: "Follow Codex",
+            title: "Follow Live State",
             action: #selector(followCodexFromMenu),
             keyEquivalent: "0"
         )
@@ -3154,7 +3158,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         if let temporaryStateItem = menu?.item(withTag: StatusMenuTag.temporaryState.rawValue) {
             temporaryStateItem.title = manualPreview.map {
                 "Temporary State: \($0.rawValue.capitalized)"
-            } ?? "Temporary State: Follow Codex"
+            } ?? "Temporary State: Follow Live State"
             for item in temporaryStateItem.submenu?.items ?? [] {
                 if let rawValue = item.representedObject as? String,
                    let state = PetState(rawValue: rawValue) {
@@ -3191,7 +3195,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             return player?.presentationStatus.menuTitle(requestedState: currentState)
                 ?? "State: \(currentState.rawValue)"
         }
-        let prefix = "Codex: \(reportedProducerState.rawValue) · Preview: \(manualPreview.rawValue)"
+        let prefix = "Live: \(reportedProducerState.rawValue) · Preview: \(manualPreview.rawValue)"
         guard let status = player?.presentationStatus else { return prefix }
         switch status {
         case .awaiting, .presented:
@@ -3362,6 +3366,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         controller.onRefreshDiagnostics = { [weak self] in self?.refreshDiagnosticsSnapshot() }
         controller.onRepairInstallation = { [weak self] in self?.repairStartupInstallation() }
         controller.onLaunchAtLoginChange = { [weak self] enabled in self?.setLaunchAtLogin(enabled) }
+        controller.onAgentSourceChange = { [weak self] mode in self?.setAgentSourceMode(mode) }
         controller.onCleanUnusedMedia = { [weak self] in self?.cleanUnusedMedia() }
         controller.onCheckForUpdates = { [weak self] in self?.updateCoordinator?.checkNow() }
         controller.onCancelUpdate = { [weak self] in self?.updateCoordinator?.cancel() }
@@ -3474,12 +3479,25 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                         clipCount: characterClipCounts[$0.id, default: 0]
                     )
                 },
-                activeCharacterID: characterLibrary.activeCharacterID
+                activeCharacterID: characterLibrary.activeCharacterID,
+                agentSourceMode: agentSourceMode
             )
         )
         settingsController.update(toolchainState: toolchainState)
         settingsController.update(dialogueVoice: dialogueVoiceCoordinator.snapshot)
         settingsController.update(sessionActivityAppearance: sessionActivityAppearance)
+    }
+
+    private func setAgentSourceMode(_ mode: AgentSourceMode) {
+        guard mode != agentSourceMode else { return }
+        do {
+            try agentSourceModeStore.save(mode)
+            agentSourceMode = mode
+        } catch {
+            logger.error("event=agent_source_save_failed")
+            presentSettingsError("Agent Source could not be saved.")
+        }
+        refreshSettings()
     }
 
     private func persistCharacterLibrary(_ updated: CharacterLibrary) throws {
@@ -3809,7 +3827,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var publisherSettingsSummary: String {
         let stateName = currentState.rawValue.capitalized
         if let manualPreview = temporaryStatePreviewPolicy.previewState {
-            return "\(publisherHealth.menuTitle(temporaryPreviewActive: true)) · Codex state: \(reportedProducerState.rawValue.capitalized) · Temporary preview: \(manualPreview.rawValue.capitalized)"
+            return "\(publisherHealth.menuTitle(temporaryPreviewActive: true)) · Live state: \(reportedProducerState.rawValue.capitalized) · Temporary preview: \(manualPreview.rawValue.capitalized)"
         }
         switch publisherHealth {
         case .live:
@@ -6915,7 +6933,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         let alert = NSAlert()
         alert.alertStyle = .informational
         alert.messageText = "Repair Statelet Startup?"
-        alert.informativeText = "This recreates only Statelet’s managed player startup item. It does not change Codex hooks, the lifecycle publisher, or any Serial service."
+        alert.informativeText = "This recreates only Statelet’s managed player startup item. It does not change Codex or Grok hooks, the lifecycle publisher, or any Serial service."
         alert.addButton(withTitle: "Repair Startup")
         alert.addButton(withTitle: "Cancel")
         let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in

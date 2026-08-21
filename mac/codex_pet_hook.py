@@ -20,6 +20,55 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 VALID_STATES = ("idle", "running", "waiting", "review")
+VALID_PROVIDERS = ("codex", "grok")
+GROK_EVENT_ALIASES = {
+    "SessionStart": "SessionStart",
+    "sessionStart": "SessionStart",
+    "session_start": "SessionStart",
+    "SessionEnd": "SessionEnd",
+    "sessionEnd": "SessionEnd",
+    "session_end": "SessionEnd",
+    "UserPromptSubmit": "UserPromptSubmit",
+    "userPromptSubmit": "UserPromptSubmit",
+    "user_prompt_submit": "UserPromptSubmit",
+    "PreToolUse": "PreToolUse",
+    "preToolUse": "PreToolUse",
+    "pre_tool_use": "PreToolUse",
+    "PostToolUse": "PostToolUse",
+    "postToolUse": "PostToolUse",
+    "post_tool_use": "PostToolUse",
+    "PostToolUseFailure": "PostToolUseFailure",
+    "postToolUseFailure": "PostToolUseFailure",
+    "post_tool_use_failure": "PostToolUseFailure",
+    "PermissionDenied": "PermissionDenied",
+    "permissionDenied": "PermissionDenied",
+    "permission_denied": "PermissionDenied",
+    "Stop": "Stop",
+    "stop": "Stop",
+    "StopFailure": "StopFailure",
+    "stopFailure": "StopFailure",
+    "stop_failure": "StopFailure",
+    "StopCancelled": "StopCancelled",
+    "stopCancelled": "StopCancelled",
+    "stop_cancelled": "StopCancelled",
+    "Notification": "Notification",
+    "notification": "Notification",
+    "SubagentStart": "SubagentStart",
+    "subagentStart": "SubagentStart",
+    "subagent_start": "SubagentStart",
+    "SubagentStop": "SubagentStop",
+    "subagentStop": "SubagentStop",
+    "subagent_stop": "SubagentStop",
+    "SubagentEnd": "SubagentStop",
+    "subagentEnd": "SubagentStop",
+    "subagent_end": "SubagentStop",
+    "PreCompact": "PreCompact",
+    "preCompact": "PreCompact",
+    "pre_compact": "PreCompact",
+    "PostCompact": "PostCompact",
+    "postCompact": "PostCompact",
+    "post_compact": "PostCompact",
+}
 VALID_EVENTS = frozenset(
     (
         "SessionStart",
@@ -38,6 +87,15 @@ VALID_EVENTS = frozenset(
 TERMINAL_EVENTS = frozenset(("SessionEnd",))
 TURN_CLOSING_EVENTS = frozenset(("Stop",))
 REVIVAL_EVENTS = frozenset(("SessionStart", "UserPromptSubmit"))
+GROK_CONTINUATION_EVENTS = frozenset(
+    (
+        "PreToolUse",
+        "PostToolUse",
+        "PermissionRequest",
+        "SubagentStart",
+        "PreCompact",
+    )
+)
 MAX_REJECTION_COUNT = 1_000_000
 MAX_PRIOR_TURNS = 8
 MAX_TOOL_IDS = 64
@@ -86,8 +144,77 @@ def default_state_dir() -> Path:
     return Path.home() / "Library" / "Application Support" / "Statelet" / "sessions"
 
 
+def agent_provider() -> str:
+    """Return the bounded provider selected by the installed hook entry."""
+    return "grok" if os.environ.get("STATELET_AGENT_PROVIDER") == "grok" else "codex"
+
+
+def normalize_payload(
+    payload: Dict[str, Any], provider: Optional[str] = None
+) -> Dict[str, Any]:
+    """Normalize supported provider envelopes without retaining their raw data."""
+    selected = provider if provider in VALID_PROVIDERS else agent_provider()
+    normalized = dict(payload)
+    normalized["_statelet_provider"] = selected
+    if selected != "grok":
+        return normalized
+
+    aliases = {
+        "hookEventName": "hook_event_name",
+        "sessionId": "session_id",
+        "promptId": "turn_id",
+        "toolName": "tool_name",
+        "toolInput": "tool_input",
+        "toolUseId": "tool_use_id",
+    }
+    for source, destination in aliases.items():
+        if destination not in normalized and source in payload:
+            normalized[destination] = payload[source]
+
+    raw_event = str(normalized.get("hook_event_name") or "")
+    event = GROK_EVENT_ALIASES.get(raw_event, raw_event)
+    normalized["hook_event_name"] = event
+    if event == "Notification":
+        notification_type = str(
+            payload.get("notificationType") or payload.get("notification_type") or ""
+        )
+        if notification_type == "permission_prompt":
+            normalized["hook_event_name"] = "PermissionRequest"
+        elif notification_type == "idle_prompt":
+            normalized["hook_event_name"] = "Stop"
+    elif event in ("StopFailure", "StopCancelled"):
+        normalized["hook_event_name"] = "Stop"
+    elif event in ("PostToolUseFailure", "PermissionDenied"):
+        normalized["hook_event_name"] = "PostToolUse"
+
+    background_tasks = payload.get("backgroundTasks")
+    if isinstance(background_tasks, list):
+        normalized["_statelet_background_active"] = any(
+            isinstance(task, dict)
+            and str(task.get("status") or "").lower()
+            in ("running", "working", "pending", "in_progress")
+            for task in background_tasks[:128]
+        )
+    return normalized
+
+
+def _is_grok_child_payload(payload: Dict[str, Any]) -> bool:
+    if payload.get("_statelet_provider") != "grok":
+        return False
+    # SubagentStart is emitted by the host but necessarily carries the new
+    # child's type. Other event payloads carrying subagentType execute inside
+    # the child session and must not enter the host projection.
+    if payload.get("hook_event_name") == "SubagentStart":
+        return False
+    subagent_type = payload.get("subagentType", payload.get("subagent_type"))
+    return isinstance(subagent_type, str) and bool(subagent_type.strip())
+
+
 def event_state(payload: Dict[str, Any]) -> str:
     event = str(payload.get("hook_event_name") or "")
+    provider = payload.get("_statelet_provider", "codex")
+    if event == "Stop" and payload.get("_statelet_background_active") is True:
+        return "running"
     if event in ("SessionStart", "SessionEnd", "Stop"):
         return "idle"
     if event == "PermissionRequest":
@@ -98,6 +225,11 @@ def event_state(payload: Dict[str, Any]) -> str:
         return "review"
     if event in ("PreToolUse", "PostToolUse"):
         tool_name = str(payload.get("tool_name") or "").lower()
+        if provider == "grok" and event == "PreToolUse":
+            if tool_name == "ask_user_question":
+                return "waiting"
+            if tool_name == "exit_plan_mode":
+                return "review"
         tool_input = payload.get("tool_input")
         searchable = tool_name + " " + json.dumps(tool_input, ensure_ascii=False).lower()
         if REVIEW_PATTERN.search(searchable):
@@ -115,6 +247,9 @@ def session_key(payload: Dict[str, Any]) -> str:
             if text:
                 raw = text
                 break
+    provider = payload.get("_statelet_provider", "codex")
+    if provider == "grok":
+        raw = "grok:" + raw
     return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:24]
 
 
@@ -309,6 +444,8 @@ def _publish_activation_target_best_effort(
     identifier: str,
     updated_at: float,
 ) -> None:
+    if payload.get("_statelet_provider", "codex") != "codex":
+        return
     if payload.get("hook_event_name") not in ("SessionStart", "UserPromptSubmit"):
         return
     target = _activation_target(payload)
@@ -482,6 +619,12 @@ def _causally_accept(
             return False
         fingerprint = _tool_fingerprint(payload)
         pending_permissions = causal.get("pending_permissions", [])
+        if payload.get("_statelet_provider") == "grok" and pending_permissions:
+            # Grok permission notifications do not carry the eventual tool
+            # fingerprint. Any correlated tool callback proves the prompt was
+            # resolved, without persisting notification or tool contents.
+            causal["pending_permissions"] = []
+            pending_permissions = []
         if fingerprint in pending_permissions:
             if event == "PreToolUse":
                 return False
@@ -504,6 +647,8 @@ def _causally_accept(
         fingerprint = _tool_fingerprint(payload)
         pending_permissions = causal.get("pending_permissions", [])
         causal["pending_permissions"] = (pending_permissions + [fingerprint])[-MAX_TOOL_IDS:]
+    elif event == "Stop" and payload.get("_statelet_provider") == "grok":
+        causal["pending_permissions"] = []
     elif event == "PreCompact":
         if causal.get("latest_event") == "PostCompact":
             return False
@@ -521,6 +666,14 @@ def _fence_accepts(payload: Dict[str, Any], event: str, fence: Dict[str, Any]) -
         return event in REVIVAL_EVENTS
     if not fence["turn_closed"]:
         return True
+    if (
+        payload.get("_statelet_provider") == "grok"
+        and event in GROK_CONTINUATION_EVENTS
+    ):
+        # A Grok Stop hook may itself be blocked. Correlated same-prompt work
+        # can therefore resume; the causal tool phases below still reject
+        # delayed callbacks that were already observed before the Stop.
+        return True
     if event == "Stop":
         incoming_turn = _private_key_hash(payload, "turn_id")
         closed_turn = fence["closed_turn"]
@@ -536,13 +689,16 @@ def _fence_accepts(payload: Dict[str, Any], event: str, fence: Dict[str, Any]) -
 
 
 def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
+    payload = normalize_payload(payload)
+    identifier = session_key(payload)
+    destination_name = identifier + ".json"
+    destination = state_dir / destination_name
+    if _is_grok_child_payload(payload):
+        return destination
     directory_fd = _open_state_directory(state_dir)
     event = str(payload.get("hook_event_name") or "")
     accepted_event = event if event in VALID_EVENTS else "unknown"
     received_at = time.time()
-    identifier = session_key(payload)
-    destination_name = identifier + ".json"
-    destination = state_dir / destination_name
     lock_fd = -1
     try:
         lock_fd = os.open(
@@ -572,6 +728,7 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
         existing_started_at = None
         existing_completed_at = None
         existing_category = None
+        existing_provider = "codex"
         existing_terminal = False
         existing_valid = (
             existing is not None
@@ -599,6 +756,9 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
                 "codex", "approval", "tool", "review", "subagent", "activity"
             }:
                 existing_category = None
+            candidate_provider = existing.get("provider", "codex")
+            if candidate_provider in VALID_PROVIDERS:
+                existing_provider = candidate_provider
         terminal_late_callback = (
             existing_valid
             and fence["session_closed"]
@@ -651,6 +811,7 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
                     if existing_terminal
                     else None,
                     "category": existing_category or event_category(existing["event"]),
+                    "provider": existing_provider,
                     "rejections": rejections,
                     "causal": preserved_causal,
                     "fence": fence,
@@ -667,6 +828,7 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
                     "started_at": received_at,
                     "completed_at": None,
                     "category": event_category("unknown"),
+                    "provider": payload["_statelet_provider"],
                     "rejections": rejections,
                     "causal": preserved_causal,
                     "fence": fence,
@@ -679,7 +841,13 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
             fence["turn_closed"] = False
             fence["closed_turn"] = None
             fence["session_closed"] = False
-        elif accepted_event in TURN_CLOSING_EVENTS:
+        elif (
+            payload.get("_statelet_provider") == "grok"
+            and accepted_event in GROK_CONTINUATION_EVENTS
+        ):
+            fence["turn_closed"] = False
+            fence["closed_turn"] = None
+        elif accepted_event in TURN_CLOSING_EVENTS and event_state(payload) == "idle":
             fence["turn_closed"] = True
             fence["closed_turn"] = (
                 _private_key_hash(payload, "turn_id")
@@ -713,6 +881,7 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
                 received_at if accepted_event in TERMINAL_EVENTS else None
             ),
             "category": event_category(accepted_event),
+            "provider": payload["_statelet_provider"],
             "rejections": {},
             "causal": proposed_causal,
             "fence": fence,

@@ -1,10 +1,10 @@
 # Statelet for macOS
 
-Statelet is a personal-local Codex lifecycle companion for macOS 13 or newer.
+Statelet is a personal-local Codex and Grok Build lifecycle companion for macOS 13 or newer.
 It is an AppKit accessory application: the transparent panel can be moved by dragging
 its body and resized from any border or corner without taking keyboard focus,
 AVFoundation owns exactly one decoder, and the menu-bar item keeps click-through
-recoverable. The current app version is 1.8.12 (build 26). New builds and
+recoverable. The current app version is 1.8.13 (build 27). New builds and
 installations use
 `Statelet.app`, bundle identifier `com.coke1120.Statelet`, `CFBundleName` and
 executable `Statelet`, Application Support under
@@ -411,6 +411,8 @@ It installs:
   `~/Library/Application Support/Statelet/Statelet/python/`
 - `com.coke1120.statelet.state-aggregator.plist`
 - `com.coke1120.statelet.mac-player.plist`
+- additive lifecycle hooks in `~/.codex/hooks.json` and
+  `~/.grok/hooks/statelet.json`
 - an example media map only when the user has no existing map
 
 The installed application is a normal `.app` at
@@ -463,10 +465,13 @@ The Settings window presents its eight destinations in a persistent native
 sidebar. Settings → Appearance owns the dialogue-bubble contrast controls and
 the activity-popup background/opacity controls; Settings → General and Help & Updates
 show the same managed-media location with an **Open in Finder** action. The
+General pane also provides an **Agent Source** selector for Combined (default),
+Codex, or Grok aggregation without deleting hidden-provider records. The
 activity popup is draggable when click-through is disabled and remembers its
 position. Rows with a fresh owner-only target expose **Open in Codex** through
 OpenAI's documented `codex://threads/<thread-id>` link; legacy or unverified
-targets remain informational, and opening never marks a completed row as read.
+targets and all Grok rows remain informational, and opening never marks a
+completed row as read.
 Rows can also show a bounded, sanitized user-facing task title resolved in
 memory through the experimental local Codex App Server. Missing titles keep the
 generic lifecycle label and do not affect **Open in Codex**.
@@ -531,7 +536,7 @@ continues to contain no raw session identifiers:
 The complete serial-free state path is:
 
 ```text
-Codex lifecycle hooks
+Codex lifecycle hooks + Grok Build global hooks
   -> per-session JSON in Application Support
   -> board-independent priority aggregator
   -> runtime/current_state.json
@@ -541,8 +546,9 @@ Codex lifecycle hooks
 ```
 
 Each hook invocation writes one privacy-safe record named with the first 24
-hexadecimal characters of the session ID's SHA-256 hash. The versioned record
-contains only mapped lifecycle state, event name, safe event category,
+hexadecimal characters of a provider-scoped session hash. Existing Codex hashes
+remain backward compatible, while Grok uses a distinct namespace. The versioned
+record contains only bounded provider, mapped lifecycle state, event name, safe event category,
 authoritative event time, bounded start/completion timestamps, local receipt
 time, terminal status, bounded rejection counts, and bounded 24-hex hashes of
 turn/tool correlation IDs with closed event phases. It excludes
@@ -578,6 +584,18 @@ test, lint, typecheck, or review work and Running otherwise. `SessionStart`,
 `SessionEnd`, and `Stop` map only that session to Idle. `Stop` closes a turn and
 does not create unread completion; `SessionEnd` alone terminalizes the session
 and appears in Completed.
+
+Grok's camelCase fields and snake_case `hookEventName` values are normalized
+before this mapping.
+`permission_prompt` and `ask_user_question` produce Waiting,
+`exit_plan_mode` produces Review, and supported Stop events plus `idle_prompt`
+settle a turn. The adapter accepts `StopCancelled` when emitted, while the
+current stable hook baseline relies on `idle_prompt` after cancellation. Active
+`backgroundTasks` keep Running. A blocked Stop may be
+revived by newer correlated work and later settled again; stale callbacks and
+child envelopes carrying `subagentType` cannot replace the host projection.
+`sessions/agent-source-v1.json` selects `combined`, `codex`, or `grok` without
+deleting records from the hidden provider.
 
 Nonterminal session records remain active for 900 seconds, except a
 `PostToolUse` record, which has a 30-second quiescent grace period when Desktop
@@ -643,11 +661,13 @@ developer-only `--force-state` option. An Offline fallback is labeled honestly
 instead of presenting Idle as live Codex activity.
 
 The installer also merges lifecycle commands additively into
-`~/.codex/hooks.json`. Unrelated hooks and top-level settings are preserved. A
+`~/.codex/hooks.json` and publishes global Grok registrations at
+`~/.grok/hooks/statelet.json`. Unrelated hooks and top-level settings are preserved. A
 valid existing Statelet-compatible hook under Application Support is reused
 (including a board installation) instead of adding duplicate commands; only
 exact obsolete `Documents/.../codex_pet_hook.py` command entries are migrated.
-Restart Codex after first installation so the new hook configuration is loaded.
+Restart Codex and any active Grok Build session after first installation so the
+new hook configuration is loaded.
 
 For a one-state visual check, temporarily stop the aggregator, publish one
 forced record, and restart it when finished:
@@ -759,7 +779,7 @@ bash mac/CodexPetMac/scripts/uninstall.sh
 
 Uninstall preflights ownership before staging or changing launchd. It removes
 only the canonical `statelet-v2`-managed `Statelet.app`, component, LaunchAgents,
-and exact Statelet hook commands. It preserves user media, the separate Global
+and exact Statelet hook commands in both provider configs. It preserves user media, the separate Global
 transition library, voice, characters, state, sessions, logs, and all legacy
 artifacts. Unmarked canonical targets
 cause a fail-closed refusal instead of deletion. Unrelated commands and settings

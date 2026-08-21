@@ -253,11 +253,52 @@ final class SessionActivityTests: XCTestCase {
         )
         let rowLabel = try XCTUnwrap(
             allDescendants(of: view).compactMap { $0 as? NSTextField }.first {
-                $0.accessibilityLabel()?.contains("Active running") == true
+                $0.accessibilityLabel()?.contains("active running") == true
             }
         )
         XCTAssertEqual(rowLabel.accessibilityRole(), .staticText)
-        XCTAssertEqual(rowLabel.accessibilityLabel(), "Active running session 1")
+        XCTAssertEqual(rowLabel.accessibilityLabel(), "Codex, active running session 1")
+    }
+
+    @MainActor
+    func testGrokRowsShowProviderAndNeverExposeCodexActivation() throws {
+        let grok = try SessionActivityItem(
+            id: String(repeating: "a", count: 24),
+            state: .running,
+            event: .userPromptSubmit,
+            eventAt: 90,
+            terminal: false,
+            provider: .grok
+        )
+        let view = SessionActivityView(
+            frame: NSRect(x: 0, y: 0, width: 320, height: 150),
+            clock: { Date(timeIntervalSince1970: 100) }
+        )
+        view.update(
+            snapshot: try SessionActivitySnapshot(emittedAt: 100, active: [grok]),
+            acknowledgedIDs: [],
+            openableIDs: [grok.id],
+            openabilityPendingIDs: [grok.id],
+            titles: [grok.id: "Must not hydrate"]
+        )
+
+        XCTAssertEqual(view.accessibilityLabel(), "Agent session activity")
+        XCTAssertFalse(allDescendants(of: view).compactMap { $0 as? NSButton }.contains {
+            $0.title == "Open in Codex"
+        })
+        XCTAssertTrue(allDescendants(of: view).compactMap { $0 as? NSTextField }.contains {
+            $0.stringValue.contains("Grok")
+        })
+        XCTAssertFalse(allDescendants(of: view).compactMap { $0 as? NSTextField }.contains {
+            $0.stringValue.contains("Must not hydrate")
+        })
+        let rowLabel = try XCTUnwrap(
+            allDescendants(of: view).compactMap { $0 as? NSTextField }.first {
+                $0.accessibilityLabel()?.contains("Grok, active running") == true
+            }
+        )
+        XCTAssertFalse(rowLabel.accessibilityHelp()?.contains("Checking whether") == true)
+        XCTAssertTrue(rowLabel.accessibilityHelp()?.contains("Informational only") == true)
     }
 
     @MainActor
@@ -293,7 +334,7 @@ final class SessionActivityTests: XCTestCase {
             $0.contains("unavailable")
         })
         let pendingLabel = try XCTUnwrap(descendants.compactMap { $0 as? NSTextField }.first {
-            $0.accessibilityLabel() == "Active running session 1"
+            $0.accessibilityLabel() == "Codex, active running session 1"
         })
         XCTAssertTrue(pendingLabel.accessibilityHelp()?.contains("Checking whether") == true)
 
@@ -434,20 +475,20 @@ final class SessionActivityTests: XCTestCase {
 
         let labels = allDescendants(of: view).compactMap { $0 as? NSTextField }
         let activeLabel = try XCTUnwrap(labels.first {
-            $0.stringValue.hasPrefix("Repair tool execution · Running")
+            $0.stringValue.hasPrefix("Codex · Repair tool execution · Running")
         })
         XCTAssertEqual(
             activeLabel.accessibilityLabel(),
-            "Repair tool execution, active running session 1"
+            "Codex, Repair tool execution, active running session 1"
         )
         XCTAssertEqual(activeLabel.lineBreakMode, .byTruncatingTail)
 
         let completedLabel = try XCTUnwrap(labels.first {
-            $0.stringValue.hasPrefix("Verify release signing · Completed")
+            $0.stringValue.hasPrefix("Codex · Verify release signing · Completed")
         })
         XCTAssertEqual(
             completedLabel.accessibilityLabel(),
-            "Verify release signing, completed unread session 1"
+            "Codex, Verify release signing, completed unread session 1"
         )
         XCTAssertTrue(completedLabel.stringValue.contains("Unread"))
 
@@ -546,7 +587,7 @@ final class SessionActivityTests: XCTestCase {
         view.layoutSubtreeIfNeeded()
         XCTAssertEqual(view.fittingSize, acceptedFittingSize)
         XCTAssertTrue(allDescendants(of: view).compactMap { $0 as? NSTextField }.contains {
-            $0.stringValue.hasPrefix(longTitle)
+            $0.stringValue.hasPrefix("Codex · \(longTitle)")
         })
 
         let buttons = allDescendants(of: view).compactMap { $0 as? NSButton }
@@ -601,10 +642,10 @@ final class SessionActivityTests: XCTestCase {
 
         let rowLabel = try XCTUnwrap(
             allDescendants(of: view).compactMap { $0 as? NSTextField }.first {
-                $0.accessibilityLabel() == "Active running session 1"
+                $0.accessibilityLabel() == "Codex, active running session 1"
             }
         )
-        XCTAssertEqual(rowLabel.stringValue, "Running · Codex #1 · just now")
+        XCTAssertEqual(rowLabel.stringValue, "Codex · Running · Lifecycle #1 · just now")
     }
 
     @MainActor
@@ -722,6 +763,26 @@ final class SessionActivityTests: XCTestCase {
             targets: [.init(id: String(repeating: "b", count: 24), threadID: "thread-2")]
         )
         XCTAssertTrue(unknown.validated(for: snapshot).isEmpty)
+
+        let grok = try SessionActivityItem(
+            id: String(repeating: "b", count: 24),
+            state: .running,
+            event: .userPromptSubmit,
+            eventAt: 91,
+            terminal: false,
+            provider: .grok
+        )
+        let mixed = try SessionActivitySnapshot(emittedAt: 101, active: [active, grok])
+        let mixedTargets = SessionActivityTargets(
+            version: 1,
+            schemaVersion: 1,
+            emittedAt: 101,
+            targets: [
+                .init(id: active.id, threadID: "thread-1"),
+                .init(id: grok.id, threadID: "thread-grok"),
+            ]
+        )
+        XCTAssertEqual(mixedTargets.validated(for: mixed), [active.id: "thread-1"])
     }
 
     func testTitleHydrationRejectsStaleCompletionAndClearsRemappedOrUnrenderedRows() throws {
@@ -1089,7 +1150,7 @@ final class SessionActivityTests: XCTestCase {
         view.layoutSubtreeIfNeeded()
         let rowLabel = try XCTUnwrap(
             allDescendants(of: view).compactMap { $0 as? NSTextField }.first {
-                $0.accessibilityLabel()?.contains("Active running") == true
+                $0.accessibilityLabel()?.contains("active running") == true
             }
         )
         let rowColor = try XCTUnwrap(rowLabel.textColor)

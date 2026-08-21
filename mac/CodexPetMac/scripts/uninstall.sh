@@ -35,6 +35,7 @@ launch_agents="$home_dir/Library/LaunchAgents"
 aggregator_plist="$launch_agents/$aggregator_label.plist"
 player_plist="$launch_agents/$player_label.plist"
 hooks_file="$home_dir/.codex/hooks.json"
+grok_hooks_file="$home_dir/.grok/hooks/statelet.json"
 widget_hook="$component/python/statelet_hook.py"
 
 is_managed_app() {
@@ -52,11 +53,88 @@ for plist in "$aggregator_plist" "$player_plist"; do
   [[ ! -e "$plist" ]] || is_managed_plist "$plist" || { printf 'Refusing to remove unmanaged LaunchAgent: %s\n' "$plist" >&2; exit 1; }
 done
 
+python_bin="$(command -v python3 || true)"
+[[ -n "$python_bin" ]] || { printf 'Python 3 is required to validate Statelet hooks.\n' >&2; exit 1; }
+attest_hook_config() {
+  "$python_bin" - "$home_dir" "$1" <<'PY'
+import json, os, stat, sys
+
+home, relative = sys.argv[1:]
+parts = tuple(part for part in relative.split("/") if part)
+directory_flags = os.O_RDONLY | os.O_DIRECTORY
+if hasattr(os, "O_CLOEXEC"):
+    directory_flags |= os.O_CLOEXEC
+if hasattr(os, "O_NOFOLLOW"):
+    directory_flags |= os.O_NOFOLLOW
+file_flags = os.O_RDONLY
+if hasattr(os, "O_CLOEXEC"):
+    file_flags |= os.O_CLOEXEC
+if hasattr(os, "O_NOFOLLOW"):
+    file_flags |= os.O_NOFOLLOW
+
+def identity(status):
+    return [status.st_dev, status.st_ino, status.st_mode, status.st_uid]
+
+current = None
+try:
+    current = os.open(home, directory_flags)
+    home_status = os.fstat(current)
+    if not stat.S_ISDIR(home_status.st_mode) or home_status.st_uid != os.getuid():
+        raise ValueError
+    parents = [identity(home_status)]
+    for index, part in enumerate(parts[:-1]):
+        try:
+            child = os.open(part, directory_flags, dir_fd=current)
+        except FileNotFoundError:
+            print(json.dumps({"state": "absent", "missing": index, "parents": parents}, separators=(",", ":")))
+            raise SystemExit(0)
+        child_status = os.fstat(child)
+        if not stat.S_ISDIR(child_status.st_mode) or child_status.st_uid != os.getuid():
+            os.close(child)
+            raise ValueError
+        os.close(current)
+        current = child
+        parents.append(identity(child_status))
+    name = parts[-1]
+    try:
+        before = os.stat(name, dir_fd=current, follow_symlinks=False)
+    except FileNotFoundError:
+        print(json.dumps({"state": "absent", "missing": len(parts) - 1, "parents": parents}, separators=(",", ":")))
+        raise SystemExit(0)
+    if not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or before.st_nlink != 1:
+        raise ValueError
+    descriptor = os.open(name, file_flags, dir_fd=current)
+    try:
+        after = os.fstat(descriptor)
+        fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if any(getattr(before, field) != getattr(after, field) for field in fields):
+            raise ValueError
+        print(json.dumps({
+            "state": "regular",
+            "parents": parents,
+            "file": [getattr(after, field) for field in fields],
+        }, separators=(",", ":")))
+    finally:
+        os.close(descriptor)
+except (OSError, ValueError, IndexError):
+    raise SystemExit(1)
+finally:
+    if current is not None:
+        os.close(current)
+PY
+}
+if ! codex_hook_snapshot="$(attest_hook_config .codex/hooks.json)" \
+  || ! grok_hook_snapshot="$(attest_hook_config .grok/hooks/statelet.json)"; then
+  printf 'Refusing unsafe Statelet hook configuration layout.\n' >&2
+  exit 1
+fi
+
 trash="$(mktemp -d "$home_dir/.statelet-uninstall.XXXXXX")"
 moved_targets=()
 moved_paths=()
 committed=0
-hook_updated=0
+codex_hook_updated=0
+grok_hook_updated=0
 targets_mutated=0
 launch_state_mutated=0
 labels=("$aggregator_label" "$player_label")
@@ -85,7 +163,8 @@ rollback() {
   local original_status=$? index rollback_failed=0
   trap - EXIT
   if [[ "$committed" -eq 0 ]]; then
-    if [[ "$hook_updated" -eq 1 ]]; then rm -f "$hooks_file"; fi
+    if [[ "$codex_hook_updated" -eq 1 ]]; then rm -f "$hooks_file"; fi
+    if [[ "$grok_hook_updated" -eq 1 ]]; then rm -f "$grok_hooks_file"; fi
     for ((index=${#moved_targets[@]}-1; index>=0; index--)); do mkdir -p "$(dirname "${moved_targets[$index]}")"; mv "${moved_paths[$index]}" "${moved_targets[$index]}"; done
     if [[ "$skip_launchctl" -eq 0 && "$launch_state_mutated" -eq 1 ]]; then restore_jobs || rollback_failed=1; fi
   fi
@@ -115,14 +194,35 @@ move_managed "$aggregator_plist" agents/aggregator
 move_managed "$player_plist" agents/player
 if [[ "${STATELET_UNINSTALL_FAIL_AT:-${CODEX_PET_UNINSTALL_FAIL_AT:-}}" == "after-targets" ]]; then printf 'Injected uninstall failure after managed target removal.\n' >&2; exit 70; fi
 if [[ -f "$hooks_file" ]]; then
-  python_bin="$(command -v python3 || true)"
-  [[ -n "$python_bin" ]] || { printf 'Python 3 is required to migrate Statelet hooks.\n' >&2; exit 1; }
+  [[ "$(attest_hook_config .codex/hooks.json)" == "$codex_hook_snapshot" ]] || { printf 'Statelet hook configuration changed during uninstall.\n' >&2; exit 1; }
   staged_hooks="$trash/hooks.updated"
   "$python_bin" "$script_dir/merge_hooks.py" --destination "$hooks_file" --output "$staged_hooks" --python "$python_bin" --hook-script "$widget_hook" --remove-widget-hook
   move_managed "$hooks_file" hooks.original
   mkdir -p "$(dirname "$hooks_file")"
   mv "$staged_hooks" "$hooks_file"
-  hook_updated=1
+  codex_hook_updated=1
+fi
+if [[ -f "$grok_hooks_file" ]]; then
+  [[ "$(attest_hook_config .grok/hooks/statelet.json)" == "$grok_hook_snapshot" ]] || { printf 'Statelet hook configuration changed during uninstall.\n' >&2; exit 1; }
+  staged_grok_hooks="$trash/grok-hooks.updated"
+  "$python_bin" "$script_dir/merge_hooks.py" --destination "$grok_hooks_file" --output "$staged_grok_hooks" --python "$python_bin" --hook-script "$widget_hook" --provider grok --remove-widget-hook
+  move_managed "$grok_hooks_file" grok-hooks.original
+  if "$python_bin" - "$staged_grok_hooks" <<'PY'
+import json, sys
+from pathlib import Path
+
+data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+hooks = data.get("hooks", {})
+other = {key: value for key, value in data.items() if key != "hooks"}
+raise SystemExit(0 if not other and isinstance(hooks, dict) and all(not groups for groups in hooks.values()) else 1)
+PY
+  then
+    rm -f "$staged_grok_hooks"
+  else
+    mkdir -p "$(dirname "$grok_hooks_file")"
+    mv "$staged_grok_hooks" "$grok_hooks_file"
+  fi
+  grok_hook_updated=1
 fi
 
 committed=1

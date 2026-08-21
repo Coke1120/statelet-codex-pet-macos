@@ -413,8 +413,40 @@ final class CodexPetCoreTests: XCTestCase {
         let decoded = try JSONDecoder.codexPet.decode(SessionActivitySnapshot.self, from: json)
         XCTAssertEqual(decoded.active.count, 1)
         XCTAssertEqual(decoded.active[0].state, .running)
+        XCTAssertEqual(decoded.active[0].provider, .codex)
         XCTAssertEqual(decoded.completed.count, 1)
         XCTAssertTrue(decoded.completed[0].terminal)
+    }
+
+    func testSessionActivityDecodesExplicitGrokProviderAndAgentSourceModes() throws {
+        let json = #"{"version":1,"schema_version":1,"emitted_at":20,"active":[{"id":"aaaaaaaaaaaaaaaaaaaaaaaa","state":"running","event":"UserPromptSubmit","event_at":10,"provider":"grok","terminal":false}],"completed":[]}"#.data(using: .utf8)!
+        let decoded = try JSONDecoder.codexPet.decode(SessionActivitySnapshot.self, from: json)
+        XCTAssertEqual(decoded.active.first?.provider, .grok)
+        XCTAssertEqual(AgentProvider.grok.displayName, "Grok")
+        XCTAssertEqual(AgentSourceMode.allCases, [.combined, .codex, .grok])
+    }
+
+    func testSessionActivityDecodesRunningNonterminalGrokStopForBackgroundTasksOnly() throws {
+        let projected = #"{"version":1,"schema_version":1,"emitted_at":20,"active":[{"id":"aaaaaaaaaaaaaaaaaaaaaaaa","state":"running","event":"Stop","event_at":10,"started_at":9,"category":"codex","provider":"grok","terminal":false}],"completed":[]}"#.data(using: .utf8)!
+        let decoded = try JSONDecoder.codexPet.decode(SessionActivitySnapshot.self, from: projected)
+        XCTAssertEqual(decoded.active.first?.provider, .grok)
+        XCTAssertEqual(decoded.active.first?.event, .stop)
+        XCTAssertEqual(decoded.active.first?.state, .running)
+        XCTAssertEqual(decoded.active.first?.terminal, false)
+
+        let invalidItems = [
+            #"{"id":"aaaaaaaaaaaaaaaaaaaaaaaa","state":"running","event":"Stop","event_at":10,"category":"codex","provider":"codex","terminal":false}"#,
+            #"{"id":"aaaaaaaaaaaaaaaaaaaaaaaa","state":"review","event":"Stop","event_at":10,"category":"codex","provider":"grok","terminal":false}"#,
+            #"{"id":"aaaaaaaaaaaaaaaaaaaaaaaa","state":"waiting","event":"Stop","event_at":10,"category":"codex","provider":"grok","terminal":false}"#,
+            #"{"id":"aaaaaaaaaaaaaaaaaaaaaaaa","state":"running","event":"SessionEnd","event_at":10,"category":"codex","provider":"grok","terminal":false}"#,
+        ]
+        for item in invalidItems {
+            let json = "{\"version\":1,\"schema_version\":1,\"emitted_at\":20,\"active\":[\(item)],\"completed\":[]}".data(using: .utf8)!
+            XCTAssertThrowsError(
+                try JSONDecoder.codexPet.decode(SessionActivitySnapshot.self, from: json),
+                item
+            )
+        }
     }
 
     func testSessionActivitySnapshotRejectsInvalidIdentifiersDuplicatesAndGroups() throws {

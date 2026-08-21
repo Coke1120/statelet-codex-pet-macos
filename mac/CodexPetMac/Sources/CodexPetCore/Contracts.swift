@@ -118,7 +118,33 @@ public enum SessionActivityCategory: String, Codable, Equatable, Sendable {
     }
 
     public var displayName: String {
-        rawValue.capitalized
+        self == .codex ? "Lifecycle" : rawValue.capitalized
+    }
+}
+
+public enum AgentProvider: String, Codable, CaseIterable, Equatable, Sendable {
+    case codex
+    case grok
+
+    public var displayName: String {
+        switch self {
+        case .codex: return "Codex"
+        case .grok: return "Grok"
+        }
+    }
+}
+
+public enum AgentSourceMode: String, Codable, CaseIterable, Equatable, Sendable {
+    case combined
+    case codex
+    case grok
+
+    public var displayName: String {
+        switch self {
+        case .combined: return "Combined"
+        case .codex: return "Codex"
+        case .grok: return "Grok"
+        }
     }
 }
 
@@ -347,6 +373,7 @@ public struct SessionActivityItem: Codable, Equatable, Sendable {
     public let startedAt: Double
     public let completedAt: Double?
     public let category: SessionActivityCategory
+    public let provider: AgentProvider
     public let terminal: Bool
 
     public init(
@@ -357,7 +384,8 @@ public struct SessionActivityItem: Codable, Equatable, Sendable {
         terminal: Bool,
         startedAt: Double? = nil,
         completedAt: Double? = nil,
-        category: SessionActivityCategory? = nil
+        category: SessionActivityCategory? = nil,
+        provider: AgentProvider = .codex
     ) throws {
         guard id.count == Self.maximumIdentifierLength,
               id.unicodeScalars.allSatisfy(
@@ -384,7 +412,11 @@ public struct SessionActivityItem: Codable, Equatable, Sendable {
             throw PetContractError.invalidValue("terminal session activity is missing completed_at")
         }
         let terminalEvent = event == .sessionEnd || event == .stop
-        guard terminal == terminalEvent else {
+        let activeGrokBackgroundStop = provider == .grok
+            && event == .stop
+            && state == .running
+            && !terminal
+        guard terminal == terminalEvent || activeGrokBackgroundStop else {
             throw PetContractError.invalidValue("session activity terminal event is inconsistent")
         }
         guard terminal || state != .idle else {
@@ -410,6 +442,7 @@ public struct SessionActivityItem: Codable, Equatable, Sendable {
         self.startedAt = resolvedStartedAt
         self.completedAt = resolvedCompletedAt
         self.category = resolvedCategory
+        self.provider = provider
         self.terminal = terminal
     }
 
@@ -421,6 +454,7 @@ public struct SessionActivityItem: Codable, Equatable, Sendable {
         case startedAt = "started_at"
         case completedAt = "completed_at"
         case category
+        case provider
         case terminal
     }
 
@@ -437,7 +471,8 @@ public struct SessionActivityItem: Codable, Equatable, Sendable {
             terminal: terminal,
             startedAt: container.decodeIfPresent(Double.self, forKey: .startedAt) ?? eventAt,
             completedAt: container.decodeIfPresent(Double.self, forKey: .completedAt),
-            category: container.decodeIfPresent(SessionActivityCategory.self, forKey: .category)
+            category: container.decodeIfPresent(SessionActivityCategory.self, forKey: .category),
+            provider: container.decodeIfPresent(AgentProvider.self, forKey: .provider) ?? .codex
         )
     }
 }

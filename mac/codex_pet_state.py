@@ -12,6 +12,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 VALID_STATES = ("idle", "running", "waiting", "review")
+VALID_PROVIDERS = ("codex", "grok")
+VALID_AGENT_SOURCE_MODES = ("combined", "codex", "grok")
 VALID_EVENTS = frozenset(
     (
         "SessionStart",
@@ -33,12 +35,13 @@ HOOK_RECORD_NAME = re.compile(r"^[0-9a-f]{24}\.json$")
 TARGET_RECORD_NAME = re.compile(r"^[0-9a-f]{24}\.target\.json$")
 SESSION_ACTIVITY_FILENAME = "activity-v1.json"
 SESSION_ACTIVITY_TARGETS_FILENAME = "activity-targets-v1.json"
+AGENT_SOURCE_FILENAME = "agent-source-v1.json"
 HOOK_RECORD_KEYS = frozenset(("version", "state", "event", "updated_at"))
 HOOK_RECORD_V2_KEYS = frozenset(
     ("version", "state", "event", "event_at", "updated_at", "terminal", "rejections", "causal")
 )
 HOOK_RECORD_V2_OPTIONAL_KEYS = frozenset(
-    ("started_at", "completed_at", "category", "fence")
+    ("started_at", "completed_at", "category", "fence", "provider")
 )
 ACTIVITY_CATEGORIES = frozenset(("codex", "approval", "tool", "review", "subagent", "activity"))
 VALID_REJECTION_REASONS = frozenset(
@@ -57,6 +60,7 @@ DEFAULT_ACTIVE_TTL = 900.0
 DEFAULT_COMPLETED_TTL = 7 * 24 * 60 * 60.0
 MAX_ACTIVITY_ENTRIES = 64
 MAX_HOOK_RECORD_BYTES = 1_048_576
+MAX_AGENT_SOURCE_BYTES = 4_096
 # A completed tool is evidence that the session is no longer actively using a
 # tool.  If Desktop fails to emit its terminal callback after that point, a
 # short grace period prevents the generic 15-minute session lease from making
@@ -244,6 +248,107 @@ def _target_record_names(directory_fd: int) -> List[str]:
         return []
 
 
+def _open_agent_source_directory(state_dir: Path) -> Optional[int]:
+    if not state_dir.is_absolute():
+        return None
+    components = state_dir.parts[1:]
+    if any(component in (".", "..") for component in components):
+        return None
+    descriptor: Optional[int] = None
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(os.sep, flags)
+        for component in components:
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+        status = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(status.st_mode)
+            or status.st_uid != os.getuid()
+            or status.st_mode & 0o077
+        ):
+            os.close(descriptor)
+            return None
+        return descriptor
+    except OSError:
+        if descriptor is not None:
+            os.close(descriptor)
+        return None
+
+
+def read_agent_source_mode(state_dir: Path) -> str:
+    """Read the bounded provider filter, defaulting invalid data to combined."""
+    directory_fd = _open_agent_source_directory(state_dir)
+    if directory_fd is None:
+        return "combined"
+    descriptor: Optional[int] = None
+    try:
+        descriptor = os.open(
+            AGENT_SOURCE_FILENAME,
+            os.O_RDONLY
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_fd,
+        )
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or before.st_mode & 0o077
+            or before.st_size < 0
+            or before.st_size > MAX_AGENT_SOURCE_BYTES
+        ):
+            return "combined"
+        raw = b""
+        remaining = before.st_size + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(1_024, remaining))
+            if not chunk:
+                break
+            raw += chunk
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_mode != after.st_mode
+            or before.st_uid != after.st_uid
+            or before.st_nlink != after.st_nlink
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or len(raw) != before.st_size
+        ):
+            return "combined"
+        record = json.loads(raw.decode("utf-8"))
+        if (
+            isinstance(record, dict)
+            and set(record) == {"version", "mode"}
+            and record.get("version") == 1
+            and not isinstance(record.get("version"), bool)
+            and record.get("mode") in VALID_AGENT_SOURCE_MODES
+        ):
+            return str(record["mode"])
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError):
+        pass
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(directory_fd)
+    return "combined"
+
+
+def _provider_is_selected(provider: str, mode: str) -> bool:
+    return mode == "combined" or provider == mode
+
+
 def read_active_states(
     state_dir: Path,
     now: Optional[float] = None,
@@ -369,6 +474,7 @@ def read_session_snapshot(
     latest_event: Optional[str] = None
     latest_event_at: Optional[float] = None
     rejections: Dict[str, int] = {}
+    source_mode = read_agent_source_mode(state_dir)
     directory_fd = _open_state_directory(state_dir)
     if directory_fd is None:
         return {
@@ -405,6 +511,7 @@ def read_session_snapshot(
                 started_at = record.get("started_at", event_at)
                 completed_at = record.get("completed_at", event_at if terminal else None)
                 category = record.get("category", _event_category(event))
+                provider = record.get("provider", "codex")
                 stored_rejections = record.get("rejections", {})
                 causal = record.get("causal")
                 fence = record.get("fence")
@@ -421,6 +528,7 @@ def read_session_snapshot(
                 or (event != "Stop" and terminal != (event == "SessionEnd"))
                 or not isinstance(category, str)
                 or category not in ACTIVITY_CATEGORIES
+                or provider not in VALID_PROVIDERS
                 or not isinstance(stored_rejections, dict)
                 or (causal is not None and not _valid_causal_metadata(causal))
                 or (fence is not None and not _valid_fence(fence))
@@ -428,14 +536,7 @@ def read_session_snapshot(
                 _add_rejection(rejections, "invalid_record")
                 _prune_if_unchanged(directory_fd, name, identity)
                 continue
-            for reason, count in stored_rejections.items():
-                if (
-                    reason in VALID_REJECTION_REASONS
-                    and isinstance(count, int)
-                    and not isinstance(count, bool)
-                    and 0 < count <= MAX_REJECTION_COUNT
-                ):
-                    _add_rejection(rejections, reason, count)
+            provider_selected = _provider_is_selected(provider, source_mode)
             event_ttl = active_ttl_for_event(event, active_ttl)
             age = current - event_at
             if age < -MAX_FUTURE_SKEW or age > event_ttl:
@@ -453,16 +554,30 @@ def read_session_snapshot(
                         else "expired"
                     )
                 )
-                _add_rejection(rejections, reason)
+                if provider_selected:
+                    _add_rejection(rejections, reason)
                 _prune_if_unchanged(directory_fd, name, identity)
                 continue
+            if not provider_selected:
+                # Source selection is only a projection. Fresh hidden records
+                # survive for immediate switching, while normal retention above
+                # still bounds disk usage independently of the selected source.
+                continue
+            for reason, count in stored_rejections.items():
+                if (
+                    reason in VALID_REJECTION_REASONS
+                    and isinstance(count, int)
+                    and not isinstance(count, bool)
+                    and 0 < count <= MAX_REJECTION_COUNT
+                ):
+                    _add_rejection(rejections, reason, count)
             if latest_event_at is None or (event_at, event) > (
                 latest_event_at,
                 latest_event or "",
             ):
                 latest_event = event
                 latest_event_at = event_at
-            if not terminal and event != "Stop":
+            if not terminal and (event != "Stop" or state != "idle"):
                 active.append((state, event_at))
                 active_expiries.append(event_at + event_ttl)
     finally:
@@ -493,6 +608,10 @@ def read_session_activity(
     current = time.time() if now is None else now
     active: List[Dict[str, Any]] = []
     completed: List[Dict[str, Any]] = []
+    completed_retention: Dict[str, List[Tuple[float, str, FileIdentity]]] = {
+        provider: [] for provider in VALID_PROVIDERS
+    }
+    source_mode = read_agent_source_mode(state_dir)
     directory_fd = _open_state_directory(state_dir)
     if directory_fd is None:
         return {
@@ -501,7 +620,6 @@ def read_session_activity(
             "active": active,
             "completed": completed,
         }
-    record_identities: Dict[str, FileIdentity] = {}
     try:
         for name in _record_names(directory_fd):
             read_status, record, identity = _read_hook_record(directory_fd, name)
@@ -523,6 +641,7 @@ def read_session_activity(
                     record.get("completed_at", event_at if terminal else None)
                 )
                 category = record.get("category", _event_category(event))
+                provider = record.get("provider", "codex")
             except (TypeError, ValueError, KeyError):
                 continue
             if (
@@ -537,6 +656,7 @@ def read_session_activity(
                 or (event != "Stop" and terminal != (event == "SessionEnd"))
                 or not isinstance(category, str)
                 or category not in ACTIVITY_CATEGORIES
+                or provider not in VALID_PROVIDERS
             ):
                 continue
             age = current - event_at
@@ -544,12 +664,20 @@ def read_session_activity(
             if age < -MAX_FUTURE_SKEW:
                 continue
             identifier = name[:-5]
-            record_identities[identifier] = identity
             is_completed = terminal and event == "SessionEnd"
             if is_completed:
                 if age > completed_ttl:
                     _prune_if_unchanged(directory_fd, name, identity)
                     continue
+                completed_retention[provider].append((event_at, identifier, identity))
+            elif age > event_ttl:
+                _prune_if_unchanged(directory_fd, name, identity)
+                continue
+            if not _provider_is_selected(provider, source_mode):
+                # Keep fresh hidden records available for immediate switching;
+                # retention is enforced above before projection filtering.
+                continue
+            if is_completed:
                 completed.append({
                     "id": identifier,
                     "state": state,
@@ -558,9 +686,14 @@ def read_session_activity(
                     "started_at": started_at,
                     "completed_at": completed_at,
                     "category": category,
+                    "provider": provider,
                     "terminal": True,
                 })
-            elif event != "Stop" and age <= event_ttl and state != "idle":
+            elif (
+                (event != "Stop" or state != "idle")
+                and age <= event_ttl
+                and state != "idle"
+            ):
                 active.append({
                     "id": identifier,
                     "state": state,
@@ -569,10 +702,13 @@ def read_session_activity(
                     "started_at": started_at,
                     "completed_at": None,
                     "category": category,
+                    "provider": provider,
                     "terminal": False,
                 })
-            elif age > event_ttl:
-                _prune_if_unchanged(directory_fd, name, identity)
+        for retained in completed_retention.values():
+            retained.sort(key=lambda item: (-item[0], item[1]))
+            for _event_at, identifier, identity in retained[MAX_ACTIVITY_ENTRIES:]:
+                _prune_if_unchanged(directory_fd, f"{identifier}.json", identity)
         active.sort(
             key=lambda item: (
                 -STATE_PRIORITY[item["state"]],
@@ -581,14 +717,6 @@ def read_session_activity(
             )
         )
         completed.sort(key=lambda item: (-item["event_at"], item["id"]))
-        # Terminal records no longer contribute to current_state.json, so the
-        # bounded activity rail may safely discard the oldest overflow entries.
-        for item in completed[MAX_ACTIVITY_ENTRIES:]:
-            _prune_if_unchanged(
-                directory_fd,
-                f"{item['id']}.json",
-                record_identities.get(item["id"]),
-            )
     finally:
         os.close(directory_fd)
     return {
@@ -612,7 +740,11 @@ def read_session_targets(
         for group in (activity.get("active", []), activity.get("completed", []))
         if isinstance(group, list)
         for item in group
-        if isinstance(item, dict) and isinstance(item.get("id"), str)
+        if (
+            isinstance(item, dict)
+            and isinstance(item.get("id"), str)
+            and item.get("provider", "codex") == "codex"
+        )
     }
     targets: List[Dict[str, str]] = []
     directory_fd = _open_state_directory(state_dir)

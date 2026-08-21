@@ -928,7 +928,7 @@ final class PetPlayerView: NSView {
             ? ""
             : ", showing \(displayedState.rawValue) animation"
         let presentation = accessiblePresentationSummary.map { ", \($0)" } ?? ""
-        setAccessibilityValue("\(liveState.rawValue) Codex state\(preview), \(mode), \(accessiblePublisherHealth)\(display)\(presentation)")
+        setAccessibilityValue("\(liveState.rawValue) agent state\(preview), \(mode), \(accessiblePublisherHealth)\(display)\(presentation)")
     }
 
     override func menu(for event: NSEvent) -> NSMenu? {
