@@ -547,7 +547,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private static let portableCopyTimeoutSeconds: TimeInterval = 120
     private static let portableValidationTimeoutSeconds: TimeInterval = 30
     private static let transitionAttestationTimeoutSeconds: TimeInterval = 20
-    private static let sessionActivityAcknowledgementKey = "Statelet.sessionActivityAcknowledgements.v1"
     private static let sessionActivityPanelSize = NSSize(width: 230, height: 150)
 
     private let logger = Logger(subsystem: StateletIdentity.bundleIdentifier, category: "app")
@@ -603,6 +602,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var sessionActivityTargets: [String: String] = [:]
     private var sessionActivityOpenableIDs: Set<String> = []
     private var sessionActivityOpenabilityRequest: [String: String] = [:]
+    private var sessionActivityResolvedOpenabilityTargets: [String: String] = [:]
     private var sessionActivityOpenabilityGeneration: UInt64 = 0
     private var sessionActivityOpenabilityTask: Task<Void, Never>?
     private var sessionActivityOpenTask: Task<Void, Never>?
@@ -833,6 +833,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         sessionActivityView.applyAppearance(sessionActivityAppearance)
         sessionActivityView.onAcknowledge = { [weak self] id in
             self?.acknowledgeSessionActivity(id)
+        }
+        sessionActivityView.onAcknowledgeAllCompleted = { [weak self] ids in
+            self?.acknowledgeSessionActivities(ids)
         }
         sessionActivityView.onOpen = { [weak self] id in
             self?.openSessionActivity(id)
@@ -1436,36 +1439,30 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func loadSessionActivityAcknowledgements() {
-        let values = UserDefaults.standard.array(
-            forKey: Self.sessionActivityAcknowledgementKey
-        ) as? [String] ?? []
-        let normalized = SessionActivityApplicationPolicy.normalizedHistory(values)
-        sessionActivityAcknowledgementHistory = normalized
-        if normalized != values {
-            UserDefaults.standard.set(
-                normalized,
-                forKey: Self.sessionActivityAcknowledgementKey
-            )
-        }
+        sessionActivityAcknowledgementHistory = SessionActivityAcknowledgementStore.restored()
     }
 
     private func persistSessionActivityAcknowledgements() {
-        UserDefaults.standard.set(
-            sessionActivityAcknowledgementHistory,
-            forKey: Self.sessionActivityAcknowledgementKey
-        )
+        SessionActivityAcknowledgementStore.persist(sessionActivityAcknowledgementHistory)
     }
 
     private func acknowledgeSessionActivity(_ id: String) {
-        guard sessionActivitySnapshot?.completed.contains(where: {
-            $0.id == id && $0.event == .sessionEnd
-        }) == true else {
-            return
-        }
-        sessionActivityAcknowledgementHistory = SessionActivityApplicationPolicy.recordingAcknowledgement(
-            id,
+        acknowledgeSessionActivities([id])
+    }
+
+    private func acknowledgeSessionActivities(_ ids: [String]) {
+        guard let sessionActivitySnapshot else { return }
+        let eligibleIDs = Set(sessionActivitySnapshot.completed.lazy.filter {
+            $0.event == .sessionEnd
+        }.map(\.id))
+        let requestedIDs = ids.filter(eligibleIDs.contains)
+        guard !requestedIDs.isEmpty else { return }
+        let updatedHistory = SessionActivityApplicationPolicy.recordingAcknowledgements(
+            requestedIDs,
             in: sessionActivityAcknowledgementHistory
         )
+        guard updatedHistory != sessionActivityAcknowledgementHistory else { return }
+        sessionActivityAcknowledgementHistory = updatedHistory
         persistSessionActivityAcknowledgements()
         refreshSessionActivityPresentation(previousTargets: sessionActivityTargets)
     }
@@ -1483,6 +1480,14 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             self.sessionActivityOpenabilityRequest = [:]
             self.refreshSessionActivityPresentation(rescheduleTitleHydration: false)
         }
+    }
+
+    private func currentSessionActivityOpenabilityState() -> SessionActivityOpenabilityPresentationState {
+        SessionActivityOpenabilityPolicy.presentationState(
+            currentTargets: sessionActivityTargets,
+            resolvedTargets: sessionActivityResolvedOpenabilityTargets,
+            openableIDs: sessionActivityOpenableIDs
+        )
     }
 
     private func scheduleSessionActivityOpenabilityResolution() {
@@ -1503,11 +1508,15 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         guard requestedTargets != sessionActivityOpenabilityRequest
                 || sessionActivityOpenabilityTask == nil else { return }
 
-        let previousRequest = sessionActivityOpenabilityRequest
         sessionActivityOpenabilityRequest = requestedTargets
-        sessionActivityOpenableIDs = Set(sessionActivityOpenableIDs.filter { id in
-            previousRequest[id] == requestedTargets[id] && requestedTargets[id] != nil
-        })
+        sessionActivityResolvedOpenabilityTargets = Dictionary(uniqueKeysWithValues:
+            sessionActivityResolvedOpenabilityTargets.compactMap { id, threadID in
+                requestedTargets[id] == threadID ? (id, threadID) : nil
+            }
+        )
+        sessionActivityOpenableIDs = sessionActivityOpenableIDs.intersection(
+            sessionActivityResolvedOpenabilityTargets.keys
+        )
         sessionActivityOpenabilityGeneration &+= 1
         let requestGeneration = sessionActivityOpenabilityGeneration
         sessionActivityOpenabilityTask?.cancel()
@@ -1521,8 +1530,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                   self.sessionActivityOpenabilityGeneration == requestGeneration,
                   self.sessionActivityOpenabilityRequest == requestedTargets else { return }
             self.sessionActivityOpenabilityTask = nil
-            guard openableIDs != self.sessionActivityOpenableIDs else { return }
+            let resolutionChanged = self.sessionActivityResolvedOpenabilityTargets != requestedTargets
+            let availabilityChanged = openableIDs != self.sessionActivityOpenableIDs
+            self.sessionActivityResolvedOpenabilityTargets = requestedTargets
             self.sessionActivityOpenableIDs = openableIDs
+            guard resolutionChanged || availabilityChanged else { return }
             self.refreshSessionActivityPresentation(
                 rescheduleTitleHydration: false,
                 rescheduleOpenability: false
@@ -1598,11 +1610,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 scheduleSessionActivityOpenabilityResolution()
             }
         }
-        let openableIDs = sessionActivityOpenableIDs.intersection(sessionActivityTargets.keys)
+        let openability = currentSessionActivityOpenabilityState()
         sessionActivityView.update(
             snapshot: sessionActivitySnapshot,
             acknowledgedIDs: Set(sessionActivityAcknowledgementHistory),
-            openableIDs: openableIDs,
+            openableIDs: openability.openableIDs,
+            openabilityPendingIDs: openability.pendingIDs,
             titles: sessionActivityTitles
         )
         if sessionActivityView.isHidden {
@@ -1649,11 +1662,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         )
         guard retained != sessionActivityTitles else { return }
         sessionActivityTitles = retained
-        let openableIDs = sessionActivityOpenableIDs.intersection(sessionActivityTargets.keys)
+        let openability = currentSessionActivityOpenabilityState()
         sessionActivityView.update(
             snapshot: sessionActivitySnapshot,
             acknowledgedIDs: Set(sessionActivityAcknowledgementHistory),
-            openableIDs: openableIDs,
+            openableIDs: openability.openableIDs,
+            openabilityPendingIDs: openability.pendingIDs,
             titles: retained
         )
     }

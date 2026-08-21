@@ -167,6 +167,69 @@ final class SessionActivityTests: XCTestCase {
     }
 
     @MainActor
+    func testClearAllCompletedAcknowledgesEveryUnreadSessionEndIncludingOverflow() throws {
+        let active = try item(
+            "a",
+            state: .running,
+            event: .userPromptSubmit,
+            terminal: false,
+            eventAt: 80
+        )
+        let stopped = try item(
+            "b",
+            state: .idle,
+            event: .stop,
+            terminal: true,
+            eventAt: 85
+        )
+        let alreadyRead = try item(
+            "c",
+            state: .idle,
+            event: .sessionEnd,
+            terminal: true,
+            eventAt: 86
+        )
+        let unread = try (0 ..< 4).map {
+            try item(
+                String($0),
+                state: .idle,
+                event: .sessionEnd,
+                terminal: true,
+                eventAt: 90 + Double($0)
+            )
+        }
+        let view = SessionActivityView(
+            frame: NSRect(x: 0, y: 0, width: 360, height: 220),
+            clock: { Date(timeIntervalSince1970: 100) }
+        )
+        var clearedIDs: [String]?
+        view.onAcknowledgeAllCompleted = { clearedIDs = $0 }
+        view.update(
+            snapshot: try SessionActivitySnapshot(
+                emittedAt: 100,
+                active: [active],
+                completed: [unread[0], stopped, alreadyRead] + Array(unread.dropFirst())
+            ),
+            acknowledgedIDs: [alreadyRead.id]
+        )
+        view.layoutSubtreeIfNeeded()
+
+        XCTAssertEqual(view.displayState.completed.count, 3)
+        XCTAssertEqual(view.displayState.hiddenCompletedCount, 1)
+        let clearAll = try XCTUnwrap(
+            allDescendants(of: view).compactMap { $0 as? NSButton }.first {
+                $0.title == "Clear all"
+            }
+        )
+        XCTAssertEqual(clearAll.accessibilityLabel(), "Clear all completed sessions")
+        clearAll.performClick(nil)
+        XCTAssertEqual(clearedIDs, unread.map(\.id))
+        XCTAssertFalse(clearedIDs?.contains(active.id) == true)
+        XCTAssertFalse(clearedIDs?.contains(stopped.id) == true)
+        XCTAssertFalse(clearedIDs?.contains(alreadyRead.id) == true)
+    }
+
+    @MainActor
     func testActivityRowsAreExplicitlyInformationalWhenActivationIsUnavailable() throws {
         let active = try item(
             "a",
@@ -195,6 +258,108 @@ final class SessionActivityTests: XCTestCase {
         )
         XCTAssertEqual(rowLabel.accessibilityRole(), .staticText)
         XCTAssertEqual(rowLabel.accessibilityLabel(), "Active running session 1")
+    }
+
+    @MainActor
+    func testAvailabilityNoticeOnlyAppearsForUnavailableOpenInCodexRows() throws {
+        let first = try item(
+            "a",
+            state: .running,
+            event: .userPromptSubmit,
+            terminal: false,
+            eventAt: 90
+        )
+        let second = try item(
+            "b",
+            state: .waiting,
+            event: .permissionRequest,
+            terminal: false,
+            eventAt: 91
+        )
+        let view = SessionActivityView(
+            frame: NSRect(x: 0, y: 0, width: 320, height: 150),
+            clock: { Date(timeIntervalSince1970: 100) }
+        )
+        let snapshot = try SessionActivitySnapshot(emittedAt: 100, active: [first, second])
+        view.update(
+            snapshot: snapshot,
+            acknowledgedIDs: [],
+            openabilityPendingIDs: [first.id, second.id]
+        )
+        view.layoutSubtreeIfNeeded()
+
+        var descendants = allDescendants(of: view)
+        XCTAssertFalse(descendants.compactMap { ($0 as? NSTextField)?.stringValue }.contains {
+            $0.contains("unavailable")
+        })
+        let pendingLabel = try XCTUnwrap(descendants.compactMap { $0 as? NSTextField }.first {
+            $0.accessibilityLabel() == "Active running session 1"
+        })
+        XCTAssertTrue(pendingLabel.accessibilityHelp()?.contains("Checking whether") == true)
+
+        view.update(
+            snapshot: snapshot,
+            acknowledgedIDs: [],
+            openableIDs: [first.id]
+        )
+        view.layoutSubtreeIfNeeded()
+        descendants = allDescendants(of: view)
+        XCTAssertNotNil(descendants.compactMap { $0 as? NSTextField }.first {
+            $0.stringValue.contains("unavailable for some sessions")
+        })
+        XCTAssertNotNil(descendants.compactMap { $0 as? NSButton }.first {
+            $0.title == "Open in Codex"
+        })
+        view.update(
+            snapshot: snapshot,
+            acknowledgedIDs: [],
+            openableIDs: [first.id, second.id]
+        )
+        view.layoutSubtreeIfNeeded()
+
+        descendants = allDescendants(of: view)
+        XCTAssertEqual(descendants.compactMap { $0 as? NSButton }.filter {
+            $0.title == "Open in Codex"
+        }.count, 2)
+        let text = descendants.compactMap { ($0 as? NSTextField)?.stringValue }
+        XCTAssertFalse(text.contains { $0.contains("Open in Codex is available") })
+        XCTAssertFalse(text.contains { $0.contains("unavailable") })
+    }
+
+    func testOpenabilityPresentationDistinguishesPendingResolvedAndRemappedTargets() {
+        let id = String(repeating: "a", count: 24)
+        let currentTargets = [id: "thread-a"]
+        let pending = SessionActivityOpenabilityPolicy.presentationState(
+            currentTargets: currentTargets,
+            resolvedTargets: [:],
+            openableIDs: []
+        )
+        XCTAssertEqual(pending.pendingIDs, [id])
+        XCTAssertTrue(pending.openableIDs.isEmpty)
+
+        let resolvedFailure = SessionActivityOpenabilityPolicy.presentationState(
+            currentTargets: currentTargets,
+            resolvedTargets: currentTargets,
+            openableIDs: []
+        )
+        XCTAssertTrue(resolvedFailure.pendingIDs.isEmpty)
+        XCTAssertTrue(resolvedFailure.openableIDs.isEmpty)
+
+        let resolvedSuccess = SessionActivityOpenabilityPolicy.presentationState(
+            currentTargets: currentTargets,
+            resolvedTargets: currentTargets,
+            openableIDs: [id]
+        )
+        XCTAssertTrue(resolvedSuccess.pendingIDs.isEmpty)
+        XCTAssertEqual(resolvedSuccess.openableIDs, [id])
+
+        let remapped = SessionActivityOpenabilityPolicy.presentationState(
+            currentTargets: [id: "thread-b"],
+            resolvedTargets: currentTargets,
+            openableIDs: [id]
+        )
+        XCTAssertEqual(remapped.pendingIDs, [id])
+        XCTAssertTrue(remapped.openableIDs.isEmpty)
     }
 
     @MainActor
@@ -1301,6 +1466,39 @@ final class SessionActivityTests: XCTestCase {
             in: history
         )
         XCTAssertEqual(touched.last, String(format: "%024x", 12))
+
+        let thirdID = String(repeating: "c", count: 24)
+        let batched = SessionActivityApplicationPolicy.recordingAcknowledgements(
+            [firstID, thirdID, "invalid"],
+            in: [firstID, secondID]
+        )
+        XCTAssertEqual(batched, [secondID, firstID, thirdID])
+    }
+
+    func testAcknowledgementStorePersistsNormalizedBatchAndReloads() {
+        let suiteName = "StateletTests.SessionActivityAcknowledgements.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let firstID = String(repeating: "a", count: 24)
+        let secondID = String(repeating: "b", count: 24)
+        let batch = SessionActivityApplicationPolicy.recordingAcknowledgements(
+            [firstID, secondID],
+            in: []
+        )
+
+        SessionActivityAcknowledgementStore.persist(batch, to: defaults)
+        XCTAssertEqual(SessionActivityAcknowledgementStore.restored(from: defaults), batch)
+
+        defaults.set(
+            ["invalid", firstID, secondID, firstID],
+            forKey: SessionActivityAcknowledgementStore.defaultsKey
+        )
+        let normalized = SessionActivityAcknowledgementStore.restored(from: defaults)
+        XCTAssertEqual(normalized, [secondID, firstID])
+        XCTAssertEqual(
+            defaults.array(forKey: SessionActivityAcknowledgementStore.defaultsKey) as? [String],
+            normalized
+        )
     }
 
     private func allDescendants(of view: NSView) -> [NSView] {
