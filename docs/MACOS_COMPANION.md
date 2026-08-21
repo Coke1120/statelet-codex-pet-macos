@@ -1,7 +1,7 @@
 # Statelet lifecycle and media reference
 
 This reference documents the internal contracts behind Statelet 1.8.12 (build
-26), the native Codex lifecycle companion for macOS. Start with
+26), the native Codex and Grok Build lifecycle companion for macOS. Start with
 [Deployment](DEPLOYMENT.md) for installation or [Using Statelet](USAGE.md) for
 daily operation.
 
@@ -9,8 +9,8 @@ daily operation.
 
 Statelet is a macOS 13+ AppKit accessory application. It requires no external
 display or development board. AVFoundation owns the active media decoder, and a
-Python standard-library publisher converts local Codex hook events into a small
-state file.
+Python standard-library publisher converts local Codex and Grok Build hook
+events into a small state file.
 
 No animation media is bundled. MP4, MOV, poster, and report files remain
 user-supplied local content.
@@ -26,7 +26,7 @@ replacement for Developer ID and notarization in public distribution.
 ## Lifecycle data flow
 
 ```text
-Codex hook event on stdin
+Codex or Grok Build hook event on stdin
   -> mac/codex_pet_hook.py
   -> ~/Library/Application Support/Statelet/sessions/<hashed-session>.json
   -> mac/codex_pet_state_aggregator.py
@@ -35,19 +35,22 @@ Codex hook event on stdin
   -> lifecycle badge and animation library
 ```
 
-The hook stores one versioned record per Codex session. It contains only:
+The hook stores one versioned record per provider session. It contains only:
 
 - schema version;
+- bounded provider (`codex` or `grok`);
 - mapped lifecycle state;
 - recognized event name;
 - authoritative event time and local receipt time;
 - terminal status; and
 - bounded rejection counts for stale or conflicting callbacks; and
-- bounded 24-hex hashes of Codex turn/tool correlation IDs plus closed event
+- bounded 24-hex hashes of turn/tool correlation IDs plus closed event
   phases, stored inside the same atomic owner-only record.
 
-The filename is the first 24 hexadecimal characters of a SHA-256 hash of the
-session identifier. Prompt text, tool output, transcript paths, and working
+The filename is the first 24 hexadecimal characters of a provider-scoped
+SHA-256 hash of the session identifier. The Codex namespace keeps its legacy
+hash unchanged, while Grok uses a distinct namespace so equal raw identifiers
+cannot collide. Prompt text, tool output, transcript paths, and working
 directories are excluded.
 The correlation metadata is never copied into `current_state.json` or app
 diagnostics and expires with its session record.
@@ -61,6 +64,31 @@ diagnostics and expires with its session record.
 | `PermissionRequest` | Waiting |
 | `PreCompact`, `PostCompact` | Review |
 | `PreToolUse`, `PostToolUse` | Review for recognized test/lint/typecheck/review work; Running otherwise |
+
+Grok Build's documented global hook surface uses camelCase field names with
+snake_case `hookEventName` values; Statelet normalizes both into the same bounded
+contract. `UserPromptSubmit` and ordinary tool activity map to Running;
+`permission_prompt` and `ask_user_question` waiting map to Waiting;
+`exit_plan_mode` maps to Review until its tool callback; and `Stop`,
+`StopFailure`, plus the `idle_prompt` notification settle the turn to Idle.
+Statelet also accepts `StopCancelled` when a Grok release emits it, while the
+current stable hook baseline uses `idle_prompt` as the cancellation backstop. A
+Stop carrying active `backgroundTasks` remains Running. Grok can
+block a Stop and continue the same prompt, so a newer correlated tool event may
+revive it; the later final Stop still settles it, while stale tool callbacks are
+rejected. Child-session payloads carrying `subagentType` are ignored for the
+top-level projection.
+
+`sessions/agent-source-v1.json` stores only `{version, mode}` where mode is
+`combined`, `codex`, or `grok`. Missing or invalid data defaults to Combined.
+Filtering is a projection: fresh records from the hidden provider remain
+available and can reappear immediately when the selection changes, while normal
+TTL and completed-history retention still bound both providers.
+
+The Grok adapter is based on the public [Grok Build hooks contract](https://docs.x.ai/build/features/hooks),
+not on private session-file tailing. ACP and streaming JSON remain separate
+options for clients that own the Grok process; Statelet's passive desktop mode
+does not require that ownership.
 
 The display hook always exits successfully after emitting valid empty JSON on
 stdout. A display-state write failure must not block or alter the Codex turn.
@@ -283,11 +311,12 @@ Only transition-based categorical lookup health is logged; raw errors, thread
 identifiers, titles, paths, and response content are excluded.
 
 Statelet is not sandboxed. The installer manages files in the current account's
-Application Support and LaunchAgents directories and merges commands into
-`~/.codex/hooks.json`. Managed directories and installed data use restrictive
-local permissions. Diagnostics intentionally report categories and counts
-rather than private content, but users should still review copied text before
-sharing it.
+Application Support and LaunchAgents directories, merges commands into
+`~/.codex/hooks.json`, and installs additive global Grok registrations at
+`~/.grok/hooks/statelet.json`. Managed directories and installed data use
+restrictive local permissions. Diagnostics intentionally report categories and
+counts rather than private content, but users should still review copied text
+before sharing it.
 
 ## Canonical installed identity
 
@@ -320,4 +349,4 @@ fresh installations or repaired startup items.
 - [Using Statelet](USAGE.md)
 
 Statelet is an independent community project and is not affiliated with or
-endorsed by OpenAI.
+endorsed by OpenAI or xAI.

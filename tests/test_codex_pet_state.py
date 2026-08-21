@@ -50,20 +50,22 @@ def write_v2_record(
     *,
     terminal: bool = False,
     rejections=None,
+    provider=None,
 ) -> None:
+    record = {
+        "version": 2,
+        "state": lifecycle,
+        "event": event,
+        "event_at": event_at,
+        "updated_at": event_at,
+        "terminal": terminal,
+        "completed_at": event_at if terminal else None,
+        "rejections": rejections or {},
+    }
+    if provider is not None:
+        record["provider"] = provider
     path.write_text(
-        json.dumps(
-            {
-                "version": 2,
-                "state": lifecycle,
-                "event": event,
-                "event_at": event_at,
-                "updated_at": event_at,
-                "terminal": terminal,
-                "completed_at": event_at if terminal else None,
-                "rejections": rejections or {},
-            }
-        ),
+        json.dumps(record),
         encoding="utf-8",
     )
 
@@ -174,6 +176,157 @@ class LifecycleStateTests(unittest.TestCase):
         self.assertEqual(state.aggregate_state(active), "waiting")
         self.assertEqual(state.aggregate_state_with_source(active), ("waiting", 9.0))
         self.assertEqual(state.aggregate_state_with_source([]), ("idle", None))
+
+    def test_agent_source_mode_filters_without_deleting_provider_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            codex_record = record_path(directory, "a")
+            grok_record = record_path(directory, "b")
+            write_v2_record(
+                codex_record, "running", "UserPromptSubmit", 99.0, provider="codex"
+            )
+            write_v2_record(
+                grok_record, "waiting", "PermissionRequest", 99.5, provider="grok"
+            )
+            source_path = directory / state.AGENT_SOURCE_FILENAME
+
+            combined = state.read_session_snapshot(directory, now=100.0)
+            source_path.write_text(
+                json.dumps({"version": 1, "mode": "codex"}), encoding="utf-8"
+            )
+            codex_only = state.read_session_snapshot(directory, now=100.0)
+            source_path.write_text(
+                json.dumps({"version": 1, "mode": "grok"}), encoding="utf-8"
+            )
+            grok_only = state.read_session_snapshot(directory, now=100.0)
+            source_path.write_text(
+                json.dumps({"version": 1, "mode": "invalid"}), encoding="utf-8"
+            )
+            invalid_falls_back = state.read_session_snapshot(directory, now=100.0)
+
+            self.assertCountEqual(
+                combined["active"], [("running", 99.0), ("waiting", 99.5)]
+            )
+            self.assertEqual(codex_only["active"], [("running", 99.0)])
+            self.assertEqual(grok_only["active"], [("waiting", 99.5)])
+            self.assertCountEqual(invalid_falls_back["active"], combined["active"])
+            self.assertTrue(codex_record.exists())
+            self.assertTrue(grok_record.exists())
+
+    def test_hidden_provider_retention_keeps_fresh_and_prunes_expired_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            fresh = record_path(directory, "f")
+            expired = record_path(directory, "e")
+            completed = record_path(directory, "c")
+            write_v2_record(
+                fresh, "running", "UserPromptSubmit", 99.0, provider="grok"
+            )
+            write_v2_record(
+                expired, "running", "UserPromptSubmit", 1.0, provider="grok"
+            )
+            write_v2_record(
+                completed,
+                "idle",
+                "SessionEnd",
+                1.0,
+                terminal=True,
+                provider="grok",
+            )
+            (directory / state.AGENT_SOURCE_FILENAME).write_text(
+                json.dumps({"version": 1, "mode": "codex"}), encoding="utf-8"
+            )
+
+            snapshot = state.read_session_snapshot(
+                directory, now=100.0, active_ttl=10.0
+            )
+            activity = state.read_session_activity(
+                directory, now=100.0, active_ttl=10.0, completed_ttl=10.0
+            )
+
+            self.assertEqual(snapshot["active"], [])
+            self.assertEqual(activity["active"], [])
+            self.assertEqual(activity["completed"], [])
+            self.assertTrue(fresh.exists())
+            self.assertFalse(expired.exists())
+            self.assertFalse(completed.exists())
+
+    def test_hidden_provider_completed_overflow_keeps_only_newest_bounded_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            total = state.MAX_ACTIVITY_ENTRIES + 7
+            for index in range(total):
+                write_v2_record(
+                    directory / f"{index:024x}.json",
+                    "idle",
+                    "SessionEnd",
+                    100.0 - (index * 0.01),
+                    terminal=True,
+                    provider="grok",
+                )
+            (directory / state.AGENT_SOURCE_FILENAME).write_text(
+                json.dumps({"version": 1, "mode": "codex"}), encoding="utf-8"
+            )
+
+            activity = state.read_session_activity(directory, now=101.0)
+            retained = sorted(directory.glob("[0-9a-f]" * 24 + ".json"))
+
+            self.assertEqual(activity["completed"], [])
+            self.assertEqual(len(retained), state.MAX_ACTIVITY_ENTRIES)
+            self.assertTrue((directory / f"{0:024x}.json").exists())
+            self.assertFalse((directory / f"{total - 1:024x}.json").exists())
+
+    def test_activity_projects_bounded_provider_and_targets_remain_codex_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            codex_id = "a" * 24
+            grok_id = "b" * 24
+            write_v2_record(
+                directory / f"{codex_id}.json",
+                "running",
+                "UserPromptSubmit",
+                99.0,
+            )
+            write_v2_record(
+                directory / f"{grok_id}.json",
+                "waiting",
+                "PermissionRequest",
+                99.5,
+                provider="grok",
+            )
+            write_target_record(
+                directory / f"{codex_id}.target.json", codex_id, "thread:codex", 99.0
+            )
+            write_target_record(
+                directory / f"{grok_id}.target.json", grok_id, "thread:grok", 99.0
+            )
+
+            activity = state.read_session_activity(directory, now=100.0)
+            targets = state.read_session_targets(directory, activity, now=100.0)
+
+        providers = {item["id"]: item["provider"] for item in activity["active"]}
+        self.assertEqual(providers, {codex_id: "codex", grok_id: "grok"})
+        self.assertEqual(
+            targets["targets"], [{"id": codex_id, "thread_id": "thread:codex"}]
+        )
+
+    def test_running_grok_stop_remains_active_until_background_work_settles(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            write_v2_record(
+                record_path(directory, "a"),
+                "running",
+                "Stop",
+                99.0,
+                provider="grok",
+            )
+
+            snapshot = state.read_session_snapshot(directory, now=100.0)
+            activity = state.read_session_activity(directory, now=100.0)
+
+        self.assertEqual(snapshot["active"], [("running", 99.0)])
+        self.assertEqual(activity["active"][0]["event"], "Stop")
+        self.assertEqual(activity["active"][0]["provider"], "grok")
 
     def test_ttl_future_skew_and_corrupt_records_fail_soft(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

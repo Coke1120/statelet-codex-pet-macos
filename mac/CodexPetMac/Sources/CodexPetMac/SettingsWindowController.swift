@@ -191,6 +191,7 @@ struct SettingsSnapshot {
     let repairAvailable: Bool
     let characterProfiles: [CharacterProfileSummary]
     let activeCharacterID: String
+    let agentSourceMode: AgentSourceMode
 
     init(
         mediaMap: MediaMap,
@@ -208,7 +209,8 @@ struct SettingsSnapshot {
         characterProfiles: [CharacterProfileSummary] = [
             CharacterProfileSummary(id: "default", name: "Default", clipCount: 0)
         ],
-        activeCharacterID: String = "default"
+        activeCharacterID: String = "default",
+        agentSourceMode: AgentSourceMode = .combined
     ) {
         self.mediaMap = mediaMap
         self.mediaMapURL = mediaMapURL
@@ -224,6 +226,7 @@ struct SettingsSnapshot {
         self.repairAvailable = repairAvailable
         self.characterProfiles = characterProfiles
         self.activeCharacterID = activeCharacterID
+        self.agentSourceMode = agentSourceMode
     }
 }
 
@@ -431,6 +434,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     var onRefreshDiagnostics: (() -> Void)?
     var onRepairInstallation: (() -> Void)?
     var onLaunchAtLoginChange: ((Bool) -> Void)?
+    var onAgentSourceChange: ((AgentSourceMode) -> Void)?
     var onCleanUnusedMedia: (() -> Void)?
     var onCheckForUpdates: (() -> Void)?
     var onCancelUpdate: (() -> Void)?
@@ -514,7 +518,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let borderOpacityLabel = NSTextField(labelWithString: "24%")
     private let borderWidthSlider = NSSlider(value: 1, minValue: 0, maxValue: 12, target: nil, action: nil)
     private let borderWidthLabel = NSTextField(labelWithString: "1.0 pt")
-    private let stateLabelEnabledCheckbox = NSButton(checkboxWithTitle: "Show current Codex state", target: nil, action: nil)
+    private let stateLabelEnabledCheckbox = NSButton(checkboxWithTitle: "Show current agent state", target: nil, action: nil)
     private let stateLabelAutomaticColorCheckbox = NSButton(checkboxWithTitle: "Automatic color by state", target: nil, action: nil)
     private let stateLabelColorWell = NSColorWell()
     private let stateLabelPositionPopup = NSPopUpButton()
@@ -547,6 +551,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let diagnosticsTextView = NSTextView()
     private let launchAtLoginCheckbox = NSButton(checkboxWithTitle: "Start Statelet when I log in", target: nil, action: nil)
     private let launchAtLoginLabel = NSTextField(wrappingLabelWithString: "Checking…")
+    private let agentSourceControl = NSSegmentedControl(
+        labels: AgentSourceMode.allCases.map(\.displayName),
+        trackingMode: .selectOne,
+        target: nil,
+        action: nil
+    )
     private let repairButton = NSButton(title: "Repair Startup…", target: nil, action: nil)
     private let animationLibraryHost = NSView()
     private let animationLibrary = AnimationLibraryView()
@@ -674,6 +684,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         diagnosticsTextView.string = snapshot.diagnosticsReport
         launchAtLoginCheckbox.state = snapshot.launchAtLoginEnabled ? .on : .off
         launchAtLoginLabel.stringValue = snapshot.launchAtLoginSummary
+        agentSourceControl.selectedSegment = AgentSourceMode.allCases.firstIndex(of: snapshot.agentSourceMode) ?? 0
         repairButton.isEnabled = snapshot.repairAvailable
         updateCharacterSelector()
     }
@@ -1294,7 +1305,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         stateLabelSizePopup.target = self
         stateLabelSizePopup.action = #selector(appearanceChanged)
         stateLabelSizePopup.setAccessibilityLabel("Current state label size")
-        let badgeHelp = NSTextField(wrappingLabelWithString: "The badge shows the requested Codex lifecycle state. Offline or stale publisher data is labeled clearly instead of pretending to be live Idle.")
+        let badgeHelp = NSTextField(wrappingLabelWithString: "The badge shows the requested agent lifecycle state. Offline or stale publisher data is labeled clearly instead of pretending to be live Idle.")
         badgeHelp.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         badgeHelp.textColor = .secondaryLabelColor
         let badgeStack = NSStackView(views: [
@@ -1381,7 +1392,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         activityStack.orientation = .vertical
         activityStack.alignment = .leading
         activityStack.spacing = 9
-        let activityBox = makeSection(title: "Codex Activity Popup", content: activityStack)
+        let activityBox = makeSection(title: "Agent Activity Popup", content: activityStack)
 
         dialogueBackgroundColorWell.target = self
         dialogueBackgroundColorWell.action = #selector(dialogueAppearanceChanged)
@@ -1480,6 +1491,24 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         startupStack.spacing = 5
         let startupBox = makeSection(title: "Startup", content: startupStack)
 
+        agentSourceControl.target = self
+        agentSourceControl.action = #selector(agentSourceChanged)
+        agentSourceControl.selectedSegment = 0
+        agentSourceControl.setAccessibilityLabel("Agent Source")
+        agentSourceControl.setAccessibilityHelp(
+            "Choose whether Statelet reflects Codex, Grok, or both local agent activity sources."
+        )
+        let agentSourceHelp = NSTextField(
+            wrappingLabelWithString: "Combined reflects local Codex and Grok lifecycle events. Codex and Grok limit the pet and activity popup to that source. Statelet stores only privacy-safe state, timing, event category, and hashed session identifiers."
+        )
+        agentSourceHelp.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        agentSourceHelp.textColor = .secondaryLabelColor
+        let agentSourceStack = NSStackView(views: [agentSourceControl, agentSourceHelp])
+        agentSourceStack.orientation = .vertical
+        agentSourceStack.alignment = .leading
+        agentSourceStack.spacing = 7
+        let agentSourceBox = makeSection(title: "Agent Source", content: agentSourceStack)
+
         let sizeTitle = NSTextField(labelWithString: "Pet size")
         sizeTitle.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
         sizeSlider.target = self
@@ -1561,7 +1590,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             title: "General",
             subtitle: "Control startup, window behavior, accessibility, and Statelet's local files."
         )
-        let stack = NSStackView(views: [header, startupBox, petWindowBox, motionBox, localBox])
+        let stack = NSStackView(views: [header, startupBox, agentSourceBox, petWindowBox, motionBox, localBox])
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -1573,6 +1602,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             stack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor),
             header.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            agentSourceBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
             startupBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
             petWindowBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
             motionBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
@@ -1653,11 +1683,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         let quickStart = makeSection(
             title: "First launch",
-            content: NSTextField(wrappingLabelWithString: "Open the Statelet menu-bar icon and choose Settings. Start with Animations → Idle, import a verified MP4 that you own or are authorized to use, then restart Codex if it was already running when Statelet was installed. If click-through is enabled, the menu-bar icon remains the recovery path.")
+            content: NSTextField(wrappingLabelWithString: "Open the Statelet menu-bar icon and choose Settings. Start with Animations → Idle, import a verified MP4 that you own or are authorized to use, then restart any selected agent that was already running when Statelet was installed. If click-through is enabled, the menu-bar icon remains the recovery path.")
         )
         let lifecycle = makeSection(
             title: "Lifecycle states",
-            content: NSTextField(wrappingLabelWithString: "Idle means no active Codex turn. Running means Codex is working. Waiting means Codex needs input or permission. Review means tests, lint, type checks or review work are active. Statelet keeps these records local and does not store prompts or tool output.")
+            content: NSTextField(wrappingLabelWithString: "Idle means no active turn from the selected Agent Source. Running means a selected agent is working. Waiting means a selected agent needs input or permission. Review means tests, lint, type checks or review work are active. Statelet keeps these records local and does not store prompts or tool output.")
         )
         let media = makeSection(
             title: "Animation and voice",
@@ -2743,6 +2773,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     @objc private func refreshDiagnostics() { onRefreshDiagnostics?() }
     @objc private func repairInstallation() { onRepairInstallation?() }
     @objc private func launchAtLoginChanged() { onLaunchAtLoginChange?(launchAtLoginCheckbox.state == .on) }
+    @objc private func agentSourceChanged() {
+        guard AgentSourceMode.allCases.indices.contains(agentSourceControl.selectedSegment) else {
+            agentSourceControl.selectedSegment = 0
+            onAgentSourceChange?(.combined)
+            return
+        }
+        onAgentSourceChange?(AgentSourceMode.allCases[agentSourceControl.selectedSegment])
+    }
     @objc private func cleanUnusedMedia() { onCleanUnusedMedia?() }
 
     @objc private func copyDiagnostics() {
@@ -2988,9 +3026,9 @@ extension PetState {
 
     var explanation: String {
         switch self {
-        case .idle: return "No active Codex turn"
-        case .running: return "Codex is working"
-        case .waiting: return "Codex needs input or permission"
+        case .idle: return "No active selected-agent turn"
+        case .running: return "Selected agent is working"
+        case .waiting: return "Selected agent needs input or permission"
         case .review: return "Tests, lint, or review"
         }
     }

@@ -83,6 +83,8 @@ player_plist="$launch_agents_dir/$player_label.plist"
 legacy_aggregator_plist="$launch_agents_dir/$legacy_aggregator_label.plist"
 legacy_player_plist="$launch_agents_dir/$legacy_player_label.plist"
 hooks_file="$home_dir/.codex/hooks.json"
+grok_hooks_dir="$home_dir/.grok/hooks"
+grok_hooks_file="$grok_hooks_dir/statelet.json"
 player_run_at_load=1
 transaction_root="$home_dir/.statelet-install-transaction"
 stage_root="$transaction_root/stage"
@@ -779,7 +781,9 @@ def validate_seal(data):
         raise ValueError("transaction seal is invalid")
 
 def validate_required_publication(data, installer_args, support):
-    if len(installer_args) < 9:
+    version = data.get("version")
+    minimum_arguments = 9 if version == 1 else 10
+    if version not in {1, 2} or len(installer_args) < minimum_arguments:
         raise ValueError("transaction publication contract is invalid")
     active_targets = {
         Path(data["operations"][index]["target"])
@@ -789,6 +793,8 @@ def validate_required_publication(data, installer_args, support):
     aggregator_plist, player_plist, legacy_aggregator_plist, legacy_player_plist = map(Path, installer_args[4:8])
     hooks = Path(installer_args[8])
     required = {app, component, aggregator_plist, hooks, support / ".legacy-migration-v1.json"}
+    if version == 2:
+        required.add(Path(installer_args[9]))
     forbidden = {legacy_app, legacy_component, legacy_aggregator_plist, legacy_player_plist}
     if not required.issubset(active_targets) or active_targets.intersection(forbidden):
         raise ValueError("transaction publication contract is invalid")
@@ -1004,7 +1010,7 @@ def load():
     if not stat.S_ISREG(journal_status.st_mode) or journal_status.st_uid != os.getuid():
         raise ValueError("transaction journal ownership is unsafe")
     data = json.loads(journal.read_text(encoding="utf-8"))
-    if data.get("version") != 1 or data.get("home") != str(home) or data.get("state") not in {"active", "files-committed", "committed"}:
+    if data.get("version") not in {1, 2} or data.get("home") != str(home) or data.get("state") not in {"active", "files-committed", "committed"}:
         raise ValueError("transaction journal identity is invalid")
     return data
 
@@ -1013,7 +1019,7 @@ if command == "init":
     sync_directory(root.parent)
     (root / "stage").mkdir(mode=0o700)
     (root / "backup").mkdir(mode=0o700)
-    write({"version": 1, "home": str(home), "state": "active", "operations": []})
+    write({"version": 2, "home": str(home), "state": "active", "operations": []})
 elif command == "record":
     kind, source, target, expected = args
     data = load()
@@ -1433,8 +1439,9 @@ recover_transaction() {
   journal_command recover \
     "$app_dest" "$legacy_app" "$component_dir" "$legacy_component" \
     "$aggregator_plist" "$player_plist" "$legacy_aggregator_plist" "$legacy_player_plist" \
-    "$hooks_file" "$applications_dir" "$home_dir/Library" "$home_dir/Library/Application Support" \
-    "$support_dir" "$launch_agents_dir" "$home_dir/.codex" "$media_dir" "$runtime_dir" "$logs_dir" "$support_dir" 2>/dev/null
+    "$hooks_file" "$grok_hooks_file" "$applications_dir" "$home_dir/Library" "$home_dir/Library/Application Support" \
+    "$support_dir" "$launch_agents_dir" "$home_dir/.codex" "$home_dir/.grok" "$grok_hooks_dir" \
+    "$media_dir" "$runtime_dir" "$logs_dir" "$support_dir" 2>/dev/null
 }
 
 if recover_transaction; then
@@ -1502,7 +1509,7 @@ rollback() {
     else
       recovery_status=$?
       if [[ "$recovery_status" -eq 77 ]]; then
-        printf 'Installed Statelet, the Codex lifecycle companion.\n'
+        printf 'Installed Statelet, the Codex and Grok lifecycle companion.\n'
         exit 0
       fi
       if [[ "$recovery_status" -eq 71 ]]; then printf 'Installation failed and launchd rollback was incomplete.\n' >&2; exit 71; fi
@@ -1531,68 +1538,17 @@ PYTHONDONTWRITEBYTECODE=1 "$python_bin" -m py_compile "$stage_component/python/s
 rm -rf "$stage_component/python/__pycache__"
 
 stage_hooks="$stage_root/hooks.json"
-"$python_bin" "$script_dir/merge_hooks.py" --destination "$hooks_file" --output "$stage_hooks" --python "$python_bin" --hook-script "$python_dir/statelet_hook.py"
+stage_grok_hooks="$stage_root/grok-statelet.json"
+if ! "$python_bin" "$script_dir/merge_hooks.py" --destination "$hooks_file" --output "$stage_hooks" --python "$python_bin" --hook-script "$python_dir/statelet_hook.py" 2>/dev/null \
+  || ! "$python_bin" "$script_dir/merge_hooks.py" --destination "$grok_hooks_file" --output "$stage_grok_hooks" --python "$python_bin" --hook-script "$python_dir/statelet_hook.py" --provider grok 2>/dev/null; then
+  printf 'Refusing unsafe Statelet hook configuration.\n' >&2
+  exit 1
+fi
 stage_quiesced_hooks="$stage_root/hooks-quiesced.json"
-if hook_drain_seconds="$("$python_bin" - "$hooks_file" "$stage_quiesced_hooks" <<'PY'
-import json, math, os, shlex, stat, sys
-from pathlib import Path
-
-source, output = map(Path, sys.argv[1:])
-data = json.loads(source.read_text(encoding="utf-8")) if source.exists() else {}
-mode = stat.S_IMODE(source.stat().st_mode) if source.exists() else 0o600
-hooks = data.get("hooks", {})
-if not isinstance(data, dict) or not isinstance(hooks, dict):
-    raise SystemExit(2)
-maximum_timeout = 0.0
-if isinstance(hooks, dict):
-    for event, groups in list(hooks.items()):
-        if not isinstance(groups, list):
-            continue
-        retained_groups = []
-        for group in groups:
-            if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
-                retained_groups.append(group)
-                continue
-            retained_items = []
-            for item in group["hooks"]:
-                command = item.get("command") if isinstance(item, dict) else None
-                try:
-                    parts = shlex.split(command) if isinstance(command, str) else []
-                except ValueError:
-                    parts = []
-                normalized = parts[1].replace("\\", "/") if len(parts) == 2 else ""
-                managed = (
-                    Path(normalized).name in {"statelet_hook.py", "codex_pet_hook.py"}
-                    and (
-                        any(prefix in normalized for prefix in ("/Library/Application Support/Statelet/", "/Library/Application Support/CodexPet/"))
-                        or normalized.endswith("/Documents/codex-pet-dev-board/mac/codex_pet_hook.py")
-                        or normalized.endswith("/Documents/codex-pet-dev-board/mac/statelet_hook.py")
-                        or normalized.endswith("/Documents/codex-pet-arduino/mac/codex_pet_hook.py")
-                        or normalized.endswith("/Documents/codex-pet-arduino/mac/statelet_hook.py")
-                    )
-                )
-                if not managed:
-                    retained_items.append(item)
-                else:
-                    try:
-                        timeout = float(item["timeout"])
-                        if not math.isfinite(timeout) or timeout < 0 or timeout > 60:
-                            raise ValueError
-                    except KeyError:
-                        timeout = 10.0
-                    except (TypeError, ValueError):
-                        raise SystemExit("Unsupported managed hook timeout.")
-                    maximum_timeout = max(maximum_timeout, timeout)
-            replacement = dict(group)
-            replacement["hooks"] = retained_items
-            if retained_items or set(replacement) - {"hooks", "matcher"}:
-                retained_groups.append(replacement)
-        hooks[event] = retained_groups
-output.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-os.chmod(output, mode)
-print(maximum_timeout + 0.1 if maximum_timeout else 0.0)
-PY
-)"; then
+stage_quiesced_grok_hooks="$stage_root/grok-statelet-quiesced.json"
+if codex_hook_drain_seconds="$("$python_bin" "$script_dir/merge_hooks.py" --destination "$hooks_file" --output "$stage_quiesced_hooks" --quiesce-managed-hooks)" \
+  && grok_hook_drain_seconds="$("$python_bin" "$script_dir/merge_hooks.py" --destination "$grok_hooks_file" --output "$stage_quiesced_grok_hooks" --quiesce-managed-hooks)" \
+  && hook_drain_seconds="$("$python_bin" -c 'import sys; print(max(float(value) for value in sys.argv[1:]))' "$codex_hook_drain_seconds" "$grok_hook_drain_seconds")"; then
   :
 else
   printf 'Refusing unsupported Statelet hook configuration.\n' >&2
@@ -1647,6 +1603,10 @@ fi
 if [[ -e "$hooks_file" ]]; then
   backup_target "$hooks_file" hooks-original.json
   install_target "$stage_quiesced_hooks" "$hooks_file"
+fi
+if [[ -e "$grok_hooks_file" ]]; then
+  backup_target "$grok_hooks_file" grok-hooks-original.json
+  install_target "$stage_quiesced_grok_hooks" "$grok_hooks_file"
 fi
 backup_target "$component_dir" component
 [[ "$legacy_component_is_managed" -eq 0 ]] || backup_target "$legacy_component" legacy/component
@@ -1773,6 +1733,8 @@ ensure_dir "$home_dir/Library/Application Support"
 ensure_private_dir "$support_dir"
 ensure_dir "$launch_agents_dir"
 ensure_dir "$home_dir/.codex"
+ensure_private_dir "$home_dir/.grok"
+ensure_private_dir "$grok_hooks_dir"
 
 backup_target "$app_dest" app
 [[ "$legacy_app_is_managed" -eq 0 ]] || backup_target "$legacy_app" legacy/app
@@ -1781,6 +1743,7 @@ backup_target "$player_plist" agents/player
 [[ ! -e "$legacy_aggregator_plist" ]] || backup_target "$legacy_aggregator_plist" agents/legacy-aggregator
 [[ ! -e "$legacy_player_plist" ]] || backup_target "$legacy_player_plist" agents/legacy-player
 [[ ! -e "$hooks_file" ]] || backup_target "$hooks_file" hooks-quiesced.json
+[[ ! -e "$grok_hooks_file" ]] || backup_target "$grok_hooks_file" grok-hooks-quiesced.json
 install_target "$stage_app" "$app_dest"
 if [[ "${STATELET_INSTALL_CRASH_AT:-}" == "after-app" ]]; then kill -KILL $$; fi
 if [[ "${STATELET_INSTALL_FAIL_AT:-${CODEX_PET_INSTALL_FAIL_AT:-}}" == "after-app" ]]; then printf 'Injected installation failure after app replacement.\n' >&2; exit 70; fi
@@ -1788,6 +1751,7 @@ install_target "$stage_component" "$component_dir"
 install_target "$stage_aggregator_plist" "$aggregator_plist"
 if [[ "$install_player" -eq 1 ]]; then install_target "$stage_player_plist" "$player_plist"; fi
 install_target "$stage_hooks" "$hooks_file"
+install_target "$stage_grok_hooks" "$grok_hooks_file"
 
 for ((index=0; index<${#migration_relatives[@]}; index++)); do
   [[ "${migration_digests[$index]}" == "__absent__" ]] && continue
@@ -1839,8 +1803,9 @@ if [[ "${STATELET_INSTALL_FAIL_AT:-${CODEX_PET_INSTALL_FAIL_AT:-}}" == "after-su
 journal_command files-commit \
   "$app_dest" "$legacy_app" "$component_dir" "$legacy_component" \
   "$aggregator_plist" "$player_plist" "$legacy_aggregator_plist" "$legacy_player_plist" \
-  "$hooks_file" "$applications_dir" "$home_dir/Library" "$home_dir/Library/Application Support" \
-  "$support_dir" "$launch_agents_dir" "$home_dir/.codex" "$media_dir" "$runtime_dir" "$logs_dir" \
+  "$hooks_file" "$grok_hooks_file" "$applications_dir" "$home_dir/Library" "$home_dir/Library/Application Support" \
+  "$support_dir" "$launch_agents_dir" "$home_dir/.codex" "$home_dir/.grok" "$grok_hooks_dir" \
+  "$media_dir" "$runtime_dir" "$logs_dir" \
   "$support_dir/media" "$support_dir/voice" "$support_dir/characters" "$support_dir/sessions" \
   "$support_dir/sessions/activity-titles-v1.json" \
   "$support_dir/alpha-runtime" "$support_dir/runtime/current_state.json" "$support_dir/media/media-map.json" \
@@ -1869,8 +1834,9 @@ fi
 journal_command commit \
   "$app_dest" "$legacy_app" "$component_dir" "$legacy_component" \
   "$aggregator_plist" "$player_plist" "$legacy_aggregator_plist" "$legacy_player_plist" \
-  "$hooks_file" "$applications_dir" "$home_dir/Library" "$home_dir/Library/Application Support" \
-  "$support_dir" "$launch_agents_dir" "$home_dir/.codex" "$media_dir" "$runtime_dir" "$logs_dir" \
+  "$hooks_file" "$grok_hooks_file" "$applications_dir" "$home_dir/Library" "$home_dir/Library/Application Support" \
+  "$support_dir" "$launch_agents_dir" "$home_dir/.codex" "$home_dir/.grok" "$grok_hooks_dir" \
+  "$media_dir" "$runtime_dir" "$logs_dir" \
   "$support_dir/media" "$support_dir/voice" "$support_dir/characters" "$support_dir/sessions" \
   "$support_dir/sessions/activity-titles-v1.json" \
   "$support_dir/alpha-runtime" "$support_dir/runtime/current_state.json" "$support_dir/media/media-map.json" \
@@ -1878,6 +1844,6 @@ journal_command commit \
 committed=1
 rm -rf "$transaction_root"
 trap - EXIT
-printf 'Installed Statelet, the Codex lifecycle companion.\n'
+printf 'Installed Statelet, the Codex and Grok lifecycle companion.\n'
 printf '  App: %s\n  Media map: %s\n  Aggregator: %s\n' "$app_dest" "$media_map" "$aggregator_plist"
 if [[ "$install_player" -eq 1 ]]; then printf '  Player: %s\n' "$player_plist"; else printf '  Player LaunchAgent: not installed\n'; fi

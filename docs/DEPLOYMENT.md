@@ -27,7 +27,7 @@ additional trust layer.
 | Goal | Procedure | Result |
 | --- | --- | --- |
 | Try the interface | Build and open the app from `dist/` | Temporary app; no lifecycle publisher, hooks, or login item are installed |
-| Use Statelet daily | Build, then run the installer | App in `~/Applications`, Codex lifecycle hooks, state aggregator, and optional login launch |
+| Use Statelet daily | Build, then run the installer | App in `~/Applications`, Codex and Grok lifecycle hooks, state aggregator, and optional login launch |
 | Publish an owner-authorized update | Push a version tag whose commit is on `main` | The release workflow publishes an ad-hoc package plus a signed manifest for existing Statelet installs |
 | Publish a binary | Complete a separate signed-release process | Developer ID signing, hardened-runtime review, notarization, stapling, and Gatekeeper testing are required |
 
@@ -121,7 +121,10 @@ The installer:
 - installs the standard-library lifecycle hook and aggregator;
 - creates marked state-aggregator and player LaunchAgents;
 - merges Statelet's commands into `~/.codex/hooks.json` without replacing
-  unrelated commands; and
+  unrelated commands;
+- installs additive global Grok Build registrations in
+  `~/.grok/hooks/statelet.json`, with provider selection supplied through the
+  hook handler environment; and
 - preserves an existing `media-map.json`, `global-transitions.json`,
   `character-library.json`, hidden per-character maps/assets, and user media
   during upgrades.
@@ -130,8 +133,8 @@ An unmanaged app or LaunchAgent at a managed destination causes installation to
 fail before replacement. See [Legacy identity migration](#legacy-identity-migration)
 for the ownership checks applied to older installations.
 
-Restart Codex after the first installation so it loads the new hook
-configuration. Launch Statelet with:
+Restart Codex and any active Grok Build session after the first installation so
+they load the new hook configuration. Launch Statelet with:
 
 ```bash
 open "$HOME/Applications/Statelet.app"
@@ -279,6 +282,7 @@ does not commit.
 ~/Library/LaunchAgents/com.coke1120.statelet.state-aggregator.plist
 ~/Library/LaunchAgents/com.coke1120.statelet.mac-player.plist
 ~/.codex/hooks.json
+~/.grok/hooks/statelet.json
 ```
 
 Statelet does not install animation media. Imported media stays under the
@@ -306,8 +310,9 @@ bash mac/CodexPetMac/scripts/uninstall.sh
 ```
 
 The uninstaller removes only marked Statelet components and exact hook commands
-that point to the removed widget runtime. It refuses unmarked component or
-LaunchAgent targets and preserves unrelated hooks.
+that point to the removed widget runtime in both Codex and Grok configurations.
+It refuses unmarked component or LaunchAgent targets and preserves unrelated
+hooks.
 
 It intentionally preserves:
 

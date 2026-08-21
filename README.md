@@ -5,8 +5,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/Coke1120/statelet-codex-pet-macos/actions/workflows/ci.yml/badge.svg)](https://github.com/Coke1120/statelet-codex-pet-macos/actions/workflows/ci.yml)
 
-Statelet is a native, local-first macOS companion for Codex. It turns Codex
-lifecycle events—Idle, Running, Waiting, and Review—into an animated,
+Statelet is a native, local-first macOS companion for Codex and Grok Build. It
+turns agent lifecycle events—Idle, Running, Waiting, and Review—into an animated,
 transparent desktop presence. It runs without a development board, keeps its
 runtime data on the Mac, and uses AppKit and AVFoundation rather than a browser
 runtime.
@@ -29,10 +29,12 @@ an Apple-authorized public binary.
 ## Highlights
 
 - Shows `idle`, `running`, `waiting`, and `review` as distinct animation states.
-- Aggregates several simultaneous Codex sessions with
+- Aggregates simultaneous Codex and Grok Build sessions with
   `waiting > review > running > idle` priority.
+- Provides **Settings → General → Agent Source** modes for Combined (default),
+  Codex-only, or Grok-only activity without deleting hidden-provider records.
 - Shows active sessions and completed-unread sessions in a compact rail beside
-  the pet without reading prompt, turn, or transcript fields.
+  the pet with provider labels, without reading prompt, turn, or transcript fields.
 - Provides a movable, border-and-corner-resizable transparent AppKit panel.
 - Keeps recovery controls in the menu bar when the panel is click-through.
 - Keeps several named characters in one local library and switches each
@@ -56,7 +58,7 @@ an Apple-authorized public binary.
 ## How it works
 
 ```text
-Codex lifecycle hooks
+Codex lifecycle hooks + Grok Build global hooks
   -> privacy-safe per-session JSON
   -> local multi-session state aggregator
      waiting > review > running > idle
@@ -66,16 +68,17 @@ Codex lifecycle hooks
   -> AVFoundation player
 ```
 
-Each hook record contains only a schema version, mapped state, safe event
-category, bounded lifecycle timestamps, and terminal status. Its filename is
-derived from a truncated SHA-256 hash of the session identifier. Statelet does
+Each hook record contains only a schema version, bounded provider, mapped state,
+safe event category, bounded lifecycle timestamps, and terminal status. Its
+filename is derived from a provider-scoped truncated SHA-256 hash of the session
+identifier; existing Codex hashes remain backward compatible. Statelet does
 not store prompts, tool output, transcript paths, or working directories in
 those records.
 
 The optional `sessions/activity-v1.json` sidecar contains only bounded active
 and completed-session summaries keyed by those opaque hashes. Each entry carries
-safe lifecycle/category labels plus bounded start, last-event, and completion
-timestamps. Statelet uses it to show the activity rail beside the pet;
+safe provider/lifecycle/category labels plus bounded start, last-event, and
+completion timestamps. Statelet uses it to show the activity rail beside the pet;
 completed entries remain unread until the user explicitly marks them as read,
 and acknowledgement state stays local and owner-only.
 
@@ -84,7 +87,8 @@ hash-to-thread mapping in the separate owner-only
 `sessions/activity-targets-v1.json` sidecar. The public activity projection
 remains identifier-free. A verified ChatGPT desktop handler can then open the
 matching local chat through the documented `codex://threads/<thread-id>` link;
-legacy or unmapped rows remain informational.
+legacy, unmapped, and Grok rows remain informational. Grok activity is never
+passed to the Codex Desktop activator or local Codex App Server.
 
 For a mapped active or completed row, the signed app can invoke the local Codex
 App Server and issue `thread/read` with `includeTurns: false`. Statelet accepts
@@ -139,9 +143,11 @@ open "$HOME/Applications/Statelet.app"
 ```
 
 The installer places `Statelet.app` in `~/Applications`, installs the local
-state publisher, adds two marked LaunchAgents, and merges lifecycle commands
-into `~/.codex/hooks.json` without replacing unrelated hooks. Restart Codex once
-after the first install so it loads the merged hook configuration.
+state publisher, adds two marked LaunchAgents, merges lifecycle commands into
+`~/.codex/hooks.json`, and installs additive global Grok registrations at
+`~/.grok/hooks/statelet.json` without replacing unrelated hooks. Restart Codex
+and any active Grok session once after the first install so they load the hook
+configuration.
 
 Statelet is an `LSUIElement` accessory app, so it intentionally has no Dock
 icon. Use the Statelet orbit icon in the menu bar to open Settings, disable
@@ -153,12 +159,13 @@ public-distribution boundary, read [Deployment](docs/DEPLOYMENT.md).
 ## First run
 
 1. Open the Statelet menu-bar icon and choose **Settings…** (`Command-,`).
-2. Open **Animations** and select **Idle**.
-3. Drag one or more local `.mp4` files onto the Idle drop zone, or choose
+2. In **General**, keep **Agent Source** on Combined or choose Codex or Grok.
+3. Open **Animations** and select **Idle**.
+4. Drag one or more local `.mp4` files onto the Idle drop zone, or choose
    **Add Clip… → Import MP4s…**.
-4. If conversion tools are missing, follow the in-app Setup Guide or
+5. If conversion tools are missing, follow the in-app Setup Guide or
    [prepare the optional toolchain](docs/DEPLOYMENT.md#prepare-mp4-conversion-tools).
-5. Restart Codex if it was already running during the first installation.
+6. Restart Codex or Grok Build if it was already running during the first installation.
 
 Statelet keeps the current animation visible while a batch converts. It appends
 each successful clip atomically and reports later failures without discarding
@@ -168,9 +175,9 @@ earlier results.
 
 | State | Meaning |
 | --- | --- |
-| Idle | No active Codex turn |
-| Running | Codex is working |
-| Waiting | Codex needs input or permission |
+| Idle | No active turn from the selected agent source |
+| Running | A selected agent is working |
+| Waiting | A selected agent needs input or permission |
 | Review | Tests, lint, type checks, or review work are active |
 
 Each session stays eligible for 900 seconds after its latest event. The
@@ -337,10 +344,11 @@ Statelet is designed for local operation:
   SHA-256 declarations before installation; package reports never silently gain
   local-attestation status.
 
-Statelet is not sandboxed. Its local installer manages LaunchAgents and merges
-commands into `~/.codex/hooks.json`, and the app reads user-selected media and
-its Application Support directory. Review the scripts before installation if
-those changes are outside your preferred trust boundary.
+Statelet is not sandboxed. Its local installer manages LaunchAgents, merges
+commands into `~/.codex/hooks.json`, installs `~/.grok/hooks/statelet.json`, and
+the app reads user-selected media and its Application Support directory. Review
+the scripts before installation if those changes are outside your preferred
+trust boundary.
 
 Report vulnerabilities according to [SECURITY.md](SECURITY.md). Do not include
 credentials, private media, complete logs, usernames, or absolute home paths in
@@ -364,7 +372,7 @@ a public report.
 - The FPS label reports intended playback FPS and the source track's nominal
   FPS. It does not measure rendered frame rate.
 - Temporary State, Next Clip cursors, and Play Once are process-local controls;
-  they do not rewrite the published Codex state.
+  they do not rewrite the published agent state.
 - Full Swift XCTest execution requires full Xcode. Command Line Tools can build
   the app and run the dependency-free core self-test but may not include XCTest.
 
@@ -391,7 +399,8 @@ bash mac/CodexPetMac/scripts/uninstall.sh
 ```
 
 The uninstaller removes only the marked Statelet app, component directory,
-LaunchAgents, and exact widget hook commands. It preserves animation media,
+LaunchAgents, and exact Statelet hook commands from Codex and Grok configs. It
+preserves unrelated hooks, animation media,
 `media-map.json`, `global-transitions.json`, `character-library.json`, hidden
 character maps and assets, state, session records, and logs so reinstall and
 recovery do not discard user data. Use Finder if you later choose to move that

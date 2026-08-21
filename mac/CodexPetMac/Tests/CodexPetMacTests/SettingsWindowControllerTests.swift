@@ -379,15 +379,18 @@ final class SettingsWindowControllerTests: XCTestCase {
         let cards = Self.descendants(of: window.contentView)
             .compactMap { $0 as? NSVisualEffectView }
             .filter { $0.identifier?.rawValue == "SettingsSectionCard" }
-        XCTAssertEqual(cards.count, 4)
+        XCTAssertEqual(cards.count, 5)
         XCTAssertTrue(cards.allSatisfy { $0.material == .contentBackground })
         XCTAssertTrue(cards.allSatisfy { $0.blendingMode == .withinWindow })
         XCTAssertTrue(cards.allSatisfy { ($0.layer?.cornerRadius ?? 0) >= 12 })
         XCTAssertTrue(cards.allSatisfy { $0.accessibilityRole() == .group })
         XCTAssertEqual(
             Set(cards.compactMap { $0.accessibilityLabel() }),
-            Set(["Startup", "Pet Window", "Motion and Accessibility", "App and Local Data"])
+            Set(["Startup", "Agent Source", "Pet Window", "Motion and Accessibility", "App and Local Data"])
         )
+        let startupCard = try XCTUnwrap(cards.first { $0.accessibilityLabel() == "Startup" })
+        let agentSourceCard = try XCTUnwrap(cards.first { $0.accessibilityLabel() == "Agent Source" })
+        XCTAssertEqual(agentSourceCard.frame.width, startupCard.frame.width, accuracy: 1)
         for card in cards {
             let title = try XCTUnwrap(
                 Self.descendants(of: card).compactMap { $0 as? NSTextField }.first {
@@ -541,6 +544,9 @@ final class SettingsWindowControllerTests: XCTestCase {
         XCTAssertTrue(Self.descendants(of: window.contentView).compactMap { $0 as? NSButton }.contains {
             $0.title == "Start Statelet when I log in"
         })
+        XCTAssertTrue(Self.descendants(of: window.contentView).compactMap { $0 as? NSSegmentedControl }.contains {
+            $0.accessibilityLabel() == "Agent Source"
+        })
         XCTAssertFalse(Self.descendants(of: window.contentView).compactMap { $0 as? NSButton }.contains {
             $0.title == "Reveal Logs"
         })
@@ -555,6 +561,38 @@ final class SettingsWindowControllerTests: XCTestCase {
         XCTAssertTrue(Self.descendants(of: window.contentView).compactMap { $0 as? NSTextField }.contains {
             $0.stringValue == "Diagnostics & Repair"
         })
+    }
+
+    func testAgentSourceControlReflectsSnapshotAndPublishesSelection() throws {
+        let controller = SettingsWindowController()
+        let window = try XCTUnwrap(controller.window)
+        controller.update(snapshot: SettingsSnapshot(
+            mediaMap: try MediaMap(),
+            mediaMapURL: URL(fileURLWithPath: "/tmp/media-map.json"),
+            publisherSummary: "Test",
+            reduceMotion: false,
+            agentSourceMode: .grok
+        ))
+        var selected: AgentSourceMode?
+        controller.onAgentSourceChange = { selected = $0 }
+        controller.show()
+        Self.pumpMainRunLoop(for: 0.1)
+        defer { window.close() }
+
+        let sidebar = try Self.settingsSidebar(in: window)
+        try Self.selectSidebar(in: sidebar, label: "General")
+        let control = try XCTUnwrap(
+            Self.descendants(of: window.contentView).compactMap { $0 as? NSSegmentedControl }.first {
+                $0.accessibilityLabel() == "Agent Source"
+            }
+        )
+        XCTAssertEqual(control.selectedSegment, 2)
+        XCTAssertEqual(control.label(forSegment: 0), "Combined")
+        XCTAssertEqual(control.label(forSegment: 1), "Codex")
+        XCTAssertEqual(control.label(forSegment: 2), "Grok")
+        control.selectedSegment = 1
+        NSApp.sendAction(try XCTUnwrap(control.action), to: control.target, from: control)
+        XCTAssertEqual(selected, .codex)
     }
 
     @MainActor

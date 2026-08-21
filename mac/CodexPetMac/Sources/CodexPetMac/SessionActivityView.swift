@@ -229,7 +229,7 @@ final class SessionActivityView: NSView {
         ])
         setAccessibilityElement(true)
         setAccessibilityRole(.group)
-        setAccessibilityLabel("Codex session activity")
+        setAccessibilityLabel("Agent session activity")
         applyAppearance(panelAppearance)
         rebuild()
     }
@@ -466,11 +466,11 @@ final class SessionActivityView: NSView {
     }
 
     private func addActiveRow(_ item: SessionActivityItem, ordinal: Int) {
-        let title = titles[item.id]
-        let genericText = "\(item.state.rawValue.capitalized) · \(item.category.displayName) #\(ordinal) · \(relativeAge(item.startedAt))"
+        let title = item.provider == .codex ? titles[item.id] : nil
+        let genericText = "\(item.provider.displayName) · \(item.state.rawValue.capitalized) · \(item.category.displayName) #\(ordinal) · \(relativeAge(item.startedAt))"
         let label = NSTextField(
             labelWithString: title.map {
-                "\($0) · \(item.state.rawValue.capitalized) · \(item.category.displayName) · \(relativeAge(item.startedAt))"
+                "\(item.provider.displayName) · \($0) · \(item.state.rawValue.capitalized) · \(item.category.displayName) · \(relativeAge(item.startedAt))"
             } ?? genericText
         )
         label.font = .systemFont(ofSize: 13, weight: .medium)
@@ -482,18 +482,18 @@ final class SessionActivityView: NSView {
         label.setAccessibilityElement(true)
         label.setAccessibilityRole(.staticText)
         label.setAccessibilityLabel(
-            title.map { "\($0), active \(item.state.rawValue) session \(ordinal)" }
-                ?? "Active \(item.state.rawValue) session \(ordinal)"
+            title.map { "\(item.provider.displayName), \($0), active \(item.state.rawValue) session \(ordinal)" }
+                ?? "\(item.provider.displayName), active \(item.state.rawValue) session \(ordinal)"
         )
         label.setAccessibilityValue("\(item.category.displayName), started \(relativeAge(item.startedAt))")
         label.setAccessibilityHelp(
-            openableIDs.contains(item.id)
+            item.provider == .codex && openableIDs.contains(item.id)
                 ? "Use Open in Codex to show this session in Codex Desktop."
-                : "Informational only. No verified Codex Desktop target is available."
+                : "Informational only. No verified Codex Desktop target is available for this \(item.provider.displayName) session."
         )
         let dotColor = resolvedActivityColor(item.state.sessionActivityColor)
         var views: [NSView] = [activityDot(color: dotColor), label]
-        if openableIDs.contains(item.id) {
+        if item.provider == .codex && openableIDs.contains(item.id) {
             views.append(openButton(for: item.id, accessibility: "Open active session in Codex"))
         }
         let row = NSStackView(views: views)
@@ -505,11 +505,11 @@ final class SessionActivityView: NSView {
 
     private func addCompletedRow(_ item: SessionActivityItem, ordinal: Int) {
         let completionTime = item.completedAt ?? item.eventAt
-        let title = titles[item.id]
-        let genericText = "Completed · \(item.category.displayName) #\(ordinal) · \(relativeAge(completionTime)) · Unread"
+        let title = item.provider == .codex ? titles[item.id] : nil
+        let genericText = "\(item.provider.displayName) · Completed · \(item.category.displayName) #\(ordinal) · \(relativeAge(completionTime)) · Unread"
         let label = NSTextField(
             labelWithString: title.map {
-                "\($0) · Completed · \(item.category.displayName) · \(relativeAge(completionTime)) · Unread"
+                "\(item.provider.displayName) · \($0) · Completed · \(item.category.displayName) · \(relativeAge(completionTime)) · Unread"
             } ?? genericText
         )
         label.font = .systemFont(ofSize: 13, weight: .medium)
@@ -521,12 +521,12 @@ final class SessionActivityView: NSView {
         label.setAccessibilityElement(true)
         label.setAccessibilityRole(.staticText)
         label.setAccessibilityLabel(
-            title.map { "\($0), completed unread session \(ordinal)" }
-                ?? "Completed unread session \(ordinal)"
+            title.map { "\(item.provider.displayName), \($0), completed unread session \(ordinal)" }
+                ?? "\(item.provider.displayName), completed unread session \(ordinal)"
         )
         label.setAccessibilityValue("\(item.category.displayName), completed \(relativeAge(completionTime))")
         label.setAccessibilityHelp(
-            openableIDs.contains(item.id)
+            item.provider == .codex && openableIDs.contains(item.id)
                 ? "Use Open in Codex to show this session, or Mark as read to acknowledge it."
                 : "Informational only. Use Mark as read to acknowledge this item."
         )
@@ -539,7 +539,7 @@ final class SessionActivityView: NSView {
 
         let dotColor = resolvedActivityColor(.systemGreen)
         var views: [NSView] = [activityDot(color: dotColor), label]
-        if openableIDs.contains(item.id) {
+        if item.provider == .codex && openableIDs.contains(item.id) {
             views.append(openButton(for: item.id, accessibility: "Open completed session in Codex"))
         }
         views.append(acknowledge)
@@ -549,7 +549,7 @@ final class SessionActivityView: NSView {
         row.spacing = 6
         row.setAccessibilityElement(true)
         row.setAccessibilityRole(.group)
-        row.setAccessibilityLabel("Completed unread session \(ordinal)")
+        row.setAccessibilityLabel("\(item.provider.displayName) completed unread session \(ordinal)")
         stack.addArrangedSubview(row)
     }
 
