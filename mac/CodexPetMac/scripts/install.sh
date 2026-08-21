@@ -123,6 +123,26 @@ raise SystemExit(0 if stat.S_ISDIR(status.st_mode) and not stat.S_ISLNK(status.s
 PY
 }
 
+validate_private_grok_configuration() {
+  "$python_bin" - "$home_dir/.grok" "$grok_hooks_dir" <<'PY'
+import os, stat, sys
+from pathlib import Path
+
+for raw_path in sys.argv[1:]:
+    path = Path(raw_path)
+    if not os.path.lexists(path):
+        continue
+    status = path.lstat()
+    if (
+        not stat.S_ISDIR(status.st_mode)
+        or stat.S_ISLNK(status.st_mode)
+        or status.st_uid != os.getuid()
+        or stat.S_IMODE(status.st_mode) != 0o700
+    ):
+        raise SystemExit(1)
+PY
+}
+
 validate_support_parent_chain() {
   "$python_bin" - "$support_dir" "$1" <<'PY'
 import os, stat, sys
@@ -357,6 +377,15 @@ def rename_exclusive(source_parent, source_name, target_parent, target_name):
         error = ctypes.get_errno()
         raise OSError(error, "exclusive rename failed")
 
+def rename_swap(source_parent, source_name, target_parent, target_name):
+    libc = ctypes.CDLL(None, use_errno=True)
+    function = libc.renameatx_np
+    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    if function(source_parent, os.fsencode(source_name), target_parent, os.fsencode(target_name), 0x00000002) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, "atomic exchange failed")
+
 def entry_digests_and_identity(parent_fd, name, exclusion_sets):
     descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
     status = os.fstat(descriptor)
@@ -432,6 +461,26 @@ def entry_digest_and_identity(parent_fd, name, excluded=()):
 def entry_digest(parent_fd, name):
     return entry_digest_and_identity(parent_fd, name)[0]
 
+def attested_file_digest_and_entry(parent_fd, name):
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+    fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode):
+            raise ValueError("attested hook source is not a regular file")
+        digest = hashlib.sha256(b"F\0.\0")
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        final = os.fstat(descriptor)
+        if any(getattr(status, field) != getattr(final, field) for field in fields):
+            raise ValueError("attested hook source changed while reading")
+    finally:
+        os.close(descriptor)
+    rebound = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if any(getattr(final, field) != getattr(rebound, field) for field in fields):
+        raise ValueError("attested hook source changed after reading")
+    return digest.hexdigest(), [getattr(final, field) for field in fields]
+
 def remove_entry(parent_fd, name):
     status = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     if stat.S_ISDIR(status.st_mode):
@@ -449,8 +498,68 @@ def open_parent(path, base):
     relative = relative_to(path, base)
     return open_directory_chain(base, relative.parts[:-1]), relative.name
 
+def open_attested_private_directories(attestations):
+    fields = ("st_dev", "st_ino", "st_mode", "st_uid")
+    opened = []
+    try:
+        for attestation in attestations:
+            if attestation.get("exists") is not True:
+                raise ValueError("private directory attestation is absent")
+            directory = Path(attestation["path"])
+            relative = relative_to(directory, home)
+            descriptor = open_directory_chain(home, relative.parts)
+            status = os.fstat(descriptor)
+            current = [getattr(status, field) for field in fields]
+            if stat.S_IMODE(status.st_mode) != 0o700 or current != attestation.get("entry"):
+                os.close(descriptor)
+                raise ValueError("private hook directory changed")
+            opened.append((descriptor, attestation))
+        return opened
+    except Exception:
+        for descriptor, _ in opened:
+            os.close(descriptor)
+        raise
+
+def validate_attested_private_directories(opened):
+    fields = ("st_dev", "st_ino", "st_mode", "st_uid")
+    for descriptor, attestation in opened:
+        status = os.fstat(descriptor)
+        current = [getattr(status, field) for field in fields]
+        if stat.S_IMODE(status.st_mode) != 0o700 or current != attestation.get("entry"):
+            raise ValueError("private hook directory changed")
+        directory = Path(attestation["path"])
+        rebound = open_directory_chain(home, relative_to(directory, home).parts)
+        try:
+            rebound_status = os.fstat(rebound)
+            rebound_entry = [getattr(rebound_status, field) for field in fields]
+            if stat.S_IMODE(rebound_status.st_mode) != 0o700 or rebound_entry != attestation.get("entry"):
+                raise ValueError("private hook directory path changed")
+        finally:
+            os.close(rebound)
+
+def close_attested_private_directories(opened):
+    for descriptor, _ in opened:
+        os.close(descriptor)
+
 def entry_identity(status):
     return [status.st_dev, status.st_ino]
+
+def validate_private_directory_attestations(data):
+    fields = ("st_dev", "st_ino", "st_mode", "st_uid")
+    for operation in data.get("operations", []):
+        for attestation in operation.get("private_directories", []):
+            directory = Path(attestation["path"])
+            relative_to(directory, home)
+            status = directory.lstat()
+            current = [getattr(status, field) for field in fields]
+            if (
+                not stat.S_ISDIR(status.st_mode)
+                or stat.S_ISLNK(status.st_mode)
+                or stat.S_IMODE(status.st_mode) != 0o700
+                or status.st_uid != os.getuid()
+                or current != attestation.get("entry")
+            ):
+                raise ValueError("private hook directory changed")
 
 def is_within(path, parent):
     try:
@@ -462,6 +571,8 @@ def is_within(path, parent):
 def active_install_indices(operations):
     active = []
     for index, operation in enumerate(operations):
+        if operation.get("adopted") is True:
+            continue
         kind = operation.get("kind")
         if kind not in {"backup", "install"}:
             continue
@@ -587,6 +698,7 @@ def validate_handed_off_install(operation):
         os.close(parent)
 
 def validate_operation_contract(data, allowed_targets):
+    adopted = []
     for operation in data.get("operations", []):
         if not isinstance(operation, dict):
             raise ValueError("transaction operation is invalid")
@@ -595,6 +707,10 @@ def validate_operation_contract(data, allowed_targets):
         target = Path(operation.get("target", ""))
         if kind not in {"backup", "install", "mkdir", "retain"} or not target.is_absolute() or str(target) not in allowed_targets:
             raise ValueError("transaction operation is invalid")
+        if "adopted" in operation:
+            if operation.get("adopted") is not True or kind not in {"backup", "install"}:
+                raise ValueError("transaction adoption is invalid")
+            adopted.append(operation)
         if kind in {"mkdir", "retain"}:
             if operation.get("source") != "":
                 raise ValueError("transaction operation is invalid")
@@ -608,6 +724,28 @@ def validate_operation_contract(data, allowed_targets):
             source.relative_to(expected_source_root)
         except ValueError as error:
             raise ValueError("transaction operation is invalid") from error
+    if adopted:
+        grok_target = home / ".grok/hooks/statelet.json"
+        adoption = data.get("grok_adoption")
+        adopted_indices = [index for index, operation in enumerate(data["operations"]) if operation.get("adopted") is True]
+        if (
+            len(adopted) != 2
+            or [operation.get("kind") for operation in adopted] != ["backup", "install"]
+            or any(Path(operation.get("target", "")) != grok_target for operation in adopted)
+            or Path(adopted[0].get("source", "")) != root / "backup/grok-hooks-original.json"
+            or Path(adopted[1].get("source", "")) != root / "stage/grok-statelet-quiesced.json"
+            or not isinstance(adoption, dict)
+            or adoption.get("phase") != "applied"
+            or adoption.get("rollback_state") not in {"merged", "absent"}
+            or adoption.get("pair") != adopted_indices
+            or Path(adoption.get("target", "")) != grok_target
+            or Path(adoption.get("source", "")) != root / "stage/grok-rollback.json"
+            or not isinstance(adoption.get("digest"), str)
+            or len(adoption["digest"]) != 64
+        ):
+            raise ValueError("transaction adoption is invalid")
+    elif "grok_adoption" in data:
+        raise ValueError("transaction adoption is invalid")
 
 def validate_retain(operation):
     parent, name = open_parent(Path(operation["target"]), home)
@@ -818,6 +956,8 @@ def validate_file_transaction(data, handed_off_targets=()):
     replayed_installs = []
     displaced_installs = set()
     for index, operation in enumerate(operations):
+        if operation.get("adopted") is True:
+            continue
         kind = operation.get("kind")
         target = Path(operation.get("target", ""))
         if kind == "backup":
@@ -851,6 +991,8 @@ def validate_file_transaction(data, handed_off_targets=()):
         raise ValueError("install ownership graph is invalid")
 
     for operation_index, operation in enumerate(operations):
+        if operation.get("adopted") is True:
+            continue
         kind = operation.get("kind")
         if kind in {"install", "backup"}:
             source_parent, source_name = open_parent(Path(operation["source"]), root)
@@ -1014,6 +1156,118 @@ def load():
         raise ValueError("transaction journal identity is invalid")
     return data
 
+def reconcile_grok_adoption(data):
+    adoption = data.get("grok_adoption")
+    if adoption is None:
+        return False
+    target = home / ".grok/hooks/statelet.json"
+    source = root / "stage/grok-rollback.json"
+    if (
+        data.get("state") != "active"
+        or adoption.get("phase") not in {"prepared", "applied"}
+        or adoption.get("rollback_state") not in {"merged", "absent"}
+        or Path(adoption.get("target", "")) != target
+        or Path(adoption.get("source", "")) != source
+        or not isinstance(adoption.get("digest"), str)
+        or len(adoption["digest"]) != 64
+        or not isinstance(adoption.get("pair"), list)
+        or len(adoption["pair"]) != 2
+    ):
+        raise ValueError("Grok adoption state is invalid")
+    backup_index, install_index = adoption["pair"]
+    if (
+        not all(type(index) is int and 0 <= index < len(data["operations"]) for index in adoption["pair"])
+        or [data["operations"][backup_index].get("kind"), data["operations"][install_index].get("kind")] != ["backup", "install"]
+        or any(data["operations"][index].get("target") != str(target) for index in adoption["pair"])
+    ):
+        raise ValueError("Grok adoption pair is invalid")
+    if adoption["phase"] == "prepared":
+        attestation = adoption.get("attestation")
+        if not isinstance(attestation, dict) or type(attestation.get("exists")) is not bool:
+            raise ValueError("Grok adoption attestation is invalid")
+        if adoption["rollback_state"] == "absent":
+            private_fds = open_attested_private_directories(attestation.get("private_directories", []))
+            try:
+                validate_attested_private_directories(private_fds)
+                if attestation.get("exists") is not False or os.path.lexists(target):
+                    raise ValueError("Grok adoption deletion changed")
+            finally:
+                close_attested_private_directories(private_fds)
+            data["operations"][backup_index]["adopted"] = True
+            data["operations"][install_index]["adopted"] = True
+            adoption["phase"] = "applied"
+            write(data)
+            return True
+        private_fds = open_attested_private_directories(attestation.get("private_directories", []))
+        source_parent, source_name = open_parent(source, root)
+        target_parent, target_name = open_parent(target, home)
+        try:
+            validate_attested_private_directories(private_fds)
+            try:
+                source_digest = entry_digest(source_parent, source_name)
+            except FileNotFoundError:
+                source_digest = None
+            try:
+                target_digest, _ = entry_digest_and_identity(target_parent, target_name)
+            except FileNotFoundError:
+                target_digest = None
+            if source_digest == adoption["digest"]:
+                gate = os.environ.get("STATELET_INSTALL_TEST_GROK_ADOPTION_APPLY_GATE")
+                if gate:
+                    gate_path = Path(gate)
+                    relative_to(gate_path, home)
+                    Path(str(gate_path) + ".ready").touch()
+                    for _ in range(1500):
+                        if Path(str(gate_path) + ".release").exists():
+                            break
+                        time.sleep(0.01)
+                    else:
+                        raise ValueError("Grok adoption apply gate timed out")
+                if entry_digest(source_parent, source_name) != adoption["digest"]:
+                    raise ValueError("Grok adoption baseline changed before application")
+                if attestation["exists"] is True:
+                    rename_swap(source_parent, source_name, target_parent, target_name)
+                    os.fsync(source_parent); os.fsync(target_parent)
+                    displaced_digest, displaced_entry = attested_file_digest_and_entry(source_parent, source_name)
+                    if displaced_digest != attestation.get("digest") or displaced_entry[:6] != attestation.get("entry", [])[:6]:
+                        rename_swap(source_parent, source_name, target_parent, target_name)
+                        os.fsync(source_parent); os.fsync(target_parent)
+                        raise ValueError("Grok adoption target changed")
+                else:
+                    rename_exclusive(source_parent, source_name, target_parent, target_name)
+                    os.fsync(source_parent); os.fsync(target_parent)
+                applied_digest = entry_digest(target_parent, target_name)
+                if applied_digest != adoption["digest"]:
+                    if attestation["exists"] is True:
+                        rename_swap(source_parent, source_name, target_parent, target_name)
+                    else:
+                        rename_exclusive(target_parent, target_name, source_parent, source_name)
+                    os.fsync(source_parent); os.fsync(target_parent)
+                    raise ValueError("Grok adoption baseline changed during application")
+                if os.environ.get("STATELET_INSTALL_CRASH_AT") == "after-grok-adoption-applied":
+                    os.kill(os.getpid(), 9)
+                target_digest = applied_digest
+            elif target_digest == adoption["digest"]:
+                if attestation["exists"] is True:
+                    displaced_digest, displaced_entry = attested_file_digest_and_entry(source_parent, source_name)
+                    if displaced_digest != attestation.get("digest") or displaced_entry[:6] != attestation.get("entry", [])[:6]:
+                        raise ValueError("Grok adoption displaced target changed")
+                elif source_digest is not None:
+                    raise ValueError("Grok adoption deletion is ambiguous")
+            else:
+                raise ValueError("Grok adoption orientation is ambiguous")
+            if target_digest != adoption["digest"]:
+                raise ValueError("Grok adoption application is ambiguous")
+            validate_attested_private_directories(private_fds)
+        finally:
+            close_attested_private_directories(private_fds)
+            os.close(source_parent); os.close(target_parent)
+        data["operations"][backup_index]["adopted"] = True
+        data["operations"][install_index]["adopted"] = True
+        adoption["phase"] = "applied"
+        write(data)
+    return True
+
 if command == "init":
     root.mkdir(mode=0o700)
     sync_directory(root.parent)
@@ -1028,7 +1282,10 @@ elif command == "record":
     data["operations"].append({"kind": kind, "source": source, "target": target, "digest": expected})
     write(data)
 elif command == "install-move":
-    source, target, expected = map(str, args)
+    if len(args) not in {3, 4}:
+        raise ValueError("invalid install arguments")
+    source, target, expected = map(str, args[:3])
+    expected_attestation = json.loads(args[3]) if len(args) == 4 else None
     data = load()
     if data["state"] != "active":
         raise ValueError("inactive transaction")
@@ -1039,16 +1296,20 @@ elif command == "install-move":
     ancestor_indices = prepare_install_ancestor_mutations(data, target_path)
     source_parent = open_directory_chain(root, source_relative.parts[:-1])
     target_parent = open_directory_chain(home, target_relative.parts[:-1])
+    private_directories = expected_attestation.get("private_directories", []) if expected_attestation else []
+    private_directory_fds = open_attested_private_directories(private_directories) if private_directories else []
     try:
         if entry_digest(source_parent, source_relative.name) != expected:
             raise ValueError("staged digest changed")
+        validate_attested_private_directories(private_directory_fds)
         source_identity = os.fstat(source_parent)
         target_identity = os.fstat(target_parent)
         data["operations"].append({"kind": "install", "source": source, "target": target, "digest": expected,
                                    "source_parent": [source_identity.st_dev, source_identity.st_ino],
                                    "target_parent": [target_identity.st_dev, target_identity.st_ino],
                                    "target_entry": None, "owned_digest": expected,
-                                   "owned_exclusions": []})
+                                   "owned_exclusions": [],
+                                   "private_directories": expected_attestation.get("private_directories", []) if expected_attestation else []})
         write(data)
         gate = os.environ.get("STATELET_INSTALL_TEST_PARENT_FD_GATE")
         if gate:
@@ -1069,11 +1330,10 @@ elif command == "install-move":
             try:
                 reopened_identity = os.fstat(reopened)
                 if [reopened_identity.st_dev, reopened_identity.st_ino] != data["operations"][-1]["target_parent"]:
-                    rename_exclusive(target_parent, target_relative.name, source_parent, source_relative.name)
-                    os.fsync(target_parent); os.fsync(source_parent)
                     raise ValueError("destination parent changed")
             finally:
                 os.close(reopened)
+            validate_attested_private_directories(private_directory_fds)
         except Exception:
             if os.path.exists(source_path):
                 raise
@@ -1085,32 +1345,188 @@ elif command == "install-move":
         validate_install_ancestor_mutations(data, ancestor_indices)
         write(data)
     finally:
+        close_attested_private_directories(private_directory_fds)
         os.close(source_parent)
         os.close(target_parent)
 elif command == "backup-move":
-    target, source, expected = map(str, args)
+    if len(args) not in {3, 4}:
+        raise ValueError("invalid backup arguments")
+    target, source, expected = map(str, args[:3])
+    expected_attestation = json.loads(args[3]) if len(args) == 4 else None
     data = load()
     target_path, source_path = Path(target), Path(source)
     ancestor_indices = prepare_install_ancestor_mutations(data, target_path)
     target_parent, target_name = open_parent(target_path, home)
     source_parent, source_name = open_parent(source_path, root)
+    private_directories = expected_attestation.get("private_directories", []) if expected_attestation else []
+    private_directory_fds = open_attested_private_directories(private_directories) if private_directories else []
     try:
-        if entry_digest(target_parent, target_name) != expected:
+        if expected_attestation is not None:
+            current_digest, current_entry = attested_file_digest_and_entry(target_parent, target_name)
+            if (
+                expected_attestation.get("exists") is not True
+                or current_entry != expected_attestation.get("entry")
+                or current_digest != expected
+            ):
+                raise ValueError("backup source identity changed")
+            validate_attested_private_directories(private_directory_fds)
+        elif entry_digest(target_parent, target_name) != expected:
             raise ValueError("backup source changed")
         source_identity, target_identity = os.fstat(source_parent), os.fstat(target_parent)
         data["operations"].append({"kind": "backup", "source": source, "target": target, "digest": expected,
                                    "source_parent": [source_identity.st_dev, source_identity.st_ino],
                                    "target_parent": [target_identity.st_dev, target_identity.st_ino],
-                                   "source_entry": None})
+                                   "source_entry": None,
+                                   "private_directories": expected_attestation.get("private_directories", []) if expected_attestation else []})
         write(data)
+        gate = os.environ.get("STATELET_INSTALL_TEST_GROK_BACKUP_FD_GATE") if expected_attestation else None
+        if gate:
+            gate_path = Path(gate)
+            relative_to(gate_path, home)
+            Path(str(gate_path) + ".ready").touch()
+            for _ in range(1500):
+                if Path(str(gate_path) + ".release").exists():
+                    break
+                time.sleep(0.01)
+            else:
+                raise ValueError("Grok backup descriptor test gate timeout")
         rename_exclusive(target_parent, target_name, source_parent, source_name)
         os.fsync(target_parent); os.fsync(source_parent)
+        try:
+            validate_attested_private_directories(private_directory_fds)
+        except Exception:
+            rename_exclusive(source_parent, source_name, target_parent, target_name)
+            os.fsync(target_parent); os.fsync(source_parent)
+            data["operations"].pop()
+            write(data)
+            raise
         saved = os.stat(source_name, dir_fd=source_parent, follow_symlinks=False)
         data["operations"][-1]["source_entry"] = entry_identity(saved)
         validate_install_ancestor_mutations(data, ancestor_indices)
         write(data)
     finally:
+        close_attested_private_directories(private_directory_fds)
         os.close(target_parent); os.close(source_parent)
+elif command == "validate-hook-attestation":
+    target, serialized = args
+    data = load()
+    if data["state"] != "active":
+        raise ValueError("inactive transaction")
+    target_path = Path(target)
+    relative_to(target_path, home)
+    attestation = json.loads(serialized)
+    if attestation.get("exists") is not False or os.path.lexists(target_path):
+        raise ValueError("hook destination changed")
+    directory_fields = ("st_dev", "st_ino", "st_mode", "st_uid")
+    for directory_attestation in attestation.get("private_directories", []):
+        directory = Path(directory_attestation["path"])
+        relative_to(directory, home)
+        if directory_attestation.get("exists") is False:
+            if os.path.lexists(directory):
+                raise ValueError("private hook directory changed")
+            continue
+        directory_status = directory.lstat()
+        current_directory = [getattr(directory_status, field) for field in directory_fields]
+        if (
+            not stat.S_ISDIR(directory_status.st_mode)
+            or stat.S_ISLNK(directory_status.st_mode)
+            or stat.S_IMODE(directory_status.st_mode) != 0o700
+            or directory_status.st_uid != os.getuid()
+            or current_directory != directory_attestation.get("entry")
+        ):
+            raise ValueError("private hook directory changed")
+elif command == "adopt-hook-edit":
+    target, staged, expected, serialized = args
+    data = load()
+    if data["state"] != "active":
+        raise ValueError("inactive transaction")
+    if reconcile_grok_adoption(data):
+        print("adopted")
+        raise SystemExit(0)
+    target_path = Path(target)
+    staged_path = Path(staged)
+    relative_to(target_path, home)
+    relative_to(staged_path, root / "stage")
+    attestation = json.loads(serialized)
+    if type(attestation.get("exists")) is not bool:
+        raise ValueError("hook edit attestation is invalid")
+    matching = [
+        (index, operation)
+        for index, operation in enumerate(data["operations"])
+        if operation.get("target") == target
+        and operation.get("kind") in {"backup", "install"}
+        and operation.get("adopted") is not True
+    ]
+    initial_backup = [item for item in matching if item[1].get("kind") == "backup" and Path(item[1].get("source", "")) == root / "backup/grok-hooks-original.json"]
+    initial_install = [item for item in matching if item[1].get("kind") == "install" and Path(item[1].get("source", "")) == root / "stage/grok-statelet-quiesced.json"]
+    if len(initial_backup) != 1 or len(initial_install) != 1 or initial_backup[0][0] >= initial_install[0][0]:
+        raise ValueError("hook adoption history is invalid")
+    backup_index, _ = initial_backup[0]
+    install_index, install_operation = initial_install[0]
+    if any(index > install_index for index, _ in matching):
+        print("not-applicable")
+        raise SystemExit(0)
+    private_directories = attestation.get("private_directories", [])
+    private_directory_fds = open_attested_private_directories(private_directories) if private_directories else []
+    try:
+        validate_attested_private_directories(private_directory_fds)
+        if attestation["exists"] is True:
+            parent, name = open_parent(target_path, home)
+            try:
+                digest_value, current_entry = attested_file_digest_and_entry(parent, name)
+            finally:
+                os.close(parent)
+            if digest_value != attestation.get("digest") or current_entry != attestation.get("entry"):
+                raise ValueError("hook edit changed during adoption")
+        else:
+            if os.path.lexists(target_path):
+                raise ValueError("deleted hook edit changed during adoption")
+            digest_value, current_entry = None, None
+    finally:
+        close_attested_private_directories(private_directory_fds)
+    if (
+        attestation["exists"] is False
+        or digest_value != install_operation.get("owned_digest", install_operation.get("digest"))
+        or current_entry[:2] != install_operation.get("target_entry")
+    ):
+        if attestation["exists"] is False:
+            data["grok_adoption"] = {
+                "phase": "prepared",
+                "rollback_state": "absent",
+                "target": str(target_path),
+                "source": str(staged_path),
+                "digest": expected,
+                "pair": [backup_index, install_index],
+                "attestation": attestation,
+            }
+            write(data)
+            if os.environ.get("STATELET_INSTALL_CRASH_AT") == "after-grok-adoption-prepared":
+                os.kill(os.getpid(), 9)
+            reconcile_grok_adoption(data)
+            print("adopted")
+            raise SystemExit(0)
+        staged_parent, staged_name = open_parent(staged_path, root)
+        try:
+            if entry_digest(staged_parent, staged_name) != expected:
+                raise ValueError("Grok adoption baseline is invalid")
+        finally:
+            os.close(staged_parent)
+        data["grok_adoption"] = {
+            "phase": "prepared",
+            "rollback_state": "merged",
+            "target": str(target_path),
+            "source": str(staged_path),
+            "digest": expected,
+            "pair": [backup_index, install_index],
+            "attestation": attestation,
+        }
+        write(data)
+        if os.environ.get("STATELET_INSTALL_CRASH_AT") == "after-grok-adoption-prepared":
+            os.kill(os.getpid(), 9)
+        reconcile_grok_adoption(data)
+        print("adopted")
+    else:
+        print("unchanged")
 elif command == "mkdir-make":
     target, mode = args
     data = load()
@@ -1224,6 +1640,7 @@ elif command == "files-commit":
     validate_required_publication(data, args, support)
     validate_backup_coverage(data)
     validate_launch_backup_attestations(data)
+    validate_private_directory_attestations(data)
     validate_file_transaction(data)
     data["handoff"] = record_handoff(support)
     record_seal(data)
@@ -1239,11 +1656,14 @@ elif command == "commit":
     validate_operation_contract(data, allowed_targets)
     validate_required_publication(data, args, support)
     validate_backup_coverage(data)
+    validate_private_directory_attestations(data)
     validate_file_transaction(data, validate_handoff_contract(data, support))
     data["state"] = "committed"
     write(data)
 elif command == "recover":
     data = load()
+    if data.get("state") == "active":
+        reconcile_grok_adoption(data)
     root_prefix = str(root) + os.sep
     allowed_exact = set(args[:-1])
     support = args[-1]
@@ -1258,6 +1678,7 @@ elif command == "recover":
     if data["state"] in {"files-committed", "committed"}:
         validate_required_publication(data, args, Path(support))
         validate_backup_coverage(data)
+        validate_private_directory_attestations(data)
     if data["state"] == "files-committed":
         validate_file_transaction(data, validate_handoff_contract(data, Path(support)))
     if data["state"] == "active" and not data.get("files_restored", False):
@@ -1269,6 +1690,8 @@ elif command == "recover":
             expected = operation.get("digest", "")
             if not target.is_absolute() or str(target) not in allowed_exact:
                 raise ValueError(f"transaction target is outside the installer allowlist: {target}")
+            if operation.get("adopted") is True:
+                continue
             if kind == "mkdir":
                 target_parent, target_name = open_parent(target, home)
                 identity = os.fstat(target_parent)
@@ -1483,6 +1906,11 @@ for plist in "$player_plist" "$legacy_player_plist"; do
   fi
 done
 
+validate_private_grok_configuration || {
+  printf 'Refusing non-private Grok hook directories.\n' >&2
+  exit 1
+}
+
 journal_command init
 committed=0
 labels=("$aggregator_label" "$player_label" "$legacy_aggregator_label" "$legacy_player_label")
@@ -1504,6 +1932,9 @@ rollback() {
   local original_status=$?
   trap - EXIT
   if [[ "$committed" -eq 0 ]]; then
+    if type prepare_grok_adoption_for_rollback >/dev/null 2>&1; then
+      prepare_grok_adoption_for_rollback || { printf 'Installation failed and Grok hook rollback preparation was ambiguous.\n' >&2; exit 74; }
+    fi
     if recover_transaction; then
       :
     else
@@ -1521,7 +1952,38 @@ rollback() {
 }
 trap rollback EXIT
 backup_target() { local target="$1" name="$2"; if [[ -e "$target" ]]; then local saved="$backup_root/$name" digest; mkdir -p "$(dirname "$saved")"; digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$target")"; journal_command backup-move "$target" "$saved" "$digest" 2>/dev/null || { printf 'Statelet backup failed safely.\n' >&2; exit 74; }; fi; }
-install_target() { local staged="$1" target="$2" parent digest; parent="$(dirname "$target")"; is_safe_destination_dir "$parent" || { printf 'Installation target parent is unsafe.\n' >&2; exit 74; }; case "$parent" in "$support_dir"|"$support_dir"/*) validate_support_parent_chain "$parent" || { printf 'Installation target parent is unsafe.\n' >&2; exit 74; } ;; esac; digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$staged")"; journal_command install-move "$staged" "$target" "$digest" 2>/dev/null || { printf 'Statelet publication failed safely.\n' >&2; exit 74; }; }
+backup_attested_hook_target() {
+  local target="$1" name="$2" attestation_file="$3"
+  local saved="$backup_root/$name" attestation exists digest
+  attestation="$("$python_bin" -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1], encoding="utf-8")), sort_keys=True, separators=(",", ":")))' "$attestation_file")" || { printf 'Statelet hook attestation is invalid.\n' >&2; exit 74; }
+  exists="$("$python_bin" -c 'import json,sys; print(1 if json.loads(sys.argv[1]).get("exists") is True else 0)' "$attestation")"
+  if [[ "$exists" -eq 0 ]]; then
+    journal_command validate-hook-attestation "$target" "$attestation" 2>/dev/null || { printf 'Grok hook configuration changed during installation.\n' >&2; exit 75; }
+    return 0
+  fi
+  digest="$("$python_bin" -c 'import json,sys; print(json.loads(sys.argv[1])["digest"])' "$attestation")"
+  mkdir -p "$(dirname "$saved")"
+  journal_command backup-move "$target" "$saved" "$digest" "$attestation" 2>/dev/null || { printf 'Grok hook configuration changed during installation.\n' >&2; exit 75; }
+}
+install_target() { local staged="$1" target="$2" attestation_file="${3:-}" parent digest attestation=""; parent="$(dirname "$target")"; is_safe_destination_dir "$parent" || { printf 'Installation target parent is unsafe.\n' >&2; exit 74; }; case "$parent" in "$support_dir"|"$support_dir"/*) validate_support_parent_chain "$parent" || { printf 'Installation target parent is unsafe.\n' >&2; exit 74; } ;; esac; digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$staged")"; if [[ -n "$attestation_file" ]]; then attestation="$("$python_bin" -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1], encoding="utf-8")), sort_keys=True, separators=(",", ":")))' "$attestation_file")"; journal_command install-move "$staged" "$target" "$digest" "$attestation" 2>/dev/null; else journal_command install-move "$staged" "$target" "$digest" 2>/dev/null; fi || { printf 'Statelet publication failed safely.\n' >&2; exit 74; }; }
+ensure_dir() { if [[ -e "$1" || -L "$1" ]]; then is_safe_destination_dir "$1" || { printf 'Refusing unsafe Statelet destination directory.\n' >&2; exit 1; }; else journal_command mkdir-make "$1" 0755 2>/dev/null || { printf 'Statelet directory creation failed safely.\n' >&2; exit 74; }; is_safe_destination_dir "$1" || exit 1; fi; }
+ensure_private_dir() { if [[ -e "$1" || -L "$1" ]]; then is_safe_destination_dir "$1" || { printf 'Refusing unsafe Statelet destination directory.\n' >&2; exit 1; }; else journal_command mkdir-make "$1" 0700 2>/dev/null || { printf 'Statelet directory creation failed safely.\n' >&2; exit 74; }; is_safe_destination_dir "$1" || exit 1; fi; }
+prepare_grok_adoption_for_rollback() {
+  local initial_attestation="${stage_quiesced_grok_attestation:-}" quiesced_stage="${stage_quiesced_grok_hooks:-}"
+  [[ -n "$initial_attestation" && -f "$initial_attestation" && -n "$quiesced_stage" && ! -e "$quiesced_stage" ]] || return 0
+  [[ -f "$transaction_root/journal.json" ]] || return 0
+  [[ "$("$python_bin" -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("state", ""))' "$transaction_root/journal.json")" == "active" ]] || return 0
+  [[ "$("$python_bin" -c 'import json,sys; print(1 if "grok_adoption" in json.load(open(sys.argv[1], encoding="utf-8")) else 0)' "$transaction_root/journal.json")" -eq 0 ]] || return 0
+  [[ "$("$python_bin" -c 'import json,sys; data=json.load(open(sys.argv[1], encoding="utf-8")); print(1 if any(str(op.get("source", "")).endswith(("/backup/grok-hooks-quiesced.json", "/stage/grok-statelet.json")) for op in data.get("operations", [])) else 0)' "$transaction_root/journal.json")" -eq 0 ]] || return 0
+  [[ "$("$python_bin" -c 'import json,sys; print(1 if json.load(open(sys.argv[1], encoding="utf-8")).get("exists") is True else 0)' "$initial_attestation")" -eq 1 ]] || return 0
+  local rollback_stage="$stage_root/grok-rollback.json" live_attestation="$stage_root/grok-live-rollback.attestation.json" serialized digest
+  "$python_bin" "$script_dir/merge_hooks.py" --destination "$grok_hooks_file" --output "$stage_grok_hooks" --python "$python_bin" --hook-script "$python_dir/statelet_hook.py" --provider grok --attestation-output "$live_attestation" --private-directory "$home_dir/.grok" --private-directory "$grok_hooks_dir" >/dev/null 2>&1 || return 1
+  /bin/cp "$stage_grok_hooks" "$rollback_stage" || return 1
+  chmod 0600 "$rollback_stage"
+  digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$rollback_stage")" || return 1
+  serialized="$("$python_bin" -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1], encoding="utf-8")), sort_keys=True, separators=(",", ":")))' "$live_attestation")" || return 1
+  journal_command adopt-hook-edit "$grok_hooks_file" "$rollback_stage" "$digest" "$serialized" >/dev/null 2>&1
+}
 
 stage_app="$stage_root/Statelet.app"
 stage_component="$stage_root/Statelet"
@@ -1539,20 +2001,31 @@ rm -rf "$stage_component/python/__pycache__"
 
 stage_hooks="$stage_root/hooks.json"
 stage_grok_hooks="$stage_root/grok-statelet.json"
+stage_grok_validation="$stage_root/grok-statelet-validation.json"
 if ! "$python_bin" "$script_dir/merge_hooks.py" --destination "$hooks_file" --output "$stage_hooks" --python "$python_bin" --hook-script "$python_dir/statelet_hook.py" 2>/dev/null \
-  || ! "$python_bin" "$script_dir/merge_hooks.py" --destination "$grok_hooks_file" --output "$stage_grok_hooks" --python "$python_bin" --hook-script "$python_dir/statelet_hook.py" --provider grok 2>/dev/null; then
+  || ! "$python_bin" "$script_dir/merge_hooks.py" --destination "$grok_hooks_file" --output "$stage_grok_validation" --python "$python_bin" --hook-script "$python_dir/statelet_hook.py" --provider grok 2>/dev/null; then
   printf 'Refusing unsafe Statelet hook configuration.\n' >&2
   exit 1
 fi
 stage_quiesced_hooks="$stage_root/hooks-quiesced.json"
 stage_quiesced_grok_hooks="$stage_root/grok-statelet-quiesced.json"
+stage_quiesced_grok_attestation="$stage_root/grok-statelet-quiesced.attestation.json"
 if codex_hook_drain_seconds="$("$python_bin" "$script_dir/merge_hooks.py" --destination "$hooks_file" --output "$stage_quiesced_hooks" --quiesce-managed-hooks)" \
-  && grok_hook_drain_seconds="$("$python_bin" "$script_dir/merge_hooks.py" --destination "$grok_hooks_file" --output "$stage_quiesced_grok_hooks" --quiesce-managed-hooks)" \
+  && grok_hook_drain_seconds="$("$python_bin" "$script_dir/merge_hooks.py" --destination "$grok_hooks_file" --output "$stage_quiesced_grok_hooks" --quiesce-managed-hooks --provider grok --attestation-output "$stage_quiesced_grok_attestation" --private-directory "$home_dir/.grok" --private-directory "$grok_hooks_dir")" \
   && hook_drain_seconds="$("$python_bin" -c 'import sys; print(max(float(value) for value in sys.argv[1:]))' "$codex_hook_drain_seconds" "$grok_hook_drain_seconds")"; then
   :
 else
   printf 'Refusing unsupported Statelet hook configuration.\n' >&2
   exit 1
+fi
+
+if [[ -n "${STATELET_INSTALL_TEST_GROK_STAGE_GATE:-}" ]]; then
+  gate="${STATELET_INSTALL_TEST_GROK_STAGE_GATE}"
+  [[ "$gate" = "$home_dir"/* ]] || { printf 'Invalid Grok stage test gate.\n' >&2; exit 2; }
+  : > "$gate.ready"
+  attempt=0
+  while [[ "$attempt" -lt 1500 && ! -e "$gate.release" ]]; do /bin/sleep 0.01; attempt=$((attempt + 1)); done
+  [[ -e "$gate.release" ]] || { printf 'Grok stage test gate timed out.\n' >&2; exit 76; }
 fi
 
 "$python_bin" - "$stage_aggregator_plist" "$stage_player_plist" "$python_bin" "$python_dir" "$support_dir" "$app_dest" "$aggregator_label" "$player_label" "$managed_marker" "$player_run_at_load" <<'PY'
@@ -1604,9 +2077,17 @@ if [[ -e "$hooks_file" ]]; then
   backup_target "$hooks_file" hooks-original.json
   install_target "$stage_quiesced_hooks" "$hooks_file"
 fi
-if [[ -e "$grok_hooks_file" ]]; then
-  backup_target "$grok_hooks_file" grok-hooks-original.json
-  install_target "$stage_quiesced_grok_hooks" "$grok_hooks_file"
+backup_attested_hook_target "$grok_hooks_file" grok-hooks-original.json "$stage_quiesced_grok_attestation"
+if [[ "$("$python_bin" -c 'import json,sys; print(1 if json.load(open(sys.argv[1], encoding="utf-8")).get("exists") is True else 0)' "$stage_quiesced_grok_attestation")" -eq 1 ]]; then
+  install_target "$stage_quiesced_grok_hooks" "$grok_hooks_file" "$stage_quiesced_grok_attestation"
+fi
+if [[ -n "${STATELET_INSTALL_TEST_GROK_QUIESCED_GATE:-}" ]]; then
+  gate="${STATELET_INSTALL_TEST_GROK_QUIESCED_GATE}"
+  [[ "$gate" = "$home_dir"/* ]] || { printf 'Invalid Grok quiesced test gate.\n' >&2; exit 2; }
+  : > "$gate.ready"
+  attempt=0
+  while [[ "$attempt" -lt 1500 && ! -e "$gate.release" ]]; do /bin/sleep 0.01; attempt=$((attempt + 1)); done
+  [[ -e "$gate.release" ]] || { printf 'Grok quiesced test gate timed out.\n' >&2; exit 76; }
 fi
 backup_target "$component_dir" component
 [[ "$legacy_component_is_managed" -eq 0 ]] || backup_target "$legacy_component" legacy/component
@@ -1725,16 +2206,12 @@ for ((index=0; index<${#migration_relatives[@]}; index++)); do
   fi
 done
 
-ensure_dir() { if [[ -e "$1" || -L "$1" ]]; then is_safe_destination_dir "$1" || { printf 'Refusing unsafe Statelet destination directory.\n' >&2; exit 1; }; else journal_command mkdir-make "$1" 0755 2>/dev/null || { printf 'Statelet directory creation failed safely.\n' >&2; exit 74; }; is_safe_destination_dir "$1" || exit 1; fi; }
-ensure_private_dir() { if [[ -e "$1" || -L "$1" ]]; then is_safe_destination_dir "$1" || { printf 'Refusing unsafe Statelet destination directory.\n' >&2; exit 1; }; else journal_command mkdir-make "$1" 0700 2>/dev/null || { printf 'Statelet directory creation failed safely.\n' >&2; exit 74; }; is_safe_destination_dir "$1" || exit 1; fi; }
 ensure_dir "$applications_dir"
 ensure_dir "$home_dir/Library"
 ensure_dir "$home_dir/Library/Application Support"
 ensure_private_dir "$support_dir"
 ensure_dir "$launch_agents_dir"
 ensure_dir "$home_dir/.codex"
-ensure_private_dir "$home_dir/.grok"
-ensure_private_dir "$grok_hooks_dir"
 
 backup_target "$app_dest" app
 [[ "$legacy_app_is_managed" -eq 0 ]] || backup_target "$legacy_app" legacy/app
@@ -1743,7 +2220,6 @@ backup_target "$player_plist" agents/player
 [[ ! -e "$legacy_aggregator_plist" ]] || backup_target "$legacy_aggregator_plist" agents/legacy-aggregator
 [[ ! -e "$legacy_player_plist" ]] || backup_target "$legacy_player_plist" agents/legacy-player
 [[ ! -e "$hooks_file" ]] || backup_target "$hooks_file" hooks-quiesced.json
-[[ ! -e "$grok_hooks_file" ]] || backup_target "$grok_hooks_file" grok-hooks-quiesced.json
 install_target "$stage_app" "$app_dest"
 if [[ "${STATELET_INSTALL_CRASH_AT:-}" == "after-app" ]]; then kill -KILL $$; fi
 if [[ "${STATELET_INSTALL_FAIL_AT:-${CODEX_PET_INSTALL_FAIL_AT:-}}" == "after-app" ]]; then printf 'Injected installation failure after app replacement.\n' >&2; exit 70; fi
@@ -1751,7 +2227,6 @@ install_target "$stage_component" "$component_dir"
 install_target "$stage_aggregator_plist" "$aggregator_plist"
 if [[ "$install_player" -eq 1 ]]; then install_target "$stage_player_plist" "$player_plist"; fi
 install_target "$stage_hooks" "$hooks_file"
-install_target "$stage_grok_hooks" "$grok_hooks_file"
 
 for ((index=0; index<${#migration_relatives[@]}; index++)); do
   [[ "${migration_digests[$index]}" == "__absent__" ]] && continue
@@ -1797,6 +2272,39 @@ for ((index=0; index<${#migration_relatives[@]}; index++)); do
     [[ "$published_digest" == "$expected_digest" ]] || { printf 'Published Statelet data failed migration validation.\n' >&2; exit 75; }
   fi
 done
+ensure_private_dir "$home_dir/.grok"
+ensure_private_dir "$grok_hooks_dir"
+if [[ -n "${STATELET_INSTALL_TEST_GROK_FINAL_STAGE_GATE:-}" ]]; then
+  gate="${STATELET_INSTALL_TEST_GROK_FINAL_STAGE_GATE}"
+  [[ "$gate" = "$home_dir"/* ]] || { printf 'Invalid Grok final-stage test gate.\n' >&2; exit 2; }
+  : > "$gate.ready"
+  attempt=0
+  while [[ "$attempt" -lt 1500 && ! -e "$gate.release" ]]; do /bin/sleep 0.01; attempt=$((attempt + 1)); done
+  [[ -e "$gate.release" ]] || { printf 'Grok final-stage test gate timed out.\n' >&2; exit 76; }
+fi
+# Keep Grok quiesced through component and migration publication. Only now
+# merge the live quiesced file and publish it through one contiguous attested
+# backup/install sequence, so new events always invoke the new component.
+stage_grok_attestation="$stage_root/grok-statelet.attestation.json"
+if ! "$python_bin" "$script_dir/merge_hooks.py" --destination "$grok_hooks_file" --output "$stage_grok_hooks" --python "$python_bin" --hook-script "$python_dir/statelet_hook.py" --provider grok --attestation-output "$stage_grok_attestation" --private-directory "$home_dir/.grok" --private-directory "$grok_hooks_dir" 2>/dev/null; then
+  printf 'Refusing unsafe Grok hook configuration.\n' >&2
+  exit 1
+fi
+stage_grok_attestation_json="$("$python_bin" -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1], encoding="utf-8")), sort_keys=True, separators=(",", ":")))' "$stage_grok_attestation")"
+if [[ "$("$python_bin" -c 'import json,sys; print(1 if json.load(open(sys.argv[1], encoding="utf-8")).get("exists") is True else 0)' "$stage_quiesced_grok_attestation")" -eq 1 ]]; then
+  stage_grok_rollback="$stage_root/grok-rollback.json"
+  /bin/cp "$stage_grok_hooks" "$stage_grok_rollback"
+  chmod 0600 "$stage_grok_rollback"
+  stage_grok_rollback_digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$stage_grok_rollback")"
+  grok_adoption_result="$(journal_command adopt-hook-edit "$grok_hooks_file" "$stage_grok_rollback" "$stage_grok_rollback_digest" "$stage_grok_attestation_json" 2>/dev/null)" || { printf 'Grok hook edit adoption failed safely.\n' >&2; exit 75; }
+  if [[ "$grok_adoption_result" == "adopted" ]]; then
+    "$python_bin" "$script_dir/merge_hooks.py" --destination "$grok_hooks_file" --output "$stage_grok_hooks" --python "$python_bin" --hook-script "$python_dir/statelet_hook.py" --provider grok --attestation-output "$stage_grok_attestation" --private-directory "$home_dir/.grok" --private-directory "$grok_hooks_dir" >/dev/null 2>&1 || { printf 'Grok hook adoption revalidation failed safely.\n' >&2; exit 75; }
+  fi
+fi
+backup_attested_hook_target "$grok_hooks_file" grok-hooks-quiesced.json "$stage_grok_attestation"
+install_target "$stage_grok_hooks" "$grok_hooks_file" "$stage_grok_attestation"
+if [[ "${STATELET_INSTALL_CRASH_AT:-}" == "after-grok-hooks" ]]; then kill -KILL $$; fi
+if [[ "${STATELET_INSTALL_FAIL_AT:-${CODEX_PET_INSTALL_FAIL_AT:-}}" == "after-grok-hooks" ]]; then printf 'Injected installation failure after Grok hook publication.\n' >&2; exit 70; fi
 if [[ "${STATELET_INSTALL_CRASH_AT:-}" == "after-support" ]]; then kill -KILL $$; fi
 if [[ "${STATELET_INSTALL_FAIL_AT:-${CODEX_PET_INSTALL_FAIL_AT:-}}" == "after-support" ]]; then printf 'Injected installation failure after support migration.\n' >&2; exit 70; fi
 

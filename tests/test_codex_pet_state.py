@@ -89,6 +89,14 @@ def write_target_record(
     )
 
 
+def write_agent_source(path: Path, mode: str, permissions: int = 0o600) -> None:
+    path.write_text(
+        json.dumps({"version": 1, "mode": mode}),
+        encoding="utf-8",
+    )
+    path.chmod(permissions)
+
+
 class FakeClock:
     def __init__(self, wall_time: float = 100.0, monotonic_time: float = 10.0):
         self.wall_time = wall_time
@@ -179,7 +187,7 @@ class LifecycleStateTests(unittest.TestCase):
 
     def test_agent_source_mode_filters_without_deleting_provider_records(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
+            directory = Path(temporary).resolve()
             codex_record = record_path(directory, "a")
             grok_record = record_path(directory, "b")
             write_v2_record(
@@ -191,17 +199,11 @@ class LifecycleStateTests(unittest.TestCase):
             source_path = directory / state.AGENT_SOURCE_FILENAME
 
             combined = state.read_session_snapshot(directory, now=100.0)
-            source_path.write_text(
-                json.dumps({"version": 1, "mode": "codex"}), encoding="utf-8"
-            )
+            write_agent_source(source_path, "codex")
             codex_only = state.read_session_snapshot(directory, now=100.0)
-            source_path.write_text(
-                json.dumps({"version": 1, "mode": "grok"}), encoding="utf-8"
-            )
+            write_agent_source(source_path, "grok")
             grok_only = state.read_session_snapshot(directory, now=100.0)
-            source_path.write_text(
-                json.dumps({"version": 1, "mode": "invalid"}), encoding="utf-8"
-            )
+            write_agent_source(source_path, "invalid")
             invalid_falls_back = state.read_session_snapshot(directory, now=100.0)
 
             self.assertCountEqual(
@@ -213,9 +215,142 @@ class LifecycleStateTests(unittest.TestCase):
             self.assertTrue(codex_record.exists())
             self.assertTrue(grok_record.exists())
 
+    def test_agent_source_mode_requires_private_directory_and_selector_metadata(
+        self,
+    ) -> None:
+        unsafe_cases = (
+            "file-0644",
+            "hardlink",
+            "dir-0755",
+            "dir-0777",
+            "oversized",
+            "deeply-nested",
+        )
+        for unsafe_case in unsafe_cases:
+            with (
+                self.subTest(unsafe_case=unsafe_case),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                directory = Path(temporary).resolve()
+                codex_id = "a" * 24
+                grok_id = "b" * 24
+                write_v2_record(
+                    directory / f"{codex_id}.json",
+                    "running",
+                    "UserPromptSubmit",
+                    99.0,
+                    provider="codex",
+                )
+                write_v2_record(
+                    directory / f"{grok_id}.json",
+                    "waiting",
+                    "PermissionRequest",
+                    99.5,
+                    provider="grok",
+                )
+                source_path = directory / state.AGENT_SOURCE_FILENAME
+                write_agent_source(source_path, "grok")
+                if unsafe_case == "file-0644":
+                    source_path.chmod(0o644)
+                elif unsafe_case == "hardlink":
+                    os.link(source_path, directory / "agent-source-hardlink.json")
+                elif unsafe_case == "dir-0755":
+                    directory.chmod(0o755)
+                elif unsafe_case == "dir-0777":
+                    directory.chmod(0o777)
+                elif unsafe_case == "oversized":
+                    source_path.write_text(
+                        json.dumps({"version": 1, "mode": "grok"})
+                        + (" " * state.MAX_AGENT_SOURCE_BYTES),
+                        encoding="utf-8",
+                    )
+                    source_path.chmod(0o600)
+                else:
+                    source_path.write_text(
+                        ("[" * 1_200) + "0" + ("]" * 1_200),
+                        encoding="utf-8",
+                    )
+                    source_path.chmod(0o600)
+
+                activity = state.read_session_activity(directory, now=100.0)
+
+                self.assertEqual(state.read_agent_source_mode(directory), "combined")
+                self.assertEqual(
+                    {item["provider"] for item in activity["active"]},
+                    {"codex", "grok"},
+                )
+                self.assertTrue(source_path.exists())
+
+    def test_agent_source_mode_accepts_private_directory_and_selector(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary).resolve()
+            directory.chmod(0o700)
+            source_path = directory / state.AGENT_SOURCE_FILENAME
+            write_agent_source(source_path, "grok", permissions=0o600)
+
+            self.assertEqual(state.read_agent_source_mode(directory), "grok")
+
+    def test_agent_source_mode_rejects_symlinked_ancestor_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            target_parent = root / "target"
+            directory = target_parent / "sessions"
+            directory.mkdir(parents=True, mode=0o700)
+            codex_id = "a" * 24
+            grok_id = "b" * 24
+            write_v2_record(
+                directory / f"{codex_id}.json",
+                "running",
+                "UserPromptSubmit",
+                99.0,
+                provider="codex",
+            )
+            write_v2_record(
+                directory / f"{grok_id}.json",
+                "waiting",
+                "PermissionRequest",
+                99.5,
+                provider="grok",
+            )
+            source_path = directory / state.AGENT_SOURCE_FILENAME
+            write_agent_source(source_path, "grok")
+            linked_parent = root / "linked"
+            linked_parent.symlink_to(target_parent, target_is_directory=True)
+            linked_directory = linked_parent / "sessions"
+            content_before = source_path.read_bytes()
+            metadata_before = source_path.stat()
+
+            activity = state.read_session_activity(linked_directory, now=100.0)
+
+            metadata_after = source_path.stat()
+            self.assertEqual(state.read_agent_source_mode(linked_directory), "combined")
+            self.assertEqual(
+                {item["provider"] for item in activity["active"]},
+                {"codex", "grok"},
+            )
+            self.assertEqual(source_path.read_bytes(), content_before)
+            self.assertEqual(
+                (
+                    metadata_after.st_dev,
+                    metadata_after.st_ino,
+                    metadata_after.st_mode,
+                    metadata_after.st_nlink,
+                    metadata_after.st_size,
+                    metadata_after.st_mtime_ns,
+                ),
+                (
+                    metadata_before.st_dev,
+                    metadata_before.st_ino,
+                    metadata_before.st_mode,
+                    metadata_before.st_nlink,
+                    metadata_before.st_size,
+                    metadata_before.st_mtime_ns,
+                ),
+            )
+
     def test_hidden_provider_retention_keeps_fresh_and_prunes_expired_records(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
+            directory = Path(temporary).resolve()
             fresh = record_path(directory, "f")
             expired = record_path(directory, "e")
             completed = record_path(directory, "c")
@@ -233,9 +368,7 @@ class LifecycleStateTests(unittest.TestCase):
                 terminal=True,
                 provider="grok",
             )
-            (directory / state.AGENT_SOURCE_FILENAME).write_text(
-                json.dumps({"version": 1, "mode": "codex"}), encoding="utf-8"
-            )
+            write_agent_source(directory / state.AGENT_SOURCE_FILENAME, "codex")
 
             snapshot = state.read_session_snapshot(
                 directory, now=100.0, active_ttl=10.0
@@ -253,7 +386,7 @@ class LifecycleStateTests(unittest.TestCase):
 
     def test_hidden_provider_completed_overflow_keeps_only_newest_bounded_history(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
+            directory = Path(temporary).resolve()
             total = state.MAX_ACTIVITY_ENTRIES + 7
             for index in range(total):
                 write_v2_record(
@@ -264,9 +397,7 @@ class LifecycleStateTests(unittest.TestCase):
                     terminal=True,
                     provider="grok",
                 )
-            (directory / state.AGENT_SOURCE_FILENAME).write_text(
-                json.dumps({"version": 1, "mode": "codex"}), encoding="utf-8"
-            )
+            write_agent_source(directory / state.AGENT_SOURCE_FILENAME, "codex")
 
             activity = state.read_session_activity(directory, now=101.0)
             retained = sorted(directory.glob("[0-9a-f]" * 24 + ".json"))
@@ -575,6 +706,42 @@ class LifecycleStateTests(unittest.TestCase):
             self.assertFalse((directory / f"{0:024x}.json").exists())
             self.assertFalse((directory / f"{1:024x}.json").exists())
             self.assertTrue((directory / ("f" * 24 + ".json")).exists())
+
+    def test_combined_activity_truncation_preserves_each_provider_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary).resolve()
+            for index in range(state.MAX_ACTIVITY_ENTRIES):
+                write_v2_record(
+                    directory / f"1{index:023x}.json",
+                    "idle",
+                    "SessionEnd",
+                    200.0 - index,
+                    terminal=True,
+                    provider="codex",
+                )
+                write_v2_record(
+                    directory / f"2{index:023x}.json",
+                    "idle",
+                    "SessionEnd",
+                    100.0 - index,
+                    terminal=True,
+                    provider="grok",
+                )
+
+            combined = state.read_session_activity(directory, now=201.0)
+            grok_paths = sorted(directory.glob("2" + ("[0-9a-f]" * 23) + ".json"))
+            write_agent_source(directory / state.AGENT_SOURCE_FILENAME, "grok")
+            grok_only = state.read_session_activity(directory, now=201.0)
+
+            self.assertEqual(len(combined["completed"]), state.MAX_ACTIVITY_ENTRIES)
+            self.assertEqual(
+                {item["provider"] for item in combined["completed"]}, {"codex"}
+            )
+            self.assertEqual(len(grok_paths), state.MAX_ACTIVITY_ENTRIES)
+            self.assertEqual(len(grok_only["completed"]), state.MAX_ACTIVITY_ENTRIES)
+            self.assertEqual(
+                {item["provider"] for item in grok_only["completed"]}, {"grok"}
+            )
 
     def test_session_activity_excludes_fresh_idle_start_without_pruning_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -60,6 +60,7 @@ DEFAULT_ACTIVE_TTL = 900.0
 DEFAULT_COMPLETED_TTL = 7 * 24 * 60 * 60.0
 MAX_ACTIVITY_ENTRIES = 64
 MAX_HOOK_RECORD_BYTES = 1_048_576
+MAX_AGENT_SOURCE_BYTES = 4_096
 # A completed tool is evidence that the session is no longer actively using a
 # tool.  If Desktop fails to emit its terminal callback after that point, a
 # short grace period prevents the generic 15-minute session lease from making
@@ -247,27 +248,101 @@ def _target_record_names(directory_fd: int) -> List[str]:
         return []
 
 
+def _open_agent_source_directory(state_dir: Path) -> Optional[int]:
+    if not state_dir.is_absolute():
+        return None
+    components = state_dir.parts[1:]
+    if any(component in (".", "..") for component in components):
+        return None
+    descriptor: Optional[int] = None
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(os.sep, flags)
+        for component in components:
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+        status = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(status.st_mode)
+            or status.st_uid != os.getuid()
+            or status.st_mode & 0o077
+        ):
+            os.close(descriptor)
+            return None
+        return descriptor
+    except OSError:
+        if descriptor is not None:
+            os.close(descriptor)
+        return None
+
+
 def read_agent_source_mode(state_dir: Path) -> str:
     """Read the bounded provider filter, defaulting invalid data to combined."""
-    directory_fd = _open_state_directory(state_dir)
+    directory_fd = _open_agent_source_directory(state_dir)
     if directory_fd is None:
         return "combined"
+    descriptor: Optional[int] = None
     try:
-        status, record, _identity = _read_hook_record(
-            directory_fd, AGENT_SOURCE_FILENAME
+        descriptor = os.open(
+            AGENT_SOURCE_FILENAME,
+            os.O_RDONLY
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_fd,
         )
+        before = os.fstat(descriptor)
         if (
-            status == HOOK_RECORD_OK
-            and isinstance(record, dict)
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or before.st_mode & 0o077
+            or before.st_size < 0
+            or before.st_size > MAX_AGENT_SOURCE_BYTES
+        ):
+            return "combined"
+        raw = b""
+        remaining = before.st_size + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(1_024, remaining))
+            if not chunk:
+                break
+            raw += chunk
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_mode != after.st_mode
+            or before.st_uid != after.st_uid
+            or before.st_nlink != after.st_nlink
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or len(raw) != before.st_size
+        ):
+            return "combined"
+        record = json.loads(raw.decode("utf-8"))
+        if (
+            isinstance(record, dict)
             and set(record) == {"version", "mode"}
             and record.get("version") == 1
             and not isinstance(record.get("version"), bool)
             and record.get("mode") in VALID_AGENT_SOURCE_MODES
         ):
             return str(record["mode"])
-        return "combined"
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError):
+        pass
     finally:
+        if descriptor is not None:
+            os.close(descriptor)
         os.close(directory_fd)
+    return "combined"
 
 
 def _provider_is_selected(provider: str, mode: str) -> bool:
@@ -545,7 +620,6 @@ def read_session_activity(
             "active": active,
             "completed": completed,
         }
-    record_identities: Dict[str, FileIdentity] = {}
     try:
         for name in _record_names(directory_fd):
             read_status, record, identity = _read_hook_record(directory_fd, name)
@@ -603,7 +677,6 @@ def read_session_activity(
                 # Keep fresh hidden records available for immediate switching;
                 # retention is enforced above before projection filtering.
                 continue
-            record_identities[identifier] = identity
             if is_completed:
                 completed.append({
                     "id": identifier,
@@ -644,14 +717,6 @@ def read_session_activity(
             )
         )
         completed.sort(key=lambda item: (-item["event_at"], item["id"]))
-        # Terminal records no longer contribute to current_state.json, so the
-        # bounded activity rail may safely discard the oldest overflow entries.
-        for item in completed[MAX_ACTIVITY_ENTRIES:]:
-            _prune_if_unchanged(
-                directory_fd,
-                f"{item['id']}.json",
-                record_identities.get(item["id"]),
-            )
     finally:
         os.close(directory_fd)
     return {

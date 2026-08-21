@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -384,8 +385,8 @@ esac
             info["NSHumanReadableCopyright"],
             "Copyright © 2026 Statelet contributors. MIT licensed.",
         )
-        self.assertEqual(info["CFBundleShortVersionString"], "1.8.12")
-        self.assertEqual(info["CFBundleVersion"], "26")
+        self.assertEqual(info["CFBundleShortVersionString"], "1.8.13")
+        self.assertEqual(info["CFBundleVersion"], "27")
         self.assertEqual(info["CFBundlePackageType"], "APPL")
         self.assertEqual(info["LSMinimumSystemVersion"], "13.0")
         self.assertTrue(info["LSUIElement"])
@@ -1707,6 +1708,7 @@ struct WatchdogHarness {
             },
         }
         destination.write_text(json.dumps(original), encoding="utf-8")
+        destination.chmod(0o600)
 
         command = [
             sys.executable,
@@ -1728,6 +1730,7 @@ struct WatchdogHarness {
         subprocess.run(command, check=True, capture_output=True, text=True)
 
         self.assertEqual(first.read_bytes(), second.read_bytes())
+        self.assertEqual(first.stat().st_mode & 0o777, 0o600)
         installed = json.loads(first.read_text(encoding="utf-8"))
         self.assertEqual(installed["unrelated"], {"keep": True})
         all_managed = []
@@ -1781,6 +1784,8 @@ struct WatchdogHarness {
         original = grok_hooks.read_bytes()
         self.assertTrue(original)
         self.assertEqual(grok_hooks.stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.home / ".grok").stat().st_mode & 0o777, 0o700)
+        self.assertEqual(grok_hooks.parent.stat().st_mode & 0o777, 0o700)
         installed = json.loads(original)
         for event in GROK_HOOK_EVENTS:
             handlers = [
@@ -1798,6 +1803,567 @@ struct WatchdogHarness {
         second = self.install(bundle, env=environment)
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(grok_hooks.read_bytes(), original)
+
+    def test_grok_merge_rejects_world_writable_existing_config_without_mutation(self) -> None:
+        merge_script = PACKAGE / "scripts" / "merge_hooks.py"
+        destination = self.base / "unsafe-grok-hooks.json"
+        output = self.base / "unsafe-grok-output.json"
+        original = b'{"unrelated":{"preserve":true},"hooks":{}}\n'
+        destination.write_bytes(original)
+        destination.chmod(0o666)
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(merge_script),
+                "--destination",
+                str(destination),
+                "--output",
+                str(output),
+                "--python",
+                sys.executable,
+                "--hook-script",
+                str(self.home / "Library/Application Support/Statelet/Statelet/python/statelet_hook.py"),
+                "--provider",
+                "grok",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(destination.read_bytes(), original)
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o666)
+        self.assertFalse(output.exists())
+
+    def test_install_rejects_nonprivate_existing_grok_directories_without_mutation(self) -> None:
+        bundle = self.make_bundle("UnsafeGrokDirectories")
+        grok_root = self.home / ".grok"
+        grok_hooks_dir = grok_root / "hooks"
+        grok_hooks_dir.mkdir(parents=True)
+        grok_root.chmod(0o755)
+        grok_hooks_dir.chmod(0o755)
+        grok_hooks = grok_hooks_dir / "statelet.json"
+        original = b'{"unrelated":{"preserve":true},"hooks":{}}\n'
+        grok_hooks.write_bytes(original)
+        grok_hooks.chmod(0o600)
+
+        result = self.install(bundle)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("non-private Grok hook directories", result.stderr)
+        self.assertEqual(grok_hooks.read_bytes(), original)
+        self.assertEqual(grok_root.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(grok_hooks_dir.stat().st_mode & 0o777, 0o755)
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+        self.assertFalse((self.home / "Applications/Statelet.app").exists())
+
+    def test_install_rejects_grok_config_changed_after_staging_and_preserves_edit(self) -> None:
+        first = self.make_bundle("GrokStageRaceFirst", "first")
+        self.assertEqual(self.install(first).returncode, 0)
+        second = self.make_bundle("GrokStageRaceSecond", "second")
+        grok_hooks = self.home / ".grok/hooks/statelet.json"
+        gate = self.home / "grok-stage-race"
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_TEST_GROK_STAGE_GATE"] = str(gate)
+        process = subprocess.Popen(
+            [
+                "bash",
+                str(INSTALL_SCRIPT),
+                "--home",
+                str(self.home),
+                "--app-bundle",
+                str(second),
+                "--skip-launchctl",
+            ],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
+            time.sleep(0.01)
+        self.assertTrue(Path(f"{gate}.ready").exists())
+        payload = json.loads(grok_hooks.read_text(encoding="utf-8"))
+        payload["unrelated"] = {"concurrent": "preserve"}
+        grok_hooks.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
+        concurrent = grok_hooks.read_bytes()
+        Path(f"{gate}.release").touch()
+        stdout, stderr = process.communicate(timeout=30)
+
+        self.assertEqual(process.returncode, 75, stdout + stderr)
+        self.assertIn("Grok hook configuration changed", stderr)
+        self.assertEqual(grok_hooks.read_bytes(), concurrent)
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+        installed = self.home / "Applications/Statelet.app/Contents/MacOS/Statelet"
+        self.assertIn(b"first", installed.read_bytes())
+
+    def test_install_rejects_grok_config_created_after_absent_attestation(self) -> None:
+        first = self.make_bundle("GrokAbsentRaceFirst", "first")
+        self.assertEqual(self.install(first).returncode, 0)
+        grok_hooks = self.home / ".grok/hooks/statelet.json"
+        grok_hooks.unlink()
+        second = self.make_bundle("GrokAbsentRaceSecond", "second")
+        gate = self.home / "grok-absent-race"
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_TEST_GROK_STAGE_GATE"] = str(gate)
+        process = subprocess.Popen(
+            ["bash", str(INSTALL_SCRIPT), "--home", str(self.home), "--app-bundle", str(second), "--skip-launchctl"],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
+            time.sleep(0.01)
+        self.assertTrue(Path(f"{gate}.ready").exists())
+        concurrent = b'{"unrelated":{"created":"preserve"},"hooks":{}}\n'
+        grok_hooks.write_bytes(concurrent)
+        grok_hooks.chmod(0o600)
+        concurrent_inode = grok_hooks.stat().st_ino
+        Path(f"{gate}.release").touch()
+        stdout, stderr = process.communicate(timeout=30)
+
+        self.assertEqual(process.returncode, 75, stdout + stderr)
+        self.assertEqual(grok_hooks.read_bytes(), concurrent)
+        self.assertEqual(grok_hooks.stat().st_ino, concurrent_inode)
+        installed = self.home / "Applications/Statelet.app/Contents/MacOS/Statelet"
+        self.assertIn(b"first", installed.read_bytes())
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+
+    def test_post_quiescence_grok_edit_is_adopted_across_rollback_and_retry(self) -> None:
+        first = self.make_bundle("GrokAdoptionFirst", "first")
+        self.assertEqual(self.install(first).returncode, 0)
+        second = self.make_bundle("GrokAdoptionSecond", "second")
+        grok_hooks = self.home / ".grok/hooks/statelet.json"
+        gate = self.home / "grok-adoption-race"
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_TEST_GROK_FINAL_STAGE_GATE"] = str(gate)
+        environment["STATELET_INSTALL_FAIL_AT"] = "after-grok-hooks"
+        process = subprocess.Popen(
+            ["bash", str(INSTALL_SCRIPT), "--home", str(self.home), "--app-bundle", str(second), "--skip-launchctl"],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
+            time.sleep(0.01)
+        self.assertTrue(Path(f"{gate}.ready").exists())
+        quiesced = json.loads(grok_hooks.read_text(encoding="utf-8"))
+        quiesced["unrelated"] = {"after_quiesce": "preserve"}
+        grok_hooks.write_text(json.dumps(quiesced, separators=(",", ":")) + "\n", encoding="utf-8")
+        Path(f"{gate}.release").touch()
+        stdout, stderr = process.communicate(timeout=30)
+
+        self.assertEqual(process.returncode, 70, stdout + stderr)
+        rolled_back = json.loads(grok_hooks.read_text(encoding="utf-8"))
+        self.assertEqual(rolled_back["unrelated"], {"after_quiesce": "preserve"})
+        managed = [
+            item for groups in rolled_back["hooks"].values() for group in groups
+            for item in group.get("hooks", [])
+            if item.get("env") == {"STATELET_AGENT_PROVIDER": "grok"}
+        ]
+        self.assertEqual(len(managed), len(GROK_HOOK_EVENTS) + 2)
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+        installed_app = self.home / "Applications/Statelet.app/Contents/MacOS/Statelet"
+        self.assertIn(b"first", installed_app.read_bytes())
+
+        retried = self.install(second)
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        converged = json.loads(grok_hooks.read_text(encoding="utf-8"))
+        self.assertEqual(converged["unrelated"], {"after_quiesce": "preserve"})
+        self.assertIn(b"second", installed_app.read_bytes())
+
+    def test_drain_window_grok_edit_rolls_back_with_handlers_and_no_journal(self) -> None:
+        first = self.make_bundle("GrokDrainEditFirst", "first")
+        self.assertEqual(self.install(first).returncode, 0)
+        second = self.make_bundle("GrokDrainEditSecond", "second")
+        grok_hooks = self.home / ".grok/hooks/statelet.json"
+        gate = self.home / "grok-drain-edit"
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_TEST_GROK_QUIESCED_GATE"] = str(gate)
+        environment["STATELET_INSTALL_FAIL_AT"] = "after-app"
+        process = subprocess.Popen(
+            ["bash", str(INSTALL_SCRIPT), "--home", str(self.home), "--app-bundle", str(second), "--skip-launchctl"],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment,
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists(): time.sleep(0.01)
+        self.assertTrue(Path(f"{gate}.ready").exists())
+        payload = json.loads(grok_hooks.read_text(encoding="utf-8"))
+        payload["unrelated"] = {"drain": "preserve"}
+        grok_hooks.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
+        Path(f"{gate}.release").touch()
+        stdout, stderr = process.communicate(timeout=30)
+
+        self.assertEqual(process.returncode, 70, stdout + stderr)
+        rolled_back = json.loads(grok_hooks.read_text(encoding="utf-8"))
+        self.assertEqual(rolled_back["unrelated"], {"drain": "preserve"})
+        managed = [item for groups in rolled_back["hooks"].values() for group in groups for item in group.get("hooks", []) if item.get("env") == {"STATELET_AGENT_PROVIDER": "grok"}]
+        self.assertEqual(len(managed), len(GROK_HOOK_EVENTS) + 2)
+        self.assertIn(b"first", (self.home / "Applications/Statelet.app/Contents/MacOS/Statelet").read_bytes())
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+
+    def test_no_edit_after_grok_publication_failure_restores_original_handlers(self) -> None:
+        first = self.make_bundle("GrokNoEditFirst", "first")
+        self.assertEqual(self.install(first).returncode, 0)
+        grok_hooks = self.home / ".grok/hooks/statelet.json"
+        original = grok_hooks.read_bytes()
+        second = self.make_bundle("GrokNoEditSecond", "second")
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_FAIL_AT"] = "after-grok-hooks"
+        failed = self.install(second, env=environment)
+        self.assertEqual(failed.returncode, 70, failed.stderr)
+        self.assertEqual(grok_hooks.read_bytes(), original)
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+
+    def assert_grok_adoption_crash_recovers(self, phase: str) -> None:
+        first = self.make_bundle(f"GrokAdoptionCrashFirst-{phase}", "first")
+        self.assertEqual(self.install(first).returncode, 0)
+        second = self.make_bundle(f"GrokAdoptionCrashSecond-{phase}", "second")
+        grok_hooks = self.home / ".grok/hooks/statelet.json"
+        gate = self.home / f"grok-adoption-crash-{phase}"
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_TEST_GROK_FINAL_STAGE_GATE"] = str(gate)
+        environment["STATELET_INSTALL_CRASH_AT"] = phase
+        process = subprocess.Popen(
+            ["bash", str(INSTALL_SCRIPT), "--home", str(self.home), "--app-bundle", str(second), "--skip-launchctl"],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment,
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists(): time.sleep(0.01)
+        self.assertTrue(Path(f"{gate}.ready").exists())
+        payload = json.loads(grok_hooks.read_text(encoding="utf-8"))
+        payload["unrelated"] = {"crash_phase": phase}
+        grok_hooks.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
+        Path(f"{gate}.release").touch()
+        process.communicate(timeout=30)
+        self.assertNotEqual(process.returncode, 0)
+
+        retried = self.install(second)
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        recovered = json.loads(grok_hooks.read_text(encoding="utf-8"))
+        self.assertEqual(recovered["unrelated"], {"crash_phase": phase})
+        managed = [item for groups in recovered["hooks"].values() for group in groups for item in group.get("hooks", []) if item.get("env") == {"STATELET_AGENT_PROVIDER": "grok"}]
+        self.assertEqual(len(managed), len(GROK_HOOK_EVENTS) + 2)
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+
+    def test_prepared_grok_adoption_crash_recovers(self) -> None:
+        self.assert_grok_adoption_crash_recovers("after-grok-adoption-prepared")
+
+    def test_applied_grok_adoption_crash_recovers(self) -> None:
+        self.assert_grok_adoption_crash_recovers("after-grok-adoption-applied")
+
+    def assert_grok_adoption_apply_race_preserves_live_target(self, mutate: str) -> None:
+        first = self.make_bundle(f"GrokAdoptionCASFirst-{mutate}", "first")
+        self.assertEqual(self.install(first).returncode, 0)
+        second = self.make_bundle(f"GrokAdoptionCASSecond-{mutate}", "second")
+        grok_hooks = self.home / ".grok/hooks/statelet.json"
+        final_gate = self.home / f"grok-cas-final-{mutate}"
+        apply_gate = self.home / f"grok-cas-apply-{mutate}"
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_TEST_GROK_FINAL_STAGE_GATE"] = str(final_gate)
+        environment["STATELET_INSTALL_TEST_GROK_ADOPTION_APPLY_GATE"] = str(apply_gate)
+        process = subprocess.Popen(
+            ["bash", str(INSTALL_SCRIPT), "--home", str(self.home), "--app-bundle", str(second), "--skip-launchctl"],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment,
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not Path(f"{final_gate}.ready").exists(): time.sleep(0.01)
+        self.assertTrue(Path(f"{final_gate}.ready").exists())
+        first_edit = json.loads(grok_hooks.read_text(encoding="utf-8"))
+        first_edit["unrelated"] = {"first": "preserve"}
+        grok_hooks.write_text(json.dumps(first_edit, separators=(",", ":")) + "\n", encoding="utf-8")
+        Path(f"{final_gate}.release").touch()
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not Path(f"{apply_gate}.ready").exists(): time.sleep(0.01)
+        self.assertTrue(Path(f"{apply_gate}.ready").exists())
+        if mutate == "target":
+            later = json.loads(grok_hooks.read_text(encoding="utf-8"))
+            later["unrelated"] = {"later": "must-survive"}
+            replacement = grok_hooks.with_suffix(".later")
+            replacement.write_text(json.dumps(later, separators=(",", ":")) + "\n", encoding="utf-8")
+            replacement.chmod(0o600)
+            os.replace(replacement, grok_hooks)
+        else:
+            baseline = self.home / ".statelet-install-transaction/stage/grok-rollback.json"
+            baseline.write_bytes(b'{"corrupt":"must-not-publish"}\n')
+            baseline.chmod(0o600)
+        preserved = grok_hooks.read_bytes()
+        preserved_inode = grok_hooks.stat().st_ino
+        Path(f"{apply_gate}.release").touch()
+        process.communicate(timeout=30)
+
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(grok_hooks.read_bytes(), preserved)
+        self.assertEqual(grok_hooks.stat().st_ino, preserved_inode)
+        self.assertTrue((self.home / ".statelet-install-transaction/journal.json").exists())
+
+    def test_grok_adoption_apply_target_race_does_not_overwrite_later_edit(self) -> None:
+        self.assert_grok_adoption_apply_race_preserves_live_target("target")
+
+    def test_grok_adoption_apply_baseline_race_does_not_publish_corruption(self) -> None:
+        self.assert_grok_adoption_apply_race_preserves_live_target("baseline")
+
+    def test_post_quiescence_grok_edit_commits_with_valid_adoption_contract(self) -> None:
+        first = self.make_bundle("GrokAdoptionCommitFirst", "first")
+        self.assertEqual(self.install(first).returncode, 0)
+        second = self.make_bundle("GrokAdoptionCommitSecond", "second")
+        grok_hooks = self.home / ".grok/hooks/statelet.json"
+        gate = self.home / "grok-adoption-commit"
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_TEST_GROK_FINAL_STAGE_GATE"] = str(gate)
+        process = subprocess.Popen(
+            ["bash", str(INSTALL_SCRIPT), "--home", str(self.home), "--app-bundle", str(second), "--skip-launchctl"],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
+            time.sleep(0.01)
+        self.assertTrue(Path(f"{gate}.ready").exists())
+        quiesced = json.loads(grok_hooks.read_text(encoding="utf-8"))
+        quiesced["unrelated"] = {"commit": "preserve"}
+        grok_hooks.write_text(json.dumps(quiesced, separators=(",", ":")) + "\n", encoding="utf-8")
+        Path(f"{gate}.release").touch()
+        stdout, stderr = process.communicate(timeout=30)
+
+        self.assertEqual(process.returncode, 0, stdout + stderr)
+        committed = json.loads(grok_hooks.read_text(encoding="utf-8"))
+        self.assertEqual(committed["unrelated"], {"commit": "preserve"})
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+
+    def test_post_quiescence_grok_deletion_rolls_back_absent_and_retry_converges(self) -> None:
+        first = self.make_bundle("GrokDeletionRollbackFirst", "first")
+        self.assertEqual(self.install(first).returncode, 0)
+        second = self.make_bundle("GrokDeletionRollbackSecond", "second")
+        grok_hooks = self.home / ".grok/hooks/statelet.json"
+        gate = self.home / "grok-deletion-rollback"
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_TEST_GROK_FINAL_STAGE_GATE"] = str(gate)
+        environment["STATELET_INSTALL_FAIL_AT"] = "after-grok-hooks"
+        process = subprocess.Popen(
+            ["bash", str(INSTALL_SCRIPT), "--home", str(self.home), "--app-bundle", str(second), "--skip-launchctl"],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment,
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
+            time.sleep(0.01)
+        self.assertTrue(Path(f"{gate}.ready").exists())
+        grok_hooks.unlink()
+        Path(f"{gate}.release").touch()
+        stdout, stderr = process.communicate(timeout=30)
+
+        self.assertEqual(process.returncode, 70, stdout + stderr)
+        self.assertFalse(grok_hooks.exists())
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+        installed_app = self.home / "Applications/Statelet.app/Contents/MacOS/Statelet"
+        self.assertIn(b"first", installed_app.read_bytes())
+        retried = self.install(second)
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertTrue(grok_hooks.is_file())
+        self.assertIn(b"second", installed_app.read_bytes())
+
+    def test_post_quiescence_grok_deletion_commits_without_ambiguous_chain(self) -> None:
+        first = self.make_bundle("GrokDeletionCommitFirst", "first")
+        self.assertEqual(self.install(first).returncode, 0)
+        second = self.make_bundle("GrokDeletionCommitSecond", "second")
+        grok_hooks = self.home / ".grok/hooks/statelet.json"
+        gate = self.home / "grok-deletion-commit"
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_TEST_GROK_FINAL_STAGE_GATE"] = str(gate)
+        process = subprocess.Popen(
+            ["bash", str(INSTALL_SCRIPT), "--home", str(self.home), "--app-bundle", str(second), "--skip-launchctl"],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment,
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
+            time.sleep(0.01)
+        self.assertTrue(Path(f"{gate}.ready").exists())
+        grok_hooks.unlink()
+        Path(f"{gate}.release").touch()
+        stdout, stderr = process.communicate(timeout=30)
+
+        self.assertEqual(process.returncode, 0, stdout + stderr)
+        self.assertTrue(grok_hooks.is_file())
+        self.assertEqual(grok_hooks.stat().st_mode & 0o777, 0o600)
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+
+    def test_prepared_absent_grok_adoption_crash_preserves_deletion_and_retries(self) -> None:
+        first = self.make_bundle("GrokAbsentCrashFirst", "first")
+        self.assertEqual(self.install(first).returncode, 0)
+        second = self.make_bundle("GrokAbsentCrashSecond", "second")
+        grok_hooks = self.home / ".grok/hooks/statelet.json"
+        gate = self.home / "grok-absent-crash"
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_TEST_GROK_FINAL_STAGE_GATE"] = str(gate)
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-grok-adoption-prepared"
+        process = subprocess.Popen(
+            ["bash", str(INSTALL_SCRIPT), "--home", str(self.home), "--app-bundle", str(second), "--skip-launchctl"],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment,
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists(): time.sleep(0.01)
+        self.assertTrue(Path(f"{gate}.ready").exists())
+        grok_hooks.unlink()
+        Path(f"{gate}.release").touch()
+        process.communicate(timeout=30)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertFalse(grok_hooks.exists())
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+        retried = self.install(second)
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertTrue(grok_hooks.is_file())
+
+    def test_final_grok_publication_stays_after_component_and_migration_publication(self) -> None:
+        source = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        final_merge = source.index("# Keep Grok quiesced through component and migration publication")
+        component_install = source.index('install_target "$stage_component" "$component_dir"')
+        migration_manifest_install = source.index('install_target "$stage_migration_manifest" "$migration_manifest"')
+        migration_postvalidation = source.index("Published Statelet data failed migration validation")
+        files_commit = source.index("journal_command files-commit")
+
+        self.assertLess(component_install, final_merge)
+        self.assertLess(migration_manifest_install, final_merge)
+        self.assertLess(migration_postvalidation, final_merge)
+        self.assertLess(final_merge, files_commit)
+
+    def test_recovery_rejects_adopted_flags_outside_exact_grok_pair(self) -> None:
+        first = self.make_bundle("InvalidAdoptionFirst", "first")
+        self.assertEqual(self.install(first).returncode, 0)
+        second = self.make_bundle("InvalidAdoptionSecond", "second")
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-app"
+        self.assertEqual(self.install(second, env=environment).returncode, -9)
+        journal_path = self.home / ".statelet-install-transaction/journal.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        app_operations = [
+            operation
+            for operation in journal["operations"]
+            if operation.get("target") == str(self.home / "Applications/Statelet.app")
+            and operation.get("kind") in {"backup", "install"}
+        ]
+        self.assertEqual([operation["kind"] for operation in app_operations], ["backup", "install"])
+        for operation in app_operations:
+            operation["adopted"] = True
+        journal_path.write_text(json.dumps(journal, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+        journal_path.chmod(0o600)
+
+        refused = self.install(second)
+
+        self.assertEqual(refused.returncode, 74)
+        self.assertIn("interrupted Statelet installation is ambiguous", refused.stderr)
+        self.assertTrue(journal_path.exists())
+
+    def test_install_rejects_same_content_grok_inode_swap_after_staging(self) -> None:
+        first = self.make_bundle("GrokInodeRaceFirst", "first")
+        self.assertEqual(self.install(first).returncode, 0)
+        second = self.make_bundle("GrokInodeRaceSecond", "second")
+        grok_hooks = self.home / ".grok/hooks/statelet.json"
+        original = grok_hooks.read_bytes()
+        gate = self.home / "grok-inode-race"
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_TEST_GROK_STAGE_GATE"] = str(gate)
+        process = subprocess.Popen(
+            ["bash", str(INSTALL_SCRIPT), "--home", str(self.home), "--app-bundle", str(second), "--skip-launchctl"],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
+            time.sleep(0.01)
+        self.assertTrue(Path(f"{gate}.ready").exists())
+        replacement = grok_hooks.with_suffix(".replacement")
+        replacement.write_bytes(original)
+        replacement.chmod(0o600)
+        os.replace(replacement, grok_hooks)
+        replacement_inode = grok_hooks.stat().st_ino
+        Path(f"{gate}.release").touch()
+        stdout, stderr = process.communicate(timeout=30)
+
+        self.assertEqual(process.returncode, 75, stdout + stderr)
+        self.assertEqual(grok_hooks.read_bytes(), original)
+        self.assertEqual(grok_hooks.stat().st_ino, replacement_inode)
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+
+    def test_install_rejects_grok_parent_mode_change_after_staging(self) -> None:
+        first = self.make_bundle("GrokParentRaceFirst", "first")
+        self.assertEqual(self.install(first).returncode, 0)
+        second = self.make_bundle("GrokParentRaceSecond", "second")
+        grok_hooks = self.home / ".grok/hooks/statelet.json"
+        original = grok_hooks.read_bytes()
+        gate = self.home / "grok-parent-race"
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_TEST_GROK_STAGE_GATE"] = str(gate)
+        process = subprocess.Popen(
+            ["bash", str(INSTALL_SCRIPT), "--home", str(self.home), "--app-bundle", str(second), "--skip-launchctl"],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
+            time.sleep(0.01)
+        self.assertTrue(Path(f"{gate}.ready").exists())
+        grok_hooks.parent.chmod(0o755)
+        Path(f"{gate}.release").touch()
+        stdout, stderr = process.communicate(timeout=30)
+
+        self.assertEqual(process.returncode, 75, stdout + stderr)
+        self.assertEqual(grok_hooks.read_bytes(), original)
+        self.assertEqual(grok_hooks.parent.stat().st_mode & 0o777, 0o755)
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+
+    def test_install_rolls_back_attested_grok_backup_after_parent_fd_swap(self) -> None:
+        first = self.make_bundle("GrokParentFDFirst", "first")
+        self.assertEqual(self.install(first).returncode, 0)
+        second = self.make_bundle("GrokParentFDSecond", "second")
+        hooks_dir = self.home / ".grok/hooks"
+        original = (hooks_dir / "statelet.json").read_bytes()
+        gate = self.home / "grok-parent-fd-race"
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_TEST_GROK_BACKUP_FD_GATE"] = str(gate)
+        process = subprocess.Popen(
+            ["bash", str(INSTALL_SCRIPT), "--home", str(self.home), "--app-bundle", str(second), "--skip-launchctl"],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
+            time.sleep(0.01)
+        self.assertTrue(Path(f"{gate}.ready").exists())
+        displaced = self.home / ".grok/hooks-displaced"
+        hooks_dir.rename(displaced)
+        hooks_dir.mkdir(mode=0o700)
+        concurrent = b'{"unrelated":{"concurrent":"preserve"},"hooks":{}}\n'
+        (hooks_dir / "statelet.json").write_bytes(concurrent)
+        (hooks_dir / "statelet.json").chmod(0o600)
+        Path(f"{gate}.release").touch()
+        stdout, stderr = process.communicate(timeout=30)
+
+        self.assertNotEqual(process.returncode, 0, stdout + stderr)
+        self.assertEqual((hooks_dir / "statelet.json").read_bytes(), concurrent)
+        self.assertEqual((displaced / "statelet.json").read_bytes(), original)
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
 
     def test_existing_application_support_board_hook_is_reused_without_duplicates(self) -> None:
         bundle = self.make_bundle("SharedHook")
@@ -2129,6 +2695,8 @@ struct WatchdogHarness {
         )
         grok_hooks_file = self.home / ".grok" / "hooks" / "statelet.json"
         grok_hooks_file.parent.mkdir(parents=True)
+        (self.home / ".grok").chmod(0o700)
+        grok_hooks_file.parent.chmod(0o700)
         grok_hooks_file.write_text(
             json.dumps(
                 {
@@ -2145,6 +2713,7 @@ struct WatchdogHarness {
             ),
             encoding="utf-8",
         )
+        grok_hooks_file.chmod(0o600)
         result = self.install(bundle)
         self.assertEqual(result.returncode, 0, result.stderr)
         installed_app = self.home / "Applications" / "Statelet.app"
@@ -2868,6 +3437,9 @@ struct WatchdogHarness {
                     case_home.mkdir()
                     hooks_file = case_home / relative
                     hooks_file.parent.mkdir(parents=True)
+                    if provider == "grok":
+                        (case_home / ".grok").chmod(0o700)
+                        hooks_file.parent.chmod(0o700)
                     external = self.base / f"external-{provider}-{kind}.json"
                     original = b'{"external":"unchanged"}\n'
                     if kind == "fifo":

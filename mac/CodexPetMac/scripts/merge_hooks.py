@@ -51,19 +51,25 @@ MAX_MIGRATION_BYTES = 32 * 1024 * 1024 * 1024
 MAX_HOOK_CONFIG_BYTES = 16 * 1024 * 1024
 
 
-def read_hook_config(path: Path, *, required: bool = False) -> tuple[Optional[dict[str, Any]], int]:
+def read_hook_config(
+    path: Path,
+    *,
+    required: bool = False,
+    owner_private: bool = False,
+) -> tuple[Optional[dict[str, Any]], int, dict[str, Any]]:
     """Read one owned, stable regular config without following its final link."""
     try:
         before = path.lstat()
     except FileNotFoundError:
         if required:
             raise ValueError("hooks destination does not exist")
-        return None, 0o600
+        return None, 0o600, {"exists": False}
     if (
         not stat.S_ISREG(before.st_mode)
         or before.st_uid != os.getuid()
         or before.st_nlink != 1
         or before.st_size > MAX_HOOK_CONFIG_BYTES
+        or (owner_private and stat.S_IMODE(before.st_mode) != 0o600)
     ):
         raise ValueError("existing hooks file is unsafe")
     flags = os.O_RDONLY
@@ -110,7 +116,42 @@ def read_hook_config(path: Path, *, required: bool = False) -> tuple[Optional[di
         raise ValueError("existing hooks file is not valid JSON") from error
     if not isinstance(loaded, dict):
         raise ValueError("existing hooks file must contain a JSON object")
-    return loaded, stat.S_IMODE(final.st_mode)
+    return loaded, stat.S_IMODE(final.st_mode), {
+        "exists": True,
+        "digest": hashlib.sha256(b"F\0.\0" + content).hexdigest(),
+        "entry": [getattr(final, field) for field in fields],
+    }
+
+
+def write_attestation(path: Path, attestation: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(attestation, handle, sort_keys=True, separators=(",", ":"))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(path, 0o600)
+
+
+def attest_private_directories(paths: list[Path]) -> list[dict[str, Any]]:
+    attestations = []
+    fields = ("st_dev", "st_ino", "st_mode", "st_uid")
+    for path in paths:
+        if not os.path.lexists(path):
+            attestations.append({"path": str(path), "exists": False})
+            continue
+        status = path.lstat()
+        if (
+            not stat.S_ISDIR(status.st_mode)
+            or stat.S_ISLNK(status.st_mode)
+            or status.st_uid != os.getuid()
+            or stat.S_IMODE(status.st_mode) != 0o700
+        ):
+            raise ValueError("Grok hook directory is not owner-private")
+        attestations.append(
+            {"path": str(path), "exists": True, "entry": [getattr(status, field) for field in fields]}
+        )
+    return attestations
 
 
 def safe_tree_digest(root: Path) -> str:
@@ -299,8 +340,11 @@ def merge(
     python: str,
     installed_hook: Path,
     provider: str,
-) -> None:
-    loaded, mode = read_hook_config(destination)
+) -> dict[str, Any]:
+    loaded, mode, attestation = read_hook_config(
+        destination,
+        owner_private=provider == "grok",
+    )
     data: dict[str, Any] = loaded if loaded is not None else {}
     hooks = data.setdefault("hooks", {})
     if not isinstance(hooks, dict):
@@ -361,7 +405,8 @@ def merge(
     with output.open("w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2)
         handle.write("\n")
-    os.chmod(output, mode)
+    os.chmod(output, 0o600 if provider == "grok" else mode)
+    return attestation
 
 
 def remove_widget_hook(
@@ -369,9 +414,13 @@ def remove_widget_hook(
     output: Path,
     widget_hook: Path,
     provider: str,
-) -> None:
+) -> dict[str, Any]:
     """Remove only the widget command, migrating to a valid shared hook."""
-    loaded, mode = read_hook_config(destination, required=True)
+    loaded, mode, attestation = read_hook_config(
+        destination,
+        required=True,
+        owner_private=provider == "grok",
+    )
     assert loaded is not None
     hooks = loaded.get("hooks")
     if not isinstance(hooks, dict):
@@ -449,12 +498,20 @@ def remove_widget_hook(
     with output.open("w", encoding="utf-8") as handle:
         json.dump(loaded, handle, indent=2)
         handle.write("\n")
-    os.chmod(output, mode)
+    os.chmod(output, 0o600 if provider == "grok" else mode)
+    return attestation
 
 
-def quiesce_managed_hooks(destination: Path, output: Path) -> float:
+def quiesce_managed_hooks(
+    destination: Path,
+    output: Path,
+    provider: str,
+) -> tuple[float, dict[str, Any]]:
     """Stage a config without Statelet handlers and return its drain timeout."""
-    loaded, mode = read_hook_config(destination)
+    loaded, mode, attestation = read_hook_config(
+        destination,
+        owner_private=provider == "grok",
+    )
     data: dict[str, Any] = loaded if loaded is not None else {}
     hooks = data.get("hooks", {})
     if not isinstance(hooks, dict):
@@ -497,8 +554,8 @@ def quiesce_managed_hooks(destination: Path, output: Path) -> float:
     with output.open("w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2)
         handle.write("\n")
-    os.chmod(output, mode)
-    return maximum_timeout + 0.1 if maximum_timeout else 0.0
+    os.chmod(output, 0o600 if provider == "grok" else mode)
+    return maximum_timeout + 0.1 if maximum_timeout else 0.0, attestation
 
 
 def main() -> int:
@@ -508,6 +565,8 @@ def main() -> int:
     parser.add_argument("--python")
     parser.add_argument("--hook-script", type=Path)
     parser.add_argument("--provider", choices=("codex", "grok"), default="codex")
+    parser.add_argument("--attestation-output", type=Path)
+    parser.add_argument("--private-directory", action="append", default=[], type=Path)
     parser.add_argument("--remove-widget-hook", action="store_true")
     parser.add_argument("--quiesce-managed-hooks", action="store_true")
     parser.add_argument("--safe-tree-digest", type=Path)
@@ -525,14 +584,23 @@ def main() -> int:
     if args.quiesce_managed_hooks:
         if args.destination is None or args.output is None:
             parser.error("hook quiescence requires destination and output")
-        print(quiesce_managed_hooks(args.destination, args.output))
+        timeout, attestation = quiesce_managed_hooks(args.destination, args.output, args.provider)
+        if args.private_directory:
+            attestation["private_directories"] = attest_private_directories(args.private_directory)
+        if args.attestation_output is not None:
+            write_attestation(args.attestation_output, attestation)
+        print(timeout)
         return 0
     if None in (args.destination, args.output, args.python, args.hook_script):
         parser.error("hook merge requires destination, output, python, and hook-script")
     if args.remove_widget_hook:
-        remove_widget_hook(args.destination, args.output, args.hook_script, args.provider)
+        attestation = remove_widget_hook(args.destination, args.output, args.hook_script, args.provider)
     else:
-        merge(args.destination, args.output, args.python, args.hook_script, args.provider)
+        attestation = merge(args.destination, args.output, args.python, args.hook_script, args.provider)
+    if args.private_directory:
+        attestation["private_directories"] = attest_private_directories(args.private_directory)
+    if args.attestation_output is not None:
+        write_attestation(args.attestation_output, attestation)
     return 0
 
 

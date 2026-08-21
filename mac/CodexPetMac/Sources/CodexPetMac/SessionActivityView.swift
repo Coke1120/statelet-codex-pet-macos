@@ -144,8 +144,38 @@ struct SessionActivityDisplayState: Equatable {
     var visibleItemCount: Int { active.count + completed.count }
 }
 
+struct SessionActivityOpenabilityPresentationState: Equatable {
+    let openableIDs: Set<String>
+    let pendingIDs: Set<String>
+}
+
+enum SessionActivityOpenabilityPolicy {
+    static func presentationState(
+        currentTargets: [String: String],
+        resolvedTargets: [String: String],
+        openableIDs: Set<String>
+    ) -> SessionActivityOpenabilityPresentationState {
+        let resolvedIDs = Set(currentTargets.compactMap { id, threadID in
+            resolvedTargets[id] == threadID ? id : nil
+        })
+        return SessionActivityOpenabilityPresentationState(
+            openableIDs: openableIDs.intersection(resolvedIDs),
+            pendingIDs: Set(currentTargets.keys).subtracting(resolvedIDs)
+        )
+    }
+}
+
 enum SessionActivityPresentation {
     static let maximumRowsPerGroup = 3
+
+    static func unacknowledgedCompletedItems(
+        snapshot: SessionActivitySnapshot?,
+        acknowledgedIDs: Set<String>
+    ) -> [SessionActivityItem] {
+        (snapshot?.completed ?? []).filter {
+            $0.event == .sessionEnd && !acknowledgedIDs.contains($0.id)
+        }
+    }
 
     static func displayState(
         snapshot: SessionActivitySnapshot?,
@@ -154,9 +184,10 @@ enum SessionActivityPresentation {
         maximumRowsPerGroup: Int = Self.maximumRowsPerGroup
     ) -> SessionActivityDisplayState {
         let active = snapshot?.active ?? []
-        let completed = (snapshot?.completed ?? []).filter {
-            $0.event == .sessionEnd && !acknowledgedIDs.contains($0.id)
-        }
+        let completed = unacknowledgedCompletedItems(
+            snapshot: snapshot,
+            acknowledgedIDs: acknowledgedIDs
+        )
         guard !compact else {
             return SessionActivityDisplayState(
                 active: [],
@@ -183,6 +214,7 @@ final class SessionActivityView: NSView {
     private var snapshot: SessionActivitySnapshot?
     private var acknowledgedIDs: Set<String> = []
     private var openableIDs: Set<String> = []
+    private var openabilityPendingIDs: Set<String> = []
     private var titles: [String: String] = [:]
     private var compactOverride: Bool?
     private var panelAppearance = try! SessionActivityPanelAppearance()
@@ -202,6 +234,7 @@ final class SessionActivityView: NSView {
     )
     private(set) var renderedItemIDs: [String] = []
     var onAcknowledge: ((String) -> Void)?
+    var onAcknowledgeAllCompleted: (([String]) -> Void)?
     var onOpen: ((String) -> Void)?
     var onExpand: (() -> Void)?
 
@@ -258,11 +291,13 @@ final class SessionActivityView: NSView {
         snapshot: SessionActivitySnapshot?,
         acknowledgedIDs: Set<String>,
         openableIDs: Set<String> = [],
+        openabilityPendingIDs: Set<String> = [],
         titles: [String: String] = [:]
     ) {
         self.snapshot = snapshot
         self.acknowledgedIDs = acknowledgedIDs
         self.openableIDs = openableIDs
+        self.openabilityPendingIDs = openabilityPendingIDs
         self.titles = titles
         rebuild()
     }
@@ -386,7 +421,14 @@ final class SessionActivityView: NSView {
             }
         } else {
             let visibleIDs = Set((displayState.active + displayState.completed).map(\.id))
-            addActivationNotice(hasOpenableItems: !openableIDs.isDisjoint(with: visibleIDs))
+            let unavailableIDs = visibleIDs
+                .subtracting(openableIDs)
+                .subtracting(openabilityPendingIDs)
+            if !unavailableIDs.isEmpty {
+                addActivationUnavailableNotice(
+                    affectsAllVisibleItems: unavailableIDs.count == visibleIDs.count
+                )
+            }
             if !displayState.active.isEmpty {
                 addGroup(
                     title: "Running · \(activeCount)",
@@ -413,10 +455,10 @@ final class SessionActivityView: NSView {
         needsLayout = true
     }
 
-    private func addActivationNotice(hasOpenableItems: Bool) {
-        let message = hasOpenableItems
-            ? "Open in Codex is available for linked sessions. Other rows remain informational."
-            : "Codex Desktop activation is unavailable for these sessions. Activity rows are informational only."
+    private func addActivationUnavailableNotice(affectsAllVisibleItems: Bool) {
+        let message = affectsAllVisibleItems
+            ? "Codex Desktop activation is unavailable for these sessions. Activity rows are informational only."
+            : "Open in Codex is unavailable for some sessions. Those activity rows are informational only."
         let notice = NSTextField(
             wrappingLabelWithString: message
         )
@@ -444,7 +486,24 @@ final class SessionActivityView: NSView {
         header.setAccessibilityElement(true)
         header.setAccessibilityRole(.staticText)
         header.setAccessibilityLabel(accessibility)
-        stack.addArrangedSubview(header)
+        if completed {
+            let clearAll = NSButton(
+                title: "Clear all",
+                target: self,
+                action: #selector(clearAllCompleted(_:))
+            )
+            clearAll.bezelStyle = .inline
+            clearAll.controlSize = .small
+            clearAll.setAccessibilityLabel("Clear all completed sessions")
+            clearAll.setAccessibilityHelp("Marks every completed session as read")
+            let headerRow = NSStackView(views: [header, clearAll])
+            headerRow.orientation = .horizontal
+            headerRow.alignment = .centerY
+            headerRow.spacing = 6
+            stack.addArrangedSubview(headerRow)
+        } else {
+            stack.addArrangedSubview(header)
+        }
 
         for (index, item) in items.enumerated() {
             renderedItemIDs.append(item.id)
@@ -489,7 +548,9 @@ final class SessionActivityView: NSView {
         label.setAccessibilityHelp(
             item.provider == .codex && openableIDs.contains(item.id)
                 ? "Use Open in Codex to show this session in Codex Desktop."
-                : "Informational only. No verified Codex Desktop target is available for this \(item.provider.displayName) session."
+                : item.provider == .codex && openabilityPendingIDs.contains(item.id)
+                    ? "Checking whether this session can be opened in Codex Desktop."
+                    : "Informational only. No verified Codex Desktop target is available for this \(item.provider.displayName) session."
         )
         let dotColor = resolvedActivityColor(item.state.sessionActivityColor)
         var views: [NSView] = [activityDot(color: dotColor), label]
@@ -528,7 +589,9 @@ final class SessionActivityView: NSView {
         label.setAccessibilityHelp(
             item.provider == .codex && openableIDs.contains(item.id)
                 ? "Use Open in Codex to show this session, or Mark as read to acknowledge it."
-                : "Informational only. Use Mark as read to acknowledge this item."
+                : item.provider == .codex && openabilityPendingIDs.contains(item.id)
+                    ? "Checking whether this session can be opened in Codex Desktop. Use Mark as read to acknowledge it."
+                    : "Informational only. Use Mark as read to acknowledge this item."
         )
 
         let acknowledge = NSButton(title: "Mark as read", target: self, action: #selector(markAsRead(_:)))
@@ -611,6 +674,15 @@ final class SessionActivityView: NSView {
     @objc private func markAsRead(_ sender: NSButton) {
         guard let id = sender.identifier?.rawValue else { return }
         onAcknowledge?(id)
+    }
+
+    @objc private func clearAllCompleted(_ sender: NSButton) {
+        let ids = SessionActivityPresentation.unacknowledgedCompletedItems(
+            snapshot: snapshot,
+            acknowledgedIDs: acknowledgedIDs
+        ).map(\.id)
+        guard !ids.isEmpty else { return }
+        onAcknowledgeAllCompleted?(ids)
     }
 
     @objc private func openInCodex(_ sender: NSButton) {

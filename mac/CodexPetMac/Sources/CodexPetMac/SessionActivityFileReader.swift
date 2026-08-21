@@ -133,6 +133,13 @@ enum SessionActivityApplicationPolicy {
         normalizedHistory(history.filter { $0 != id } + [id])
     }
 
+    static func recordingAcknowledgements(
+        _ ids: [String],
+        in history: [String]
+    ) -> [String] {
+        normalizedHistory(history + ids)
+    }
+
     static func normalizedHistory(_ history: [String]) -> [String] {
         var ordered: [String] = []
         for id in history where id.count == SessionActivityItem.maximumIdentifierLength {
@@ -140,6 +147,29 @@ enum SessionActivityApplicationPolicy {
             ordered.append(id)
         }
         return Array(ordered.suffix(maximumAcknowledgements))
+    }
+}
+
+enum SessionActivityAcknowledgementStore {
+    static let defaultsKey = "Statelet.sessionActivityAcknowledgements.v1"
+
+    static func restored(from defaults: UserDefaults = .standard) -> [String] {
+        let values = defaults.array(forKey: defaultsKey) as? [String] ?? []
+        let normalized = SessionActivityApplicationPolicy.normalizedHistory(values)
+        if normalized != values {
+            defaults.set(normalized, forKey: defaultsKey)
+        }
+        return normalized
+    }
+
+    static func persist(
+        _ history: [String],
+        to defaults: UserDefaults = .standard
+    ) {
+        defaults.set(
+            SessionActivityApplicationPolicy.normalizedHistory(history),
+            forKey: defaultsKey
+        )
     }
 }
 
