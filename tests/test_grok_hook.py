@@ -202,6 +202,35 @@ class GrokHookTests(unittest.TestCase):
         self.assertEqual((stale["event"], stale["state"]), ("PreToolUse", "running"))
         self.assertEqual(stale["rejections"], {"stale_event": 1})
 
+    def test_blocked_stop_revives_for_same_prompt_permission_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            self.write(
+                state_dir,
+                {
+                    "hookEventName": "stop",
+                    "sessionId": "session",
+                    "promptId": "prompt",
+                },
+            )
+            revived = self.write(
+                state_dir,
+                {
+                    "hookEventName": "notification",
+                    "notificationType": "permission_prompt",
+                    "sessionId": "session",
+                    "promptId": "prompt",
+                },
+            )
+
+        self.assertEqual(
+            (revived["event"], revived["state"]),
+            ("PermissionRequest", "waiting"),
+        )
+        self.assertFalse(revived["fence"]["turn_closed"])
+        self.assertEqual(len(revived["causal"]["pending_permissions"]), 1)
+        self.assertEqual(revived["rejections"], {})
+
     def test_revived_blocked_stop_can_settle_with_final_idle_notification(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state_dir = Path(temporary)

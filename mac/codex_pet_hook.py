@@ -88,7 +88,13 @@ TERMINAL_EVENTS = frozenset(("SessionEnd",))
 TURN_CLOSING_EVENTS = frozenset(("Stop",))
 REVIVAL_EVENTS = frozenset(("SessionStart", "UserPromptSubmit"))
 GROK_CONTINUATION_EVENTS = frozenset(
-    ("PreToolUse", "PostToolUse", "SubagentStart", "PreCompact")
+    (
+        "PreToolUse",
+        "PostToolUse",
+        "PermissionRequest",
+        "SubagentStart",
+        "PreCompact",
+    )
 )
 MAX_REJECTION_COUNT = 1_000_000
 MAX_PRIOR_TURNS = 8
