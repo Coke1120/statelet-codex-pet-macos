@@ -215,23 +215,22 @@ private final class SettingsResizeOverlayView: NSView {
     }
 
     private func cursor(for edges: Edges) -> NSCursor {
-        if #available(macOS 15.0, *) {
-            let position: NSCursor.FrameResizePosition
-            switch edges {
-            case [.left, .bottom]: position = .bottomLeft
-            case [.right, .bottom]: position = .bottomRight
-            case [.left, .top]: position = .topLeft
-            case [.right, .top]: position = .topRight
-            case [.left]: position = .left
-            case [.right]: position = .right
-            case [.bottom]: position = .bottom
-            default: position = .top
+        let hasHorizontalEdge = edges.contains(.left) || edges.contains(.right)
+        let hasVerticalEdge = edges.contains(.bottom) || edges.contains(.top)
+        if hasHorizontalEdge, hasVerticalEdge {
+            let symbolName = edges == [.left, .bottom] || edges == [.right, .top]
+                ? "arrow.up.right.and.arrow.down.left"
+                : "arrow.up.left.and.arrow.down.right"
+            let configuration = NSImage.SymbolConfiguration(pointSize: 16, weight: .medium)
+            if let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
+                .withSymbolConfiguration(configuration) {
+                return NSCursor(
+                    image: image,
+                    hotSpot: NSPoint(x: image.size.width / 2, y: image.size.height / 2)
+                )
             }
-            return NSCursor.frameResize(position: position, directions: .all)
         }
-        return edges.contains(.left) || edges.contains(.right)
-            ? .resizeLeftRight
-            : .resizeUpDown
+        return hasHorizontalEdge ? .resizeLeftRight : .resizeUpDown
     }
 
     private func clamped(_ value: CGFloat, minimum: CGFloat, maximum: CGFloat) -> CGFloat {
