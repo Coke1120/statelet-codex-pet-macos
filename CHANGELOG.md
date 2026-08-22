@@ -3,6 +3,24 @@
 All notable changes to Statelet are documented here. Versions follow semantic
 versioning for the public source release.
 
+## [1.8.14] - 2026-08-22
+
+### Fixed
+
+- Settings now releases its fixed content dimensions for the duration of a
+  native live resize, restoring pointer-driven resizing from every window edge
+  and corner while preserving pane stability, the minimum size, screen clamp,
+  and saved custom dimensions.
+
+### Distribution notes
+
+- Version 1.8.14 supersedes 1.8.13 with the Settings resize repair; existing
+  private media, voice, models, credentials, logs, and runtime data remain local
+  and excluded from releases.
+- The package remains ad-hoc signed for owner-authorized personal updates. It
+  is not Developer ID signed, notarized, or presented as an Apple-authorized
+  public binary.
+
 ## [1.8.13] - 2026-08-22
 
 ### Added
@@ -488,6 +506,7 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
+[1.8.14]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.14
 [1.8.13]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.13
 [1.8.12]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.12
 [1.8.11]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.11

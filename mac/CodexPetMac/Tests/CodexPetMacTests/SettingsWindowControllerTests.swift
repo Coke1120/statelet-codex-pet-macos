@@ -140,7 +140,7 @@ final class SettingsWindowControllerTests: XCTestCase {
         XCTAssertEqual(Self.contentSize(of: restoredWindow).height, laterUserSize.height, accuracy: 1)
     }
 
-    func testSettingsWindowFrameResizeUpdatesContentConstraintsAndPersistsSize() throws {
+    func testSettingsWindowFrameResizeUpdatesLayoutAndPersistsSize() throws {
         let suiteName = "statelet-settings-frame-resize-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer {
@@ -180,6 +180,54 @@ final class SettingsWindowControllerTests: XCTestCase {
         let persisted = try XCTUnwrap(SettingsWindowSizeStore.restored(from: defaults))
         XCTAssertEqual(persisted.width, contentSize.width, accuracy: 1)
         XCTAssertEqual(persisted.height, contentSize.height, accuracy: 1)
+    }
+
+    func testSettingsWindowReleasesFixedContentDimensionsDuringLiveResize() throws {
+        let suiteName = "statelet-settings-live-resize-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let controller = SettingsWindowController(defaults: defaults)
+        let window = try XCTUnwrap(controller.window)
+        let contentView = try XCTUnwrap(window.contentView)
+        controller.show()
+        Self.pumpMainRunLoop(for: 0.1)
+        defer {
+            window.close()
+            Self.pumpMainRunLoop(for: 0.05)
+        }
+
+        let requiredFixedDimensions = contentView.constraints.filter { constraint in
+            constraint.isActive
+                && constraint.priority == .required
+                && constraint.relation == .equal
+                && constraint.firstItem === contentView
+                && constraint.secondItem == nil
+                && (constraint.firstAttribute == .width || constraint.firstAttribute == .height)
+        }
+        XCTAssertEqual(requiredFixedDimensions.count, 2)
+
+        controller.windowWillStartLiveResize(
+            Notification(name: NSWindow.willStartLiveResizeNotification, object: window)
+        )
+        XCTAssertTrue(requiredFixedDimensions.allSatisfy { !$0.isActive })
+
+        let resizedFrame = NSRect(
+            origin: window.frame.origin,
+            size: NSSize(width: window.frame.width - 80, height: window.frame.height - 20)
+        )
+        window.setFrame(resizedFrame, display: false)
+        Self.pumpMainRunLoop(for: 0.05)
+        XCTAssertEqual(window.frame.width, resizedFrame.width, accuracy: 1)
+        XCTAssertEqual(window.frame.height, resizedFrame.height, accuracy: 1)
+
+        controller.windowDidEndLiveResize(
+            Notification(name: NSWindow.didEndLiveResizeNotification, object: window)
+        )
+        XCTAssertTrue(requiredFixedDimensions.allSatisfy(\.isActive))
+        XCTAssertEqual(Self.contentSize(of: window).width, resizedFrame.width, accuracy: 1)
+        XCTAssertEqual(Self.contentSize(of: window).height, resizedFrame.height, accuracy: 1)
     }
 
     func testSettingsSidebarProvidesOrderedAccessibleKeyboardNavigationAndPersistsSelection() throws {

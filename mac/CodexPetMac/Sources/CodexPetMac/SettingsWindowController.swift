@@ -923,13 +923,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         changePane()
         splitViewController.preferredContentSize = requestedContentSize
         let splitRootView = splitViewController.view
-        guard let contentView = window.contentView else { return }
         NSLayoutConstraint.activate([
             splitViewController.splitView.leadingAnchor.constraint(equalTo: splitRootView.leadingAnchor),
             splitViewController.splitView.trailingAnchor.constraint(equalTo: splitRootView.trailingAnchor),
             splitViewController.splitView.topAnchor.constraint(equalTo: splitRootView.topAnchor),
             splitViewController.splitView.bottomAnchor.constraint(equalTo: splitRootView.bottomAnchor),
         ])
+        guard let contentView = window.contentView else { return }
         splitRootView.frame = contentView.bounds
         splitRootView.autoresizingMask = [.width, .height]
         contentView.addSubview(splitRootView)
@@ -2418,7 +2418,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     func windowDidResize(_ notification: Notification) {
         if let size = window?.contentView?.bounds.size, size.width > 0, size.height > 0 {
-            updateSplitPreferredContentSizes(for: size)
+            updateWindowSizingPreferences(for: size)
         }
         persistSettingsWindowSize()
     }
@@ -2427,6 +2427,21 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let contentSize = sender.contentRect(forFrameRect: NSRect(origin: .zero, size: frameSize)).size
         updateWindowSizingPreferences(for: contentSize)
         return frameSize
+    }
+
+    func windowWillStartLiveResize(_ notification: Notification) {
+        NSLayoutConstraint.deactivate(
+            [windowContentWidthConstraint, windowContentHeightConstraint].compactMap { $0 }
+        )
+    }
+
+    func windowDidEndLiveResize(_ notification: Notification) {
+        guard let size = window?.contentView?.bounds.size, size.width > 0, size.height > 0 else { return }
+        updateWindowSizingPreferences(for: size)
+        NSLayoutConstraint.activate(
+            [windowContentWidthConstraint, windowContentHeightConstraint].compactMap { $0 }
+        )
+        persistSettingsWindowSize()
     }
 
     func windowDidChangeScreen(_ notification: Notification) {
@@ -2551,6 +2566,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             width: min(max(requestedSize.width, effectiveMinimumSize.width), maximumContentSize.width),
             height: min(max(requestedSize.height, effectiveMinimumSize.height), maximumContentSize.height)
         )
+        updateWindowSizingPreferences(for: targetSize)
         window.setContentSize(targetSize)
 
         var frame = window.frame
