@@ -138,6 +138,32 @@ class MacPetPackagingTests(unittest.TestCase):
             env=env,
         )
 
+    def wait_for_test_gate(
+        self,
+        process: subprocess.Popen,
+        gate: Path,
+        *,
+        timeout: float = 60,
+    ) -> None:
+        ready = Path(f"{gate}.ready")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if ready.exists():
+                return
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                self.fail(f"installer exited before test gate {gate}: {stdout}{stderr}")
+            time.sleep(0.01)
+
+        Path(f"{gate}.release").touch()
+        process.terminate()
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate(timeout=5)
+        self.fail(f"installer did not reach test gate {gate}: {stdout}{stderr}")
+
     def journal_command(self, root: Path, command: str, *args: str) -> subprocess.CompletedProcess[str]:
         source = INSTALL_SCRIPT.read_text(encoding="utf-8")
         start = source.index("import ctypes,", source.index("journal_command()"))
@@ -385,8 +411,8 @@ esac
             info["NSHumanReadableCopyright"],
             "Copyright © 2026 Statelet contributors. MIT licensed.",
         )
-        self.assertEqual(info["CFBundleShortVersionString"], "1.8.14")
-        self.assertEqual(info["CFBundleVersion"], "28")
+        self.assertEqual(info["CFBundleShortVersionString"], "1.8.15")
+        self.assertEqual(info["CFBundleVersion"], "29")
         self.assertEqual(info["CFBundlePackageType"], "APPL")
         self.assertEqual(info["LSMinimumSystemVersion"], "13.0")
         self.assertTrue(info["LSUIElement"])
@@ -501,18 +527,22 @@ struct PetPanelHarness {
         guard panel.collectionBehavior.contains(.canJoinAllSpaces) else { exit(2) }
         guard panel.collectionBehavior.contains(.ignoresCycle) else { exit(3) }
         guard panel.collectionBehavior.contains(.fullScreenAuxiliary) else { exit(4) }
+        guard !panel.isVisible else { exit(5) }
+
+        panel.apply(alwaysOnTop: true, fullScreenAuxiliary: true)
+        guard !panel.isVisible else { exit(6) }
 
         panel.apply(alwaysOnTop: false, fullScreenAuxiliary: true)
-        guard panel.level == .normal, !panel.isFloatingPanel else { exit(5) }
-        guard panel.collectionBehavior.contains(.canJoinAllSpaces) else { exit(6) }
-        guard panel.collectionBehavior.contains(.ignoresCycle) else { exit(7) }
-        guard panel.collectionBehavior.contains(.fullScreenAuxiliary) else { exit(8) }
+        guard panel.level == .normal, !panel.isFloatingPanel else { exit(7) }
+        guard panel.collectionBehavior.contains(.canJoinAllSpaces) else { exit(8) }
+        guard panel.collectionBehavior.contains(.ignoresCycle) else { exit(9) }
+        guard panel.collectionBehavior.contains(.fullScreenAuxiliary) else { exit(10) }
 
         panel.apply(alwaysOnTop: true, fullScreenAuxiliary: false)
-        guard panel.level == .floating, panel.isFloatingPanel else { exit(9) }
-        guard panel.collectionBehavior.contains(.canJoinAllSpaces) else { exit(10) }
-        guard panel.collectionBehavior.contains(.ignoresCycle) else { exit(11) }
-        guard !panel.collectionBehavior.contains(.fullScreenAuxiliary) else { exit(12) }
+        guard panel.level == .floating, panel.isFloatingPanel else { exit(11) }
+        guard panel.collectionBehavior.contains(.canJoinAllSpaces) else { exit(12) }
+        guard panel.collectionBehavior.contains(.ignoresCycle) else { exit(13) }
+        guard !panel.collectionBehavior.contains(.fullScreenAuxiliary) else { exit(14) }
         print("pet-panel-level-ok")
     }
 }
@@ -1883,10 +1913,7 @@ struct WatchdogHarness {
             text=True,
             env=environment,
         )
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
-            time.sleep(0.01)
-        self.assertTrue(Path(f"{gate}.ready").exists())
+        self.wait_for_test_gate(process, gate)
         payload = json.loads(grok_hooks.read_text(encoding="utf-8"))
         payload["unrelated"] = {"concurrent": "preserve"}
         grok_hooks.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
@@ -1918,10 +1945,7 @@ struct WatchdogHarness {
             text=True,
             env=environment,
         )
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
-            time.sleep(0.01)
-        self.assertTrue(Path(f"{gate}.ready").exists())
+        self.wait_for_test_gate(process, gate)
         concurrent = b'{"unrelated":{"created":"preserve"},"hooks":{}}\n'
         grok_hooks.write_bytes(concurrent)
         grok_hooks.chmod(0o600)
@@ -1953,10 +1977,7 @@ struct WatchdogHarness {
             text=True,
             env=environment,
         )
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
-            time.sleep(0.01)
-        self.assertTrue(Path(f"{gate}.ready").exists())
+        self.wait_for_test_gate(process, gate)
         quiesced = json.loads(grok_hooks.read_text(encoding="utf-8"))
         quiesced["unrelated"] = {"after_quiesce": "preserve"}
         grok_hooks.write_text(json.dumps(quiesced, separators=(",", ":")) + "\n", encoding="utf-8")
@@ -1995,9 +2016,7 @@ struct WatchdogHarness {
             ["bash", str(INSTALL_SCRIPT), "--home", str(self.home), "--app-bundle", str(second), "--skip-launchctl"],
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment,
         )
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists(): time.sleep(0.01)
-        self.assertTrue(Path(f"{gate}.ready").exists())
+        self.wait_for_test_gate(process, gate)
         payload = json.loads(grok_hooks.read_text(encoding="utf-8"))
         payload["unrelated"] = {"drain": "preserve"}
         grok_hooks.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
@@ -2038,9 +2057,7 @@ struct WatchdogHarness {
             ["bash", str(INSTALL_SCRIPT), "--home", str(self.home), "--app-bundle", str(second), "--skip-launchctl"],
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment,
         )
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists(): time.sleep(0.01)
-        self.assertTrue(Path(f"{gate}.ready").exists())
+        self.wait_for_test_gate(process, gate)
         payload = json.loads(grok_hooks.read_text(encoding="utf-8"))
         payload["unrelated"] = {"crash_phase": phase}
         grok_hooks.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
@@ -2076,16 +2093,12 @@ struct WatchdogHarness {
             ["bash", str(INSTALL_SCRIPT), "--home", str(self.home), "--app-bundle", str(second), "--skip-launchctl"],
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment,
         )
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline and not Path(f"{final_gate}.ready").exists(): time.sleep(0.01)
-        self.assertTrue(Path(f"{final_gate}.ready").exists())
+        self.wait_for_test_gate(process, final_gate)
         first_edit = json.loads(grok_hooks.read_text(encoding="utf-8"))
         first_edit["unrelated"] = {"first": "preserve"}
         grok_hooks.write_text(json.dumps(first_edit, separators=(",", ":")) + "\n", encoding="utf-8")
         Path(f"{final_gate}.release").touch()
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline and not Path(f"{apply_gate}.ready").exists(): time.sleep(0.01)
-        self.assertTrue(Path(f"{apply_gate}.ready").exists())
+        self.wait_for_test_gate(process, apply_gate)
         if mutate == "target":
             later = json.loads(grok_hooks.read_text(encoding="utf-8"))
             later["unrelated"] = {"later": "must-survive"}
@@ -2129,10 +2142,7 @@ struct WatchdogHarness {
             text=True,
             env=environment,
         )
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
-            time.sleep(0.01)
-        self.assertTrue(Path(f"{gate}.ready").exists())
+        self.wait_for_test_gate(process, gate)
         quiesced = json.loads(grok_hooks.read_text(encoding="utf-8"))
         quiesced["unrelated"] = {"commit": "preserve"}
         grok_hooks.write_text(json.dumps(quiesced, separators=(",", ":")) + "\n", encoding="utf-8")
@@ -2157,10 +2167,7 @@ struct WatchdogHarness {
             ["bash", str(INSTALL_SCRIPT), "--home", str(self.home), "--app-bundle", str(second), "--skip-launchctl"],
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment,
         )
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
-            time.sleep(0.01)
-        self.assertTrue(Path(f"{gate}.ready").exists())
+        self.wait_for_test_gate(process, gate)
         grok_hooks.unlink()
         Path(f"{gate}.release").touch()
         stdout, stderr = process.communicate(timeout=30)
@@ -2187,10 +2194,7 @@ struct WatchdogHarness {
             ["bash", str(INSTALL_SCRIPT), "--home", str(self.home), "--app-bundle", str(second), "--skip-launchctl"],
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment,
         )
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
-            time.sleep(0.01)
-        self.assertTrue(Path(f"{gate}.ready").exists())
+        self.wait_for_test_gate(process, gate)
         grok_hooks.unlink()
         Path(f"{gate}.release").touch()
         stdout, stderr = process.communicate(timeout=30)
@@ -2213,9 +2217,7 @@ struct WatchdogHarness {
             ["bash", str(INSTALL_SCRIPT), "--home", str(self.home), "--app-bundle", str(second), "--skip-launchctl"],
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment,
         )
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists(): time.sleep(0.01)
-        self.assertTrue(Path(f"{gate}.ready").exists())
+        self.wait_for_test_gate(process, gate)
         grok_hooks.unlink()
         Path(f"{gate}.release").touch()
         process.communicate(timeout=30)
@@ -2283,10 +2285,7 @@ struct WatchdogHarness {
             text=True,
             env=environment,
         )
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
-            time.sleep(0.01)
-        self.assertTrue(Path(f"{gate}.ready").exists())
+        self.wait_for_test_gate(process, gate)
         replacement = grok_hooks.with_suffix(".replacement")
         replacement.write_bytes(original)
         replacement.chmod(0o600)
@@ -2317,10 +2316,7 @@ struct WatchdogHarness {
             text=True,
             env=environment,
         )
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
-            time.sleep(0.01)
-        self.assertTrue(Path(f"{gate}.ready").exists())
+        self.wait_for_test_gate(process, gate)
         grok_hooks.parent.chmod(0o755)
         Path(f"{gate}.release").touch()
         stdout, stderr = process.communicate(timeout=30)
@@ -2347,10 +2343,7 @@ struct WatchdogHarness {
             text=True,
             env=environment,
         )
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
-            time.sleep(0.01)
-        self.assertTrue(Path(f"{gate}.ready").exists())
+        self.wait_for_test_gate(process, gate)
         displaced = self.home / ".grok/hooks-displaced"
         hooks_dir.rename(displaced)
         hooks_dir.mkdir(mode=0o700)

@@ -1114,6 +1114,33 @@ final class SessionActivityTests: XCTestCase {
     }
 
     @MainActor
+    func testActivityPanelDisablesImplicitResizeAndAppearanceActions() throws {
+        let view = SessionActivityView(
+            frame: NSRect(x: 0, y: 0, width: 230, height: 150)
+        )
+        let layer = try XCTUnwrap(view.layer)
+
+        for key in [
+            "bounds",
+            "position",
+            "frame",
+            "contents",
+            "sublayers",
+            "cornerRadius",
+            "borderWidth",
+            "borderColor",
+            "backgroundColor",
+            "opacity",
+            "hidden",
+        ] {
+            XCTAssertTrue(
+                layer.actions?[key] is NSNull,
+                "activity panel must disable implicit \(key) actions"
+            )
+        }
+    }
+
+    @MainActor
     func testActivityContrastClampsZeroOpacityAndSemanticRowsToReadableColors() throws {
         let appearance = try SessionActivityPanelAppearance(
             backgroundColor: "#20242A",

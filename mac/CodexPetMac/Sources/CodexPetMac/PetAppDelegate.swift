@@ -1340,7 +1340,10 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         guard let panel else { return }
         let size = NSSize(width: mediaMap.window.width, height: mediaMap.window.height)
         let resized = WindowFramePolicy.applyingConfiguredSize(size, to: panel.frame)
-        panel.setFrame(positionStore.clampedFrame(resized), display: true)
+        let targetFrame = positionStore.clampedFrame(resized)
+        if panel.frame != targetFrame {
+            panel.setFrame(targetFrame, display: false)
+        }
         clickThrough = options.clickThroughOverride ?? mediaMap.window.clickThrough
         panel.ignoresMouseEvents = clickThrough
         sessionActivityPanel?.ignoresMouseEvents = clickThrough

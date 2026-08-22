@@ -118,6 +118,20 @@ final class PetPlayerView: NSView {
         symbolName: "arrow.up.right.and.arrow.down.left"
     )
 
+    private static let disabledLayerActions: [String: CAAction] = [
+        "bounds": NSNull(),
+        "position": NSNull(),
+        "frame": NSNull(),
+        "contents": NSNull(),
+        "sublayers": NSNull(),
+        "cornerRadius": NSNull(),
+        "borderWidth": NSNull(),
+        "borderColor": NSNull(),
+        "backgroundColor": NSNull(),
+        "opacity": NSNull(),
+        "hidden": NSNull(),
+    ]
+
     private(set) var playerLayer = AVPlayerLayer()
     private(set) var destinationPlayerLayer = AVPlayerLayer()
     let lifecycleTransitionPlayerLayer = AVPlayerLayer()
@@ -162,19 +176,23 @@ final class PetPlayerView: NSView {
         wantsLayer = true
         layer = CALayer()
         layer?.backgroundColor = NSColor.clear.cgColor
+        layer?.actions = Self.disabledLayerActions
         playerLayer.videoGravity = .resizeAspect
         playerLayer.backgroundColor = NSColor.clear.cgColor
         playerLayer.zPosition = 0
+        playerLayer.actions = Self.disabledLayerActions
         layer?.addSublayer(playerLayer)
         destinationPlayerLayer.videoGravity = .resizeAspect
         destinationPlayerLayer.backgroundColor = NSColor.clear.cgColor
         destinationPlayerLayer.isHidden = true
         destinationPlayerLayer.zPosition = 1
+        destinationPlayerLayer.actions = Self.disabledLayerActions
         layer?.addSublayer(destinationPlayerLayer)
         lifecycleTransitionPlayerLayer.videoGravity = .resizeAspect
         lifecycleTransitionPlayerLayer.backgroundColor = NSColor.clear.cgColor
         lifecycleTransitionPlayerLayer.isHidden = true
         lifecycleTransitionPlayerLayer.zPosition = 2
+        lifecycleTransitionPlayerLayer.actions = Self.disabledLayerActions
         layer?.addSublayer(lifecycleTransitionPlayerLayer)
 
         posterView.imageScaling = .scaleProportionallyUpOrDown
@@ -212,6 +230,9 @@ final class PetPlayerView: NSView {
     }
 
     override func layout() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
         super.layout()
         playerLayer.frame = bounds
         destinationPlayerLayer.frame = bounds
@@ -500,6 +521,9 @@ final class PetPlayerView: NSView {
     }
 
     func applyAppearance(_ configuration: PetAppearanceConfiguration) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
         appearanceConfiguration = configuration
         let workspace = NSWorkspace.shared
         let reduceTransparency = workspace.accessibilityDisplayShouldReduceTransparency
@@ -979,7 +1003,7 @@ final class PetPlayerView: NSView {
         } else {
             window.setFrame(
                 resizedFrame(from: interaction.windowFrame, delta: delta, edges: interaction.resizeEdges),
-                display: true
+                display: false
             )
         }
     }

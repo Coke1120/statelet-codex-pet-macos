@@ -238,11 +238,26 @@ final class SessionActivityView: NSView {
     var onOpen: ((String) -> Void)?
     var onExpand: (() -> Void)?
 
+    private static let disabledLayerActions: [String: CAAction] = [
+        "bounds": NSNull(),
+        "position": NSNull(),
+        "frame": NSNull(),
+        "contents": NSNull(),
+        "sublayers": NSNull(),
+        "cornerRadius": NSNull(),
+        "borderWidth": NSNull(),
+        "borderColor": NSNull(),
+        "backgroundColor": NSNull(),
+        "opacity": NSNull(),
+        "hidden": NSNull(),
+    ]
+
     init(frame frameRect: NSRect = .zero, clock: @escaping () -> Date = Date.init) {
         self.clock = clock
         super.init(frame: frameRect)
         wantsLayer = true
         layer = CALayer()
+        layer?.actions = Self.disabledLayerActions
         layer?.cornerCurve = .continuous
         layer?.cornerRadius = 12
         layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.92).cgColor
@@ -308,6 +323,9 @@ final class SessionActivityView: NSView {
     }
 
     func applyAppearance(_ appearance: SessionActivityPanelAppearance) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
         panelAppearance = appearance
         let reduceTransparency = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
         let increaseContrast = NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast

@@ -34,7 +34,7 @@ private final class SettingsWindow: NSWindow {
 // fixed content dimensions below prevent that geometry regression, and this
 // perimeter-only view supplies the pointer resize interaction they suppress.
 private final class SettingsResizeOverlayView: NSView {
-    private struct Edges: OptionSet {
+    private struct Edges: Hashable, OptionSet {
         let rawValue: Int
 
         static let left = Edges(rawValue: 1 << 0)
@@ -57,6 +57,7 @@ private final class SettingsResizeOverlayView: NSView {
     var allowedFrameProvider: (() -> NSRect?)?
     var onResizeFrame: ((NSRect) -> Void)?
     private var resizeSession: ResizeSession?
+    private var cachedCursors: [Edges: NSCursor] = [:]
 
     override var acceptsFirstResponder: Bool { false }
 
@@ -215,8 +216,12 @@ private final class SettingsResizeOverlayView: NSView {
     }
 
     private func cursor(for edges: Edges) -> NSCursor {
+        if let cachedCursor = cachedCursors[edges] { return cachedCursor }
+
         let hasHorizontalEdge = edges.contains(.left) || edges.contains(.right)
         let hasVerticalEdge = edges.contains(.bottom) || edges.contains(.top)
+        let resolvedCursor: NSCursor
+
         if hasHorizontalEdge, hasVerticalEdge {
             let symbolName = edges == [.left, .bottom] || edges == [.right, .top]
                 ? "arrow.up.right.and.arrow.down.left"
@@ -224,13 +229,19 @@ private final class SettingsResizeOverlayView: NSView {
             let configuration = NSImage.SymbolConfiguration(pointSize: 16, weight: .medium)
             if let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
                 .withSymbolConfiguration(configuration) {
-                return NSCursor(
+                resolvedCursor = NSCursor(
                     image: image,
                     hotSpot: NSPoint(x: image.size.width / 2, y: image.size.height / 2)
                 )
+            } else {
+                resolvedCursor = hasHorizontalEdge ? .resizeLeftRight : .resizeUpDown
             }
+        } else {
+            resolvedCursor = hasHorizontalEdge ? .resizeLeftRight : .resizeUpDown
         }
-        return hasHorizontalEdge ? .resizeLeftRight : .resizeUpDown
+
+        cachedCursors[edges] = resolvedCursor
+        return resolvedCursor
     }
 
     private func clamped(_ value: CGFloat, minimum: CGFloat, maximum: CGFloat) -> CGFloat {
@@ -248,12 +259,27 @@ private enum SettingsVisualMetrics {
 }
 
 private final class SessionActivityAppearancePreviewView: NSView {
+    private static let disabledLayerActions: [String: CAAction] = [
+        "bounds": NSNull(),
+        "position": NSNull(),
+        "frame": NSNull(),
+        "contents": NSNull(),
+        "sublayers": NSNull(),
+        "cornerRadius": NSNull(),
+        "borderWidth": NSNull(),
+        "borderColor": NSNull(),
+        "backgroundColor": NSNull(),
+        "opacity": NSNull(),
+        "hidden": NSNull(),
+    ]
+
     private let label = NSTextField(labelWithString: "Running · Tool #1 · just now")
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
         layer = CALayer()
+        layer?.actions = Self.disabledLayerActions
         layer?.cornerCurve = .continuous
         layer?.cornerRadius = 10
         label.alignment = .center
@@ -279,6 +305,9 @@ private final class SessionActivityAppearancePreviewView: NSView {
     }
 
     func apply(_ appearance: SessionActivityPanelAppearance) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
         let increaseContrast = NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
         let reduceTransparency = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
         let resolved = SessionActivityView.resolveAppearance(
@@ -300,12 +329,27 @@ private final class SessionActivityAppearancePreviewView: NSView {
 }
 
 private final class DialogueAppearancePreviewView: NSView {
+    private static let disabledLayerActions: [String: CAAction] = [
+        "bounds": NSNull(),
+        "position": NSNull(),
+        "frame": NSNull(),
+        "contents": NSNull(),
+        "sublayers": NSNull(),
+        "cornerRadius": NSNull(),
+        "borderWidth": NSNull(),
+        "borderColor": NSNull(),
+        "backgroundColor": NSNull(),
+        "opacity": NSNull(),
+        "hidden": NSNull(),
+    ]
+
     private let label = NSTextField(labelWithString: "Statelet dialogue preview")
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
         layer = CALayer()
+        layer?.actions = Self.disabledLayerActions
         layer?.cornerCurve = .continuous
         layer?.cornerRadius = 10
         label.alignment = .center
@@ -331,6 +375,9 @@ private final class DialogueAppearancePreviewView: NSView {
     }
 
     func apply(_ appearance: PetAppearanceConfiguration) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
         let resolved = PetPlayerView.resolveDialogueAppearance(
             configuration: appearance,
             systemBackgroundColor: .windowBackgroundColor,
@@ -1172,7 +1219,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             return safeFrame.width > 0 && safeFrame.height > 0 ? safeFrame : nil
         }
         resizeOverlay.onResizeFrame = { [weak window] frame in
-            window?.setFrame(frame, display: true)
+            // Frame changes invalidate their own drawing. Forcing immediate
+            // whole-window display during rapid drag events makes constrained
+            // pane content visibly flicker.
+            window?.setFrame(frame, display: false)
         }
         contentView.addSubview(resizeOverlay, positioned: .above, relativeTo: splitRootView)
         window.setContentSize(requestedContentSize)

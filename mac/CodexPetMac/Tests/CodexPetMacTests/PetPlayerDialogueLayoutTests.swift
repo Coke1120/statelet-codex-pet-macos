@@ -5,6 +5,39 @@ import XCTest
 
 final class PetPlayerDialogueLayoutTests: XCTestCase {
     @MainActor
+    func testPlayerLayersDisableImplicitResizeAndAppearanceActions() throws {
+        let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 480))
+        let layers: [(String, CALayer)] = [
+            ("root", try XCTUnwrap(view.layer)),
+            ("player", view.playerLayer),
+            ("destination", view.destinationPlayerLayer),
+            ("transition", view.lifecycleTransitionPlayerLayer),
+        ]
+        let keys = [
+            "bounds",
+            "position",
+            "frame",
+            "contents",
+            "sublayers",
+            "cornerRadius",
+            "borderWidth",
+            "borderColor",
+            "backgroundColor",
+            "opacity",
+            "hidden",
+        ]
+
+        for (name, layer) in layers {
+            for key in keys {
+                XCTAssertTrue(
+                    layer.actions?[key] is NSNull,
+                    "\(name) layer must disable implicit \(key) actions"
+                )
+            }
+        }
+    }
+
+    @MainActor
     func testCustomWhiteOnWhiteDialogueFallsBackToReadableText() throws {
         let appearance = try PetAppearanceConfiguration(
             dialogueBackgroundColor: "#FFFFFF",

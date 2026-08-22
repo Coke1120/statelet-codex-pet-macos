@@ -738,7 +738,8 @@ final class SettingsWindowControllerTests: XCTestCase {
         let sidebar = try Self.settingsSidebar(in: window)
         try Self.selectSidebar(in: sidebar, label: "Appearance")
 
-        let labels = Self.descendants(of: window.contentView)
+        let appearanceViews = Self.descendants(of: window.contentView)
+        let labels = appearanceViews
             .compactMap { $0.accessibilityLabel() }
         for label in [
             "Dialogue bubble background color",
@@ -752,6 +753,33 @@ final class SettingsWindowControllerTests: XCTestCase {
             "Activity popup appearance preview",
         ] {
             XCTAssertTrue(labels.contains(label), "missing \(label)")
+        }
+        for label in [
+            "Dialogue bubble appearance preview",
+            "Activity popup appearance preview",
+        ] {
+            let preview = try XCTUnwrap(
+                appearanceViews.first { $0.accessibilityLabel() == label }
+            )
+            let layer = try XCTUnwrap(preview.layer)
+            for key in [
+                "bounds",
+                "position",
+                "frame",
+                "contents",
+                "sublayers",
+                "cornerRadius",
+                "borderWidth",
+                "borderColor",
+                "backgroundColor",
+                "opacity",
+                "hidden",
+            ] {
+                XCTAssertTrue(
+                    layer.actions?[key] is NSNull,
+                    "\(label) must disable implicit \(key) actions"
+                )
+            }
         }
         try Self.selectSidebar(in: sidebar, label: "Help & Updates")
         XCTAssertTrue(Self.descendants(of: window.contentView).compactMap { $0 as? NSTextField }.contains {
