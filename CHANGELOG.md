@@ -7,10 +7,9 @@ versioning for the public source release.
 
 ### Fixed
 
-- Settings now releases its fixed content dimensions for the duration of a
-  native live resize, restoring pointer-driven resizing from every window edge
-  and corner while preserving pane stability, the minimum size, screen clamp,
-  and saved custom dimensions.
+- Settings now provides reliable pointer-driven resize handles along every
+  window edge and corner while preserving pane stability, the minimum size,
+  screen clamp, and saved custom dimensions.
 
 ### Distribution notes
 

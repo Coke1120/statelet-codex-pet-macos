@@ -182,12 +182,13 @@ final class SettingsWindowControllerTests: XCTestCase {
         XCTAssertEqual(persisted.height, contentSize.height, accuracy: 1)
     }
 
-    func testSettingsWindowReleasesFixedContentDimensionsDuringLiveResize() throws {
+    func testSettingsWindowProvidesEdgeAndCornerResizeHandlesWithoutStealingInteriorClicks() throws {
         let suiteName = "statelet-settings-live-resize-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer {
             defaults.removePersistentDomain(forName: suiteName)
         }
+        SettingsWindowSizeStore.persist(NSSize(width: 900, height: 600), to: defaults)
         let controller = SettingsWindowController(defaults: defaults)
         let window = try XCTUnwrap(controller.window)
         let contentView = try XCTUnwrap(window.contentView)
@@ -208,26 +209,98 @@ final class SettingsWindowControllerTests: XCTestCase {
         }
         XCTAssertEqual(requiredFixedDimensions.count, 2)
 
-        controller.windowWillStartLiveResize(
-            Notification(name: NSWindow.willStartLiveResizeNotification, object: window)
+        let overlay = try XCTUnwrap(
+            Self.descendants(of: contentView).first {
+                $0.identifier?.rawValue == "SettingsResizeOverlay"
+            }
         )
-        XCTAssertTrue(requiredFixedDimensions.allSatisfy { !$0.isActive })
+        XCTAssertEqual(overlay.frame, contentView.bounds)
+        XCTAssertTrue(contentView.hitTest(NSPoint(x: 2, y: contentView.bounds.midY)) === overlay)
+        XCTAssertTrue(contentView.hitTest(NSPoint(x: contentView.bounds.maxX - 2, y: 2)) === overlay)
+        XCTAssertFalse(contentView.hitTest(NSPoint(x: contentView.bounds.midX, y: contentView.bounds.midY)) === overlay)
 
-        let resizedFrame = NSRect(
-            origin: window.frame.origin,
-            size: NSSize(width: window.frame.width - 80, height: window.frame.height - 20)
+        let initialFrame = window.frame
+        try Self.drag(
+            overlay: overlay,
+            in: window,
+            from: NSPoint(x: overlay.bounds.maxX - 2, y: overlay.bounds.maxY - 2),
+            by: NSPoint(x: 40, y: 30)
         )
-        window.setFrame(resizedFrame, display: false)
         Self.pumpMainRunLoop(for: 0.05)
-        XCTAssertEqual(window.frame.width, resizedFrame.width, accuracy: 1)
-        XCTAssertEqual(window.frame.height, resizedFrame.height, accuracy: 1)
+        XCTAssertEqual(window.frame.minX, initialFrame.minX, accuracy: 1)
+        XCTAssertEqual(window.frame.minY, initialFrame.minY, accuracy: 1)
+        XCTAssertEqual(window.frame.width, initialFrame.width + 40, accuracy: 1)
+        XCTAssertEqual(window.frame.height, initialFrame.height + 30, accuracy: 1)
+        let persisted = try XCTUnwrap(SettingsWindowSizeStore.restored(from: defaults))
+        XCTAssertEqual(persisted.width, Self.contentSize(of: window).width, accuracy: 1)
+        XCTAssertEqual(persisted.height, Self.contentSize(of: window).height, accuracy: 1)
+    }
 
-        controller.windowDidEndLiveResize(
-            Notification(name: NSWindow.didEndLiveResizeNotification, object: window)
+    func testSettingsResizeHandlesAnchorOppositeEdgesAndClampMinimumAndVisibleScreen() throws {
+        let suiteName = "statelet-settings-resize-clamp-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        SettingsWindowSizeStore.persist(NSSize(width: 900, height: 620), to: defaults)
+        let controller = SettingsWindowController(defaults: defaults)
+        let window = try XCTUnwrap(controller.window)
+        controller.show()
+        Self.pumpMainRunLoop(for: 0.1)
+        defer {
+            window.close()
+            Self.pumpMainRunLoop(for: 0.05)
+        }
+        let overlay = try XCTUnwrap(
+            Self.descendants(of: window.contentView).first {
+                $0.identifier?.rawValue == "SettingsResizeOverlay"
+            }
         )
-        XCTAssertTrue(requiredFixedDimensions.allSatisfy(\.isActive))
-        XCTAssertEqual(Self.contentSize(of: window).width, resizedFrame.width, accuracy: 1)
-        XCTAssertEqual(Self.contentSize(of: window).height, resizedFrame.height, accuracy: 1)
+        let initialFrame = window.frame
+
+        try Self.drag(
+            overlay: overlay,
+            in: window,
+            from: NSPoint(x: 2, y: overlay.bounds.maxY - 2),
+            by: NSPoint(x: 40, y: -30)
+        )
+        Self.pumpMainRunLoop(for: 0.05)
+        XCTAssertEqual(window.frame.maxX, initialFrame.maxX, accuracy: 1)
+        XCTAssertEqual(window.frame.minY, initialFrame.minY, accuracy: 1)
+        XCTAssertEqual(window.frame.width, initialFrame.width - 40, accuracy: 1)
+        XCTAssertEqual(window.frame.height, initialFrame.height - 30, accuracy: 1)
+
+        window.setFrame(initialFrame, display: false)
+        Self.pumpMainRunLoop(for: 0.05)
+        try Self.drag(
+            overlay: overlay,
+            in: window,
+            from: NSPoint(x: 2, y: 2),
+            by: NSPoint(x: 10_000, y: 10_000)
+        )
+        Self.pumpMainRunLoop(for: 0.05)
+        XCTAssertEqual(window.frame.maxX, initialFrame.maxX, accuracy: 1)
+        XCTAssertEqual(window.frame.maxY, initialFrame.maxY, accuracy: 1)
+        XCTAssertEqual(Self.contentSize(of: window).width, window.contentMinSize.width, accuracy: 1)
+        XCTAssertEqual(Self.contentSize(of: window).height, window.contentMinSize.height, accuracy: 1)
+
+        window.setFrame(initialFrame, display: false)
+        Self.pumpMainRunLoop(for: 0.05)
+        try Self.drag(
+            overlay: overlay,
+            in: window,
+            from: NSPoint(x: 2, y: 2),
+            by: NSPoint(x: -10_000, y: -10_000)
+        )
+        Self.pumpMainRunLoop(for: 0.05)
+        let screen = try XCTUnwrap(window.screen ?? NSScreen.main ?? NSScreen.screens.first)
+        let safeFrame = screen.visibleFrame.insetBy(dx: 12, dy: 12)
+        XCTAssertEqual(window.frame.minX, safeFrame.minX, accuracy: 1)
+        XCTAssertEqual(window.frame.minY, safeFrame.minY, accuracy: 1)
+        XCTAssertEqual(window.frame.maxX, initialFrame.maxX, accuracy: 1)
+        XCTAssertEqual(window.frame.maxY, initialFrame.maxY, accuracy: 1)
+        XCTAssertLessThanOrEqual(Self.contentSize(of: window).width, window.contentMaxSize.width + 1)
+        XCTAssertLessThanOrEqual(Self.contentSize(of: window).height, window.contentMaxSize.height + 1)
     }
 
     func testSettingsSidebarProvidesOrderedAccessibleKeyboardNavigationAndPersistsSelection() throws {
@@ -1128,6 +1201,31 @@ final class SettingsWindowControllerTests: XCTestCase {
 
     private static func contentSize(of window: NSWindow) -> NSSize {
         window.contentView?.bounds.size ?? window.contentLayoutRect.size
+    }
+
+    private static func drag(overlay: NSView, in window: NSWindow, from point: NSPoint, by delta: NSPoint) throws {
+        let initialWindowPoint = overlay.convert(point, to: nil)
+        let draggedWindowPoint = NSPoint(
+            x: initialWindowPoint.x + delta.x,
+            y: initialWindowPoint.y + delta.y
+        )
+        window.sendEvent(try mouseEvent(type: .leftMouseDown, location: initialWindowPoint, window: window))
+        window.sendEvent(try mouseEvent(type: .leftMouseDragged, location: draggedWindowPoint, window: window))
+        window.sendEvent(try mouseEvent(type: .leftMouseUp, location: draggedWindowPoint, window: window))
+    }
+
+    private static func mouseEvent(type: NSEvent.EventType, location: NSPoint, window: NSWindow) throws -> NSEvent {
+        try XCTUnwrap(NSEvent.mouseEvent(
+            with: type,
+            location: location,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 1,
+            pressure: 1
+        ))
     }
 
     private static func pumpMainRunLoop(for duration: TimeInterval) {

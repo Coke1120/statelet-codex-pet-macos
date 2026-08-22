@@ -7,6 +7,7 @@ private final class TopAlignedSettingsDocumentView: NSView {
 
 private final class SettingsWindow: NSWindow {
     var onWillApplyContentSize: ((NSSize) -> Void)?
+    var resizeEventHandler: ((NSEvent) -> Bool)?
 
     override func setContentSize(_ size: NSSize) {
         onWillApplyContentSize?(size)
@@ -21,6 +22,220 @@ private final class SettingsWindow: NSWindow {
     override func setFrame(_ frameRect: NSRect, display flag: Bool, animate animateFlag: Bool) {
         onWillApplyContentSize?(contentRect(forFrameRect: frameRect).size)
         super.setFrame(frameRect, display: flag, animate: animateFlag)
+    }
+
+    override func sendEvent(_ event: NSEvent) {
+        if resizeEventHandler?(event) == true { return }
+        super.sendEvent(event)
+    }
+}
+
+// AppKit re-fits this constraint-heavy split view whenever a pane changes. The
+// fixed content dimensions below prevent that geometry regression, and this
+// perimeter-only view supplies the pointer resize interaction they suppress.
+private final class SettingsResizeOverlayView: NSView {
+    private struct Edges: OptionSet {
+        let rawValue: Int
+
+        static let left = Edges(rawValue: 1 << 0)
+        static let right = Edges(rawValue: 1 << 1)
+        static let bottom = Edges(rawValue: 1 << 2)
+        static let top = Edges(rawValue: 1 << 3)
+    }
+
+    private struct ResizeSession {
+        let edges: Edges
+        let initialMouseLocation: NSPoint
+        let initialFrame: NSRect
+        let minimumFrameSize: NSSize
+        let maximumFrameSize: NSSize
+        let allowedFrame: NSRect?
+    }
+
+    private static let edgeInset: CGFloat = 10
+
+    var allowedFrameProvider: (() -> NSRect?)?
+    var onResizeFrame: ((NSRect) -> Void)?
+    private var resizeSession: ResizeSession?
+
+    override var acceptsFirstResponder: Bool { false }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden, alphaValue > 0 else { return nil }
+        let localPoint = superview.map { convert(point, from: $0) } ?? point
+        guard bounds.contains(localPoint), !edges(at: localPoint).isEmpty else { return nil }
+        return self
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        let inset = Self.edgeInset
+        let horizontalLength = max(0, bounds.width - inset * 2)
+        let verticalLength = max(0, bounds.height - inset * 2)
+
+        addCursorRect(
+            NSRect(x: inset, y: 0, width: horizontalLength, height: inset),
+            cursor: cursor(for: [.bottom])
+        )
+        addCursorRect(
+            NSRect(x: inset, y: max(0, bounds.height - inset), width: horizontalLength, height: inset),
+            cursor: cursor(for: [.top])
+        )
+        addCursorRect(
+            NSRect(x: 0, y: inset, width: inset, height: verticalLength),
+            cursor: cursor(for: [.left])
+        )
+        addCursorRect(
+            NSRect(x: max(0, bounds.width - inset), y: inset, width: inset, height: verticalLength),
+            cursor: cursor(for: [.right])
+        )
+        for (rect, edges) in cornerCursorRects(inset: inset) {
+            addCursorRect(rect, cursor: cursor(for: edges))
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        _ = handleWindowEvent(event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        _ = handleWindowEvent(event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        _ = handleWindowEvent(event)
+    }
+
+    func handleWindowEvent(_ event: NSEvent) -> Bool {
+        switch event.type {
+        case .leftMouseDown:
+            return beginResize(with: event)
+        case .leftMouseDragged:
+            guard resizeSession != nil else { return false }
+            resize(with: event)
+            return true
+        case .leftMouseUp:
+            guard resizeSession != nil else { return false }
+            resizeSession = nil
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func beginResize(with event: NSEvent) -> Bool {
+        guard let window else { return false }
+        let localPoint = convert(event.locationInWindow, from: nil)
+        let resizeEdges = edges(at: localPoint)
+        guard !resizeEdges.isEmpty else { return false }
+
+        resizeSession = ResizeSession(
+            edges: resizeEdges,
+            initialMouseLocation: window.convertPoint(toScreen: event.locationInWindow),
+            initialFrame: window.frame,
+            minimumFrameSize: window.frameRect(
+                forContentRect: NSRect(origin: .zero, size: window.contentMinSize)
+            ).size,
+            maximumFrameSize: window.frameRect(
+                forContentRect: NSRect(origin: .zero, size: window.contentMaxSize)
+            ).size,
+            allowedFrame: allowedFrameProvider?()
+        )
+        return true
+    }
+
+    private func resize(with event: NSEvent) {
+        guard let window, let session = resizeSession else { return }
+        let mouseLocation = window.convertPoint(toScreen: event.locationInWindow)
+        let deltaX = mouseLocation.x - session.initialMouseLocation.x
+        let deltaY = mouseLocation.y - session.initialMouseLocation.y
+        var frame = session.initialFrame
+
+        if session.edges.contains(.left) {
+            let availableWidth = session.initialFrame.maxX - (session.allowedFrame?.minX ?? -.greatestFiniteMagnitude)
+            frame.size.width = clamped(
+                session.initialFrame.width - deltaX,
+                minimum: session.minimumFrameSize.width,
+                maximum: min(session.maximumFrameSize.width, availableWidth)
+            )
+            frame.origin.x = session.initialFrame.maxX - frame.width
+        } else if session.edges.contains(.right) {
+            let availableWidth = (session.allowedFrame?.maxX ?? .greatestFiniteMagnitude) - session.initialFrame.minX
+            frame.size.width = clamped(
+                session.initialFrame.width + deltaX,
+                minimum: session.minimumFrameSize.width,
+                maximum: min(session.maximumFrameSize.width, availableWidth)
+            )
+        }
+
+        if session.edges.contains(.bottom) {
+            let availableHeight = session.initialFrame.maxY - (session.allowedFrame?.minY ?? -.greatestFiniteMagnitude)
+            frame.size.height = clamped(
+                session.initialFrame.height - deltaY,
+                minimum: session.minimumFrameSize.height,
+                maximum: min(session.maximumFrameSize.height, availableHeight)
+            )
+            frame.origin.y = session.initialFrame.maxY - frame.height
+        } else if session.edges.contains(.top) {
+            let availableHeight = (session.allowedFrame?.maxY ?? .greatestFiniteMagnitude) - session.initialFrame.minY
+            frame.size.height = clamped(
+                session.initialFrame.height + deltaY,
+                minimum: session.minimumFrameSize.height,
+                maximum: min(session.maximumFrameSize.height, availableHeight)
+            )
+        }
+
+        onResizeFrame?(frame)
+    }
+
+    private func edges(at point: NSPoint) -> Edges {
+        var result: Edges = []
+        if point.x <= Self.edgeInset { result.insert(.left) }
+        if point.x >= bounds.maxX - Self.edgeInset { result.insert(.right) }
+        if point.y <= Self.edgeInset { result.insert(.bottom) }
+        if point.y >= bounds.maxY - Self.edgeInset { result.insert(.top) }
+        return result
+    }
+
+    private func cornerCursorRects(inset: CGFloat) -> [(NSRect, Edges)] {
+        [
+            (NSRect(x: 0, y: 0, width: inset, height: inset), [.left, .bottom]),
+            (NSRect(x: max(0, bounds.width - inset), y: 0, width: inset, height: inset), [.right, .bottom]),
+            (NSRect(x: 0, y: max(0, bounds.height - inset), width: inset, height: inset), [.left, .top]),
+            (
+                NSRect(
+                    x: max(0, bounds.width - inset),
+                    y: max(0, bounds.height - inset),
+                    width: inset,
+                    height: inset
+                ),
+                [.right, .top]
+            ),
+        ]
+    }
+
+    private func cursor(for edges: Edges) -> NSCursor {
+        if #available(macOS 15.0, *) {
+            let position: NSCursor.FrameResizePosition
+            switch edges {
+            case [.left, .bottom]: position = .bottomLeft
+            case [.right, .bottom]: position = .bottomRight
+            case [.left, .top]: position = .topLeft
+            case [.right, .top]: position = .topRight
+            case [.left]: position = .left
+            case [.right]: position = .right
+            case [.bottom]: position = .bottom
+            default: position = .top
+            }
+            return NSCursor.frameResize(position: position, directions: .all)
+        }
+        return edges.contains(.left) || edges.contains(.right)
+            ? .resizeLeftRight
+            : .resizeUpDown
+    }
+
+    private func clamped(_ value: CGFloat, minimum: CGFloat, maximum: CGFloat) -> CGFloat {
+        min(max(value, min(minimum, maximum)), maximum)
     }
 }
 
@@ -581,6 +796,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private var minimumPaneHeightConstraint: NSLayoutConstraint?
     private var windowContentWidthConstraint: NSLayoutConstraint?
     private var windowContentHeightConstraint: NSLayoutConstraint?
+    private let resizeOverlay = SettingsResizeOverlayView()
     private var isRefreshingSidebarSelection = false
     private var hasShownWindow = false
     private let defaults: UserDefaults
@@ -894,6 +1110,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         detailView.addSubview(paneHost)
         let minimumPaneWidth = paneHost.widthAnchor.constraint(greaterThanOrEqualToConstant: 438)
         let minimumPaneHeight = paneHost.heightAnchor.constraint(greaterThanOrEqualToConstant: 470)
+        minimumPaneWidth.priority = .defaultLow
+        minimumPaneHeight.priority = .defaultLow
         minimumPaneWidthConstraint = minimumPaneWidth
         minimumPaneHeightConstraint = minimumPaneHeight
         NSLayoutConstraint.activate([
@@ -920,7 +1138,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         if let initialRow = Self.sidebarRow(for: initialSection) {
             sidebarTableView.selectRowIndexes(IndexSet(integer: initialRow), byExtendingSelection: false)
         }
-        changePane()
         splitViewController.preferredContentSize = requestedContentSize
         let splitRootView = splitViewController.view
         NSLayoutConstraint.activate([
@@ -933,16 +1150,34 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         splitRootView.frame = contentView.bounds
         splitRootView.autoresizingMask = [.width, .height]
         contentView.addSubview(splitRootView)
+
         let windowContentWidth = contentView.widthAnchor.constraint(equalToConstant: requestedContentSize.width)
         let windowContentHeight = contentView.heightAnchor.constraint(equalToConstant: requestedContentSize.height)
         windowContentWidthConstraint = windowContentWidth
         windowContentHeightConstraint = windowContentHeight
         NSLayoutConstraint.activate([windowContentWidth, windowContentHeight])
         (window as? SettingsWindow)?.onWillApplyContentSize = { [weak self] size in
-            guard let self else { return }
-            updateWindowSizingPreferences(for: size)
+            self?.updateWindowSizingPreferences(for: size)
         }
+        (window as? SettingsWindow)?.resizeEventHandler = { [weak self] event in
+            self?.resizeOverlay.handleWindowEvent(event) ?? false
+        }
+
+        resizeOverlay.frame = contentView.bounds
+        resizeOverlay.autoresizingMask = [.width, .height]
+        resizeOverlay.identifier = NSUserInterfaceItemIdentifier("SettingsResizeOverlay")
+        resizeOverlay.setAccessibilityElement(false)
+        resizeOverlay.allowedFrameProvider = { [weak window] in
+            guard let screen = window?.screen ?? NSScreen.main ?? NSScreen.screens.first else { return nil }
+            let safeFrame = screen.visibleFrame.insetBy(dx: Self.screenMargin, dy: Self.screenMargin)
+            return safeFrame.width > 0 && safeFrame.height > 0 ? safeFrame : nil
+        }
+        resizeOverlay.onResizeFrame = { [weak window] frame in
+            window?.setFrame(frame, display: true)
+        }
+        contentView.addSubview(resizeOverlay, positioned: .above, relativeTo: splitRootView)
         window.setContentSize(requestedContentSize)
+        changePane()
     }
 
     private func buildAnimationsPane() {
@@ -1660,6 +1895,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             view.translatesAutoresizingMaskIntoConstraints = false
             diagnosticsPane.addSubview(view)
         }
+        let preferredScrollHeight = scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 260)
+        preferredScrollHeight.priority = .defaultLow
         NSLayoutConstraint.activate([
             header.topAnchor.constraint(equalTo: diagnosticsPane.topAnchor, constant: 4),
             header.leadingAnchor.constraint(equalTo: diagnosticsPane.leadingAnchor),
@@ -1667,7 +1904,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             scroll.topAnchor.constraint(equalTo: header.bottomAnchor, constant: SettingsVisualMetrics.pageSectionSpacing),
             scroll.leadingAnchor.constraint(equalTo: diagnosticsPane.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: diagnosticsPane.trailingAnchor),
-            scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 260),
+            preferredScrollHeight,
             controls.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 10),
             controls.leadingAnchor.constraint(equalTo: diagnosticsPane.leadingAnchor),
             controls.trailingAnchor.constraint(lessThanOrEqualTo: diagnosticsPane.trailingAnchor),
@@ -1850,6 +2087,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             promptsPane.addSubview(view)
         }
         promptsPane.addSubview(scroll)
+        let preferredScrollHeight = scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 330)
+        preferredScrollHeight.priority = .defaultLow
         NSLayoutConstraint.activate([
             header.topAnchor.constraint(equalTo: promptsPane.topAnchor, constant: 4),
             header.leadingAnchor.constraint(equalTo: promptsPane.leadingAnchor),
@@ -1859,7 +2098,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             scroll.topAnchor.constraint(equalTo: promptControls.bottomAnchor, constant: 10),
             scroll.leadingAnchor.constraint(equalTo: promptsPane.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: promptsPane.trailingAnchor),
-            scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 330),
+            preferredScrollHeight,
             checklist.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 12),
             checklist.leadingAnchor.constraint(equalTo: promptsPane.leadingAnchor),
             checklist.trailingAnchor.constraint(equalTo: promptsPane.trailingAnchor),
@@ -2429,21 +2668,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         return frameSize
     }
 
-    func windowWillStartLiveResize(_ notification: Notification) {
-        NSLayoutConstraint.deactivate(
-            [windowContentWidthConstraint, windowContentHeightConstraint].compactMap { $0 }
-        )
-    }
-
-    func windowDidEndLiveResize(_ notification: Notification) {
-        guard let size = window?.contentView?.bounds.size, size.width > 0, size.height > 0 else { return }
-        updateWindowSizingPreferences(for: size)
-        NSLayoutConstraint.activate(
-            [windowContentWidthConstraint, windowContentHeightConstraint].compactMap { $0 }
-        )
-        persistSettingsWindowSize()
-    }
-
     func windowDidChangeScreen(_ notification: Notification) {
         fitWindowToVisibleScreen(usePreferredSize: false)
     }
@@ -2516,6 +2740,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         updateSplitPreferredContentSizes(for: size)
     }
 
+    private func applyWindowContentSize(_ size: NSSize) {
+        updateWindowSizingPreferences(for: size)
+        window?.setContentSize(size)
+    }
+
     private static func isLegacyPreferredContentSize(_ size: NSSize) -> Bool {
         [legacyPreferredContentSize, previousPreferredContentSize].contains { preferredSize in
             abs(size.width - preferredSize.width) <= 1
@@ -2566,8 +2795,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             width: min(max(requestedSize.width, effectiveMinimumSize.width), maximumContentSize.width),
             height: min(max(requestedSize.height, effectiveMinimumSize.height), maximumContentSize.height)
         )
-        updateWindowSizingPreferences(for: targetSize)
-        window.setContentSize(targetSize)
+        applyWindowContentSize(targetSize)
 
         var frame = window.frame
         frame.origin.x = min(max(frame.origin.x, safeFrame.minX), safeFrame.maxX - frame.width)
