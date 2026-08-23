@@ -869,6 +869,8 @@ final class StateletUpdateCoordinator {
     var onSnapshot: ((StateletUpdateSnapshot) -> Void)? {
         didSet { onSnapshot?(snapshot) }
     }
+    var onRelaunchRequested: (() -> Bool)?
+    var onTerminationRequested: (() -> Void)?
 
     private(set) var snapshot: StateletUpdateSnapshot
     private let installedVersion: StateletVersion
@@ -889,6 +891,7 @@ final class StateletUpdateCoordinator {
     private var readyUpdate: (StateletDownloadedUpdate, StateletUpdateCandidate)?
     private var downloadProgressToken: UUID?
     private var isTerminating = false
+    private var isRelaunchRequestPending = false
 
     convenience init(
         defaults: UserDefaults = .standard,
@@ -1031,18 +1034,37 @@ final class StateletUpdateCoordinator {
     }
 
     func installReadyUpdate() {
-        Task { @MainActor [weak self] in self?.scheduleReadyInstall() }
+        Task { @MainActor [weak self] in
+            guard let self,
+                  !self.isRelaunchRequestPending,
+                  self.readyUpdate != nil else { return }
+            self.isRelaunchRequestPending = true
+            guard self.onRelaunchRequested?() == true else {
+                _ = self.scheduleReadyInstall(
+                    status: "Statelet could not restart automatically. Quit and reopen it to install the update."
+                )
+                return
+            }
+            guard self.scheduleReadyInstall(
+                status: "Restarting Statelet to install the update…"
+            ) else { return }
+            self.onTerminationRequested?()
+        }
     }
 
     @MainActor
-    private func scheduleReadyInstall() {
-        guard let readyUpdate else { return }
+    @discardableResult
+    private func scheduleReadyInstall(
+        status: String = "Update scheduled for the next Statelet restart."
+    ) -> Bool {
+        guard let readyUpdate else { return false }
         publish(
-            status: "Update scheduled for the next Statelet restart.",
+            status: status,
             candidate: readyUpdate.1,
             progress: 1,
             isScheduled: true
         )
+        return true
     }
 
     @MainActor
@@ -1063,6 +1085,7 @@ final class StateletUpdateCoordinator {
             throw error
         }
         self.readyUpdate = nil
+        isRelaunchRequestPending = false
         defaults.removeObject(forKey: pendingInstallRetryKey)
         publish(
             status: "Update installed. Reopen Statelet to use the new version.",
@@ -1076,6 +1099,7 @@ final class StateletUpdateCoordinator {
     func discardPreparedUpdateAtTermination() {
         readyUpdate?.0.removeOwnedStaging()
         readyUpdate = nil
+        isRelaunchRequestPending = false
     }
 
     @MainActor

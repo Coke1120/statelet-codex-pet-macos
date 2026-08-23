@@ -54,6 +54,9 @@ private func runPlaybackSmokeHelper(arguments: [String]) -> Never {
 if CommandLine.arguments.dropFirst().first == "--statelet-playback-smoke-helper" {
     runPlaybackSmokeHelper(arguments: CommandLine.arguments)
 }
+if CommandLine.arguments.dropFirst().first == "--statelet-shortcut-smoke-helper" {
+    StateletShortcutSmokeHelper.run()
+}
 
 guard let singletonLock = SingletonLock() else {
     FileHandle.standardError.write(Data("Statelet is already running or its lock cannot be created.\n".utf8))

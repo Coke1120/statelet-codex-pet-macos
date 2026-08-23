@@ -3,6 +3,33 @@
 All notable changes to Statelet are documented here. Versions follow semantic
 versioning for the public source release.
 
+## [1.8.17] - 2026-08-24
+
+### Added
+
+- Statelet now installs a native macOS application menu with standard App,
+  File, Edit, and Window commands, including Command-Q, Command-W, Command-,
+  and the usual editing and window shortcuts.
+
+### Fixed
+
+- Choosing Install & Relaunch for a verified in-app update now prepares a
+  detached relaunch helper, quits through the existing safe termination gate,
+  commits the transactional update only after quiescence, and automatically
+  reopens Statelet after the previous process exits.
+- Relaunch preparation is single-shot and fails closed: if the helper cannot be
+  prepared, the update remains scheduled and Settings explains that a manual
+  quit and reopen is required.
+
+### Distribution notes
+
+- Version 1.8.17 supersedes 1.8.16 with automatic relaunch and native macOS
+  shortcut support; existing private media, voice, models, credentials, logs,
+  and runtime data remain local and excluded from releases.
+- The package remains ad-hoc signed for owner-authorized personal updates. It
+  is not Developer ID signed, notarized, or presented as an Apple-authorized
+  public binary.
+
 ## [1.8.16] - 2026-08-23
 
 ### Fixed
@@ -525,6 +552,8 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
+[1.8.17]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.17
+[1.8.16]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.16
 [1.8.14]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.14
 [1.8.13]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.13
 [1.8.12]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.12

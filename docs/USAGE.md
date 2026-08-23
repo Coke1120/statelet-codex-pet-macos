@@ -652,7 +652,9 @@ recovery, and diagnostics. It also shows the installed version and update
 status. Statelet checks for releases automatically at launch and at most once
 per day; **Check Now** is available when a manual refresh is useful. Automatic
 installation is opt-in and only applies a verified update at a safe restart
-boundary. Offline checks leave the current app running unchanged.
+boundary. Choosing **Install & Relaunch** performs that safe termination,
+transactional install, and managed-app relaunch without requiring a manual
+quit/open cycle. Offline checks leave the current app running unchanged.
 Installation remains fail-closed until a release package is signed by the
 pinned Statelet repository release key, matches the immutable GitHub repository
 and `main` tag commit, and passes the manifest, bundle identity, architecture,
@@ -662,6 +664,11 @@ but is not required for owner-authorized personal updates. Version 1.8.5 is the
 first build containing this trust path, so an existing v1.8.4 or earlier install
 needs one manual bootstrap update before later signed releases can install
 themselves.
+
+While Statelet Settings is active, standard macOS shortcuts are available from
+the application menu: **Command-W** closes the active window, **Command-Q** quits,
+**Command-,** opens Settings, common Edit shortcuts use the responder chain, and
+**Command-M** minimizes the active window.
 
 **Settings → Prompt Generator** provides copy-ready, vendor-neutral authoring prompts for
 Idle, Running, Waiting, and Review. Replace the character placeholder with a

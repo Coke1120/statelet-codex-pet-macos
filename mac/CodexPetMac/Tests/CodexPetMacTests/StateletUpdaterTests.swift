@@ -810,6 +810,8 @@ final class StateletUpdaterTests: XCTestCase {
         let downloadProgress = expectation(description: "download progress")
         let ready = expectation(description: "ready")
         let scheduled = expectation(description: "scheduled for restart")
+        let relaunchRequested = expectation(description: "relaunch requested")
+        let terminationRequested = expectation(description: "termination requested")
         let installed = expectation(description: "installed at termination boundary")
         var installCount = 0
         let candidateVersion = try XCTUnwrap(StateletVersion(version: "2.0.0", build: "20"))
@@ -840,14 +842,21 @@ final class StateletUpdaterTests: XCTestCase {
                 scheduled.fulfill()
             }
         }
+        coordinator.onRelaunchRequested = {
+            relaunchRequested.fulfill()
+            return true
+        }
+        coordinator.onTerminationRequested = { terminationRequested.fulfill() }
 
         coordinator.checkNow()
         await fulfillment(of: [downloadProgress, ready], timeout: 2)
         XCTAssertTrue(coordinator.snapshot.isReadyToInstall)
         XCTAssertEqual(coordinator.snapshot.progress, 1)
         coordinator.installReadyUpdate()
-        await fulfillment(of: [scheduled], timeout: 2)
+        coordinator.installReadyUpdate()
+        await fulfillment(of: [scheduled, relaunchRequested, terminationRequested], timeout: 2)
         XCTAssertEqual(installCount, 0)
+        XCTAssertEqual(coordinator.snapshot.status, "Restarting Statelet to install the update…")
         XCTAssertFalse(coordinator.snapshot.isReadyToInstall)
         XCTAssertTrue(coordinator.snapshot.isScheduledForRestart)
 
@@ -965,6 +974,7 @@ final class StateletUpdaterTests: XCTestCase {
         let scheduled = expectation(description: "scheduled")
         let installed = expectation(description: "installed at termination")
         var installCount = 0
+        var relaunchRequestCount = 0
         let candidateVersion = try XCTUnwrap(StateletVersion(version: "2.0.0", build: "20"))
         let coordinator = StateletUpdateCoordinator(
             installedVersion: try XCTUnwrap(StateletVersion(version: "1.0.0", build: "1")),
@@ -990,11 +1000,16 @@ final class StateletUpdaterTests: XCTestCase {
         coordinator.onSnapshot = { snapshot in
             if snapshot.isScheduledForRestart { scheduled.fulfill() }
         }
+        coordinator.onRelaunchRequested = {
+            relaunchRequestCount += 1
+            return true
+        }
         coordinator.setAutomaticInstall(true)
         XCTAssertTrue(defaults.bool(forKey: "StateletUpdater.automaticInstall.v1"))
         coordinator.checkNow()
         await fulfillment(of: [scheduled], timeout: 2)
         XCTAssertEqual(installCount, 0)
+        XCTAssertEqual(relaunchRequestCount, 0)
         XCTAssertTrue(coordinator.snapshot.isScheduledForRestart)
 
         let updateQuiescent = coordinator.shutdownAndWaitForQuiescence()

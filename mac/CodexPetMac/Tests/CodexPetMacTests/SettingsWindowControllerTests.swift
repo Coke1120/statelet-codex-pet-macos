@@ -995,7 +995,7 @@ final class SettingsWindowControllerTests: XCTestCase {
                 [
                     "Check for Statelet updates",
                     "Cancel Statelet update",
-                    "Install verified Statelet update at restart",
+                    "Install verified Statelet update and relaunch",
                     "Automatically install verified updates",
                 ].contains($0.accessibilityLabel() ?? "")
             }

@@ -726,6 +726,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        StateletMainMenu.install(
+            on: NSApp,
+            settingsTarget: self,
+            settingsAction: #selector(showSettings)
+        )
         conversionProfile = AlphaConversionProfile.restored()
         options = LaunchOptions.parse(arguments: CommandLine.arguments)
         agentSourceModeStore = AgentSourceModeStore(sessionActivityURL: options.sessionActivityURL)
@@ -747,6 +752,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             )
             updater.onSnapshot = { [weak self] snapshot in
                 self?.settingsController?.update(update: snapshot)
+            }
+            updater.onRelaunchRequested = { [weak self] in
+                self?.prepareRelaunchForReadyUpdate() ?? false
+            }
+            updater.onTerminationRequested = {
+                NSApp.terminate(nil)
             }
             updateCoordinator = updater
             updater.startAutomaticChecks()
@@ -7235,6 +7246,17 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
+
+    private func prepareRelaunchForReadyUpdate() -> Bool {
+        do {
+            try StateletAppRelauncher.scheduleRelaunch()
+        } catch {
+            logger.error("event=update_relaunch_schedule_failed action=wait_for_manual_restart")
+            return false
+        }
+        logger.info("event=update_relaunch_scheduled action=prepare_safe_install")
+        return true
+    }
 
     private func savePanelFrame() {
         guard let panel else { return }

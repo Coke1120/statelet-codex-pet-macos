@@ -815,7 +815,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let updateProgress = NSProgressIndicator()
     private let checkForUpdatesButton = NSButton(title: "Check Now", target: nil, action: nil)
     private let cancelUpdateButton = NSButton(title: "Cancel", target: nil, action: nil)
-    private let installUpdateButton = NSButton(title: "Install at Restart", target: nil, action: nil)
+    private let installUpdateButton = NSButton(title: "Install & Relaunch", target: nil, action: nil)
     private let automaticInstallCheckbox = NSButton(checkboxWithTitle: "Automatically install verified updates at the next safe restart", target: nil, action: nil)
     private let diagnosticsTextView = NSTextView()
     private let launchAtLoginCheckbox = NSButton(checkboxWithTitle: "Start Statelet when I log in", target: nil, action: nil)
@@ -2008,7 +2008,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let managedMedia = makeSection(title: "Managed media location", content: managedMediaStack)
         let accessibility = makeSection(
             title: "Interaction and accessibility",
-            content: NSTextField(wrappingLabelWithString: "Settings supports keyboard navigation and VoiceOver labels. Reduce Motion replaces transition motion with verified posters when available. If click-through prevents pointer access to the pet, use the Statelet menu-bar icon to reopen Settings or turn click-through off.")
+            content: NSTextField(wrappingLabelWithString: "Settings supports keyboard navigation, VoiceOver labels, and standard macOS shortcuts including Command-W and Command-Q. Reduce Motion replaces transition motion with verified posters when available. If click-through prevents pointer access to the pet, use the Statelet menu-bar icon to reopen Settings or turn click-through off.")
         )
         let recovery = makeSection(
             title: "Recovery and diagnostics",
@@ -2046,7 +2046,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         installUpdateButton.action = #selector(installUpdate)
         installUpdateButton.bezelStyle = .rounded
         installUpdateButton.isEnabled = false
-        installUpdateButton.setAccessibilityLabel("Install verified Statelet update at restart")
+        installUpdateButton.setAccessibilityLabel("Install verified Statelet update and relaunch")
         automaticInstallCheckbox.target = self
         automaticInstallCheckbox.action = #selector(automaticInstallChanged)
         automaticInstallCheckbox.setAccessibilityLabel("Automatically install verified updates")

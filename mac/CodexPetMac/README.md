@@ -4,7 +4,7 @@ Statelet is a personal-local Codex and Grok Build lifecycle companion for macOS 
 It is an AppKit accessory application: the transparent panel can be moved by dragging
 its body and resized from any border or corner without taking keyboard focus,
 AVFoundation owns exactly one decoder, and the menu-bar item keeps click-through
-recoverable. The current app version is 1.8.16 (build 30). New builds and
+recoverable. The current app version is 1.8.17 (build 31). New builds and
 installations use
 `Statelet.app`, bundle identifier `com.coke1120.Statelet`, `CFBundleName` and
 executable `Statelet`, Application Support under
@@ -309,7 +309,11 @@ The current **Help & Updates** destination is separate from **Prompt Generator**
 lifecycle, animation, voice/privacy, recovery, and diagnostics guidance and
 shows the installed version plus the privacy-safe update status. Automatic
 checks do not block the local app; verified installation waits for a safe
-restart boundary and never replaces an unmanaged app. Installation also stays
+restart boundary and never replaces an unmanaged app. **Install & Relaunch**
+uses the normal termination path to quiesce local work, publishes the verified
+bundle transactionally, and then reopens the managed app. The automatic-install
+option continues to wait for the next safe restart instead of interrupting an
+active session. Installation also stays
 fail-closed until a release artifact carries the pinned Statelet repository
 signature. The signed manifest binds the immutable GitHub repository, `main`
 tag commit, version/build, package identity, size, and SHA-256 before download.
@@ -318,6 +322,11 @@ while owner-authorized personal updates may remain ad-hoc signed. Version 1.8.5
 is the first build containing the pinned repository key, so an existing v1.8.4
 or earlier app requires one manual bootstrap install before later signed tags
 can update themselves.
+
+When Statelet Settings is active, the application main menu exposes standard
+macOS commands and shortcuts, including **Command-W** to close the active window,
+**Command-Q** to quit, **Command-,** for Settings, common Edit shortcuts, and
+**Command-M** to minimize.
 
 Only convert character media you own or are authorized to use for the intended
 derivative and distribution scope. Keep private input, alpha masters, reports,
