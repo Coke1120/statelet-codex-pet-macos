@@ -1,8 +1,13 @@
 name: macOS CI
 
+# Pull requests get one review run, main gets the post-merge run, and release
+# tags are handled by the separate least-privilege publishing workflow.
 on:
   push:
+    branches:
+      - main
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
