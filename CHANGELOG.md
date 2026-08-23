@@ -3,6 +3,26 @@
 All notable changes to Statelet are documented here. Versions follow semantic
 versioning for the public source release.
 
+## [1.8.16] - 2026-08-23
+
+### Fixed
+
+- Settings and pet window resizing now coalesces drag frames on the main queue,
+  applies layout and display updates consistently, and persists Settings size
+  only when the resize gesture ends, eliminating resize flashing.
+- Pointer-driven pet resizing now uses the event's converted screen location,
+  making frame updates deterministic while preserving the existing minimum-size
+  and anchoring behavior.
+
+### Distribution notes
+
+- Version 1.8.16 supersedes 1.8.15 with the resize stability and regression
+  coverage above; existing private media, voice, models, credentials, logs, and
+  runtime data remain local and excluded from releases.
+- The package remains ad-hoc signed for owner-authorized personal updates. It
+  is not Developer ID signed, notarized, or presented as an Apple-authorized
+  public binary.
+
 ## [1.8.14] - 2026-08-22
 
 ### Fixed

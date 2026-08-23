@@ -1343,6 +1343,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         let targetFrame = positionStore.clampedFrame(resized)
         if panel.frame != targetFrame {
             panel.setFrame(targetFrame, display: false)
+            panel.contentView?.layoutSubtreeIfNeeded()
+            panel.displayIfNeeded()
         }
         clickThrough = options.clickThroughOverride ?? mediaMap.window.clickThrough
         panel.ignoresMouseEvents = clickThrough

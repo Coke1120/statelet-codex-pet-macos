@@ -157,6 +157,15 @@ final class PetPlayerView: NSView {
     private var fpsBadgeIsEnabled = false
     private var fpsBadgeHasReading = false
     private var pointerInteraction: PointerInteraction?
+    private let resizeFrameScheduler: WindowResizeFrameCoordinator.Scheduler
+    private lazy var resizeFrameCoordinator = WindowResizeFrameCoordinator(
+        schedule: resizeFrameScheduler
+    ) { [weak self] frame in
+        guard let self, let window = self.window, window.frame != frame else { return }
+        window.setFrame(frame, display: false)
+        self.layoutSubtreeIfNeeded()
+        window.displayIfNeeded()
+    }
     var contextMenuProvider: (() -> NSMenu?)?
     var onAdvanceClip: (() -> Void)?
     var onPetClick: (() -> Void)?
@@ -171,7 +180,18 @@ final class PetPlayerView: NSView {
     // sequences while preserving the nonactivating panel's focus behavior.
     override var mouseDownCanMoveWindow: Bool { false }
 
-    override init(frame frameRect: NSRect) {
+    override convenience init(frame frameRect: NSRect) {
+        self.init(
+            frame: frameRect,
+            resizeFrameScheduler: WindowResizeFrameCoordinator.scheduleOnMain
+        )
+    }
+
+    init(
+        frame frameRect: NSRect,
+        resizeFrameScheduler: @escaping WindowResizeFrameCoordinator.Scheduler
+    ) {
+        self.resizeFrameScheduler = resizeFrameScheduler
         super.init(frame: frameRect)
         wantsLayer = true
         layer = CALayer()
@@ -978,8 +998,9 @@ final class PetPlayerView: NSView {
         guard event.buttonNumber == 0,
               !event.modifierFlags.contains(.control),
               let window else { return }
+        resizeFrameCoordinator.cancel()
         pointerInteraction = PointerInteraction(
-            mouse: NSEvent.mouseLocation,
+            mouse: window.convertPoint(toScreen: event.locationInWindow),
             windowFrame: window.frame,
             resizeEdges: resizeEdges(at: convert(event.locationInWindow, from: nil))
         )
@@ -987,7 +1008,7 @@ final class PetPlayerView: NSView {
 
     override func mouseDragged(with event: NSEvent) {
         guard let window, var interaction = pointerInteraction else { return }
-        let mouse = NSEvent.mouseLocation
+        let mouse = window.convertPoint(toScreen: event.locationInWindow)
         let delta = NSPoint(x: mouse.x - interaction.mouse.x, y: mouse.y - interaction.mouse.y)
         if !interaction.didDrag,
            hypot(delta.x, delta.y) < Self.dragThreshold {
@@ -1001,15 +1022,17 @@ final class PetPlayerView: NSView {
                 y: interaction.windowFrame.origin.y + delta.y
             ))
         } else {
-            window.setFrame(
-                resizedFrame(from: interaction.windowFrame, delta: delta, edges: interaction.resizeEdges),
-                display: false
+            resizeFrameCoordinator.submit(
+                resizedFrame(from: interaction.windowFrame, delta: delta, edges: interaction.resizeEdges)
             )
         }
     }
 
     override func mouseUp(with event: NSEvent) {
         guard let interaction = pointerInteraction else { return }
+        if interaction.didDrag, !interaction.resizeEdges.isEmpty {
+            resizeFrameCoordinator.flush()
+        }
         pointerInteraction = nil
         if interaction.didDrag, !interaction.resizeEdges.isEmpty {
             if let size = window?.frame.size {

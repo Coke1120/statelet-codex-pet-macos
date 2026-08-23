@@ -236,6 +236,110 @@ final class SettingsWindowControllerTests: XCTestCase {
         XCTAssertEqual(persisted.height, Self.contentSize(of: window).height, accuracy: 1)
     }
 
+    func testSettingsLiveResizeCoalescesFramesAndPersistsOnlyWhenGestureEnds() throws {
+        let suiteName = "statelet-settings-coalesced-resize-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        SettingsWindowSizeStore.persist(NSSize(width: 900, height: 600), to: defaults)
+        let controller = SettingsWindowController(defaults: defaults)
+        let window = try XCTUnwrap(controller.window)
+        let contentView = try XCTUnwrap(window.contentView)
+        controller.show()
+        Self.pumpMainRunLoop(for: 0.1)
+        defer {
+            window.close()
+            Self.pumpMainRunLoop(for: 0.05)
+        }
+
+        let overlay = try XCTUnwrap(
+            Self.descendants(of: contentView).first {
+                $0.identifier?.rawValue == "SettingsResizeOverlay"
+            }
+        )
+        let requiredFixedDimensions = contentView.constraints.filter { constraint in
+            constraint.isActive
+                && constraint.priority == .required
+                && constraint.relation == .equal
+                && constraint.firstItem === contentView
+                && constraint.secondItem == nil
+                && (constraint.firstAttribute == .width || constraint.firstAttribute == .height)
+        }
+        let widthConstraint = try XCTUnwrap(requiredFixedDimensions.first {
+            $0.firstAttribute == .width
+        })
+        let heightConstraint = try XCTUnwrap(requiredFixedDimensions.first {
+            $0.firstAttribute == .height
+        })
+        var widthChangeCount = 0
+        var heightChangeCount = 0
+        let widthObservation = widthConstraint.observe(\.constant, options: [.new]) { _, _ in
+            widthChangeCount += 1
+        }
+        let heightObservation = heightConstraint.observe(\.constant, options: [.new]) { _, _ in
+            heightChangeCount += 1
+        }
+        defer {
+            widthObservation.invalidate()
+            heightObservation.invalidate()
+        }
+        let baselinePersistedSize = try XCTUnwrap(SettingsWindowSizeStore.restored(from: defaults))
+        let initialFrame = window.frame
+        let initialWindowPoint = overlay.convert(
+            NSPoint(x: overlay.bounds.maxX - 2, y: overlay.bounds.maxY - 2),
+            to: nil
+        )
+        let firstDraggedPoint = NSPoint(
+            x: initialWindowPoint.x + 20,
+            y: initialWindowPoint.y + 15
+        )
+        let latestDraggedPoint = NSPoint(
+            x: initialWindowPoint.x + 40,
+            y: initialWindowPoint.y + 30
+        )
+
+        window.sendEvent(try Self.mouseEvent(
+            type: .leftMouseDown,
+            location: initialWindowPoint,
+            window: window
+        ))
+        window.sendEvent(try Self.mouseEvent(
+            type: .leftMouseDragged,
+            location: firstDraggedPoint,
+            window: window
+        ))
+        window.sendEvent(try Self.mouseEvent(
+            type: .leftMouseDragged,
+            location: latestDraggedPoint,
+            window: window
+        ))
+
+        XCTAssertEqual(window.frame, initialFrame)
+
+        Self.pumpMainRunLoop(for: 0.05)
+
+        XCTAssertEqual(window.frame.width, initialFrame.width + 40, accuracy: 1)
+        XCTAssertEqual(window.frame.height, initialFrame.height + 30, accuracy: 1)
+        XCTAssertEqual(widthChangeCount, 1)
+        XCTAssertEqual(heightChangeCount, 1)
+        XCTAssertEqual(
+            try XCTUnwrap(SettingsWindowSizeStore.restored(from: defaults)),
+            baselinePersistedSize
+        )
+
+        window.sendEvent(try Self.mouseEvent(
+            type: .leftMouseUp,
+            location: latestDraggedPoint,
+            window: window
+        ))
+        Self.pumpMainRunLoop(for: 0.05)
+
+        let persistedSize = try XCTUnwrap(SettingsWindowSizeStore.restored(from: defaults))
+        XCTAssertEqual(persistedSize.width, Self.contentSize(of: window).width, accuracy: 1)
+        XCTAssertEqual(persistedSize.height, Self.contentSize(of: window).height, accuracy: 1)
+    }
+
     func testSettingsResizeHandlesAnchorOppositeEdgesAndClampMinimumAndVisibleScreen() throws {
         let suiteName = "statelet-settings-resize-clamp-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))

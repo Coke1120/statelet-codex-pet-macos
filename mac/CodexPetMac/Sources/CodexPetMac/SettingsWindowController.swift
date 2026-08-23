@@ -56,10 +56,15 @@ private final class SettingsResizeOverlayView: NSView {
 
     var allowedFrameProvider: (() -> NSRect?)?
     var onResizeFrame: ((NSRect) -> Void)?
+    var onResizeEnded: (() -> Void)?
     private var resizeSession: ResizeSession?
     private var cachedCursors: [Edges: NSCursor] = [:]
+    private lazy var frameCoordinator = WindowResizeFrameCoordinator { [weak self] frame in
+        self?.onResizeFrame?(frame)
+    }
 
     override var acceptsFirstResponder: Bool { false }
+    var isResizing: Bool { resizeSession != nil }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard !isHidden, alphaValue > 0 else { return nil }
@@ -110,6 +115,7 @@ private final class SettingsResizeOverlayView: NSView {
     func handleWindowEvent(_ event: NSEvent) -> Bool {
         switch event.type {
         case .leftMouseDown:
+            frameCoordinator.cancel()
             return beginResize(with: event)
         case .leftMouseDragged:
             guard resizeSession != nil else { return false }
@@ -117,7 +123,9 @@ private final class SettingsResizeOverlayView: NSView {
             return true
         case .leftMouseUp:
             guard resizeSession != nil else { return false }
+            frameCoordinator.flush()
             resizeSession = nil
+            onResizeEnded?()
             return true
         default:
             return false
@@ -186,7 +194,7 @@ private final class SettingsResizeOverlayView: NSView {
             )
         }
 
-        onResizeFrame?(frame)
+        frameCoordinator.submit(frame)
     }
 
     private func edges(at point: NSPoint) -> Edges {
@@ -1219,10 +1227,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             return safeFrame.width > 0 && safeFrame.height > 0 ? safeFrame : nil
         }
         resizeOverlay.onResizeFrame = { [weak window] frame in
-            // Frame changes invalidate their own drawing. Forcing immediate
-            // whole-window display during rapid drag events makes constrained
-            // pane content visibly flicker.
-            window?.setFrame(frame, display: false)
+            guard let window, window.frame != frame else { return }
+            window.setFrame(frame, display: false)
+            window.contentView?.layoutSubtreeIfNeeded()
+            window.displayIfNeeded()
+        }
+        resizeOverlay.onResizeEnded = { [weak self] in
+            self?.persistSettingsWindowSize()
         }
         contentView.addSubview(resizeOverlay, positioned: .above, relativeTo: splitRootView)
         window.setContentSize(requestedContentSize)
@@ -2705,9 +2716,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowDidResize(_ notification: Notification) {
-        if let size = window?.contentView?.bounds.size, size.width > 0, size.height > 0 {
-            updateWindowSizingPreferences(for: size)
-        }
+        guard !resizeOverlay.isResizing, window?.inLiveResize != true else { return }
+        persistSettingsWindowSize()
+    }
+
+    func windowDidEndLiveResize(_ notification: Notification) {
         persistSettingsWindowSize()
     }
 
