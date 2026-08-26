@@ -1,0 +1,4 @@
+interface:
+  display_name: "Craft Video Generation Prompts"
+  short_description: "Create concise, reliable video generation prompts"
+  default_prompt: "Use $craft-video-generation-prompts to create or improve a concise video-generation prompt."
