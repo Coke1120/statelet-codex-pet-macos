@@ -18,7 +18,6 @@ __pycache__/
 htmlcov/
 .codebase-memory/
 .omo/
-.omx/
 .venv/
 venv/
 
