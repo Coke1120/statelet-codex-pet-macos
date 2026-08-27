@@ -411,8 +411,8 @@ esac
             info["NSHumanReadableCopyright"],
             "Copyright © 2026 Statelet contributors. MIT licensed.",
         )
-        self.assertEqual(info["CFBundleShortVersionString"], "1.8.17")
-        self.assertEqual(info["CFBundleVersion"], "31")
+        self.assertEqual(info["CFBundleShortVersionString"], "1.8.18")
+        self.assertEqual(info["CFBundleVersion"], "32")
         self.assertEqual(info["CFBundlePackageType"], "APPL")
         self.assertEqual(info["LSMinimumSystemVersion"], "13.0")
         self.assertTrue(info["LSUIElement"])
