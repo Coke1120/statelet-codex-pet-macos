@@ -3,6 +3,24 @@
 All notable changes to Statelet are documented here. Versions follow semantic
 versioning for the public source release.
 
+## [1.8.19] - 2026-08-28
+
+### Changed
+
+- Voice Setup now uses full-width native cards with clearer provider details,
+  status presentation, actions, and accessibility labels.
+- The Qwen recipe is presented as a readable multiline summary, while the
+  provider selector and local-privacy guidance are easier to scan.
+
+### Distribution notes
+
+- Version 1.8.19 supersedes 1.8.18 with the improved Voice Setup experience;
+  existing private media, voice, models, credentials, logs, prompts, and
+  runtime data remain local and excluded from releases.
+- The package remains ad-hoc signed for owner-authorized personal updates. It
+  is not Developer ID signed, notarized, or presented as an Apple-authorized
+  public binary.
+
 ## [1.8.18] - 2026-08-28
 
 ### Added
@@ -577,6 +595,7 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
+[1.8.19]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.19
 [1.8.18]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.18
 [1.8.17]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.17
 [1.8.16]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.16
