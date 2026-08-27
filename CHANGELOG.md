@@ -3,6 +3,31 @@
 All notable changes to Statelet are documented here. Versions follow semantic
 versioning for the public source release.
 
+## [1.8.18] - 2026-08-28
+
+### Added
+
+- Added repository-local guidance for creating concise text-to-video and
+  image-to-video prompts while keeping generated prompt files out of the
+  release.
+
+### Fixed
+
+- The FPS badge now centers its text inside a dedicated container at every
+  supported label size while preserving padding and accessibility.
+- Stopping a Codex turn now clears unresolved permission bookkeeping, and the
+  lifecycle and activity projections ignore stale non-idle Codex `Stop`
+  records without suppressing supported Grok background activity.
+
+### Distribution notes
+
+- Version 1.8.18 supersedes 1.8.17 with centered FPS presentation and accurate
+  per-session status rows; existing private media, voice, models, credentials,
+  logs, prompts, and runtime data remain local and excluded from releases.
+- The package remains ad-hoc signed for owner-authorized personal updates. It
+  is not Developer ID signed, notarized, or presented as an Apple-authorized
+  public binary.
+
 ## [1.8.17] - 2026-08-24
 
 ### Added
@@ -552,6 +577,7 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
+[1.8.18]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.18
 [1.8.17]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.17
 [1.8.16]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.16
 [1.8.14]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.14
