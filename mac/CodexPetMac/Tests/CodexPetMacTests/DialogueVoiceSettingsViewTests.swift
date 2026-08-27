@@ -5,6 +5,34 @@ import XCTest
 
 final class DialogueVoiceSettingsViewTests: XCTestCase {
     @MainActor
+    func testVoiceSetupUsesAccessibleNativeProviderCards() throws {
+        let view = DialogueVoiceSettingsView(frame: NSRect(x: 0, y: 0, width: 900, height: 700))
+        let descendants = Self.descendants(of: view)
+        let cards = descendants.compactMap { $0 as? NSVisualEffectView }
+            .filter { $0.identifier?.rawValue == "VoiceSetupCard" }
+
+        XCTAssertEqual(cards.count, 4)
+        XCTAssertEqual(
+            Set(cards.compactMap { $0.accessibilityLabel() }),
+            Set([
+                "Local voice provider selector",
+                "GPT-SoVITS voice profile card",
+                "Qwen3-TTS voice profile card",
+                "VoxCPM2 voice profile card",
+            ])
+        )
+
+        let providerControl = try XCTUnwrap(descendants.compactMap { $0 as? NSSegmentedControl }
+            .first { $0.accessibilityLabel() == "Voice provider" })
+        XCTAssertEqual(providerControl.segmentCount, 3)
+
+        let recipe = try XCTUnwrap(descendants.compactMap { $0 as? NSTextField }
+            .first { $0.accessibilityLabel() == "Qwen3-TTS generation recipe" })
+        XCTAssertEqual(recipe.maximumNumberOfLines, 0)
+        XCTAssertEqual(recipe.lineBreakMode, .byWordWrapping)
+    }
+
+    @MainActor
     func testConsecutiveAddsPreserveSubmittedStateAndLanguage() throws {
         let view = DialogueVoiceSettingsView(frame: NSRect(x: 0, y: 0, width: 900, height: 700))
         var library = try DialogueVoiceLibrary()

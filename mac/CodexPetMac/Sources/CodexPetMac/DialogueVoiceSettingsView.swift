@@ -13,6 +13,14 @@ private final class TopAlignedVoiceDocumentView: NSView {
     override var isFlipped: Bool { true }
 }
 
+private enum VoiceSetupVisualMetrics {
+    static let cardCornerRadius: CGFloat = 14
+    static let cardInset: CGFloat = 16
+    static let cardSpacing: CGFloat = 10
+    static let sectionSpacing: CGFloat = 12
+    static let detailLabelWidth: CGFloat = 136
+}
+
 final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate, NSTextViewDelegate {
     var onImportGPTWeight: ((DialogueVoiceProfileDraft) -> Void)?
     var onImportSoVITSWeight: ((DialogueVoiceProfileDraft) -> Void)?
@@ -65,6 +73,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     )
     private let dialoguePage = NSStackView()
     private let voiceSetupPage = NSStackView()
+    private let providerSelectorCard = NSVisualEffectView()
     private let voiceProviderControl = NSSegmentedControl(
         // Legacy provider contract: labels: ["GPT-SoVITS", "Qwen3-TTS"];
         // VoxCPM2 is appended as a third provider without renaming either.
@@ -74,6 +83,9 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         target: nil,
         action: nil
     )
+    private let gptProfileCard = NSVisualEffectView()
+    private let qwenProfileCard = NSVisualEffectView()
+    private let voxProfileCard = NSVisualEffectView()
     private let gptProfilePage = NSStackView()
     private let qwenProfilePage = NSStackView()
     private let voxProfilePage = NSStackView()
@@ -234,6 +246,12 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             active: library.activeProviderKind == .gptSovits,
             activeStatus: library.profileStatus
         )
+        applyProviderStatusAppearance(
+            profileStatusLabel,
+            configured: library.profile != nil,
+            active: library.activeProviderKind == .gptSovits,
+            status: library.profileStatus
+        )
         applyQwenSummary(profile: library.qwenProfile, activeProviderKind: library.activeProviderKind)
         applyVoxSummary(profile: library.voxcpm2Profile, activeProviderKind: library.activeProviderKind)
 
@@ -352,62 +370,101 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         configureTable()
         configureVoiceSections()
 
-        let profileTitle = sectionTitle("GPT-SOVITS PROFILE")
-        let profileHelp = helpLabel("Connect to a GPT-SoVITS API running only on this Mac. Statelet stores managed copies of the selected model files and reference audio.")
-        let profileGrid = NSGridView(views: [
-            [fieldLabel("Display name"), nameField],
-            [fieldLabel("API base URL"), apiBaseURLField],
-            [fieldLabel("Prompt language"), promptLanguageField],
-            [fieldLabel("Default text language"), defaultTextLanguageField],
-            [fieldLabel("Reference text"), referenceTextField],
-            [fieldLabel("Validation status"), profileStatusLabel],
-            [fieldLabel("GPT weight"), fileRow(label: gptWeightLabel, button: importGPTButton)],
-            [fieldLabel("SoVITS weight"), fileRow(label: sovitsWeightLabel, button: importSoVITSButton)],
-            [fieldLabel("Reference audio"), fileRow(label: referenceAudioLabel, button: importReferenceAudioButton)],
+        let profileGrid = profileDetails([
+            ("Display name", nameField),
+            ("API base URL", apiBaseURLField),
+            ("Prompt language", promptLanguageField),
+            ("Default text language", defaultTextLanguageField),
+            ("Reference text", referenceTextField),
+            ("Validation status", profileStatusLabel),
+            ("GPT weight", fileRow(label: gptWeightLabel, button: importGPTButton)),
+            ("SoVITS weight", fileRow(label: sovitsWeightLabel, button: importSoVITSButton)),
+            ("Reference audio", fileRow(label: referenceAudioLabel, button: importReferenceAudioButton)),
         ])
-        profileGrid.translatesAutoresizingMaskIntoConstraints = false
-        profileGrid.rowSpacing = 7
-        profileGrid.columnSpacing = 10
-        profileGrid.column(at: 0).xPlacement = .trailing
-        profileGrid.column(at: 1).xPlacement = .fill
-        let profileGridRow = centeredRow(profileGrid)
-        let profileActions = buttonRow([saveProfileButton, useGPTButton, removeProfileButton])
+        let profileActions = profileActionRow(
+            primary: [saveProfileButton, useGPTButton],
+            destructive: [removeProfileButton]
+        )
 
-        let qwenTitle = sectionTitle("QWEN3-TTS PROFILE")
-        let qwenHelp = helpLabel("Import a trusted, self-contained Qwen handover package for private local generation. Statelet displays only managed basenames and never reveals the reference transcript here.")
-        let qwenGrid = NSGridView(views: [
-            [fieldLabel("Provider status"), qwenStatusLabel],
-            [fieldLabel("Managed package"), qwenPackageLabel],
-            [fieldLabel("Python runtime"), qwenRuntimeLabel],
-            [fieldLabel("Generation recipe"), qwenConfigurationLabel],
+        let qwenGrid = profileDetails([
+            ("Provider status", qwenStatusLabel),
+            ("Managed package", qwenPackageLabel),
+            ("Python runtime", qwenRuntimeLabel),
+            ("Generation recipe", qwenConfigurationLabel),
         ])
-        qwenGrid.translatesAutoresizingMaskIntoConstraints = false
-        qwenGrid.rowSpacing = 7
-        qwenGrid.columnSpacing = 10
-        qwenGrid.column(at: 0).xPlacement = .trailing
-        qwenGrid.column(at: 1).xPlacement = .fill
-        let qwenActions = buttonRow([importQwenButton, useQwenButton, removeQwenButton])
-        let voxTitle = sectionTitle("VOXCPM2 PROFILE")
-        let voxHelp = helpLabel("Privately import a trusted VoxCPM2 snapshot, select its Python runtime and reference WAV, then enter the exact transcript.")
-        let voxGrid = NSGridView(views: [
-            [fieldLabel("Provider status"), voxStatusLabel],
-            [fieldLabel("Snapshot"), voxSnapshotLabel],
-            [fieldLabel("Python runtime"), voxRuntimeLabel],
-            [fieldLabel("Reference text"), voxReferenceTextField],
+        let qwenActions = profileActionRow(
+            primary: [importQwenButton, useQwenButton],
+            destructive: [removeQwenButton]
+        )
+        let voxGrid = profileDetails([
+            ("Provider status", voxStatusLabel),
+            ("Snapshot", voxSnapshotLabel),
+            ("Python runtime", voxRuntimeLabel),
+            ("Reference text", voxReferenceTextField),
         ])
-        let voxActions = buttonRow([importVoxButton, useVoxButton, removeVoxButton])
+        let voxActions = profileActionRow(
+            primary: [importVoxButton, useVoxButton],
+            destructive: [removeVoxButton]
+        )
 
         configurePage(
             gptProfilePage,
-            views: [profileTitle, profileHelp, profileGridRow, profileActions],
+            views: [profileGrid, profileActions],
             accessibilityLabel: "GPT-SoVITS profile setup"
         )
         configurePage(
             qwenProfilePage,
-            views: [qwenTitle, qwenHelp, centeredRow(qwenGrid), qwenActions],
+            views: [qwenGrid, qwenActions],
             accessibilityLabel: "Qwen3-TTS profile setup"
         )
-        configurePage(voxProfilePage, views: [voxTitle, voxHelp, centeredRow(voxGrid), voxActions], accessibilityLabel: "VoxCPM2 profile setup")
+        configurePage(
+            voxProfilePage,
+            views: [voxGrid, voxActions],
+            accessibilityLabel: "VoxCPM2 profile setup"
+        )
+        configureVoiceSetupCard(
+            gptProfileCard,
+            title: "GPT-SoVITS",
+            subtitle: "Connect to a loopback GPT-SoVITS API and keep managed copies of the selected model files and reference audio.",
+            content: gptProfilePage,
+            accessibilityLabel: "GPT-SoVITS voice profile card"
+        )
+        configureVoiceSetupCard(
+            qwenProfileCard,
+            title: "Qwen3-TTS",
+            subtitle: "Import a trusted, self-contained handover package for private local generation. Only managed basenames are shown here.",
+            content: qwenProfilePage,
+            accessibilityLabel: "Qwen3-TTS voice profile card"
+        )
+        configureVoiceSetupCard(
+            voxProfileCard,
+            title: "VoxCPM2",
+            subtitle: "Configure a trusted local snapshot, Python runtime, reference WAV, and its exact transcript.",
+            content: voxProfilePage,
+            accessibilityLabel: "VoxCPM2 voice profile card"
+        )
+
+        let providerPrivacyNote = helpLabel(
+            "Models, reference audio, transcripts, and generated speech remain private on this Mac."
+        )
+        providerPrivacyNote.textColor = .tertiaryLabelColor
+        let providerPickerRow = leadingRow(voiceProviderControl)
+        let providerPickerContent = NSStackView(views: [providerPickerRow, providerPrivacyNote])
+        providerPickerContent.translatesAutoresizingMaskIntoConstraints = false
+        providerPickerContent.orientation = .vertical
+        providerPickerContent.alignment = .width
+        providerPickerContent.spacing = 8
+        NSLayoutConstraint.activate([
+            providerPickerRow.widthAnchor.constraint(equalTo: providerPickerContent.widthAnchor),
+            providerPrivacyNote.widthAnchor.constraint(equalTo: providerPickerContent.widthAnchor),
+        ])
+        configureVoiceSetupCard(
+            providerSelectorCard,
+            title: "Local voice provider",
+            subtitle: "Choose a provider to inspect or configure. Switching this view does not activate the provider.",
+            content: providerPickerContent,
+            accessibilityLabel: "Local voice provider selector"
+        )
 
         let dialogueTitle = sectionTitle("STATE-OWNED MESSAGES & VOICE")
         let dialogueHelp = helpLabel("Each message and its generated voice belongs to one Statelet lifecycle state. Adding or updating a message requests background pre-generation.")
@@ -451,9 +508,10 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
 
         configurePage(
             voiceSetupPage,
-            views: [centeredRow(voiceProviderControl), gptProfilePage, qwenProfilePage, voxProfilePage],
+            views: [providerSelectorCard, gptProfileCard, qwenProfileCard, voxProfileCard],
             accessibilityLabel: "Voice Setup page"
         )
+        voiceSetupPage.setCustomSpacing(VoiceSetupVisualMetrics.sectionSpacing, after: providerSelectorCard)
         configurePage(
             dialoguePage,
             views: [
@@ -472,13 +530,14 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             ],
             accessibilityLabel: "Dialogue page"
         )
-        gptProfilePage.setCustomSpacing(4, after: profileTitle)
-        qwenProfilePage.setCustomSpacing(4, after: qwenTitle)
         dialoguePage.setCustomSpacing(4, after: dialogueTitle)
         dialoguePage.setCustomSpacing(4, after: playbackTitle)
 
         activityLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         activityLabel.textColor = .secondaryLabelColor
+        activityLabel.alignment = .left
+        activityLabel.maximumNumberOfLines = 0
+        activityLabel.lineBreakMode = .byWordWrapping
         activityLabel.isHidden = true
         activityLabel.setAccessibilityLabel("Dialogue voice activity")
 
@@ -509,6 +568,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             voiceSectionPickerRow.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             dialoguePage.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             voiceSetupPage.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
+            activityLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             linesScrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 190),
             dialogueLanguageField.widthAnchor.constraint(greaterThanOrEqualToConstant: 150),
             dialogueStatePopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 110),
@@ -550,6 +610,86 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         }
     }
 
+    private func configureVoiceSetupCard(
+        _ card: NSVisualEffectView,
+        title: String,
+        subtitle: String,
+        content: NSView,
+        accessibilityLabel: String
+    ) {
+        card.translatesAutoresizingMaskIntoConstraints = false
+        card.identifier = NSUserInterfaceItemIdentifier("VoiceSetupCard")
+        card.material = .contentBackground
+        card.blendingMode = .withinWindow
+        card.state = .followsWindowActiveState
+        card.wantsLayer = true
+        card.layer?.cornerCurve = .continuous
+        card.layer?.cornerRadius = VoiceSetupVisualMetrics.cardCornerRadius
+        card.layer?.masksToBounds = true
+        card.setAccessibilityElement(true)
+        card.setAccessibilityRole(.group)
+        card.setAccessibilityLabel(accessibilityLabel)
+        card.setAccessibilityHelp(subtitle)
+        card.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
+        titleLabel.textColor = .labelColor
+        titleLabel.setAccessibilityElement(false)
+        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let subtitleLabel = helpLabel(subtitle)
+        subtitleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        content.translatesAutoresizingMaskIntoConstraints = false
+        content.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let cardStack = NSStackView(views: [titleLabel, subtitleLabel, content])
+        cardStack.translatesAutoresizingMaskIntoConstraints = false
+        cardStack.orientation = .vertical
+        cardStack.alignment = .width
+        cardStack.spacing = VoiceSetupVisualMetrics.cardSpacing
+        cardStack.setCustomSpacing(4, after: titleLabel)
+        cardStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        card.addSubview(cardStack)
+        NSLayoutConstraint.activate([
+            cardStack.topAnchor.constraint(equalTo: card.topAnchor, constant: VoiceSetupVisualMetrics.cardInset),
+            cardStack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: VoiceSetupVisualMetrics.cardInset),
+            cardStack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -VoiceSetupVisualMetrics.cardInset),
+            cardStack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -VoiceSetupVisualMetrics.cardInset),
+            titleLabel.widthAnchor.constraint(equalTo: cardStack.widthAnchor),
+            subtitleLabel.widthAnchor.constraint(equalTo: cardStack.widthAnchor),
+            content.widthAnchor.constraint(equalTo: cardStack.widthAnchor),
+        ])
+    }
+
+    private func profileDetails(_ details: [(String, NSView)]) -> NSStackView {
+        let stack = NSStackView()
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical
+        stack.alignment = .width
+        stack.spacing = 10
+        stack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        for (title, value) in details {
+            let label = fieldLabel(title)
+            label.alignment = .right
+            label.widthAnchor.constraint(equalToConstant: VoiceSetupVisualMetrics.detailLabelWidth).isActive = true
+            value.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            value.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+            let row = NSStackView(views: [label, value])
+            row.translatesAutoresizingMaskIntoConstraints = false
+            row.orientation = .horizontal
+            row.alignment = .top
+            row.distribution = .fill
+            row.spacing = 14
+            row.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            stack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        return stack
+    }
+
     private func selectVoiceSection(_ section: VoiceSection, userInitiated: Bool) {
         voiceSectionControl.selectedSegment = section.rawValue
         dialoguePage.isHidden = section != .dialogue
@@ -565,6 +705,9 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         gptProfilePage.isHidden = provider != .gptSovits
         qwenProfilePage.isHidden = provider != .qwen3TTS
         voxProfilePage.isHidden = provider != .voxcpm2
+        gptProfileCard.isHidden = provider != .gptSovits
+        qwenProfileCard.isHidden = provider != .qwen3TTS
+        voxProfileCard.isHidden = provider != .voxcpm2
         if userInitiated {
             hasSelectedVoiceProvider = true
         }
@@ -603,6 +746,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             (promptLanguageField, "Reference prompt language", "Language identifier accepted by the local GPT-SoVITS API."),
             (defaultTextLanguageField, "Default dialogue text language", "Used when preparing new dialogue lines."),
             (referenceTextField, "Reference audio transcript", "Enter the exact spoken text in the imported reference audio."),
+            (voxReferenceTextField, "VoxCPM2 reference transcript", "Enter the exact spoken text in the selected VoxCPM2 reference WAV."),
             (dialogueLanguageField, "Dialogue text language", "Language identifier for the dialogue currently being edited."),
         ] {
             field.delegate = self
@@ -615,19 +759,30 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             label.textColor = .secondaryLabelColor
             label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         }
-        profileStatusLabel.textColor = .secondaryLabelColor
+        for label in [profileStatusLabel, qwenStatusLabel, voxStatusLabel] {
+            label.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
+            label.textColor = .secondaryLabelColor
+        }
         profileStatusLabel.setAccessibilityLabel("Voice profile validation status")
-        for label in [qwenStatusLabel, qwenPackageLabel, qwenRuntimeLabel, qwenConfigurationLabel] {
+        for label in [qwenPackageLabel, qwenRuntimeLabel, qwenConfigurationLabel, voxSnapshotLabel, voxRuntimeLabel] {
             label.textColor = .secondaryLabelColor
             label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         }
         qwenPackageLabel.lineBreakMode = .byTruncatingMiddle
         qwenRuntimeLabel.lineBreakMode = .byTruncatingMiddle
+        qwenConfigurationLabel.maximumNumberOfLines = 0
+        qwenConfigurationLabel.lineBreakMode = .byWordWrapping
+        qwenConfigurationLabel.alignment = .left
+        voxSnapshotLabel.lineBreakMode = .byTruncatingMiddle
+        voxRuntimeLabel.lineBreakMode = .byTruncatingMiddle
         qwenStatusLabel.setAccessibilityLabel("Qwen3-TTS provider status")
         qwenPackageLabel.setAccessibilityLabel("Qwen3-TTS managed package")
         qwenRuntimeLabel.setAccessibilityLabel("Qwen3-TTS Python runtime")
         qwenConfigurationLabel.setAccessibilityLabel("Qwen3-TTS generation recipe")
         qwenConfigurationLabel.setAccessibilityHelp("Fixed local Japanese zero-shot output and sampling parameters. The private reference transcript is not displayed.")
+        voxStatusLabel.setAccessibilityLabel("VoxCPM2 provider status")
+        voxSnapshotLabel.setAccessibilityLabel("VoxCPM2 managed snapshot")
+        voxRuntimeLabel.setAccessibilityLabel("VoxCPM2 Python runtime")
     }
 
     private func configureButtons() {
@@ -806,6 +961,27 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 8
+        return row
+    }
+
+    private func profileActionRow(primary: [NSButton], destructive: [NSButton]) -> NSStackView {
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        destructive.forEach { $0.hasDestructiveAction = true }
+        let row = NSStackView(views: primary + [spacer] + destructive)
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        return row
+    }
+
+    private func leadingRow(_ view: NSView) -> NSStackView {
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        view.setContentHuggingPriority(.required, for: .horizontal)
+        let row = NSStackView(views: [view, spacer])
+        row.orientation = .horizontal
+        row.alignment = .centerY
         return row
     }
 
@@ -1027,6 +1203,29 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         return active ? "Active · \(profileStatusTitle(activeStatus))" : "Configured"
     }
 
+    private func applyProviderStatusAppearance(
+        _ label: NSTextField,
+        configured: Bool,
+        active: Bool,
+        status: DialogueVoiceProfileStatus
+    ) {
+        label.toolTip = label.stringValue
+        guard configured, active else {
+            label.textColor = .secondaryLabelColor
+            return
+        }
+        label.textColor = switch status {
+        case .ready:
+            .systemGreen
+        case .validating, .unavailable:
+            .systemOrange
+        case .invalid:
+            .systemRed
+        case .notConfigured:
+            .secondaryLabelColor
+        }
+    }
+
     private func safeBasename(_ path: String) -> String {
         let basename = URL(fileURLWithPath: path).lastPathComponent
         return basename.isEmpty ? "Imported file" : basename
@@ -1040,22 +1239,61 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             qwenStatusLabel.stringValue = "Not configured"
             qwenPackageLabel.stringValue = "Not imported"
             qwenRuntimeLabel.stringValue = "Not selected"
-            qwenConfigurationLabel.stringValue = "Japanese zero-shot · 24 kHz PCM16"
+            qwenConfigurationLabel.stringValue = "Japanese zero-shot · 24 kHz PCM16\nImport a handover package to view sampling details."
+            applyProviderStatusAppearance(
+                qwenStatusLabel,
+                configured: false,
+                active: false,
+                status: .notConfigured
+            )
             return
         }
+        let isActive = activeProviderKind == .qwen3TTS
         qwenStatusLabel.stringValue = providerStatusTitle(
             configured: true,
-            active: activeProviderKind == .qwen3TTS,
+            active: isActive,
             activeStatus: profileStatus
+        )
+        applyProviderStatusAppearance(
+            qwenStatusLabel,
+            configured: true,
+            active: isActive,
+            status: profileStatus
         )
         qwenPackageLabel.stringValue = "\(profile.name) · \(safeBasename(profile.packageRootRelativePath))"
         qwenRuntimeLabel.stringValue = safeBasename(profile.pythonExecutablePath)
-        qwenConfigurationLabel.stringValue = "Japanese zero-shot · 24 kHz PCM16 · seed \(profile.seed) · temperature \(profile.temperature) · top-k \(profile.topK) · top-p \(profile.topP) · repetition \(profile.repetitionPenalty) · max \(profile.maximumTokens) tokens"
+        qwenConfigurationLabel.stringValue = """
+        Japanese zero-shot · 24 kHz PCM16
+        Sampling: seed \(profile.seed) · temperature \(profile.temperature) · top-k \(profile.topK) · top-p \(profile.topP)
+        Limits: repetition \(profile.repetitionPenalty) · max \(profile.maximumTokens) tokens
+        """
     }
 
     private func applyVoxSummary(profile: VoxCPM2VoiceProfile?, activeProviderKind: DialogueVoiceProviderKind?) {
-        guard let profile else { voxStatusLabel.stringValue = "Not configured"; voxSnapshotLabel.stringValue = "Not selected"; voxRuntimeLabel.stringValue = "Not selected"; return }
-        voxStatusLabel.stringValue = providerStatusTitle(configured: true, active: activeProviderKind == .voxcpm2, activeStatus: profileStatus)
+        guard let profile else {
+            voxStatusLabel.stringValue = "Not configured"
+            voxSnapshotLabel.stringValue = "Not selected"
+            voxRuntimeLabel.stringValue = "Not selected"
+            applyProviderStatusAppearance(
+                voxStatusLabel,
+                configured: false,
+                active: false,
+                status: .notConfigured
+            )
+            return
+        }
+        let isActive = activeProviderKind == .voxcpm2
+        voxStatusLabel.stringValue = providerStatusTitle(
+            configured: true,
+            active: isActive,
+            activeStatus: profileStatus
+        )
+        applyProviderStatusAppearance(
+            voxStatusLabel,
+            configured: true,
+            active: isActive,
+            status: profileStatus
+        )
         voxSnapshotLabel.stringValue = safeBasename(profile.snapshotPath)
         voxRuntimeLabel.stringValue = safeBasename(profile.pythonExecutablePath)
         if voxReferenceTextField.stringValue.isEmpty { voxReferenceTextField.stringValue = profile.referenceText }

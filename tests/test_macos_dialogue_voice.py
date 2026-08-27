@@ -455,8 +455,10 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         self.assertEqual(labels, ["Dialogue", "Voice Setup"])
         self.assertIn('voiceSectionControl.setAccessibilityLabel("Voice section")', self.voice_view)
         self.assertIn("let voiceSectionPickerRow = centeredRow(voiceSectionControl)", self.voice_view)
-        self.assertIn("let profileGridRow = centeredRow(profileGrid)", self.voice_view)
-        self.assertIn("views: [profileTitle, profileHelp, profileGridRow, profileActions]", self.voice_view)
+        self.assertIn("views: [profileGrid, profileActions]", self.voice_view)
+        self.assertIn("views: [qwenGrid, qwenActions]", self.voice_view)
+        self.assertNotIn("centeredRow(profileGrid)", self.voice_view)
+        self.assertNotIn("centeredRow(qwenGrid)", self.voice_view)
         self.assertIn(
             "voiceSectionPickerRow.widthAnchor.constraint(equalTo: contentStack.widthAnchor)",
             self.voice_view,
@@ -471,6 +473,32 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
             self.assertIn(f"{page}.isHidden", self.voice_view)
         self.assertNotIn("removeArrangedSubview(dialoguePage)", self.voice_view)
         self.assertNotIn("removeArrangedSubview(voiceSetupPage)", self.voice_view)
+
+    def test_voice_setup_uses_full_width_native_cards_and_readable_provider_details(self) -> None:
+        for card in (
+            "providerSelectorCard",
+            "gptProfileCard",
+            "qwenProfileCard",
+            "voxProfileCard",
+        ):
+            self.assertIn(f"private let {card} = NSVisualEffectView()", self.voice_view)
+
+        self.assertIn('card.identifier = NSUserInterfaceItemIdentifier("VoiceSetupCard")', self.voice_view)
+        self.assertIn("card.material = .contentBackground", self.voice_view)
+        self.assertIn("card.layer?.cornerCurve = .continuous", self.voice_view)
+        self.assertIn("content.widthAnchor.constraint(equalTo: cardStack.widthAnchor)", self.voice_view)
+        self.assertIn(
+            "views: [providerSelectorCard, gptProfileCard, qwenProfileCard, voxProfileCard]",
+            self.voice_view,
+        )
+        self.assertIn("qwenConfigurationLabel.maximumNumberOfLines = 0", self.voice_view)
+        self.assertIn("qwenConfigurationLabel.lineBreakMode = .byWordWrapping", self.voice_view)
+        self.assertIn("Sampling: seed", self.voice_view)
+        self.assertIn("Models, reference audio, transcripts, and generated speech remain private on this Mac.", self.voice_view)
+
+        selection = method_body(self.voice_view, "    private func selectDisplayedProvider")
+        for card in ("gptProfileCard", "qwenProfileCard", "voxProfileCard"):
+            self.assertIn(f"{card}.isHidden", selection)
 
     def test_dialogue_messages_and_voice_are_owned_by_lifecycle_state(self) -> None:
         self.assertIn('sectionTitle("STATE-OWNED MESSAGES & VOICE")', self.voice_view)
