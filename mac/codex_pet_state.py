@@ -365,6 +365,13 @@ def active_ttl_for_event(event: str, active_ttl: float) -> float:
     return active_ttl
 
 
+def _event_projects_as_active(event: str, state: str, provider: str) -> bool:
+    """Allow only Grok background work to remain active after Stop."""
+    if event != "Stop":
+        return True
+    return provider == "grok" and state == "running"
+
+
 def _add_rejection(rejections: Dict[str, int], reason: str, count: int = 1) -> None:
     if reason not in VALID_REJECTION_REASONS or (
         len(rejections) >= MAX_REJECTION_REASONS and reason not in rejections
@@ -577,7 +584,7 @@ def read_session_snapshot(
             ):
                 latest_event = event
                 latest_event_at = event_at
-            if not terminal and (event != "Stop" or state != "idle"):
+            if not terminal and _event_projects_as_active(event, state, provider):
                 active.append((state, event_at))
                 active_expiries.append(event_at + event_ttl)
     finally:
@@ -690,7 +697,7 @@ def read_session_activity(
                     "terminal": True,
                 })
             elif (
-                (event != "Stop" or state != "idle")
+                _event_projects_as_active(event, state, provider)
                 and age <= event_ttl
                 and state != "idle"
             ):

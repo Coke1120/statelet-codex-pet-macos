@@ -459,6 +459,21 @@ class LifecycleStateTests(unittest.TestCase):
         self.assertEqual(activity["active"][0]["event"], "Stop")
         self.assertEqual(activity["active"][0]["provider"], "grok")
 
+    def test_stale_waiting_codex_stop_never_projects_as_active(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            record = record_path(directory, "a")
+            write_v2_record(record, "waiting", "Stop", 99.0)
+
+            snapshot = state.read_session_snapshot(directory, now=100.0)
+            activity = state.read_session_activity(directory, now=100.0)
+            record_still_exists = record.exists()
+
+        self.assertEqual(snapshot["active"], [])
+        self.assertEqual(activity["active"], [])
+        self.assertEqual(activity["completed"], [])
+        self.assertTrue(record_still_exists)
+
     def test_ttl_future_skew_and_corrupt_records_fail_soft(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

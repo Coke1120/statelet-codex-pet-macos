@@ -647,7 +647,10 @@ def _causally_accept(
         fingerprint = _tool_fingerprint(payload)
         pending_permissions = causal.get("pending_permissions", [])
         causal["pending_permissions"] = (pending_permissions + [fingerprint])[-MAX_TOOL_IDS:]
-    elif event == "Stop" and payload.get("_statelet_provider") == "grok":
+    elif event == "Stop":
+        # Stop closes the current turn for every provider. A permission that
+        # was never followed by a tool callback cannot keep the session in the
+        # waiting projection after that boundary.
         causal["pending_permissions"] = []
     elif event == "PreCompact":
         if causal.get("latest_event") == "PostCompact":

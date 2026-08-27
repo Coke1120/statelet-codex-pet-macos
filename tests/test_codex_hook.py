@@ -108,6 +108,34 @@ class HookHardeningTests(unittest.TestCase):
         self.assertFalse(record["terminal"])
         self.assertIsNone(record["completed_at"])
 
+    def test_stop_clears_unresolved_permission_before_returning_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "sessions"
+            common = {
+                "session_id": "session",
+                "turn_id": "turn-one",
+            }
+            output = hook.write_event(
+                dict(
+                    common,
+                    hook_event_name="PermissionRequest",
+                    tool_name="Bash",
+                    tool_input={"command": "needs-approval"},
+                ),
+                state_dir,
+            )
+            waiting = json.loads(output.read_text(encoding="utf-8"))
+            hook.write_event(dict(common, hook_event_name="Stop"), state_dir)
+            stopped = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(waiting["state"], "waiting")
+        self.assertEqual(len(waiting["causal"]["pending_permissions"]), 1)
+        self.assertEqual(stopped["event"], "Stop")
+        self.assertEqual(stopped["state"], "idle")
+        self.assertEqual(stopped["causal"]["pending_permissions"], [])
+        self.assertTrue(stopped["fence"]["turn_closed"])
+        self.assertFalse(stopped["terminal"])
+
     def test_session_identity_aliases_are_hashed_and_distinct(self) -> None:
         aliases = ("session_id", "thread_id", "conversation_id", "sessionId")
         keys = {
