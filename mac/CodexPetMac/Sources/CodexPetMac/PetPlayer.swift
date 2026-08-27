@@ -138,7 +138,8 @@ final class PetPlayerView: NSView {
     private let posterView = NSImageView()
     private let placeholderLabel = NSTextField(wrappingLabelWithString: "")
     private let stateBadge = PetStateBadgeView()
-    private let fpsBadge = NSTextField(labelWithString: "")
+    private let fpsBadge = NSView()
+    private let fpsBadgeLabel = NSTextField(labelWithString: "")
     private let dialogueBubble = NSView()
     private let dialogueLabel = NSTextField(wrappingLabelWithString: "")
     private let nextClipButton = NSButton()
@@ -312,13 +313,29 @@ final class PetPlayerView: NSView {
     }
 
     private func configureFPSBadge() {
-        fpsBadge.alignment = .center
-        fpsBadge.lineBreakMode = .byClipping
         fpsBadge.translatesAutoresizingMaskIntoConstraints = true
         fpsBadge.wantsLayer = true
         fpsBadge.layer?.cornerCurve = .continuous
+        fpsBadge.layer?.masksToBounds = true
         fpsBadge.isHidden = true
+        fpsBadge.setAccessibilityElement(true)
+        fpsBadge.setAccessibilityRole(.staticText)
         fpsBadge.setAccessibilityLabel("Video frame rate")
+
+        fpsBadgeLabel.alignment = .center
+        fpsBadgeLabel.lineBreakMode = .byClipping
+        fpsBadgeLabel.maximumNumberOfLines = 1
+        fpsBadgeLabel.translatesAutoresizingMaskIntoConstraints = false
+        fpsBadgeLabel.setAccessibilityElement(false)
+        fpsBadge.addSubview(fpsBadgeLabel)
+        NSLayoutConstraint.activate([
+            fpsBadgeLabel.centerXAnchor.constraint(equalTo: fpsBadge.centerXAnchor),
+            fpsBadgeLabel.centerYAnchor.constraint(equalTo: fpsBadge.centerYAnchor),
+            fpsBadgeLabel.leadingAnchor.constraint(greaterThanOrEqualTo: fpsBadge.leadingAnchor, constant: 8),
+            fpsBadgeLabel.trailingAnchor.constraint(lessThanOrEqualTo: fpsBadge.trailingAnchor, constant: -8),
+            fpsBadgeLabel.topAnchor.constraint(greaterThanOrEqualTo: fpsBadge.topAnchor, constant: 4),
+            fpsBadgeLabel.bottomAnchor.constraint(lessThanOrEqualTo: fpsBadge.bottomAnchor, constant: -4),
+        ])
         addSubview(fpsBadge)
     }
 
@@ -327,7 +344,7 @@ final class PetPlayerView: NSView {
         reduceTransparency: Bool
     ) {
         fpsBadgeIsEnabled = configuration.showFPS
-        fpsBadge.textColor = NSColor.codexPet(hex: configuration.fpsColor)
+        fpsBadgeLabel.textColor = NSColor.codexPet(hex: configuration.fpsColor)
         fpsBadge.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(
             reduceTransparency ? 1 : 0.82
         ).cgColor
@@ -337,7 +354,7 @@ final class PetPlayerView: NSView {
         case .regular: fontSize = 11
         case .large: fontSize = 14
         }
-        fpsBadge.font = .monospacedDigitSystemFont(ofSize: fontSize, weight: .semibold)
+        fpsBadgeLabel.font = .monospacedDigitSystemFont(ofSize: fontSize, weight: .semibold)
         fpsBadge.layer?.cornerRadius = fontSize
         fpsBadge.isHidden = !fpsBadgeIsEnabled || !fpsBadgeHasReading
         needsLayout = true
@@ -351,7 +368,7 @@ final class PetPlayerView: NSView {
         reducedMotion: Bool
     ) {
         if reducedMotion {
-            fpsBadge.stringValue = "Still"
+            fpsBadgeLabel.stringValue = "Still"
             fpsBadge.setAccessibilityValue("Still image because Reduce Motion is enabled")
             fpsBadgeHasReading = true
         } else {
@@ -359,19 +376,19 @@ final class PetPlayerView: NSView {
             let intended = Self.usableFramesPerSecond(intended)
             switch (intended, nominal) {
             case let (.some(intended), .some(nominal)) where abs(intended - nominal) < 0.05:
-                fpsBadge.stringValue = "\(Self.formatFPS(intended)) FPS"
+                fpsBadgeLabel.stringValue = "\(Self.formatFPS(intended)) FPS"
                 fpsBadge.setAccessibilityValue("Intended playback and nominal frame rate are \(Self.formatFPS(intended)) frames per second")
                 fpsBadgeHasReading = true
             case let (.some(intended), .some(nominal)):
-                fpsBadge.stringValue = "\(Self.formatFPS(intended)) FPS · \(Self.formatFPS(nominal)) nominal"
+                fpsBadgeLabel.stringValue = "\(Self.formatFPS(intended)) FPS · \(Self.formatFPS(nominal)) nominal"
                 fpsBadge.setAccessibilityValue("Intended playback \(Self.formatFPS(intended)) frames per second; source nominal \(Self.formatFPS(nominal)) frames per second")
                 fpsBadgeHasReading = true
             case let (.some(intended), nil):
-                fpsBadge.stringValue = "\(Self.formatFPS(intended)) FPS intended"
+                fpsBadgeLabel.stringValue = "\(Self.formatFPS(intended)) FPS intended"
                 fpsBadge.setAccessibilityValue("Intended playback \(Self.formatFPS(intended)) frames per second")
                 fpsBadgeHasReading = true
             case let (nil, .some(nominal)):
-                fpsBadge.stringValue = "\(Self.formatFPS(nominal)) FPS nominal"
+                fpsBadgeLabel.stringValue = "\(Self.formatFPS(nominal)) FPS nominal"
                 fpsBadge.setAccessibilityValue("Nominal \(Self.formatFPS(nominal)) frames per second; current frame rate unavailable")
                 fpsBadgeHasReading = true
             case (nil, nil):
@@ -401,7 +418,7 @@ final class PetPlayerView: NSView {
         guard !fpsBadge.isHidden else { return }
         let horizontalPadding: CGFloat = 8
         let verticalPadding: CGFloat = 4
-        let fittingSize = fpsBadge.intrinsicContentSize
+        let fittingSize = fpsBadgeLabel.intrinsicContentSize
         let size = NSSize(
             width: ceil(fittingSize.width + horizontalPadding * 2),
             height: ceil(fittingSize.height + verticalPadding * 2)

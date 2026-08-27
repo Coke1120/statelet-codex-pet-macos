@@ -191,6 +191,32 @@ final class PetPlayerDialogueLayoutTests: XCTestCase {
     }
 
     @MainActor
+    func testFPSBadgeLabelIsCenteredInsideContainerAtEverySize() throws {
+        for size in PetAppearanceConfiguration.StateLabelSize.allCases {
+            let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 480))
+            view.applyAppearance(try PetAppearanceConfiguration(showFPS: true, fpsLabelSize: size))
+            view.updateFPSBadge(
+                nominalFramesPerSecond: 29.97,
+                intendedFramesPerSecond: 14.985,
+                reducedMotion: false
+            )
+            view.layoutSubtreeIfNeeded()
+
+            let badge = try XCTUnwrap(
+                view.subviews.first { $0.accessibilityLabel() == "Video frame rate" }
+            )
+            let label = try XCTUnwrap(badge.subviews.compactMap { $0 as? NSTextField }.first)
+            badge.layoutSubtreeIfNeeded()
+            let alignmentRect = label.alignmentRect(forFrame: label.frame)
+
+            XCTAssertEqual(alignmentRect.midX, badge.bounds.midX, accuracy: 0.5, "Horizontal alignment for \(size)")
+            XCTAssertEqual(alignmentRect.midY, badge.bounds.midY, accuracy: 0.5, "Vertical alignment for \(size)")
+            XCTAssertGreaterThanOrEqual(alignmentRect.minX, 8, "Leading padding for \(size)")
+            XCTAssertGreaterThanOrEqual(alignmentRect.minY, 4, "Bottom padding for \(size)")
+        }
+    }
+
+    @MainActor
     private func assertDialogueBubbleAvoidsOverlays(
         stateLabelPosition: StateLabelPosition,
         file: StaticString = #filePath,
