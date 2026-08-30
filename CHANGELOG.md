@@ -3,6 +3,35 @@
 All notable changes to Statelet are documented here. Versions follow semantic
 versioning for the public source release.
 
+## [1.8.20] - 2026-08-30
+
+### Security
+
+- Bounded hook, updater, installer, alpha-conversion, and local voice inputs;
+  authenticated GPT-SoVITS loopback TLS and Qwen/Vox Python runtime identity;
+  and rejected mutable or malformed runtime, source, and bundle boundaries.
+- Bound installer recovery journals, migration manifests, release artifacts,
+  and alpha conversion reports to canonical authenticated content.
+
+### Fixed
+
+- App termination now permanently closes media, voice, conversion, and tool
+  re-entry, drains owned finalizers, and reaps complete process groups before an
+  update may replace the running bundle.
+- Release publication is draft-first, exact-head CI gated, and independently
+  verifies hosted manifests, signatures, archive identity, and asset bytes.
+- Removed the unused Pillow runtime dependency and expanded fail-closed tests
+  for races, cancellation, malformed files, legacy recovery, and low disk.
+
+### Distribution notes
+
+- Version 1.8.20 supersedes 1.8.19 with repository-wide boundary hardening;
+  existing private media, voice, models, credentials, logs, prompts, and
+  runtime data remain local and excluded from releases.
+- The package remains ad-hoc signed for owner-authorized personal updates. It
+  is not Developer ID signed, notarized, or presented as an Apple-authorized
+  public binary.
+
 ## [1.8.19] - 2026-08-28
 
 ### Changed
@@ -595,6 +624,7 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
+[1.8.20]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.20
 [1.8.19]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.19
 [1.8.18]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.18
 [1.8.17]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.17
