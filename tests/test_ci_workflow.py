@@ -18,6 +18,16 @@ class CIWorkflowTests(unittest.TestCase):
         self.assertNotIn("tags:", ci_triggers)
         self.assertIn('tags:\n      - "v*"', release_triggers)
 
+    def test_ci_runs_the_complete_opt_in_avplayer_integration_suite(self) -> None:
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn("--skip PetPlayerPlaybackIntegrationTests", workflow)
+        self.assertIn("--filter PetPlayerPlaybackIntegrationTests", workflow)
+        self.assertNotIn(
+            "--filter PetPlayerPlaybackIntegrationTests/testSameState",
+            workflow,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

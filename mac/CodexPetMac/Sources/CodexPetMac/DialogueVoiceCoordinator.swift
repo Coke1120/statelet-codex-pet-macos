@@ -36,38 +36,6 @@ struct DialogueVoiceCoordinatorSnapshot {
 }
 
 final class DialogueVoiceCoordinator: @unchecked Sendable {
-    private final class DetachedActivityTracker: @unchecked Sendable {
-        private let condition = NSCondition()
-        private var activeCount = 0
-
-        func begin() {
-            condition.lock()
-            activeCount += 1
-            condition.unlock()
-        }
-
-        func finish() {
-            condition.lock()
-            activeCount -= 1
-            if activeCount == 0 {
-                condition.broadcast()
-            }
-            condition.unlock()
-        }
-
-        func waitForQuiescence(timeout: TimeInterval) -> Bool {
-            let deadline = Date(timeIntervalSinceNow: max(0, timeout))
-            condition.lock()
-            defer { condition.unlock() }
-            while activeCount > 0 {
-                if !condition.wait(until: deadline), activeCount > 0 {
-                    return false
-                }
-            }
-            return true
-        }
-    }
-
     private enum GenerationResult: Sendable {
         case success(String, ValidatedProviderIdentity)
         case failure(String)
@@ -165,7 +133,10 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     private let managedFileRemove: ManagedFileRemove
     private let voxSnapshotInstall: VoxSnapshotInstall
     private let voxReferenceInstall: VoxReferenceInstall
-    private let detachedActivities = DetachedActivityTracker()
+    private let detachedActivities = OwnedOperationTracker()
+    private let mainThreadFinalizations = MainThreadFinalizationQueue()
+    private let beforeImportFinalization: @Sendable () -> Void
+    private let beforeGenerationFinalization: @Sendable () -> Void
 
     private(set) var library: DialogueVoiceLibrary
     private(set) var draft: DialogueVoiceProfileDraft
@@ -245,7 +216,9 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         sleepForInterval: @escaping @Sendable (TimeInterval) async throws -> Void = { seconds in
             let nanoseconds = UInt64((seconds * 1_000_000_000).rounded())
             try await Task.sleep(nanoseconds: nanoseconds)
-        }
+        },
+        beforeImportFinalization: @escaping @Sendable () -> Void = {},
+        beforeGenerationFinalization: @escaping @Sendable () -> Void = {}
     ) {
         self.applicationSupportRoot = applicationSupportRoot
         let voiceRoot = applicationSupportRoot.appendingPathComponent("voice", isDirectory: true)
@@ -262,6 +235,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         self.voxReferenceInstall = voxReferenceInstall
         self.randomIndex = randomIndex
         self.sleepForInterval = sleepForInterval
+        self.beforeImportFinalization = beforeImportFinalization
+        self.beforeGenerationFinalization = beforeGenerationFinalization
         playbackService = DialogueReadyPlaybackService(
             applicationSupportRoot: applicationSupportRoot,
             player: audioPlayer
@@ -269,7 +244,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         library = try! DialogueVoiceLibrary()
         draft = DialogueVoiceProfileDraft(
             name: "",
-            apiBaseURL: "http://127.0.0.1:9880",
+            apiBaseURL: "https://127.0.0.1:9880",
+            tlsLeafCertificateSHA256: "",
             promptLanguage: "",
             defaultTextLanguage: "",
             referenceText: ""
@@ -308,6 +284,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             draft = DialogueVoiceProfileDraft(
                 name: profile.name,
                 apiBaseURL: profile.apiBaseURL.absoluteString,
+                tlsLeafCertificateSHA256: profile.tlsLeafCertificateSHA256 ?? "",
                 promptLanguage: profile.promptLanguage,
                 defaultTextLanguage: profile.defaultTextLanguage,
                 referenceText: profile.referenceText
@@ -390,15 +367,16 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     }
 
     /// Cancels voice work and waits until detached import, validation, and
-    /// generation operations have stopped touching updater-sensitive files and
-    /// processes. This is intentionally synchronous for the app termination
-    /// boundary; detached operations signal completion before dispatching their
-    /// final state update back to the main actor.
+    /// generation operations have completed their final persistence, cleanup,
+    /// or ownership handoff on the main actor.
     @discardableResult
     func shutdownAndWaitForQuiescence(timeout: TimeInterval = 5) -> Bool {
         assertMainThread()
         shutdown()
-        return detachedActivities.waitForQuiescence(timeout: timeout)
+        return detachedActivities.waitForQuiescence(
+            timeout: timeout,
+            mainThreadWork: mainThreadFinalizations.drain
+        )
     }
 
     func importAsset(sourceURL: URL, kind: DialogueVoiceAssetKind, preserving draft: DialogueVoiceProfileDraft) {
@@ -411,8 +389,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         activityMessage = "Importing \(assetDisplayName(kind))…"
         notify()
         let installer = installer
-        detachedActivities.begin()
-        let detachedActivities = detachedActivities
+        let activity = detachedActivities.begin()
+        let beforeImportFinalization = beforeImportFinalization
         activeImportTask = Task.detached(priority: .userInitiated) { [self] in
             let result: Result<DialogueVoiceInstalledAsset, DialogueVoiceRuntimeError>
             do {
@@ -424,8 +402,9 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             } catch {
                 result = .failure(.copyFailed)
             }
-            detachedActivities.finish()
-            await MainActor.run {
+            beforeImportFinalization()
+            mainThreadFinalizations.enqueue {
+                defer { activity.finish() }
                 guard sequence == self.importSequence else {
                     if case let .success(asset) = result {
                         let cleanup = self.deferCleanup(paths: [asset.relativePath])
@@ -501,8 +480,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
 
         let root = applicationSupportRoot
         let qwenPackageInstall = qwenPackageInstall
-        detachedActivities.begin()
-        let detachedActivities = detachedActivities
+        let activity = detachedActivities.begin()
+        let beforeImportFinalization = beforeImportFinalization
         activeImportTask = Task.detached(priority: .userInitiated) {
             let result: Result<
                 (Qwen3TTSImportedPackage, Qwen3TTSPythonRuntimeIdentity),
@@ -522,8 +501,9 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             } catch {
                 result = .failure(.profileRejected)
             }
-            detachedActivities.finish()
-            await MainActor.run {
+            beforeImportFinalization()
+            self.mainThreadFinalizations.enqueue {
+                defer { activity.finish() }
                 self.inFlightQwenPackagePaths.subtract(reservedPaths)
                 guard sequence == self.importSequence else {
                     // This detached importer has now stopped using its reserved
@@ -655,8 +635,9 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         notify()
         let voxSnapshotInstall = voxSnapshotInstall
         let voxReferenceInstall = voxReferenceInstall
-        detachedActivities.begin()
-        let detachedActivities = detachedActivities
+        let previousVoxProfile = library.voxcpm2Profile
+        let activity = detachedActivities.begin()
+        let beforeImportFinalization = beforeImportFinalization
         activeImportTask = Task.detached(priority: .userInitiated) {
             let result: VoxCPM2ProfileImportResult
             do {
@@ -669,7 +650,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                     )
                     do {
                         let runtime = try Qwen3TTSProfileValidator.validatePythonExecutable(at: pythonExecutableURL)
-                        let previous = await MainActor.run { self.library.voxcpm2Profile }
+                        let previous = previousVoxProfile
                         let provisional = try VoxCPM2VoiceProfile(
                             id: previous?.id ?? UUID(), revision: (previous?.revision ?? 0) + 1,
                             name: previous?.name ?? "VoxCPM2 Voice",
@@ -720,8 +701,9 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             } catch {
                 result = .failure(.profileRejected, installedPaths: [])
             }
-            detachedActivities.finish()
-            await MainActor.run {
+            beforeImportFinalization()
+            self.mainThreadFinalizations.enqueue {
+                defer { activity.finish() }
                 self.inFlightVoxImportPaths.subtract(reservedPaths)
                 guard sequence == self.importSequence else {
                     let abandonedPaths: [String] = switch result {
@@ -873,24 +855,43 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         )
 
         let previousProfile = library.profile
-        let fingerprint = DialogueVoiceProfileFingerprint.compute(
-            apiBaseURL: apiURL,
-            referenceText: draft.referenceText,
-            promptLanguage: draft.promptLanguage,
-            defaultTextLanguage: draft.defaultTextLanguage,
-            assetDigests: assetDigests
-        )
-        let profile = try GPTSoVITSVoiceProfile(
+        let candidateProfile = try GPTSoVITSVoiceProfile(
             id: previousProfile?.id ?? UUID(),
             revision: (previousProfile?.revision ?? 0) + 1,
             name: draft.name,
             apiBaseURL: apiURL,
+            tlsLeafCertificateSHA256: draft.tlsLeafCertificateSHA256,
             gptWeightRelativePath: gptPath,
             sovitsWeightRelativePath: sovitsPath,
             referenceAudioRelativePath: referencePath,
             referenceText: draft.referenceText,
             promptLanguage: draft.promptLanguage,
             defaultTextLanguage: draft.defaultTextLanguage,
+            inputFingerprint: String(repeating: "0", count: 64)
+        )
+        guard let tlsLeafCertificateSHA256 = candidateProfile.tlsLeafCertificateSHA256 else {
+            throw DialogueVoiceError.invalidProfile
+        }
+        let fingerprint = DialogueVoiceProfileFingerprint.compute(
+            apiBaseURL: candidateProfile.apiBaseURL,
+            tlsLeafCertificateSHA256: tlsLeafCertificateSHA256,
+            referenceText: candidateProfile.referenceText,
+            promptLanguage: candidateProfile.promptLanguage,
+            defaultTextLanguage: candidateProfile.defaultTextLanguage,
+            assetDigests: assetDigests
+        )
+        let profile = try GPTSoVITSVoiceProfile(
+            id: candidateProfile.id,
+            revision: candidateProfile.revision,
+            name: candidateProfile.name,
+            apiBaseURL: candidateProfile.apiBaseURL,
+            tlsLeafCertificateSHA256: tlsLeafCertificateSHA256,
+            gptWeightRelativePath: candidateProfile.gptWeightRelativePath,
+            sovitsWeightRelativePath: candidateProfile.sovitsWeightRelativePath,
+            referenceAudioRelativePath: candidateProfile.referenceAudioRelativePath,
+            referenceText: candidateProfile.referenceText,
+            promptLanguage: candidateProfile.promptLanguage,
+            defaultTextLanguage: candidateProfile.defaultTextLanguage,
             inputFingerprint: fingerprint
         )
 
@@ -1118,16 +1119,13 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         try updated.enqueueCleanup(paths: generatedPaths + managedAssetPaths.sorted())
         try store.save(updated)
         library = updated
-        let cleanup = retryPendingCleanup(
-            preserving: removedProvider == .gptSovits
-                ? inFlightQwenPackagePaths
-                : cleanupPreservationPaths
-        )
+        let cleanup = retryPendingCleanup(preserving: cleanupPreservationPaths)
         if removedProvider == .gptSovits {
             importedAssets = DialogueVoiceImportedAssets()
             draft = DialogueVoiceProfileDraft(
                 name: "",
-                apiBaseURL: "http://127.0.0.1:9880",
+                apiBaseURL: "https://127.0.0.1:9880",
+                tlsLeafCertificateSHA256: "",
                 promptLanguage: "",
                 defaultTextLanguage: "",
                 referenceText: ""
@@ -1529,8 +1527,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                 outputRelativePath: outputRelativePath
             )
         }
-        detachedActivities.begin()
-        let detachedActivities = detachedActivities
+        let activity = detachedActivities.begin()
         profileValidationTask = Task.detached(priority: .utility) { [self] in
             let result: ProfileValidationResult
             do {
@@ -1538,24 +1535,42 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                     profile: profile,
                     applicationSupportRoot: root
                 )
+                let invalidOutputs = readyOutputs.filter { output in
+                    guard let data = try? DialogueVoiceAssetInstaller.readManagedFile(
+                        relativePath: output.outputRelativePath,
+                        root: root,
+                        maximumBytes: 67_108_864
+                    ) else {
+                        return true
+                    }
+                    return !GPTSoVITSAPIClient.isValidWAV(data)
+                }
+                guard let tlsLeafCertificateSHA256 = profile.tlsLeafCertificateSHA256,
+                      (try? DialogueVoiceEndpointPolicy.validatedLoopbackURL(profile.apiBaseURL)) != nil else {
+                    result = .unavailable(.gptSovits(validatedAssets), invalidOutputs)
+                    mainThreadFinalizations.enqueue {
+                        defer { activity.finish() }
+                        guard sequence == self.profileValidationSequence,
+                              self.library.activeProviderKind == .gptSovits,
+                              self.library.profile?.id == profile.id,
+                              self.library.profile?.revision == profile.revision,
+                              self.library.profile?.inputFingerprint == profile.inputFingerprint else {
+                            return
+                        }
+                        self.profileValidationTask = nil
+                        self.finishProfileValidation(profile: profile, result: result)
+                    }
+                    return
+                }
                 let fingerprint = DialogueVoiceProfileFingerprint.compute(
                     apiBaseURL: profile.apiBaseURL,
+                    tlsLeafCertificateSHA256: tlsLeafCertificateSHA256,
                     referenceText: profile.referenceText,
                     promptLanguage: profile.promptLanguage,
                     defaultTextLanguage: profile.defaultTextLanguage,
                     assetDigests: validatedAssets.digests
                 )
                 if fingerprint == profile.inputFingerprint {
-                    let invalidOutputs = readyOutputs.filter { output in
-                        guard let data = try? DialogueVoiceAssetInstaller.readManagedFile(
-                            relativePath: output.outputRelativePath,
-                            root: root,
-                            maximumBytes: 67_108_864
-                        ) else {
-                            return true
-                        }
-                        return !GPTSoVITSAPIClient.isValidWAV(data)
-                    }
                     do {
                         try await self.client.validateProfile(
                             profile,
@@ -1574,8 +1589,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             } catch {
                 result = .invalid
             }
-            detachedActivities.finish()
-            await MainActor.run {
+            mainThreadFinalizations.enqueue {
+                defer { activity.finish() }
                 guard sequence == self.profileValidationSequence,
                       self.library.activeProviderKind == .gptSovits,
                       self.library.profile?.id == profile.id,
@@ -1619,8 +1634,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             )
         }
         let qwenClient = qwenClient
-        detachedActivities.begin()
-        let detachedActivities = detachedActivities
+        let activity = detachedActivities.begin()
         profileValidationTask = Task.detached(priority: .utility) { [self] in
             let result: ProfileValidationResult
             do {
@@ -1651,8 +1665,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             } catch {
                 result = .invalid
             }
-            detachedActivities.finish()
-            await MainActor.run {
+            mainThreadFinalizations.enqueue {
+                defer { activity.finish() }
                 guard sequence == self.profileValidationSequence,
                       self.library.activeProviderKind == .qwen3TTS,
                       self.library.qwenProfile?.id == profile.id,
@@ -1678,8 +1692,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                 outputRelativePath: outputRelativePath
             )
         }
-        detachedActivities.begin()
-        let detachedActivities = detachedActivities
+        let activity = detachedActivities.begin()
         profileValidationTask = Task.detached(priority: .utility) {
             let result: ProfileValidationResult
             var probeSummary: String?
@@ -1706,8 +1719,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             } catch { result = .invalid }
             let validationResult = result
             let validationSummary = probeSummary
-            detachedActivities.finish()
-            await MainActor.run {
+            self.mainThreadFinalizations.enqueue {
+                defer { activity.finish() }
                 guard sequence == self.profileValidationSequence,
                       self.library.activeProviderKind == .voxcpm2,
                       self.library.voxcpm2Profile?.id == profile.id,
@@ -1770,7 +1783,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                 let cleanup = retryPendingCleanup()
                 activityMessage = cleanupAwareMessage(
                     provider == .gptSovits
-                        ? "Voice assets are valid, but the local GPT-SoVITS service is unavailable. Start API v2 and save the profile again."
+                        ? "Voice assets are valid, but the pinned HTTPS GPT-SoVITS gateway is unavailable or this legacy profile has no TLS pin. Restore the gateway and save the profile again."
                         : provider == .qwen3TTS
                         ? "The Qwen voice package is valid, but its local Python runtime is unavailable. Restore the selected runtime and validate again."
                         : "The VoxCPM2 inputs are pinned, but synthesis is unavailable until the bundled offline helper is installed.",
@@ -1901,8 +1914,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             let qwenProfile = library.qwenProfile
             let voxProfile = library.voxcpm2Profile
             let voxcpm2Client = voxcpm2Client
-            detachedActivities.begin()
-            let detachedActivities = detachedActivities
+            let activity = detachedActivities.begin()
+            let beforeGenerationFinalization = beforeGenerationFinalization
             activeGenerationTask = Task.detached(priority: .userInitiated) { [self] in
                 let result: GenerationResult
                 do {
@@ -1920,8 +1933,13 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                             let validatedAssets = try DialogueVoiceProfileFingerprint.validateAssets(
                                 profile: profile, applicationSupportRoot: root
                             )
+                            guard let tlsLeafCertificateSHA256 = profile.tlsLeafCertificateSHA256,
+                                  (try? DialogueVoiceEndpointPolicy.validatedLoopbackURL(profile.apiBaseURL)) != nil else {
+                                throw DialogueVoiceRuntimeError.inferenceUnavailable
+                            }
                             let fingerprint = DialogueVoiceProfileFingerprint.compute(
                                 apiBaseURL: profile.apiBaseURL,
+                                tlsLeafCertificateSHA256: tlsLeafCertificateSHA256,
                                 referenceText: profile.referenceText,
                                 promptLanguage: profile.promptLanguage,
                                 defaultTextLanguage: profile.defaultTextLanguage,
@@ -1990,8 +2008,9 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                 } catch {
                     result = .failure(DialogueVoiceRuntimeError.inferenceUnavailable.safeCode)
                 }
-                detachedActivities.finish()
-                await MainActor.run {
+                beforeGenerationFinalization()
+                mainThreadFinalizations.enqueue {
+                    defer { activity.finish() }
                     self.finishGeneration(ticket: ticket, result: result)
                 }
             }

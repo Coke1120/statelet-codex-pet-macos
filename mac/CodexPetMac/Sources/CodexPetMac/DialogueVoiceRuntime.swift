@@ -4,6 +4,7 @@ import CryptoKit
 import Darwin
 import Foundation
 import os
+import Security
 
 enum DialogueVoiceAssetKind: String, Sendable {
     case gptWeight = "gpt"
@@ -59,7 +60,7 @@ enum DialogueVoiceRuntimeError: LocalizedError, Sendable, Equatable {
         case .invalidManagedPath:
             return "A managed voice asset is missing or no longer trusted."
         case .inferenceUnavailable:
-            return "The local GPT-SoVITS service is unavailable. Start API v2 and retry."
+            return "The pinned HTTPS GPT-SoVITS gateway is unavailable or its leaf certificate does not match the saved SHA-256 pin."
         case .profileRejected:
             return "GPT-SoVITS rejected the selected model or reference profile."
         case .requestRejected:
@@ -104,6 +105,7 @@ struct Qwen3TTSValidatedPackage: Equatable, Sendable {
     let configFile: URL
     let generatorFile: URL
     let referenceAudioFile: URL
+    let runtimeIdentity: Qwen3TTSPythonRuntimeIdentity
     let identityTokens: [String]
     let treeSHA256: String
 }
@@ -112,6 +114,23 @@ struct Qwen3TTSPythonRuntimeIdentity: Equatable, Sendable {
     let invocationPath: String
     let finalTargetSHA256: String
     let stableIdentityToken: String
+}
+
+struct Qwen3TTSRuntimeSearchPlan: Equatable, Sendable {
+    let pythonHome: String
+    let roots: [String]
+}
+
+struct QwenRuntimeValidationControl: @unchecked Sendable {
+    let deadlineUptime: TimeInterval
+    let isCancelled: @Sendable () -> Bool
+
+    func check() throws {
+        if isCancelled() { throw DialogueVoiceRuntimeError.cancelled }
+        if ProcessInfo.processInfo.systemUptime >= deadlineUptime {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+    }
 }
 
 struct Qwen3TTSImportedPackage: Sendable {
@@ -1655,6 +1674,7 @@ enum Qwen3TTSProfileValidator {
             configFile: applicationSupportRoot.appendingPathComponent(relativePaths[1]),
             generatorFile: applicationSupportRoot.appendingPathComponent(relativePaths[2]),
             referenceAudioFile: applicationSupportRoot.appendingPathComponent(relativePaths[3]),
+            runtimeIdentity: runtimeAfter,
             identityTokens: packageIdentities + [runtimeAfter.stableIdentityToken],
             treeSHA256: packageTreeSHA256
         )
@@ -1702,12 +1722,135 @@ enum Qwen3TTSProfileValidator {
             configFile: applicationSupportRoot.appendingPathComponent(relativePaths[1]),
             generatorFile: applicationSupportRoot.appendingPathComponent(relativePaths[2]),
             referenceAudioFile: applicationSupportRoot.appendingPathComponent(relativePaths[3]),
+            runtimeIdentity: runtime,
             identityTokens: packageIdentities + [runtime.stableIdentityToken],
             treeSHA256: profile.packageTreeSHA256
         )
     }
 
     static func validatePythonExecutable(at url: URL) throws -> Qwen3TTSPythonRuntimeIdentity {
+        let control = QwenRuntimeValidationControl(
+            deadlineUptime: ProcessInfo.processInfo.systemUptime + 120,
+            isCancelled: { Task<Never, Never>.isCancelled }
+        )
+        return try validatePythonRuntimeAuthority(at: url, control: control).identity
+    }
+
+    static func validatePythonExecutable(
+        at url: URL,
+        control: QwenRuntimeValidationControl
+    ) throws -> Qwen3TTSPythonRuntimeIdentity {
+        try validatePythonRuntimeAuthority(at: url, control: control).identity
+    }
+
+    static func validatedRuntimeSearchPlan(
+        at url: URL,
+        environment: [String: String],
+        control: QwenRuntimeValidationControl
+    ) throws -> Qwen3TTSRuntimeSearchPlan {
+        try control.check()
+        try validatePythonLaunchEnvironment(environment)
+        let selected = try validatePythonRuntimeAuthority(at: url, control: control)
+        var orderedRoots = selected.layout.coreRoots
+        var visitedTrees = Set<String>()
+        var ignoredDiscoveries: [URL] = []
+        for root in orderedRoots {
+            try validatePotentialPythonSearchRootAuthority(
+                root,
+                visitedTrees: &visitedTrees,
+                discoveredSearchRoots: &ignoredDiscoveries,
+                control: control
+            )
+        }
+
+        if let virtualEnvironmentRoot = selected.layout.virtualEnvironmentRoot {
+            try appendPythonSiteRoots(
+                at: virtualEnvironmentRoot,
+                version: selected.layout.version,
+                to: &orderedRoots,
+                visitedTrees: &visitedTrees,
+                control: control
+            )
+        }
+        if selected.layout.virtualEnvironmentRoot == nil
+            || selected.layout.includesBaseSitePackages {
+            try appendPythonSiteRoots(
+                at: selected.layout.baseRoot,
+                version: selected.layout.version,
+                to: &orderedRoots,
+                visitedTrees: &visitedTrees,
+                control: control
+            )
+        }
+
+        var seen = Set<String>()
+        let roots = orderedRoots.compactMap { root -> String? in
+            let path = root.standardizedFileURL.path
+            guard seen.insert(path).inserted else { return nil }
+            return path
+        }
+        guard !roots.isEmpty,
+              roots.count <= 4_096,
+              roots.reduce(0, { $0 + $1.utf8.count }) <= 262_144 else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        return Qwen3TTSRuntimeSearchPlan(
+            pythonHome: selected.layout.baseRoot.path,
+            roots: roots
+        )
+    }
+
+    static func validateLaunchResource(
+        at url: URL,
+        maximumBytes: UInt64,
+        control: QwenRuntimeValidationControl? = nil
+    ) throws -> String {
+        try checkValidation(control)
+        try validateRuntimePathAuthority(url, control: control)
+        let digest = try sha256RegularFile(
+            url,
+            maximumBytes: maximumBytes,
+            control: control
+        )
+        var status = stat()
+        guard Darwin.lstat(url.path, &status) == 0,
+              status.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        return DialogueVoiceFileIdentity(status).token + ":" + digest
+    }
+
+    static func validateLaunchDirectory(
+        at url: URL,
+        control: QwenRuntimeValidationControl? = nil
+    ) throws {
+        try checkValidation(control)
+        try validateRuntimePathAuthority(url, control: control)
+        var status = stat()
+        guard Darwin.lstat(url.path, &status) == 0,
+              status.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+    }
+
+    private struct PythonRuntimeAuthorityValidation {
+        let identity: Qwen3TTSPythonRuntimeIdentity
+        let layout: PythonRuntimeLayout
+    }
+
+    private struct PythonRuntimeLayout {
+        let version: String
+        let baseRoot: URL
+        let virtualEnvironmentRoot: URL?
+        let includesBaseSitePackages: Bool
+        let coreRoots: [URL]
+    }
+
+    private static func validatePythonRuntimeAuthority(
+        at url: URL,
+        control: QwenRuntimeValidationControl
+    ) throws -> PythonRuntimeAuthorityValidation {
+        try control.check()
         guard url.isFileURL,
               url.host.map({ $0.isEmpty || $0 == "localhost" }) ?? true else {
             throw DialogueVoiceRuntimeError.inferenceUnavailable
@@ -1716,13 +1859,1014 @@ enum Qwen3TTSProfileValidator {
         guard invocation.path.hasPrefix("/"), FileManager.default.isExecutableFile(atPath: invocation.path) else {
             throw DialogueVoiceRuntimeError.inferenceUnavailable
         }
-        let launcher = try pythonLauncherIdentity(invocation)
-        let digest = try sha256RegularFile(launcher.target, maximumBytes: 1_073_741_824)
-        return Qwen3TTSPythonRuntimeIdentity(
-            invocationPath: invocation.path,
-            finalTargetSHA256: digest,
-            stableIdentityToken: launcher.token
+        let launcher = try pythonLauncherIdentity(invocation, control: control)
+        try validateRuntimePathAuthority(invocation, control: control)
+        try validateRuntimePathAuthority(launcher.target, control: control)
+        let authenticated = try authenticatedPythonLayout(
+            invocation: invocation,
+            finalTarget: launcher.target,
+            control: control
         )
+        var visitedEnvironments = Set<String>()
+        var visitedTrees = Set<String>()
+        var searchRoots: [URL] = []
+        try validatePythonEnvironmentAuthority(
+            invocation,
+            visitedEnvironments: &visitedEnvironments,
+            visitedTrees: &visitedTrees,
+            discoveredSearchRoots: &searchRoots,
+            control: control
+        )
+        try validatePythonEnvironmentAuthority(
+            launcher.target,
+            visitedEnvironments: &visitedEnvironments,
+            visitedTrees: &visitedTrees,
+            discoveredSearchRoots: &searchRoots,
+            control: control
+        )
+        let digest = try sha256RegularFile(
+            launcher.target,
+            maximumBytes: 1_073_741_824,
+            control: control
+        )
+        let launcherAfter = try pythonLauncherIdentity(invocation, control: control)
+        guard launcher == launcherAfter else {
+            throw DialogueVoiceRuntimeError.sourceChanged
+        }
+        try validateRuntimePathAuthority(invocation, control: control)
+        try validateRuntimePathAuthority(launcherAfter.target, control: control)
+        visitedEnvironments.removeAll(keepingCapacity: true)
+        visitedTrees.removeAll(keepingCapacity: true)
+        searchRoots.removeAll(keepingCapacity: true)
+        try validatePythonEnvironmentAuthority(
+            invocation,
+            visitedEnvironments: &visitedEnvironments,
+            visitedTrees: &visitedTrees,
+            discoveredSearchRoots: &searchRoots,
+            control: control
+        )
+        try validatePythonEnvironmentAuthority(
+            launcherAfter.target,
+            visitedEnvironments: &visitedEnvironments,
+            visitedTrees: &visitedTrees,
+            discoveredSearchRoots: &searchRoots,
+            control: control
+        )
+        let authenticatedAfter = try authenticatedPythonLayout(
+            invocation: invocation,
+            finalTarget: launcherAfter.target,
+            control: control
+        )
+        guard authenticated.layout.version == authenticatedAfter.layout.version,
+              authenticated.layout.baseRoot == authenticatedAfter.layout.baseRoot,
+              authenticated.layout.virtualEnvironmentRoot
+                == authenticatedAfter.layout.virtualEnvironmentRoot,
+              authenticated.layout.includesBaseSitePackages
+                == authenticatedAfter.layout.includesBaseSitePackages,
+              authenticated.dependencyToken == authenticatedAfter.dependencyToken else {
+            throw DialogueVoiceRuntimeError.sourceChanged
+        }
+        return PythonRuntimeAuthorityValidation(
+            identity: Qwen3TTSPythonRuntimeIdentity(
+                invocationPath: invocation.path,
+                finalTargetSHA256: digest,
+                stableIdentityToken: launcherAfter.token + ":" + authenticatedAfter.dependencyToken
+            ),
+            layout: authenticatedAfter.layout
+        )
+    }
+
+    private static let maximumPythonEnvironmentEntries = 500_000
+    private static let maximumRuntimeAuthoritySymlinkResolutionSteps = 32
+
+    private static func checkValidation(_ control: QwenRuntimeValidationControl?) throws {
+        if let control { try control.check() }
+        else { try Task.checkCancellation() }
+    }
+
+    /// A selected runtime may be mutable by its owner, but it must never be
+    /// replaceable or editable by another local principal between validation
+    /// and launch. Root and the current effective user are the only accepted
+    /// owners; group/other-writable entries and write-granting ACLs are rejected.
+    private static func validateRuntimePathAuthority(
+        _ url: URL,
+        control: QwenRuntimeValidationControl? = nil
+    ) throws {
+        var activeSymlinks = Set<String>()
+        try validateRuntimePathAuthority(
+            url,
+            control: control,
+            activeSymlinks: &activeSymlinks,
+            remainingSymlinkSteps: maximumRuntimeAuthoritySymlinkResolutionSteps
+        )
+    }
+
+    private static func validateRuntimePathAuthority(
+        _ url: URL,
+        control: QwenRuntimeValidationControl?,
+        activeSymlinks: inout Set<String>,
+        remainingSymlinkSteps: Int
+    ) throws {
+        try checkValidation(control)
+        let effectiveUser = Darwin.geteuid()
+        let components = url.standardized.pathComponents
+        guard components.first == "/" else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        if components.count == 1 {
+            var rootStatus = stat()
+            guard Darwin.lstat("/", &rootStatus) == 0,
+                  rootStatus.st_uid == 0,
+                  rootStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
+                  rootStatus.st_mode & mode_t(S_IWGRP | S_IWOTH) == 0,
+                  try !hasWriteGrantingACL(at: URL(fileURLWithPath: "/"), isSymbolicLink: false) else {
+                throw DialogueVoiceRuntimeError.inferenceUnavailable
+            }
+            return
+        }
+        var current = URL(fileURLWithPath: "/", isDirectory: true)
+        for (index, component) in components.dropFirst().enumerated() {
+            try checkValidation(control)
+            current.appendPathComponent(component)
+            var status = stat()
+            guard Darwin.lstat(current.path, &status) == 0,
+                  status.st_uid == 0 || status.st_uid == effectiveUser,
+                  try !hasWriteGrantingACL(
+                      at: current,
+                      isSymbolicLink: status.st_mode & mode_t(S_IFMT) == mode_t(S_IFLNK)
+                  ) else {
+                throw DialogueVoiceRuntimeError.inferenceUnavailable
+            }
+            let kind = status.st_mode & mode_t(S_IFMT)
+            if kind == mode_t(S_IFLNK) {
+                let symlinkPath = current.standardizedFileURL.path
+                guard remainingSymlinkSteps > 0,
+                      activeSymlinks.insert(symlinkPath).inserted else {
+                    throw DialogueVoiceRuntimeError.inferenceUnavailable
+                }
+                defer { activeSymlinks.remove(symlinkPath) }
+                let resolved = try resolveAuthoritySymlink(at: current)
+                guard resolved.path != current.path else {
+                    throw DialogueVoiceRuntimeError.inferenceUnavailable
+                }
+                try validateRuntimePathAuthority(
+                    resolved,
+                    control: control,
+                    activeSymlinks: &activeSymlinks,
+                    remainingSymlinkSteps: remainingSymlinkSteps - 1
+                )
+                continue
+            }
+            guard status.st_mode & mode_t(S_IWGRP | S_IWOTH) == 0 else {
+                throw DialogueVoiceRuntimeError.inferenceUnavailable
+            }
+            let isLeaf = index == components.count - 2
+            guard isLeaf
+                    ? kind == mode_t(S_IFREG) || kind == mode_t(S_IFDIR)
+                    : kind == mode_t(S_IFDIR) else {
+                throw DialogueVoiceRuntimeError.inferenceUnavailable
+            }
+        }
+    }
+
+    static func isSealedSystemRuntimePath(_ path: String) -> Bool {
+        if path == "/System" || path.hasPrefix("/System/") { return true }
+        if path == "/usr" { return true }
+        for root in ["/usr/bin", "/usr/lib", "/usr/libexec", "/usr/sbin", "/usr/share"] {
+            if path == root || path.hasPrefix(root + "/") { return true }
+        }
+        return false
+    }
+
+    private static func hasWriteGrantingACL(
+        at url: URL,
+        isSymbolicLink: Bool
+    ) throws -> Bool {
+        errno = 0
+        let accessControlList: acl_t? = url.path.withCString { path in
+            isSymbolicLink
+                ? Darwin.acl_get_link_np(path, ACL_TYPE_EXTENDED)
+                : Darwin.acl_get_file(path, ACL_TYPE_EXTENDED)
+        }
+        guard let accessControlList else {
+            let error = errno
+            // Darwin reports ENOENT when an existing object has no extended
+            // ACL. Every caller has already lstat'd the same authority path.
+            if error == ENOENT || error == EOPNOTSUPP || error == ENOTSUP { return false }
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        defer { _ = Darwin.acl_free(UnsafeMutableRawPointer(accessControlList)) }
+
+        let writePermissions: [acl_perm_t] = [
+            ACL_WRITE_DATA,
+            ACL_APPEND_DATA,
+            ACL_DELETE,
+            ACL_DELETE_CHILD,
+            ACL_WRITE_ATTRIBUTES,
+            ACL_WRITE_EXTATTRIBUTES,
+            ACL_WRITE_SECURITY,
+            ACL_CHANGE_OWNER,
+        ]
+        var entry: acl_entry_t?
+        var result = Darwin.acl_get_entry(
+            accessControlList,
+            ACL_FIRST_ENTRY.rawValue,
+            &entry
+        )
+        while result == 0 {
+            guard let currentEntry = entry else {
+                throw DialogueVoiceRuntimeError.inferenceUnavailable
+            }
+            var tag = ACL_UNDEFINED_TAG
+            var permissions: acl_permset_t?
+            guard Darwin.acl_get_tag_type(currentEntry, &tag) == 0,
+                  Darwin.acl_get_permset(currentEntry, &permissions) == 0,
+                  let permissions else {
+                throw DialogueVoiceRuntimeError.inferenceUnavailable
+            }
+            if tag == ACL_EXTENDED_ALLOW {
+                for permission in writePermissions {
+                    let present = Darwin.acl_get_perm_np(permissions, permission)
+                    guard present >= 0 else {
+                        throw DialogueVoiceRuntimeError.inferenceUnavailable
+                    }
+                    if present == 1 { return true }
+                }
+            }
+            result = Darwin.acl_get_entry(
+                accessControlList,
+                ACL_NEXT_ENTRY.rawValue,
+                &entry
+            )
+        }
+        guard result == -1, errno == EINVAL else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        return false
+    }
+
+    private static func resolveAuthoritySymlink(at url: URL) throws -> URL {
+        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
+        let length = Darwin.readlink(url.path, &buffer, Int(PATH_MAX))
+        guard length > 0, length < Int(PATH_MAX) else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        let raw = String(
+            decoding: buffer.prefix(length).map(UInt8.init(bitPattern:)),
+            as: UTF8.self
+        )
+        let resolved = raw.hasPrefix("/")
+            ? URL(fileURLWithPath: raw).standardized
+            : URL(
+                fileURLWithPath: (url.deletingLastPathComponent().path as NSString)
+                    .appendingPathComponent(raw)
+            ).standardized
+        guard resolved.path.hasPrefix("/") else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        return resolved
+    }
+
+    private struct AuthenticatedPythonLayout {
+        let layout: PythonRuntimeLayout
+        let dependencyToken: String
+    }
+
+    private struct MachOLoadPaths {
+        var dependencies: [String]
+        var runpaths: [String]
+    }
+
+    private static func authenticatedPythonLayout(
+        invocation: URL,
+        finalTarget: URL,
+        control: QwenRuntimeValidationControl
+    ) throws -> AuthenticatedPythonLayout {
+        try control.check()
+        let loadPaths = try pythonMachOLoadPaths(at: finalTarget, control: control)
+        let pythonDependencies = loadPaths.dependencies.filter { raw in
+            let name = (raw as NSString).lastPathComponent.lowercased()
+            return name == "python"
+                || name == "python3"
+                || (name.hasPrefix("libpython") && name.hasSuffix(".dylib"))
+        }
+        guard !pythonDependencies.isEmpty else {
+            // Reject shebang scripts, xcrun shims, and native wrappers which
+            // do not directly load an authenticated Python runtime.
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+
+        var resolvedDependencies: [URL] = []
+        for dependency in pythonDependencies {
+            var resolvedThisDependency = false
+            for candidate in resolveMachOLoadPath(
+                dependency,
+                executable: finalTarget,
+                runpaths: loadPaths.runpaths
+            ) {
+                var status = stat()
+                guard Darwin.lstat(candidate.path, &status) == 0 else { continue }
+                guard status.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+                      status.st_size > 0 else {
+                    throw DialogueVoiceRuntimeError.inferenceUnavailable
+                }
+                try validateRuntimePathAuthority(candidate, control: control)
+                resolvedDependencies.append(candidate)
+                resolvedThisDependency = true
+            }
+            guard resolvedThisDependency else {
+                throw DialogueVoiceRuntimeError.inferenceUnavailable
+            }
+        }
+        let uniqueDependencyPaths = Set(resolvedDependencies.map(\.path))
+        guard uniqueDependencyPaths.count == 1,
+              let dependency = resolvedDependencies.first else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+
+        let invocationRoot = pythonEnvironmentRoot(for: invocation)
+        let targetRoot = pythonEnvironmentRoot(for: finalTarget)
+        let configurationURL = invocationRoot.appendingPathComponent("pyvenv.cfg")
+        let configuration = try readPythonEnvironmentConfiguration(
+            configurationURL,
+            control: control
+        )
+        let fields = configuration.map(parsePythonEnvironmentConfiguration) ?? [:]
+        let isVirtualEnvironment = configuration != nil
+        let includesBaseSitePackages = fields["include-system-site-packages"]?
+            .lowercased() == "true"
+
+        var baseCandidates: [URL] = []
+        for key in ["home", "executable"] {
+            guard let value = fields[key], value.hasPrefix("/") else { continue }
+            var candidate = URL(fileURLWithPath: value).standardizedFileURL
+            if key == "executable" { candidate.deleteLastPathComponent() }
+            if candidate.lastPathComponent == "bin" { candidate.deleteLastPathComponent() }
+            baseCandidates.append(candidate)
+        }
+        baseCandidates.append(targetRoot)
+        baseCandidates.append(dependency.deletingLastPathComponent())
+
+        var layouts: [(version: String, root: URL, standardLibrary: URL)] = []
+        var seenLayouts = Set<String>()
+        for candidate in baseCandidates {
+            try control.check()
+            for library in ["lib", "lib64"] {
+                let libraryRoot = candidate.appendingPathComponent(library, isDirectory: true)
+                guard let entries = try? FileManager.default.contentsOfDirectory(
+                    at: libraryRoot,
+                    includingPropertiesForKeys: nil,
+                    options: []
+                ) else { continue }
+                for entry in entries.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+                    guard let version = pythonVersion(fromLibraryDirectory: entry.lastPathComponent) else {
+                        continue
+                    }
+                    let osModule = entry.appendingPathComponent("os.py")
+                    let encodings = entry.appendingPathComponent("encodings/__init__.py")
+                    var osStatus = stat()
+                    var encodingsStatus = stat()
+                    guard Darwin.lstat(osModule.path, &osStatus) == 0,
+                          Darwin.lstat(encodings.path, &encodingsStatus) == 0,
+                          osStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+                          encodingsStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+                          osStatus.st_size > 0,
+                          encodingsStatus.st_size > 0 else { continue }
+                    let key = candidate.path + "|" + version
+                    if seenLayouts.insert(key).inserted {
+                        layouts.append((version, candidate, entry))
+                    }
+                }
+            }
+        }
+
+        let versionHints = pythonVersionHints(finalTarget: finalTarget, dependency: dependency)
+        if !versionHints.isEmpty {
+            layouts.removeAll { !versionHints.contains($0.version) }
+        }
+        guard layouts.count == 1, let selected = layouts.first else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        try validateRuntimePathAuthority(selected.root, control: control)
+        try validateRuntimePathAuthority(selected.standardLibrary, control: control)
+        let dependencyDigest = try sha256RegularFile(
+            dependency,
+            maximumBytes: 1_073_741_824,
+            control: control
+        )
+        var dependencyStatus = stat()
+        guard Darwin.lstat(dependency.path, &dependencyStatus) == 0 else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        let coreRoots = [
+            selected.standardLibrary
+                .deletingLastPathComponent()
+                .appendingPathComponent("python\(selected.version).zip"),
+            selected.standardLibrary,
+            selected.standardLibrary.appendingPathComponent("lib-dynload", isDirectory: true),
+        ]
+        return AuthenticatedPythonLayout(
+            layout: PythonRuntimeLayout(
+                version: selected.version,
+                baseRoot: selected.root,
+                virtualEnvironmentRoot: isVirtualEnvironment ? invocationRoot : nil,
+                includesBaseSitePackages: includesBaseSitePackages,
+                coreRoots: coreRoots
+            ),
+            dependencyToken: DialogueVoiceFileIdentity(dependencyStatus).token
+                + ":" + dependencyDigest
+        )
+    }
+
+    private static func pythonEnvironmentRoot(for executable: URL) -> URL {
+        let parent = executable.deletingLastPathComponent().standardizedFileURL
+        return parent.lastPathComponent == "bin"
+            ? parent.deletingLastPathComponent().standardizedFileURL
+            : parent
+    }
+
+    private static func parsePythonEnvironmentConfiguration(_ text: String) -> [String: String] {
+        var fields: [String: String] = [:]
+        for rawLine in text.split(whereSeparator: \.isNewline) {
+            let parts = rawLine.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            let key = parts[0].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let value = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+            fields[key] = value
+        }
+        return fields
+    }
+
+    private static func pythonVersion(fromLibraryDirectory name: String) -> String? {
+        guard name.hasPrefix("python") else { return nil }
+        let version = String(name.dropFirst("python".count))
+        let pieces = version.split(separator: ".", omittingEmptySubsequences: false)
+        guard pieces.count == 2,
+              pieces.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isNumber) }) else {
+            return nil
+        }
+        return version
+    }
+
+    private static func pythonVersionHints(finalTarget: URL, dependency: URL) -> Set<String> {
+        var hints = Set<String>()
+        for component in finalTarget.pathComponents + dependency.pathComponents {
+            if let version = pythonVersion(fromLibraryDirectory: component) {
+                hints.insert(version)
+            } else if component.hasPrefix("python") || component.hasPrefix("libpython") {
+                let digits = component.filter { $0.isNumber || $0 == "." }
+                let pieces = digits.split(separator: ".")
+                if pieces.count >= 2 {
+                    hints.insert("\(pieces[0]).\(pieces[1])")
+                }
+            }
+        }
+        return hints
+    }
+
+    private static func resolveMachOLoadPath(
+        _ raw: String,
+        executable: URL,
+        runpaths: [String]
+    ) -> [URL] {
+        let executableRoot = executable.deletingLastPathComponent()
+        func resolve(_ value: String) -> URL? {
+            if value.hasPrefix("/") {
+                return URL(fileURLWithPath: value).standardizedFileURL
+            }
+            for token in ["@executable_path/", "@loader_path/"] where value.hasPrefix(token) {
+                return executableRoot
+                    .appendingPathComponent(String(value.dropFirst(token.count)))
+                    .standardizedFileURL
+            }
+            return nil
+        }
+        if let direct = resolve(raw) { return [direct] }
+        guard raw.hasPrefix("@rpath/") else { return [] }
+        let suffix = String(raw.dropFirst("@rpath/".count))
+        return runpaths.compactMap { runpath in
+            guard let root = resolve(runpath) else { return nil }
+            return root.appendingPathComponent(suffix).standardizedFileURL
+        }
+    }
+
+    private static func pythonMachOLoadPaths(
+        at url: URL,
+        control: QwenRuntimeValidationControl
+    ) throws -> MachOLoadPaths {
+        try control.check()
+        var status = stat()
+        guard Darwin.lstat(url.path, &status) == 0,
+              status.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              status.st_size > 0,
+              status.st_size <= 1_073_741_824 else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        let identity = DialogueVoiceFileIdentity(status)
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        guard data.count == Int(status.st_size) else {
+            throw DialogueVoiceRuntimeError.sourceChanged
+        }
+        let slices = try machOSlices(in: data)
+        var dependencies: [String] = []
+        var runpaths: [String] = []
+        for slice in slices {
+            try control.check()
+            let paths = try machOLoadPaths(
+                in: data,
+                sliceOffset: slice.offset,
+                endian: slice.endian,
+                control: control
+            )
+            guard paths.dependencies.contains(where: { raw in
+                let name = (raw as NSString).lastPathComponent.lowercased()
+                return name == "python"
+                    || name == "python3"
+                    || (name.hasPrefix("libpython") && name.hasSuffix(".dylib"))
+            }) else {
+                throw DialogueVoiceRuntimeError.inferenceUnavailable
+            }
+            dependencies.append(contentsOf: paths.dependencies)
+            runpaths.append(contentsOf: paths.runpaths)
+        }
+        var rebound = stat()
+        guard Darwin.lstat(url.path, &rebound) == 0,
+              DialogueVoiceFileIdentity(rebound) == identity else {
+            throw DialogueVoiceRuntimeError.sourceChanged
+        }
+        return MachOLoadPaths(dependencies: dependencies, runpaths: runpaths)
+    }
+
+    private enum MachOEndian { case little, big }
+    private struct MachOSlice { let offset: Int; let endian: MachOEndian }
+
+    private static func machOSlices(in data: Data) throws -> [MachOSlice] {
+        guard data.count >= 4 else { throw DialogueVoiceRuntimeError.inferenceUnavailable }
+        let bytes = [UInt8](data.prefix(4))
+        if bytes == [0xcf, 0xfa, 0xed, 0xfe] { return [MachOSlice(offset: 0, endian: .little)] }
+        if bytes == [0xfe, 0xed, 0xfa, 0xcf] { return [MachOSlice(offset: 0, endian: .big)] }
+        let isFat64: Bool
+        let endian: MachOEndian
+        if bytes == [0xca, 0xfe, 0xba, 0xbe] { isFat64 = false; endian = .big }
+        else if bytes == [0xca, 0xfe, 0xba, 0xbf] { isFat64 = true; endian = .big }
+        else if bytes == [0xbe, 0xba, 0xfe, 0xca] { isFat64 = false; endian = .little }
+        else if bytes == [0xbf, 0xba, 0xfe, 0xca] { isFat64 = true; endian = .little }
+        else { throw DialogueVoiceRuntimeError.inferenceUnavailable }
+        let count = Int(try machOUInt32(data, at: 4, endian: endian))
+        guard count > 0, count <= 32 else { throw DialogueVoiceRuntimeError.inferenceUnavailable }
+        let stride = isFat64 ? 32 : 20
+        var slices: [MachOSlice] = []
+        for index in 0..<count {
+            let entry = 8 + index * stride
+            let offset: Int
+            if isFat64 {
+                guard let exactOffset = Int(exactly: try machOUInt64(
+                    data,
+                    at: entry + 8,
+                    endian: endian
+                )) else {
+                    throw DialogueVoiceRuntimeError.inferenceUnavailable
+                }
+                offset = exactOffset
+            } else {
+                offset = Int(try machOUInt32(data, at: entry + 8, endian: endian))
+            }
+            guard offset <= data.count, data.count - offset >= 32 else {
+                throw DialogueVoiceRuntimeError.inferenceUnavailable
+            }
+            let magic = [UInt8](data[offset..<offset + 4])
+            if magic == [0xcf, 0xfa, 0xed, 0xfe] {
+                slices.append(MachOSlice(offset: offset, endian: .little))
+            } else if magic == [0xfe, 0xed, 0xfa, 0xcf] {
+                slices.append(MachOSlice(offset: offset, endian: .big))
+            } else {
+                throw DialogueVoiceRuntimeError.inferenceUnavailable
+            }
+        }
+        return slices
+    }
+
+    private static func machOLoadPaths(
+        in data: Data,
+        sliceOffset: Int,
+        endian: MachOEndian,
+        control: QwenRuntimeValidationControl
+    ) throws -> MachOLoadPaths {
+        let commandCount = Int(try machOUInt32(data, at: sliceOffset + 16, endian: endian))
+        let commandsSize = Int(try machOUInt32(data, at: sliceOffset + 20, endian: endian))
+        guard commandCount > 0,
+              commandCount <= 16_384,
+              commandsSize >= 0,
+              sliceOffset + 32 + commandsSize <= data.count else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        var cursor = sliceOffset + 32
+        var result = MachOLoadPaths(dependencies: [], runpaths: [])
+        for index in 0..<commandCount {
+            if index % 64 == 0 { try control.check() }
+            let command = try machOUInt32(data, at: cursor, endian: endian)
+            let size = Int(try machOUInt32(data, at: cursor + 4, endian: endian))
+            guard size >= 8, cursor + size <= sliceOffset + 32 + commandsSize else {
+                throw DialogueVoiceRuntimeError.inferenceUnavailable
+            }
+            let baseCommand = command & 0x7fff_ffff
+            if [UInt32(0x0c), 0x18, 0x1f, 0x23].contains(baseCommand) {
+                let offset = Int(try machOUInt32(data, at: cursor + 8, endian: endian))
+                result.dependencies.append(try machOCString(data, start: cursor + offset, end: cursor + size))
+            } else if baseCommand == 0x1c {
+                let offset = Int(try machOUInt32(data, at: cursor + 8, endian: endian))
+                result.runpaths.append(try machOCString(data, start: cursor + offset, end: cursor + size))
+            }
+            cursor += size
+        }
+        return result
+    }
+
+    private static func machOCString(_ data: Data, start: Int, end: Int) throws -> String {
+        guard start >= 0, start < end, end <= data.count,
+              let terminator = data[start..<end].firstIndex(of: 0),
+              let value = String(data: data[start..<terminator], encoding: .utf8),
+              !value.isEmpty else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        return value
+    }
+
+    private static func machOUInt32(
+        _ data: Data,
+        at offset: Int,
+        endian: MachOEndian
+    ) throws -> UInt32 {
+        guard offset >= 0, offset + 4 <= data.count else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        let value = data[offset..<offset + 4].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        return endian == .big ? value : value.byteSwapped
+    }
+
+    private static func machOUInt64(
+        _ data: Data,
+        at offset: Int,
+        endian: MachOEndian
+    ) throws -> UInt64 {
+        guard offset >= 0, offset + 8 <= data.count else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        let value = data[offset..<offset + 8].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+        return endian == .big ? value : value.byteSwapped
+    }
+
+    private static func validatePythonEnvironmentAuthority(
+        _ invocation: URL,
+        visitedEnvironments: inout Set<String>,
+        visitedTrees: inout Set<String>,
+        discoveredSearchRoots: inout [URL],
+        control: QwenRuntimeValidationControl
+    ) throws {
+        try control.check()
+        let executableParent = invocation.deletingLastPathComponent().standardizedFileURL
+        let environmentRoot = executableParent.lastPathComponent == "bin"
+            ? executableParent.deletingLastPathComponent().standardizedFileURL
+            : executableParent
+        guard visitedEnvironments.insert(environmentRoot.path).inserted else { return }
+        if environmentRoot.path == "/" {
+            // `/bin` is a sealed top-level system runtime location; treating
+            // its coarse parent as a Python module tree would incorrectly
+            // traverse unrelated mutable volumes such as `/private`.
+            try validateRuntimePathAuthority(executableParent, control: control)
+            return
+        }
+        try validatePythonTreeAuthority(
+            environmentRoot,
+            visitedTrees: &visitedTrees,
+            discoveredSearchRoots: &discoveredSearchRoots,
+            control: control
+        )
+
+        let configurationURL = environmentRoot.appendingPathComponent("pyvenv.cfg")
+        if let configuration = try readPythonEnvironmentConfiguration(
+            configurationURL,
+            control: control
+        ) {
+            for rawLine in configuration.split(whereSeparator: \.isNewline) {
+                let parts = rawLine.split(separator: "=", maxSplits: 1)
+                guard parts.count == 2 else { continue }
+                let key = parts[0].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                guard key == "home" || key == "executable" else { continue }
+                let value = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                guard value.hasPrefix("/") else {
+                    throw DialogueVoiceRuntimeError.inferenceUnavailable
+                }
+                var base = URL(fileURLWithPath: value).standardizedFileURL
+                if key == "executable" { base.deleteLastPathComponent() }
+                if base.lastPathComponent == "bin" { base.deleteLastPathComponent() }
+                guard base.path != environmentRoot.path else { continue }
+                let syntheticExecutable = base
+                    .appendingPathComponent("bin", isDirectory: true)
+                    .appendingPathComponent("python", isDirectory: false)
+                try validatePythonEnvironmentAuthority(
+                    syntheticExecutable,
+                    visitedEnvironments: &visitedEnvironments,
+                    visitedTrees: &visitedTrees,
+                    discoveredSearchRoots: &discoveredSearchRoots,
+                    control: control
+                )
+            }
+        }
+    }
+
+    private static func validatePythonTreeAuthority(
+        _ root: URL,
+        visitedTrees: inout Set<String>,
+        discoveredSearchRoots: inout [URL],
+        control: QwenRuntimeValidationControl
+    ) throws {
+        try control.check()
+        let root = root.standardizedFileURL
+        guard visitedTrees.insert(root.path).inserted else { return }
+        try validateRuntimePathAuthority(root, control: control)
+        var rootStatus = stat()
+        guard Darwin.lstat(root.path, &rootStatus) == 0,
+              rootStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        if rootStatus.st_uid == 0, isSealedSystemRuntimePath(root.path) { return }
+
+        let effectiveUser = Darwin.geteuid()
+        var entryCount = 0
+        var enumerationFailed = false
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: nil,
+            options: [],
+            errorHandler: { _, _ in
+                enumerationFailed = true
+                return false
+            }
+        ) else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        while let entry = enumerator.nextObject() as? URL {
+            entryCount += 1
+            guard entryCount <= maximumPythonEnvironmentEntries else {
+                throw DialogueVoiceRuntimeError.inferenceUnavailable
+            }
+            if entryCount % 64 == 0 { try control.check() }
+            var status = stat()
+            guard Darwin.lstat(entry.path, &status) == 0,
+                  status.st_uid == 0 || status.st_uid == effectiveUser,
+                  try !hasWriteGrantingACL(
+                      at: entry,
+                      isSymbolicLink: status.st_mode & mode_t(S_IFMT) == mode_t(S_IFLNK)
+                  ) else {
+                throw DialogueVoiceRuntimeError.inferenceUnavailable
+            }
+            let kind = status.st_mode & mode_t(S_IFMT)
+            if kind == mode_t(S_IFLNK) {
+                let resolved = try resolveAuthoritySymlink(at: entry)
+                guard resolved.path != entry.path else {
+                    throw DialogueVoiceRuntimeError.inferenceUnavailable
+                }
+                try validateRuntimePathAuthority(resolved, control: control)
+                var resolvedStatus = stat()
+                guard Darwin.lstat(resolved.path, &resolvedStatus) == 0 else {
+                    throw DialogueVoiceRuntimeError.inferenceUnavailable
+                }
+                if resolvedStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) {
+                    guard resolved.path != "/" else {
+                        throw DialogueVoiceRuntimeError.inferenceUnavailable
+                    }
+                    try validatePythonTreeAuthority(
+                        resolved,
+                        visitedTrees: &visitedTrees,
+                        discoveredSearchRoots: &discoveredSearchRoots,
+                        control: control
+                    )
+                }
+                continue
+            }
+            guard kind == mode_t(S_IFDIR) || kind == mode_t(S_IFREG),
+                  status.st_mode & mode_t(S_IWGRP | S_IWOTH) == 0 else {
+                throw DialogueVoiceRuntimeError.inferenceUnavailable
+            }
+        }
+        guard !enumerationFailed else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+    }
+
+    private static func validatePotentialPythonSearchRootAuthority(
+        _ candidate: URL,
+        visitedTrees: inout Set<String>,
+        discoveredSearchRoots: inout [URL],
+        control: QwenRuntimeValidationControl
+    ) throws {
+        try control.check()
+        let candidate = candidate.standardizedFileURL
+        guard candidate.path.hasPrefix("/") else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        var status = stat()
+        if Darwin.lstat(candidate.path, &status) == 0 {
+            try validateRuntimePathAuthority(candidate, control: control)
+            let resolvedCandidate = candidate.resolvingSymlinksInPath().standardizedFileURL
+            guard Darwin.lstat(resolvedCandidate.path, &status) == 0 else {
+                throw DialogueVoiceRuntimeError.inferenceUnavailable
+            }
+            let kind = status.st_mode & mode_t(S_IFMT)
+            guard kind == mode_t(S_IFDIR) || kind == mode_t(S_IFREG) else {
+                throw DialogueVoiceRuntimeError.inferenceUnavailable
+            }
+            discoveredSearchRoots.append(candidate)
+            if kind == mode_t(S_IFDIR) {
+                try validatePythonTreeAuthority(
+                    resolvedCandidate,
+                    visitedTrees: &visitedTrees,
+                    discoveredSearchRoots: &discoveredSearchRoots,
+                    control: control
+                )
+            }
+            return
+        }
+        guard errno == ENOENT else { throw DialogueVoiceRuntimeError.inferenceUnavailable }
+        var existingParent = candidate.deletingLastPathComponent()
+        while Darwin.lstat(existingParent.path, &status) != 0 {
+            try control.check()
+            guard errno == ENOENT, existingParent.path != "/" else {
+                throw DialogueVoiceRuntimeError.inferenceUnavailable
+            }
+            existingParent.deleteLastPathComponent()
+        }
+        try validateRuntimePathAuthority(existingParent, control: control)
+        discoveredSearchRoots.append(candidate)
+    }
+
+    private static func readBoundedRuntimeText(
+        _ url: URL,
+        maximumBytes: Int,
+        allowsEmpty: Bool,
+        control: QwenRuntimeValidationControl
+    ) throws -> String? {
+        try control.check()
+        var pathStatus = stat()
+        guard Darwin.lstat(url.path, &pathStatus) == 0 else {
+            if errno == ENOENT { return nil }
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        guard pathStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              (allowsEmpty || pathStatus.st_size > 0),
+              pathStatus.st_size >= 0,
+              pathStatus.st_size <= maximumBytes else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        try validateRuntimePathAuthority(url, control: control)
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else { throw DialogueVoiceRuntimeError.inferenceUnavailable }
+        defer { Darwin.close(descriptor) }
+        var opened = stat()
+        guard Darwin.fstat(descriptor, &opened) == 0,
+              DialogueVoiceFileIdentity(opened) == DialogueVoiceFileIdentity(pathStatus) else {
+            throw DialogueVoiceRuntimeError.sourceChanged
+        }
+        var data = Data()
+        while data.count <= Int(opened.st_size) {
+            try control.check()
+            let capacity = min(4_096, Int(opened.st_size) + 1 - data.count)
+            if capacity == 0 { break }
+            var buffer = [UInt8](repeating: 0, count: capacity)
+            let count = Darwin.read(descriptor, &buffer, buffer.count)
+            guard count >= 0 else { throw DialogueVoiceRuntimeError.inferenceUnavailable }
+            if count == 0 { break }
+            data.append(contentsOf: buffer.prefix(count))
+        }
+        var final = stat()
+        var rebound = stat()
+        guard Int64(data.count) == Int64(opened.st_size),
+              Darwin.fstat(descriptor, &final) == 0,
+              DialogueVoiceFileIdentity(final) == DialogueVoiceFileIdentity(opened),
+              Darwin.lstat(url.path, &rebound) == 0,
+              DialogueVoiceFileIdentity(rebound) == DialogueVoiceFileIdentity(final),
+              let value = String(data: data, encoding: .utf8) else {
+            throw DialogueVoiceRuntimeError.sourceChanged
+        }
+        return value
+    }
+
+    private static func readPythonEnvironmentConfiguration(
+        _ url: URL,
+        control: QwenRuntimeValidationControl
+    ) throws -> String? {
+        try readBoundedRuntimeText(
+            url,
+            maximumBytes: 65_536,
+            allowsEmpty: false,
+            control: control
+        )
+    }
+
+    private static func validatePythonLaunchEnvironment(_ environment: [String: String]) throws {
+        let forbiddenExact = Set([
+            "PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONINSPECT",
+            "PYTHONEXECUTABLE", "__PYVENV_LAUNCHER__", "VIRTUAL_ENV",
+            "LD_LIBRARY_PATH", "LD_PRELOAD",
+        ])
+        let allowedPythonKeys = Set(["PYTHONNOUSERSITE", "PYTHONDONTWRITEBYTECODE"])
+        for key in environment.keys {
+            let upper = key.uppercased()
+            if forbiddenExact.contains(upper)
+                || (upper.hasPrefix("PYTHON") && !allowedPythonKeys.contains(upper))
+                || upper.hasPrefix("DYLD_")
+                || upper.hasPrefix("LD_PRELOAD_") {
+                throw DialogueVoiceRuntimeError.inferenceUnavailable
+            }
+        }
+    }
+
+    private static func pythonSiteCandidates(prefix: URL, version: String) -> [URL] {
+        ["lib", "lib64"].flatMap { library in
+            ["site-packages", "dist-packages"].map { packages in
+                prefix
+                    .appendingPathComponent(library, isDirectory: true)
+                    .appendingPathComponent("python\(version)", isDirectory: true)
+                    .appendingPathComponent(packages, isDirectory: true)
+                    .standardizedFileURL
+            }
+        }
+    }
+
+    private static func appendPythonSiteRoots(
+        at prefix: URL,
+        version: String,
+        to orderedRoots: inout [URL],
+        visitedTrees: inout Set<String>,
+        control: QwenRuntimeValidationControl
+    ) throws {
+        for siteRoot in pythonSiteCandidates(prefix: prefix, version: version) {
+            try control.check()
+            var status = stat()
+            guard Darwin.lstat(siteRoot.path, &status) == 0 else {
+                if errno == ENOENT { continue }
+                throw DialogueVoiceRuntimeError.inferenceUnavailable
+            }
+            guard status.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
+                throw DialogueVoiceRuntimeError.inferenceUnavailable
+            }
+            var ignoredDiscoveries: [URL] = []
+            try validatePotentialPythonSearchRootAuthority(
+                siteRoot,
+                visitedTrees: &visitedTrees,
+                discoveredSearchRoots: &ignoredDiscoveries,
+                control: control
+            )
+            orderedRoots.append(siteRoot)
+
+            let entries = try FileManager.default.contentsOfDirectory(
+                at: siteRoot,
+                includingPropertiesForKeys: nil,
+                options: []
+            )
+            let pathFiles = entries
+                .filter { $0.pathExtension == "pth" }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            for pathFile in pathFiles {
+                guard let configuration = try readBoundedRuntimeText(
+                    pathFile,
+                    maximumBytes: 65_536,
+                    allowsEmpty: true,
+                    control: control
+                ) else {
+                    throw DialogueVoiceRuntimeError.inferenceUnavailable
+                }
+                for rawLine in configuration.split(whereSeparator: \.isNewline) {
+                    try control.check()
+                    let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !line.isEmpty, !line.hasPrefix("#") else { continue }
+                    // `-S` keeps executable .pth directives inert. Pure path
+                    // entries retain CPython's filename and line order.
+                    if line == "import"
+                        || line.hasPrefix("import ")
+                        || line.hasPrefix("import\t") {
+                        continue
+                    }
+                    let candidate = line.hasPrefix("/")
+                        ? URL(fileURLWithPath: line).standardizedFileURL
+                        : siteRoot.appendingPathComponent(line).standardizedFileURL
+                    guard Darwin.lstat(candidate.path, &status) == 0 else {
+                        if errno == ENOENT { continue }
+                        throw DialogueVoiceRuntimeError.inferenceUnavailable
+                    }
+                    try validatePotentialPythonSearchRootAuthority(
+                        candidate,
+                        visitedTrees: &visitedTrees,
+                        discoveredSearchRoots: &ignoredDiscoveries,
+                        control: control
+                    )
+                    orderedRoots.append(candidate)
+                }
+            }
+        }
     }
 
     static func computeInputFingerprint(components: [String]) -> String {
@@ -1744,7 +2888,11 @@ enum Qwen3TTSProfileValidator {
 
     private static let maximumPythonLauncherResolutionSteps = 32
 
-    private static func pythonLauncherIdentity(_ url: URL) throws -> PythonLauncherIdentity {
+    private static func pythonLauncherIdentity(
+        _ url: URL,
+        control: QwenRuntimeValidationControl
+    ) throws -> PythonLauncherIdentity {
+        try control.check()
         var launcherStatus = stat()
         guard Darwin.lstat(url.path, &launcherStatus) == 0 else {
             throw DialogueVoiceRuntimeError.inferenceUnavailable
@@ -1754,7 +2902,7 @@ enum Qwen3TTSProfileValidator {
         if kind == mode_t(S_IFREG) {
             target = url
         } else if kind == mode_t(S_IFLNK) {
-            target = try resolvePythonLauncherTarget(startingAt: url)
+            target = try resolvePythonLauncherTarget(startingAt: url, control: control)
         } else {
             throw DialogueVoiceRuntimeError.inferenceUnavailable
         }
@@ -1768,10 +2916,14 @@ enum Qwen3TTSProfileValidator {
         )
     }
 
-    private static func resolvePythonLauncherTarget(startingAt launcher: URL) throws -> URL {
+    private static func resolvePythonLauncherTarget(
+        startingAt launcher: URL,
+        control: QwenRuntimeValidationControl
+    ) throws -> URL {
         var candidate = launcher
         var visited = Set<String>()
         for _ in 0..<maximumPythonLauncherResolutionSteps {
+            try control.check()
             guard visited.insert(candidate.path).inserted else {
                 throw DialogueVoiceRuntimeError.inferenceUnavailable
             }
@@ -1881,7 +3033,12 @@ enum Qwen3TTSProfileValidator {
         return tokens.sorted()
     }
 
-    private static func sha256RegularFile(_ url: URL, maximumBytes: UInt64) throws -> String {
+    private static func sha256RegularFile(
+        _ url: URL,
+        maximumBytes: UInt64,
+        control: QwenRuntimeValidationControl? = nil
+    ) throws -> String {
+        try checkValidation(control)
         let descriptor = Darwin.open(url.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         guard descriptor >= 0 else { throw DialogueVoiceRuntimeError.inferenceUnavailable }
         defer { Darwin.close(descriptor) }
@@ -1896,6 +3053,7 @@ enum Qwen3TTSProfileValidator {
         var count: UInt64 = 0
         var buffer = [UInt8](repeating: 0, count: 1_048_576)
         while true {
+            try checkValidation(control)
             let readCount = buffer.withUnsafeMutableBytes { Darwin.read(descriptor, $0.baseAddress, $0.count) }
             if readCount == 0 { break }
             guard readCount > 0 else {
@@ -1921,6 +3079,7 @@ struct VoxCPM2ValidatedProfile: Equatable, Sendable {
     let snapshotRoot: URL
     let modelRoot: URL
     let pythonExecutable: URL
+    let runtimeIdentity: Qwen3TTSPythonRuntimeIdentity
     let referenceAudio: URL
     let identityTokens: [String]
 }
@@ -1978,6 +3137,7 @@ enum VoxCPM2ProfileValidator {
                 ? snapshot.appendingPathComponent("model", isDirectory: true)
                 : snapshot,
             pythonExecutable: URL(fileURLWithPath: runtime.invocationPath),
+            runtimeIdentity: runtime,
             referenceAudio: applicationSupportRoot.appendingPathComponent(profile.referenceAudioRelativePath),
             identityTokens: treeAfter.identityTokens + [runtime.stableIdentityToken, referenceIdentity]
         )
@@ -2051,6 +3211,7 @@ struct DialogueVoiceValidatedAssets: Equatable, Sendable {
 enum DialogueVoiceProfileFingerprint {
     static func compute(
         apiBaseURL: URL,
+        tlsLeafCertificateSHA256: String,
         referenceText: String,
         promptLanguage: String,
         defaultTextLanguage: String,
@@ -2058,8 +3219,9 @@ enum DialogueVoiceProfileFingerprint {
     ) -> String {
         var hasher = SHA256()
         for field in [
-            "statelet-gpt-sovits-api-v2-pcm-wav-v1",
+            "statelet-gpt-sovits-api-v2-pcm-wav-pinned-tls-v1",
             apiBaseURL.absoluteString,
+            tlsLeafCertificateSHA256.lowercased(),
             assetDigests.gptWeight,
             assetDigests.sovitsWeight,
             assetDigests.referenceAudio,
@@ -2805,8 +3967,31 @@ struct DialogueVoiceAssetInstaller: Sendable {
     }
 }
 
+enum DialogueVoicePinnedTLS {
+    static func matches(
+        leafCertificateDER: Data?,
+        expectedSHA256: String?
+    ) -> Bool {
+        guard let leafCertificateDER,
+              let expectedSHA256,
+              expectedSHA256.count == 64,
+              expectedSHA256.unicodeScalars.allSatisfy({ scalar in
+                  (48...57).contains(scalar.value)
+                      || (65...70).contains(scalar.value)
+                      || (97...102).contains(scalar.value)
+              }) else {
+            return false
+        }
+        let actualSHA256 = SHA256.hash(data: leafCertificateDER)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return actualSHA256 == expectedSHA256.lowercased()
+    }
+}
+
 final class DialogueVoiceBoundedRequest: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private let maximumBytes: Int
+    private let expectedLeafCertificateSHA256: String?
     private let lock = NSLock()
     private var data = Data()
     private var response: URLResponse?
@@ -2815,8 +4000,28 @@ final class DialogueVoiceBoundedRequest: NSObject, URLSessionDataDelegate, @unch
     private var session: URLSession?
     private var finished = false
 
-    init(maximumBytes: Int) {
+    init(maximumBytes: Int, expectedLeafCertificateSHA256: String? = nil) {
         self.maximumBytes = maximumBytes
+        self.expectedLeafCertificateSHA256 = expectedLeafCertificateSHA256
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              let serverTrust = challenge.protectionSpace.serverTrust,
+              let certificateChain = SecTrustCopyCertificateChain(serverTrust) as? [SecCertificate],
+              let leafCertificate = certificateChain.first,
+              DialogueVoicePinnedTLS.matches(
+                  leafCertificateDER: SecCertificateCopyData(leafCertificate) as Data,
+                  expectedSHA256: expectedLeafCertificateSHA256
+              ) else {
+            completionHandler(.cancelAuthenticationChallenge, nil)
+            return
+        }
+        completionHandler(.useCredential, URLCredential(trust: serverTrust))
     }
 
     func perform(
@@ -2931,7 +4136,20 @@ final class DialogueVoiceBoundedRequest: NSObject, URLSessionDataDelegate, @unch
     }
 }
 
+typealias GPTSoVITSRequestPerformer = @Sendable (
+    URLRequest,
+    Int,
+    String,
+    URLSessionConfiguration
+) async throws -> (Data, URLResponse)
+
 actor GPTSoVITSAPIClient {
+    private struct ActivatedProfile {
+        let baseURL: URL
+        let tlsLeafCertificateSHA256: String
+        let referenceAudioURL: URL
+    }
+
     private struct TTSBody: Encodable {
         let text: String
         let textLanguage: String
@@ -2976,8 +4194,17 @@ actor GPTSoVITSAPIClient {
     private static let maximumAudioResponseBytes = 67_108_864
 
     private let configuration: URLSessionConfiguration
+    private let requestPerformer: GPTSoVITSRequestPerformer
 
-    init(configuration: URLSessionConfiguration = .ephemeral) {
+    init(
+        configuration: URLSessionConfiguration = .ephemeral,
+        requestPerformer: @escaping GPTSoVITSRequestPerformer = { request, maximumBytes, pin, configuration in
+            try await DialogueVoiceBoundedRequest(
+                maximumBytes: maximumBytes,
+                expectedLeafCertificateSHA256: pin
+            ).perform(request, configuration: configuration)
+        }
+    ) {
         configuration.waitsForConnectivity = false
         configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         configuration.urlCache = nil
@@ -2986,6 +4213,7 @@ actor GPTSoVITSAPIClient {
         configuration.timeoutIntervalForRequest = 120
         configuration.timeoutIntervalForResource = 180
         self.configuration = configuration
+        self.requestPerformer = requestPerformer
     }
 
     static func encodedTTSRequestBody(
@@ -3010,12 +4238,11 @@ actor GPTSoVITSAPIClient {
         applicationSupportRoot: URL
     ) async throws -> Data {
         try Task.checkCancellation()
-        let referenceAudioURL = try await activateProfile(
+        let activatedProfile = try await activateProfile(
             profile,
             applicationSupportRoot: applicationSupportRoot
         )
-        let baseURL = try Self.validatedBaseURL(profile.apiBaseURL)
-        let endpoint = baseURL.appendingPathComponent("tts")
+        let endpoint = activatedProfile.baseURL.appendingPathComponent("tts")
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -3023,13 +4250,14 @@ actor GPTSoVITSAPIClient {
         request.httpBody = try Self.encodedTTSRequestBody(
             text: line.text,
             textLanguage: line.textLanguage,
-            referenceAudioPath: referenceAudioURL.path,
+            referenceAudioPath: activatedProfile.referenceAudioURL.path,
             promptText: profile.referenceText,
             promptLanguage: profile.promptLanguage
         )
         let (data, response) = try await perform(
             request,
-            maximumBytes: Self.maximumAudioResponseBytes
+            maximumBytes: Self.maximumAudioResponseBytes,
+            tlsLeafCertificateSHA256: activatedProfile.tlsLeafCertificateSHA256
         )
         guard let http = response as? HTTPURLResponse else {
             throw DialogueVoiceRuntimeError.inferenceUnavailable
@@ -3056,8 +4284,11 @@ actor GPTSoVITSAPIClient {
     private func activateProfile(
         _ profile: GPTSoVITSVoiceProfile,
         applicationSupportRoot: URL
-    ) async throws -> URL {
+    ) async throws -> ActivatedProfile {
         let baseURL = try Self.validatedBaseURL(profile.apiBaseURL)
+        guard let tlsLeafCertificateSHA256 = profile.tlsLeafCertificateSHA256 else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
         let gptWeightURL = try DialogueVoiceAssetInstaller.resolveManagedFile(
             relativePath: profile.gptWeightRelativePath,
             root: applicationSupportRoot,
@@ -3081,22 +4312,29 @@ actor GPTSoVITSAPIClient {
             baseURL: baseURL,
             endpoint: "set_gpt_weights",
             queryName: "weights_path",
-            value: gptWeightURL.path
+            value: gptWeightURL.path,
+            tlsLeafCertificateSHA256: tlsLeafCertificateSHA256
         )
         try await setWeight(
             baseURL: baseURL,
             endpoint: "set_sovits_weights",
             queryName: "weights_path",
-            value: sovitsWeightURL.path
+            value: sovitsWeightURL.path,
+            tlsLeafCertificateSHA256: tlsLeafCertificateSHA256
         )
-        return referenceAudioURL
+        return ActivatedProfile(
+            baseURL: baseURL,
+            tlsLeafCertificateSHA256: tlsLeafCertificateSHA256,
+            referenceAudioURL: referenceAudioURL
+        )
     }
 
     private func setWeight(
         baseURL: URL,
         endpoint: String,
         queryName: String,
-        value: String
+        value: String,
+        tlsLeafCertificateSHA256: String
     ) async throws {
         var components = URLComponents(
             url: baseURL.appendingPathComponent(endpoint),
@@ -3109,7 +4347,8 @@ actor GPTSoVITSAPIClient {
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         let (_, response) = try await perform(
             request,
-            maximumBytes: Self.maximumControlResponseBytes
+            maximumBytes: Self.maximumControlResponseBytes,
+            tlsLeafCertificateSHA256: tlsLeafCertificateSHA256
         )
         guard let http = response as? HTTPURLResponse else {
             throw DialogueVoiceRuntimeError.inferenceUnavailable
@@ -3123,12 +4362,17 @@ actor GPTSoVITSAPIClient {
 
     private func perform(
         _ request: URLRequest,
-        maximumBytes: Int
+        maximumBytes: Int,
+        tlsLeafCertificateSHA256: String
     ) async throws -> (Data, URLResponse) {
         do {
             try Task.checkCancellation()
-            return try await DialogueVoiceBoundedRequest(maximumBytes: maximumBytes)
-                .perform(request, configuration: configuration)
+            return try await requestPerformer(
+                request,
+                maximumBytes,
+                tlsLeafCertificateSHA256,
+                configuration
+            )
         } catch let error as DialogueVoiceRuntimeError {
             throw error
         } catch is CancellationError {
@@ -3226,6 +4470,7 @@ actor GPTSoVITSAPIClient {
 
 struct Qwen3TTSProcessInvocation: Sendable {
     let executableURL: URL
+    let expectedRuntimeIdentity: Qwen3TTSPythonRuntimeIdentity
     let helperURL: URL
     let currentDirectoryURL: URL
     let environment: [String: String]
@@ -3237,6 +4482,7 @@ struct Qwen3TTSProcessInvocation: Sendable {
 
     init(
         executableURL: URL,
+        expectedRuntimeIdentity: Qwen3TTSPythonRuntimeIdentity,
         helperURL: URL,
         currentDirectoryURL: URL,
         environment: [String: String],
@@ -3247,6 +4493,7 @@ struct Qwen3TTSProcessInvocation: Sendable {
         deniesNetwork: Bool = true
     ) {
         self.executableURL = executableURL
+        self.expectedRuntimeIdentity = expectedRuntimeIdentity
         self.helperURL = helperURL
         self.currentDirectoryURL = currentDirectoryURL
         self.environment = environment
@@ -3426,6 +4673,36 @@ struct Qwen3TTSProcessRunner: Sendable {
         _ invocation: Qwen3TTSProcessInvocation,
         cancellation: QwenProcessCancellation
     ) throws {
+        let totalTimeout = min(120, max(0.05, invocation.timeout))
+        let operationDeadline = ProcessInfo.processInfo.systemUptime + totalTimeout
+        let control = QwenRuntimeValidationControl(
+            deadlineUptime: operationDeadline,
+            isCancelled: { cancellation.isCancelled }
+        )
+        try control.check()
+        let runtimeBeforeLaunch = try Qwen3TTSProfileValidator.validatePythonExecutable(
+            at: invocation.executableURL,
+            control: control
+        )
+        guard runtimeBeforeLaunch == invocation.expectedRuntimeIdentity else {
+            throw DialogueVoiceRuntimeError.inputFingerprintMismatch
+        }
+        let searchPlanBeforeLaunch = try Qwen3TTSProfileValidator.validatedRuntimeSearchPlan(
+            at: invocation.executableURL,
+            environment: invocation.environment,
+            control: control
+        )
+        let helperIdentityBeforeLaunch = try Qwen3TTSProfileValidator.validateLaunchResource(
+            at: invocation.helperURL,
+            maximumBytes: 1_048_576,
+            control: control
+        )
+        try Qwen3TTSProfileValidator.validateLaunchDirectory(
+            at: invocation.currentDirectoryURL,
+            control: control
+        )
+        let bootstrap = try Self.pythonBootstrap(searchPlan: searchPlanBeforeLaunch)
+        try control.check()
         let process = Process()
         let stdinPipe = Pipe()
         let stdoutPipe = Pipe()
@@ -3437,14 +4714,22 @@ struct Qwen3TTSProcessRunner: Sendable {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
             process.arguments = [
                 "-p", Self.networkDeniedSandboxProfile,
-                invocation.executableURL.path, "-B", invocation.helperURL.path,
+                invocation.executableURL.path,
+                "-S", "-B", "-c", bootstrap, invocation.helperURL.path,
             ]
         } else {
             process.executableURL = invocation.executableURL
-            process.arguments = ["-B", invocation.helperURL.path]
+            process.arguments = [
+                "-S", "-B", "-c", bootstrap, invocation.helperURL.path,
+            ]
         }
         process.currentDirectoryURL = invocation.currentDirectoryURL
-        process.environment = invocation.environment
+        var processEnvironment = invocation.environment
+        processEnvironment["PYTHONHOME"] = searchPlanBeforeLaunch.pythonHome
+        processEnvironment["PYTHONNOUSERSITE"] = "1"
+        processEnvironment.removeValue(forKey: "PYTHONPATH")
+        processEnvironment.removeValue(forKey: "__PYVENV_LAUNCHER__")
+        process.environment = processEnvironment
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
@@ -3473,9 +4758,10 @@ struct Qwen3TTSProcessRunner: Sendable {
         )
         defer { finalizer.finalize() }
 
-        let groupDeadline = Date().addingTimeInterval(2)
+        let groupDeadline = min(operationDeadline, ProcessInfo.processInfo.systemUptime + 2)
         while process.isRunning,
-              Date() < groupDeadline,
+              ProcessInfo.processInfo.systemUptime < groupDeadline,
+              !cancellation.isCancelled,
               !processGroupValidator(process.processIdentifier) {
             Thread.sleep(forTimeInterval: 0.01)
         }
@@ -3491,8 +4777,9 @@ struct Qwen3TTSProcessRunner: Sendable {
             throw DialogueVoiceRuntimeError.inferenceUnavailable
         }
 
-        let deadline = Date().addingTimeInterval(min(120, max(0.05, invocation.timeout)))
-        while process.isRunning, Date() < deadline, !cancellation.isCancelled {
+        while process.isRunning,
+              ProcessInfo.processInfo.systemUptime < operationDeadline,
+              !cancellation.isCancelled {
             Thread.sleep(forTimeInterval: 0.05)
         }
         if cancellation.isCancelled { throw DialogueVoiceRuntimeError.cancelled }
@@ -3513,10 +4800,43 @@ struct Qwen3TTSProcessRunner: Sendable {
         guard !forcedCleanup else {
             throw DialogueVoiceRuntimeError.inferenceUnavailable
         }
+        let runtimeAfterLaunch = try Qwen3TTSProfileValidator.validatePythonExecutable(
+            at: invocation.executableURL,
+            control: control
+        )
+        guard runtimeAfterLaunch == invocation.expectedRuntimeIdentity else {
+            throw DialogueVoiceRuntimeError.sourceChanged
+        }
+        let searchPlanAfterLaunch = try Qwen3TTSProfileValidator.validatedRuntimeSearchPlan(
+            at: invocation.executableURL,
+            environment: invocation.environment,
+            control: control
+        )
+        let helperIdentityAfterLaunch = try Qwen3TTSProfileValidator.validateLaunchResource(
+            at: invocation.helperURL,
+            maximumBytes: 1_048_576,
+            control: control
+        )
+        guard searchPlanAfterLaunch == searchPlanBeforeLaunch,
+              helperIdentityAfterLaunch == helperIdentityBeforeLaunch else {
+            throw DialogueVoiceRuntimeError.sourceChanged
+        }
         guard !invocation.requiresOutputFile
                 || FileManager.default.fileExists(atPath: invocation.outputURL.path) else {
             throw DialogueVoiceRuntimeError.invalidAudio
         }
+    }
+
+    private static func pythonBootstrap(searchPlan: Qwen3TTSRuntimeSearchPlan) throws -> String {
+        let rootsData = try JSONSerialization.data(
+            withJSONObject: searchPlan.roots,
+            options: [.withoutEscapingSlashes]
+        )
+        guard rootsData.count <= 262_144,
+              let roots = String(data: rootsData, encoding: .utf8) else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        return "import sys;sys.path[:]=\(roots);p=sys.argv[1];sys.argv=sys.argv[1:];g={'__name__':'__main__','__file__':p,'__package__':None,'__cached__':None,'__spec__':None,'__loader__':None};exec(compile(open(p,'rb').read(),p,'exec'),g,g)"
     }
 
 }
@@ -3543,7 +4863,7 @@ actor Qwen3TTSClient {
         _ profile: Qwen3TTSVoiceProfile,
         applicationSupportRoot: URL
     ) async throws {
-        _ = try Qwen3TTSProfileValidator.snapshot(
+        let validated = try Qwen3TTSProfileValidator.snapshot(
             profile: profile,
             applicationSupportRoot: applicationSupportRoot
         )
@@ -3556,7 +4876,8 @@ actor Qwen3TTSClient {
         defer { try? FileManager.default.removeItem(at: probeRoot) }
         let marker = probeRoot.appendingPathComponent("probe.ok")
         try await runner(Qwen3TTSProcessInvocation(
-            executableURL: URL(fileURLWithPath: profile.pythonExecutablePath),
+            executableURL: validated.pythonExecutable,
+            expectedRuntimeIdentity: validated.runtimeIdentity,
             helperURL: probe,
             currentDirectoryURL: probeRoot,
             environment: Self.environment(home: probeRoot),
@@ -3605,6 +4926,7 @@ actor Qwen3TTSClient {
         }
         try await runner(Qwen3TTSProcessInvocation(
             executableURL: validated.pythonExecutable,
+            expectedRuntimeIdentity: validated.runtimeIdentity,
             helperURL: helper,
             currentDirectoryURL: jobDirectory,
             environment: Self.environment(home: jobDirectory),
@@ -3779,7 +5101,9 @@ actor VoxCPM2Client {
             "probe_output": marker.path,
         ], options: [.sortedKeys])
         try await runner(Qwen3TTSProcessInvocation(
-            executableURL: validated.pythonExecutable, helperURL: probe, currentDirectoryURL: job,
+            executableURL: validated.pythonExecutable,
+            expectedRuntimeIdentity: validated.runtimeIdentity,
+            helperURL: probe, currentDirectoryURL: job,
             environment: Self.environment(home: job), standardInput: request,
             outputURL: marker, timeout: 30
         ))
@@ -3829,7 +5153,9 @@ actor VoxCPM2Client {
         ], options: [.sortedKeys])
         guard request.count <= 262_144 else { throw DialogueVoiceRuntimeError.requestRejected }
         try await runner(Qwen3TTSProcessInvocation(
-            executableURL: validated.pythonExecutable, helperURL: helper, currentDirectoryURL: job,
+            executableURL: validated.pythonExecutable,
+            expectedRuntimeIdentity: validated.runtimeIdentity,
+            helperURL: helper, currentDirectoryURL: job,
             environment: Self.environment(home: job), standardInput: request, outputURL: output, timeout: 120
         ))
         try Task.checkCancellation()

@@ -4,7 +4,24 @@ import Darwin
 public enum DialogueVoiceEndpointPolicy {
     public static func validatedLoopbackURL(_ url: URL) throws -> URL {
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              components.scheme?.lowercased() == "http",
+              components.scheme?.lowercased() == "https",
+              components.user == nil,
+              components.password == nil,
+              components.query == nil,
+              components.fragment == nil,
+              components.path.isEmpty || components.path == "/",
+              let host = components.host?.lowercased(),
+              isNumericLoopbackHost(host) else {
+            throw DialogueVoiceError.invalidEndpoint
+        }
+        return url
+    }
+
+    /// Decoder-only compatibility for profiles written before pinned TLS was
+    /// required. Runtime use still goes through `validatedLoopbackURL`.
+    static func validatedPersistedLoopbackURL(_ url: URL) throws -> URL {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              ["http", "https"].contains(components.scheme?.lowercased() ?? ""),
               components.user == nil,
               components.password == nil,
               components.query == nil,
@@ -58,7 +75,7 @@ public enum DialogueVoiceError: Error, Equatable, LocalizedError {
         case .invalidProfile:
             return "The voice profile is invalid."
         case .invalidEndpoint:
-            return "The voice service must use a numeric loopback-only HTTP endpoint."
+            return "The voice service must use a numeric loopback-only HTTPS endpoint."
         case .invalidLanguage:
             return "The language value is invalid."
         case .invalidText:
@@ -207,6 +224,18 @@ private enum DialogueVoiceValidation {
         }
         return value
     }
+
+    static func certificateSHA256(_ value: String) throws -> String {
+        guard value.count == 64,
+              value.unicodeScalars.allSatisfy({ scalar in
+                  (48...57).contains(scalar.value)
+                      || (65...70).contains(scalar.value)
+                      || (97...102).contains(scalar.value)
+              }) else {
+            throw DialogueVoiceError.invalidProfile
+        }
+        return value.lowercased()
+    }
 }
 
 public enum DialogueVoiceProviderKind: String, Codable, CaseIterable, Sendable {
@@ -321,6 +350,7 @@ public struct GPTSoVITSVoiceProfile: Codable, Equatable, Sendable {
     public let revision: Int
     public let name: String
     public let apiBaseURL: URL
+    public let tlsLeafCertificateSHA256: String?
     public let gptWeightRelativePath: String
     public let sovitsWeightRelativePath: String
     public let referenceAudioRelativePath: String
@@ -334,6 +364,7 @@ public struct GPTSoVITSVoiceProfile: Codable, Equatable, Sendable {
         revision: Int = 1,
         name: String,
         apiBaseURL: URL,
+        tlsLeafCertificateSHA256: String,
         gptWeightRelativePath: String,
         sovitsWeightRelativePath: String,
         referenceAudioRelativePath: String,
@@ -341,6 +372,38 @@ public struct GPTSoVITSVoiceProfile: Codable, Equatable, Sendable {
         promptLanguage: String,
         defaultTextLanguage: String,
         inputFingerprint: String
+    ) throws {
+        try self.init(
+            id: id,
+            revision: revision,
+            name: name,
+            apiBaseURL: apiBaseURL,
+            tlsLeafCertificateSHA256: tlsLeafCertificateSHA256,
+            gptWeightRelativePath: gptWeightRelativePath,
+            sovitsWeightRelativePath: sovitsWeightRelativePath,
+            referenceAudioRelativePath: referenceAudioRelativePath,
+            referenceText: referenceText,
+            promptLanguage: promptLanguage,
+            defaultTextLanguage: defaultTextLanguage,
+            inputFingerprint: inputFingerprint,
+            allowLegacyTransport: false
+        )
+    }
+
+    private init(
+        id: UUID,
+        revision: Int,
+        name: String,
+        apiBaseURL: URL,
+        tlsLeafCertificateSHA256: String?,
+        gptWeightRelativePath: String,
+        sovitsWeightRelativePath: String,
+        referenceAudioRelativePath: String,
+        referenceText: String,
+        promptLanguage: String,
+        defaultTextLanguage: String,
+        inputFingerprint: String,
+        allowLegacyTransport: Bool
     ) throws {
         guard revision > 0 else { throw DialogueVoiceError.invalidProfile }
         self.id = id
@@ -350,7 +413,20 @@ public struct GPTSoVITSVoiceProfile: Codable, Equatable, Sendable {
             maximum: DialogueVoiceValidation.maximumLabelLength,
             error: .invalidProfile
         )
-        self.apiBaseURL = try DialogueVoiceValidation.endpoint(apiBaseURL)
+        self.apiBaseURL = try allowLegacyTransport
+            ? DialogueVoiceEndpointPolicy.validatedPersistedLoopbackURL(apiBaseURL)
+            : DialogueVoiceValidation.endpoint(apiBaseURL)
+        if allowLegacyTransport {
+            self.tlsLeafCertificateSHA256 = try tlsLeafCertificateSHA256.map(
+                DialogueVoiceValidation.certificateSHA256
+            )
+        } else {
+            guard let tlsLeafCertificateSHA256 else {
+                throw DialogueVoiceError.invalidProfile
+            }
+            self.tlsLeafCertificateSHA256 = try DialogueVoiceValidation
+                .certificateSHA256(tlsLeafCertificateSHA256)
+        }
         self.gptWeightRelativePath = try DialogueVoiceValidation.managedPath(gptWeightRelativePath)
         self.sovitsWeightRelativePath = try DialogueVoiceValidation.managedPath(sovitsWeightRelativePath)
         self.referenceAudioRelativePath = try DialogueVoiceValidation.managedPath(referenceAudioRelativePath)
@@ -368,6 +444,7 @@ public struct GPTSoVITSVoiceProfile: Codable, Equatable, Sendable {
         case id, revision
         case name
         case apiBaseURL = "api_base_url"
+        case tlsLeafCertificateSHA256 = "tls_leaf_certificate_sha256"
         case gptWeightRelativePath = "gpt_weight_relative_path"
         case sovitsWeightRelativePath = "sovits_weight_relative_path"
         case referenceAudioRelativePath = "reference_audio_relative_path"
@@ -384,13 +461,18 @@ public struct GPTSoVITSVoiceProfile: Codable, Equatable, Sendable {
             revision: container.decode(Int.self, forKey: .revision),
             name: container.decode(String.self, forKey: .name),
             apiBaseURL: container.decode(URL.self, forKey: .apiBaseURL),
+            tlsLeafCertificateSHA256: container.decodeIfPresent(
+                String.self,
+                forKey: .tlsLeafCertificateSHA256
+            ),
             gptWeightRelativePath: container.decode(String.self, forKey: .gptWeightRelativePath),
             sovitsWeightRelativePath: container.decode(String.self, forKey: .sovitsWeightRelativePath),
             referenceAudioRelativePath: container.decode(String.self, forKey: .referenceAudioRelativePath),
             referenceText: container.decode(String.self, forKey: .referenceText),
             promptLanguage: container.decode(String.self, forKey: .promptLanguage),
             defaultTextLanguage: container.decode(String.self, forKey: .defaultTextLanguage),
-            inputFingerprint: container.decode(String.self, forKey: .inputFingerprint)
+            inputFingerprint: container.decode(String.self, forKey: .inputFingerprint),
+            allowLegacyTransport: true
         )
     }
 }

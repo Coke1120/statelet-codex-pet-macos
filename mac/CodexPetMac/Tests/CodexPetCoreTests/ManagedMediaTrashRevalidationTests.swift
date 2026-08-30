@@ -283,7 +283,7 @@ final class ManagedMediaTrashRevalidationTests: XCTestCase {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let catalogURL = fixture.root.appendingPathComponent("character-library.json")
-        let firstCatalog = try CharacterLibrary.legacy
+        let firstCatalog = CharacterLibrary.legacy
         try writeCatalog(firstCatalog, to: catalogURL)
         let snapshot = try ManagedMediaTrashRevalidator.captureLibrary(
             targetURLs: [fixture.movieURL],

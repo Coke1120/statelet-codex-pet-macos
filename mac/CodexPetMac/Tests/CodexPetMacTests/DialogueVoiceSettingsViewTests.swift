@@ -30,6 +30,13 @@ final class DialogueVoiceSettingsViewTests: XCTestCase {
             .first { $0.accessibilityLabel() == "Qwen3-TTS generation recipe" })
         XCTAssertEqual(recipe.maximumNumberOfLines, 0)
         XCTAssertEqual(recipe.lineBreakMode, .byWordWrapping)
+
+        let pinField = try XCTUnwrap(descendants.compactMap { $0 as? NSTextField }
+            .first { $0.accessibilityLabel() == "GPT-SoVITS TLS leaf certificate SHA-256" })
+        XCTAssertTrue(pinField.accessibilityHelp()?.contains("64 hexadecimal") == true)
+        let tlsHelp = try XCTUnwrap(descendants.compactMap { $0 as? NSTextField }
+            .first { $0.accessibilityLabel() == "GPT-SoVITS pinned TLS requirement" })
+        XCTAssertTrue(tlsHelp.stringValue.contains("rejects HTTP"))
     }
 
     @MainActor
@@ -38,7 +45,8 @@ final class DialogueVoiceSettingsViewTests: XCTestCase {
         var library = try DialogueVoiceLibrary()
         let draft = DialogueVoiceProfileDraft(
             name: "",
-            apiBaseURL: "http://127.0.0.1:9880",
+            apiBaseURL: "https://127.0.0.1:9880",
+            tlsLeafCertificateSHA256: String(repeating: "c", count: 64),
             promptLanguage: "japanese",
             defaultTextLanguage: "japanese",
             referenceText: ""

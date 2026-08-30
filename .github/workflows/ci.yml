@@ -67,12 +67,12 @@ jobs:
           swift test -c release --package-path mac/CodexPetMac
           --skip PetPlayerPlaybackIntegrationTests
 
-      - name: Run same-state AVPlayer integration
+      - name: Run complete AVPlayer integration suite
         env:
           STATELET_RUN_AVPLAYER_INTEGRATION: "1"
         run: >-
           swift test -c release --package-path mac/CodexPetMac
-          --filter PetPlayerPlaybackIntegrationTests/testSameState
+          --filter PetPlayerPlaybackIntegrationTests
 
       - name: Run Swift core self-test
         run: swift run --package-path mac/CodexPetMac -c release codex-pet-core-self-test

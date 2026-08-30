@@ -7,6 +7,9 @@
 - Copy selected assets below Statelet Application Support with private
   permissions. Refuse symbolic links, unsafe relative paths, oversized files,
   redirects, proxies, hostnames, and non-loopback destinations.
+- Expose API v2 through HTTPS on numeric loopback and pin the SHA-256 of the
+  leaf certificate's DER bytes in the Statelet profile. Protect the matching
+  private key as local private configuration; never commit or bundle it.
 - Treat `torch.load(..., weights_only=False)` checkpoints as executable input.
   Load only weights the user trusts and verify managed copies by SHA-256.
 - Never include `.ckpt`, `.pth`, reference audio, generated WAV, dialogue JSON,
@@ -14,6 +17,27 @@
   releases.
 
 ## API v2 activation and synthesis
+
+GPT-SoVITS commonly exposes plain HTTP. Statelet does not connect to that
+transport. Terminate TLS in the service itself or in a locally managed gateway
+that owns an authenticated, non-raceable upstream channel (for example, an
+owner-private Unix socket). A gateway that simply forwards to a replaceable
+plain-loopback backend does not preserve the peer-authentication boundary.
+
+The profile endpoint must be a numeric-loopback HTTPS URL such as
+`https://127.0.0.1:9880`, together with exactly 64 hexadecimal characters for
+the leaf DER certificate SHA-256. For a PEM certificate, derive the pin without
+printing private-key material:
+
+```bash
+openssl x509 -in statelet-gpt-sovits-leaf.pem -outform DER | shasum -a 256
+```
+
+Statelet applies this exact pin to every weight-activation and synthesis
+request. It intentionally accepts a self-signed leaf only when its DER hash
+matches; absent and mismatched certificates are rejected. There is no HTTP or
+bearer-token fallback. Rotate the certificate only as an explicit local
+operation, then enter its new pin and save the profile again.
 
 Activate both weights for every job through:
 
@@ -90,8 +114,10 @@ not repair an already abandoned request.
 4. Permit startup to exceed 60 seconds while the process remains alive and
    reports loading progress; elapsed startup time alone is not permission to
    submit another synthesis request.
-5. Require `http://127.0.0.1:9880/` to answer promptly before retry; HTTP 404 at
-   the unused root route is sufficient health evidence.
+5. Require the saved HTTPS endpoint, for example `https://127.0.0.1:9880/`, to
+   answer promptly with the saved leaf-certificate pin before retry; a 404 at
+   the unused root route is sufficient health evidence only after TLS pinning
+   succeeds.
 6. Revalidate the profile and generate one deterministic short line. Confirm it
    reaches `ready` and passes WAV energy checks before filling the whole queue.
 
@@ -127,7 +153,8 @@ not repair an already abandoned request.
 Require all of the following:
 
 1. Original and managed asset hashes match.
-2. API listens only on numeric loopback.
+2. API or its authenticated gateway listens only on numeric-loopback HTTPS,
+   and every request authenticates the expected leaf DER SHA-256 pin.
 3. Every required state has a ready line at the current policy version.
 4. Each WAV is regular, managed, valid PCM, non-empty, measurably non-silent,
    and no longer than 15 seconds for operational short-state acceptance.

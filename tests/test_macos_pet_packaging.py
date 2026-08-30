@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import importlib.util
 import os
 import plistlib
 import shlex
@@ -87,7 +88,6 @@ class MacPetPackagingTests(unittest.TestCase):
                 str(bundle),
                 "--executable",
                 str(executable),
-                "--skip-sign",
             ],
             cwd=ROOT,
             check=True,
@@ -179,6 +179,23 @@ class MacPetPackagingTests(unittest.TestCase):
     def safe_tree_digest(self, path: Path) -> str:
         result = subprocess.run(
             [sys.executable, str(PACKAGE / "scripts" / "merge_hooks.py"), "--safe-tree-digest", str(path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    def legacy_unframed_tree_digest(self, path: Path) -> str:
+        """Reproduce the pre-v2 digest only for fail-closed regression coverage."""
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(PACKAGE / "scripts" / "merge_hooks.py"),
+                "--safe-tree-digest",
+                str(path),
+                "--safe-tree-digest-algorithm",
+                "statelet-unframed-v1",
+            ],
             check=True,
             capture_output=True,
             text=True,
@@ -327,12 +344,58 @@ esac
             "handoff": journal["handoff"],
             "launch": sealed_launch,
         }
+        if journal.get("version") == 3:
+            payload["digest_algorithm"] = journal.get("digest_algorithm")
         journal["seal"] = {
             "version": 1,
             "operation_count": payload["operation_count"],
             "active_targets": payload["active_targets"],
             "digest": hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
         }
+
+    def downgrade_transaction_to_genuine_legacy_v1(self, transaction: Path) -> dict[str, object]:
+        """Rewrite a fresh files-committed fixture exactly as the old v1 writer did."""
+        journal_path = transaction / "journal.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        self.assertEqual(journal["version"], 3)
+        self.assertEqual(journal.pop("digest_algorithm"), "statelet-safe-tree-v2")
+        journal["version"] = 1
+        grok_root = self.home / ".grok"
+        journal["operations"] = [
+            operation
+            for operation in journal["operations"]
+            if not Path(operation["target"]).is_relative_to(grok_root)
+        ]
+
+        manifest = self.home / "Library/Application Support/Statelet/.legacy-migration-v1.json"
+        manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertEqual(manifest_data.pop("digest_algorithm"), "statelet-safe-tree-v2")
+        manifest_data["version"] = 1
+        manifest.write_text(
+            json.dumps(manifest_data, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        manifest.chmod(0o600)
+
+        for operation in journal["operations"]:
+            if operation["kind"] == "install":
+                self.assertEqual(operation.get("owned_exclusions"), [])
+                digest = self.legacy_unframed_tree_digest(Path(operation["target"]))
+                operation["digest"] = digest
+                operation["owned_digest"] = digest
+            elif operation["kind"] == "backup":
+                operation["digest"] = self.legacy_unframed_tree_digest(Path(operation["source"]))
+            elif operation["kind"] == "retain":
+                operation["digest"] = self.legacy_unframed_tree_digest(Path(operation["target"]))
+
+        self.recompute_transaction_seal(journal)
+        journal_path.write_text(
+            json.dumps(journal, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        journal_path.chmod(0o600)
+        shutil.rmtree(grok_root)
+        return journal
 
     def assert_sealed_operation_tamper_is_rejected(self, *, skip_launchctl: bool, empty: bool) -> None:
         first = self.make_bundle(f"SealFirst-{skip_launchctl}-{empty}", "first")
@@ -442,6 +505,11 @@ esac
             path = alpha_tools / resource
             self.assertTrue(os.access(path, os.R_OK))
             self.assertFalse(path.stat().st_mode & 0o111)
+        alpha_requirements = (alpha_tools / "requirements-alpha.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("numpy==2.0.2", alpha_requirements)
+        self.assertNotIn("Pillow", alpha_requirements)
 
         qwen_tools = bundle / "Contents" / "Resources" / "QwenTTS"
         expected_qwen_resources = {"qwen3_tts_generate.py", "qwen3_tts_probe.py"}
@@ -663,7 +731,7 @@ struct PetPanelHarness {
             temp = Path(temporary)
             fake_python = temp / "fake-python"
             fake_python.write_text(
-                "#!/bin/sh\ntrap '' TERM\nsleep 1000 &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$2.childpid\"\nwhile :; do echo harmless-noise >&2; sleep 0.02; done\n",
+                "#!/bin/sh\ntrap '' TERM HUP\nsleep 1000 &\nchild=$!\npidfile=\nfor argument do\n  case \"$argument\" in\n    *.py) pidfile=\"$argument.childpid\"; break ;;\n  esac\ndone\n[ -n \"$pidfile\" ] || exit 90\nprintf '%s\\n' \"$child\" > \"$pidfile\"\ntrap 'exit 143' TERM\nwhile :; do echo harmless-noise >&2; sleep 0.02; done\n",
                 encoding="utf-8",
             )
             fake_python.chmod(0o755)
@@ -985,12 +1053,8 @@ struct WatchdogHarness {
             RunLoop.main.run(until: Date().addingTimeInterval(0.01))
         }
         guard case let .failure(slowError)? = slowResult.value,
-              slowError.localizedDescription.contains("timed out") else { exit(30) }
-        let cleanupDeadline = Date().addingTimeInterval(1)
-        while FileManager.default.fileExists(atPath: slowDestination.path), Date() < cleanupDeadline {
-            usleep(10_000)
-        }
-        guard !FileManager.default.fileExists(atPath: slowDestination.path) else { exit(31) }
+              slowError.localizedDescription.contains("timed out"),
+              !FileManager.default.fileExists(atPath: slowDestination.path) else { exit(30) }
         let unquotedPath = "/Users/leoho/My Videos/foo.mp4"
         let quotedPath = "'/Users/leoho/My Videos/foo.mp4'"
         let sanitized = AlphaConversionCoordinator.sanitizedFailureMessage(
@@ -1083,7 +1147,7 @@ struct WatchdogHarness {
               !structuredError.localizedDescription.contains("/Users/") else { exit(39) }
         let coordinator = AlphaConversionCoordinator(
             overallDeadlineSeconds: 2,
-            noProgressDeadlineSeconds: 0.3,
+            noProgressDeadlineSeconds: 1,
             terminationGraceSeconds: 0.15
         )
         let toolchain = AlphaToolchain(
@@ -1094,6 +1158,30 @@ struct WatchdogHarness {
             avconvert: URL(fileURLWithPath: "/usr/bin/true")
         )
         let result = LockedResult<AlphaConversionResult>()
+        let childPIDURL = URL(fileURLWithPath: arguments[3] + ".childpid")
+        func requireChildRecordReady(_ code: Int32) {
+            let readyDeadline = Date().addingTimeInterval(0.8)
+            while !FileManager.default.fileExists(atPath: childPIDURL.path), Date() < readyDeadline {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+            }
+            guard FileManager.default.fileExists(atPath: childPIDURL.path) else { exit(code) }
+        }
+        func requireRecordedChildExited(missingCode: Int32, aliveCode: Int32) {
+            guard let childText = try? String(contentsOf: childPIDURL, encoding: .utf8),
+                  let childPID = pid_t(childText.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+                let files = (try? FileManager.default.contentsOfDirectory(
+                    atPath: childPIDURL.deletingLastPathComponent().path
+                )) ?? []
+                let detail = "missing child PID at \(childPIDURL.path); files=\(files)\n"
+                try? FileHandle.standardError.write(contentsOf: Data(detail.utf8))
+                exit(missingCode)
+            }
+            let reapDeadline = Date().addingTimeInterval(1)
+            while kill(childPID, 0) == 0, Date() < reapDeadline {
+                usleep(10_000)
+            }
+            guard kill(childPID, 0) != 0, errno == ESRCH else { exit(aliveCode) }
+        }
         let started = Date()
         coordinator.convert(
             sourceURL: temporary.appendingPathComponent("source.mp4"),
@@ -1106,12 +1194,15 @@ struct WatchdogHarness {
             phase: { _ in },
             completion: { result.set($0) }
         )
+        requireChildRecordReady(46)
         while result.value == nil, Date().timeIntervalSince(started) < 3 {
             RunLoop.main.run(until: Date().addingTimeInterval(0.02))
         }
         guard case let .failure(error)? = result.value else { exit(2) }
         guard error.localizedDescription.contains("no progress") else { exit(3) }
         guard !coordinator.isRunning else { exit(4) }
+        requireRecordedChildExited(missingCode: 42, aliveCode: 43)
+        try? FileManager.default.removeItem(at: childPIDURL)
         result.clear()
         coordinator.convert(
             sourceURL: temporary.appendingPathComponent("source.mp4"),
@@ -1124,9 +1215,8 @@ struct WatchdogHarness {
             phase: { _ in },
             completion: { result.set($0) }
         )
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
-            coordinator.cancel()
-        }
+        requireChildRecordReady(47)
+        coordinator.cancel()
         let cancelStarted = Date()
         while result.value == nil, Date().timeIntervalSince(cancelStarted) < 2 {
             RunLoop.main.run(until: Date().addingTimeInterval(0.02))
@@ -1134,6 +1224,8 @@ struct WatchdogHarness {
         guard case let .failure(cancelError)? = result.value,
               cancelError.localizedDescription.contains("cancelled") else { exit(5) }
         guard !coordinator.isRunning else { exit(6) }
+        requireRecordedChildExited(missingCode: 44, aliveCode: 45)
+        try? FileManager.default.removeItem(at: childPIDURL)
         result.clear()
         coordinator.convert(
             sourceURL: temporary.appendingPathComponent("source.mp4"),
@@ -1146,22 +1238,15 @@ struct WatchdogHarness {
             phase: { _ in },
             completion: { result.set($0) }
         )
+        requireChildRecordReady(48)
         let launchDeadline = Date().addingTimeInterval(1)
         while !coordinator.isRunning, Date() < launchDeadline {
             RunLoop.main.run(until: Date().addingTimeInterval(0.01))
         }
         guard coordinator.terminateAndWait(graceSeconds: 0.1, deadlineSeconds: 1.5),
+              result.value != nil,
               !coordinator.isRunning else { exit(7) }
-        let childPIDURL = URL(fileURLWithPath: arguments[3] + ".childpid")
-        guard let childText = try? String(contentsOf: childPIDURL, encoding: .utf8),
-              let childPID = pid_t(childText.trimmingCharacters(in: .whitespacesAndNewlines)) else {
-            exit(8)
-        }
-        let reapDeadline = Date().addingTimeInterval(1)
-        while kill(childPID, 0) == 0, Date() < reapDeadline {
-            usleep(10_000)
-        }
-        guard kill(childPID, 0) != 0, errno == ESRCH else { exit(9) }
+        requireRecordedChildExited(missingCode: 8, aliveCode: 9)
         print("watchdog-ok")
     }
 }
@@ -1368,6 +1453,8 @@ struct WatchdogHarness {
         self.assertIn("func terminateAndWait", coordinator)
         self.assertIn("SIGTERM", coordinator)
         self.assertIn("SIGKILL", coordinator)
+        self.assertIn("pendingCompletionCount", coordinator)
+        self.assertIn("serviceTerminationWaitSlice", coordinator)
 
     def test_conversion_journal_is_private_path_free_and_attested_before_recovery(self) -> None:
         source = PET_APP_DELEGATE.read_text(encoding="utf-8")
@@ -1546,6 +1633,266 @@ struct WatchdogHarness {
             (self.home / "Library" / "Application Support" / "Statelet" / "media" / "media-map.json").stat().st_mode & 0o777,
             0o600,
         )
+
+    def test_install_rejects_marker_valid_bundle_with_invalid_code_signature(self) -> None:
+        bundle = self.make_bundle("InvalidSignature", "trusted")
+        executable = bundle / "Contents" / "MacOS" / "Statelet"
+        original = executable.read_bytes()
+        mutated = original.replace(b"# trusted", b"# forged!")
+        self.assertNotEqual(mutated, original)
+        self.assertEqual(len(mutated), len(original))
+        executable.write_bytes(mutated)
+        executable.chmod(0o755)
+
+        result = self.install(bundle)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("failed identity or code-signature validation", result.stderr)
+        self.assertFalse((self.home / "Applications" / "Statelet.app").exists())
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+
+    def test_install_rejects_symlinked_app_source_without_following_it(self) -> None:
+        bundle = self.make_bundle("SymlinkedSource")
+        source_link = self.base / "StateletSource.app"
+        source_link.symlink_to(bundle, target_is_directory=True)
+
+        result = self.install(source_link)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsafe or unstable Statelet.app source", result.stderr)
+        self.assertFalse((self.home / "Applications" / "Statelet.app").exists())
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+
+    def test_safe_copy_detects_in_place_source_mutation_and_removes_snapshot(self) -> None:
+        helper_path = PACKAGE / "scripts" / "merge_hooks.py"
+        specification = importlib.util.spec_from_file_location(
+            "statelet_merge_hooks_snapshot_test",
+            helper_path,
+        )
+        self.assertIsNotNone(specification)
+        self.assertIsNotNone(specification.loader)
+        module = importlib.util.module_from_spec(specification)
+        specification.loader.exec_module(module)
+        source = self.base / "mutable-source.bin"
+        source.write_bytes(b"A" * (2 * 1024 * 1024))
+        destination = self.base / "private-snapshot.bin"
+        source_identity = (source.stat().st_dev, source.stat().st_ino)
+        original_read = module.os.read
+        mutated = False
+
+        def mutate_after_first_chunk(descriptor: int, size: int) -> bytes:
+            nonlocal mutated
+            chunk = original_read(descriptor, size)
+            status = os.fstat(descriptor)
+            if chunk and not mutated and (status.st_dev, status.st_ino) == source_identity:
+                with source.open("r+b") as handle:
+                    handle.seek(1024 * 1024)
+                    handle.write(b"B" * 4096)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                mutated = True
+            return chunk
+
+        module.os.read = mutate_after_first_chunk
+        try:
+            with self.assertRaisesRegex(ValueError, "changed during validation"):
+                module.safe_copy_tree(source, destination)
+        finally:
+            module.os.read = original_read
+
+        self.assertTrue(mutated)
+        self.assertFalse(destination.exists())
+
+    def test_safe_tree_digest_frames_content_boundaries_and_modes(self) -> None:
+        helper_path = PACKAGE / "scripts" / "merge_hooks.py"
+        specification = importlib.util.spec_from_file_location(
+            "statelet_merge_hooks_digest_framing_test",
+            helper_path,
+        )
+        self.assertIsNotNone(specification)
+        self.assertIsNotNone(specification.loader)
+        module = importlib.util.module_from_spec(specification)
+        specification.loader.exec_module(module)
+        absorbed_record = self.base / "absorbed-record"
+        split_record = self.base / "split-record"
+        absorbed_record.mkdir()
+        split_record.mkdir()
+        (absorbed_record / "a").write_bytes(b"X" + b"F\0b\0" + b"Y")
+        (split_record / "a").write_bytes(b"X")
+        (split_record / "b").write_bytes(b"Y")
+
+        self.assertEqual(
+            self.legacy_unframed_tree_digest(absorbed_record),
+            self.legacy_unframed_tree_digest(split_record),
+        )
+        absorbed_digest = module.safe_tree_digest(absorbed_record)
+        split_digest = module.safe_tree_digest(split_record)
+        self.assertNotEqual(absorbed_digest, split_digest)
+
+        (split_record / "b").chmod(0o600)
+        self.assertNotEqual(split_digest, module.safe_tree_digest(split_record))
+
+        hook_config = self.base / "hooks.json"
+        hook_config.write_text('{"hooks":{}}\n', encoding="utf-8")
+        hook_config.chmod(0o640)
+        _, _, attestation = module.read_hook_config(hook_config, required=True)
+        self.assertEqual(attestation["version"], 2)
+        self.assertEqual(attestation["digest_algorithm"], "statelet-safe-tree-v2")
+        self.assertEqual(attestation["digest"], module.safe_tree_digest(hook_config))
+
+    def test_framed_snapshot_digest_is_accepted_by_install_journal(self) -> None:
+        helper_path = PACKAGE / "scripts" / "merge_hooks.py"
+        specification = importlib.util.spec_from_file_location(
+            "statelet_merge_hooks_journal_digest_test",
+            helper_path,
+        )
+        self.assertIsNotNone(specification)
+        self.assertIsNotNone(specification.loader)
+        module = importlib.util.module_from_spec(specification)
+        specification.loader.exec_module(module)
+        source = self.base / "digest-source"
+        (source / "nested").mkdir(parents=True)
+        (source / "root.txt").write_bytes(b"root")
+        (source / "nested" / "payload.bin").write_bytes(b"payload")
+        (source / "nested" / "payload.bin").chmod(0o600)
+        transaction = self.home / ".statelet-install-transaction"
+
+        initialized = self.journal_command(transaction, "init")
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        hook_config = self.home / "legacy-hook.json"
+        hook_config.write_text('{"hooks":{}}\n', encoding="utf-8")
+        hook_config.chmod(0o600)
+        _, _, legacy_attestation = module.read_hook_config(hook_config, required=True)
+        legacy_attestation["digest"] = self.legacy_unframed_tree_digest(hook_config)
+        legacy_attestation.pop("version")
+        legacy_attestation.pop("digest_algorithm")
+        rejected_attestation = self.journal_command(
+            transaction,
+            "backup-move",
+            str(hook_config),
+            str(transaction / "backup" / "legacy-hook.json"),
+            legacy_attestation["digest"],
+            json.dumps(legacy_attestation, sort_keys=True, separators=(",", ":")),
+        )
+        self.assertNotEqual(rejected_attestation.returncode, 0)
+        self.assertTrue(hook_config.exists())
+        self.assertFalse((transaction / "backup" / "legacy-hook.json").exists())
+        staged = transaction / "stage" / "digest-source"
+        module.safe_copy_tree(source, staged)
+        expected = module.safe_tree_digest(source)
+        self.assertEqual(expected, module.safe_tree_digest(staged))
+
+        legacy = self.legacy_unframed_tree_digest(staged)
+        rejected = self.journal_command(
+            transaction,
+            "install-move",
+            str(staged),
+            str(self.home / "published-digest-source"),
+            legacy,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertTrue(staged.exists())
+        journal = json.loads((transaction / "journal.json").read_text(encoding="utf-8"))
+        self.assertEqual(journal["operations"], [])
+
+        installed = self.journal_command(
+            transaction,
+            "install-move",
+            str(staged),
+            str(self.home / "published-digest-source"),
+            expected,
+        )
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        published = self.home / "published-digest-source"
+        self.assertEqual(expected, module.safe_tree_digest(published))
+        journal = json.loads((transaction / "journal.json").read_text(encoding="utf-8"))
+        self.assertEqual(journal["operations"][-1]["digest"], expected)
+
+    def test_install_rejects_app_source_executable_swap_after_private_snapshot(self) -> None:
+        bundle = self.make_bundle("SourceExecutableSwap", "trusted")
+        executable = bundle / "Contents" / "MacOS" / "Statelet"
+        gate = self.home / "app-source-snapshot-gate"
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_TEST_APP_SOURCE_GATE"] = str(gate)
+        process = subprocess.Popen(
+            [
+                "bash",
+                str(INSTALL_SCRIPT),
+                "--home",
+                str(self.home),
+                "--app-bundle",
+                str(bundle),
+                "--skip-launchctl",
+            ],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        self.wait_for_test_gate(process, gate)
+        original = executable.read_bytes()
+        mutated = original.replace(b"# trusted", b"# forged!")
+        self.assertNotEqual(mutated, original)
+        self.assertEqual(len(mutated), len(original))
+        replacement = executable.with_name("Statelet.replacement")
+        replacement.write_bytes(mutated)
+        replacement.chmod(0o755)
+        os.replace(replacement, executable)
+        Path(f"{gate}.release").touch()
+
+        _, stderr = process.communicate(timeout=30)
+
+        self.assertEqual(process.returncode, 75, stderr)
+        self.assertIn("source or private snapshot changed", stderr)
+        self.assertFalse((self.home / "Applications" / "Statelet.app").exists())
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+
+    def test_install_rejects_staged_executable_mutation_before_destination_changes(self) -> None:
+        bundle = self.make_bundle("StagedExecutableMutation", "trusted")
+        gate = self.home / "app-stage-snapshot-gate"
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_TEST_APP_SOURCE_GATE"] = str(gate)
+        process = subprocess.Popen(
+            [
+                "bash",
+                str(INSTALL_SCRIPT),
+                "--home",
+                str(self.home),
+                "--app-bundle",
+                str(bundle),
+                "--skip-launchctl",
+            ],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        self.wait_for_test_gate(process, gate)
+        staged_executable = (
+            self.home
+            / ".statelet-install-transaction"
+            / "stage"
+            / "Statelet.app"
+            / "Contents"
+            / "MacOS"
+            / "Statelet"
+        )
+        original = staged_executable.read_bytes()
+        mutated = original.replace(b"# trusted", b"# forged!")
+        self.assertNotEqual(mutated, original)
+        self.assertEqual(len(mutated), len(original))
+        staged_executable.write_bytes(mutated)
+        staged_executable.chmod(0o755)
+        Path(f"{gate}.release").touch()
+
+        _, stderr = process.communicate(timeout=30)
+
+        self.assertEqual(process.returncode, 75, stderr)
+        self.assertIn("source or private snapshot changed", stderr)
+        self.assertFalse((self.home / "Applications" / "Statelet.app").exists())
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
 
     def test_install_removes_owned_regular_obsolete_activity_titles(self) -> None:
         bundle = self.make_bundle("ObsoleteActivityTitles")
@@ -2029,6 +2376,39 @@ struct WatchdogHarness {
         managed = [item for groups in rolled_back["hooks"].values() for group in groups for item in group.get("hooks", []) if item.get("env") == {"STATELET_AGENT_PROVIDER": "grok"}]
         self.assertEqual(len(managed), len(GROK_HOOK_EVENTS) + 2)
         self.assertIn(b"first", (self.home / "Applications/Statelet.app/Contents/MacOS/Statelet").read_bytes())
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+
+    def test_staged_app_mutation_at_grok_quiesced_gate_is_rejected_before_replacement(self) -> None:
+        first = self.make_bundle("AppPublicationBoundaryFirst", "first")
+        self.assertEqual(self.install(first).returncode, 0)
+        installed_executable = self.home / "Applications/Statelet.app/Contents/MacOS/Statelet"
+        original = installed_executable.read_bytes()
+        second = self.make_bundle("AppPublicationBoundarySecond", "second")
+        gate = self.home / "app-publication-boundary"
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_TEST_GROK_QUIESCED_GATE"] = str(gate)
+        process = subprocess.Popen(
+            ["bash", str(INSTALL_SCRIPT), "--home", str(self.home), "--app-bundle", str(second), "--skip-launchctl"],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        self.wait_for_test_gate(process, gate)
+        staged_executable = self.home / ".statelet-install-transaction/stage/Statelet.app/Contents/MacOS/Statelet"
+        staged = staged_executable.read_bytes()
+        forged = staged.replace(b"# second", b"# forged")
+        self.assertNotEqual(forged, staged)
+        self.assertEqual(len(forged), len(staged))
+        staged_executable.write_bytes(forged)
+        staged_executable.chmod(0o755)
+        Path(f"{gate}.release").touch()
+        stdout, stderr = process.communicate(timeout=30)
+
+        self.assertEqual(process.returncode, 75, stdout + stderr)
+        self.assertIn("Staged Statelet.app changed before destination publication", stderr)
+        self.assertEqual(installed_executable.read_bytes(), original)
         self.assertFalse((self.home / ".statelet-install-transaction").exists())
 
     def test_no_edit_after_grok_publication_failure_restores_original_handlers(self) -> None:
@@ -2530,21 +2910,13 @@ struct WatchdogHarness {
         self.assertEqual(crashed.returncode, -9, crashed.stderr)
 
         transaction = self.home / ".statelet-install-transaction"
-        journal_path = transaction / "journal.json"
-        journal = json.loads(journal_path.read_text(encoding="utf-8"))
-        grok_root = self.home / ".grok"
-        journal["version"] = 1
-        journal["operations"] = [
-            operation
+        journal = self.downgrade_transaction_to_genuine_legacy_v1(transaction)
+        self.assertNotIn("digest_algorithm", journal)
+        self.assertTrue(all(
+            operation.get("digest") in {"", self.legacy_unframed_tree_digest(Path(operation["target"]))}
             for operation in journal["operations"]
-            if not Path(operation["target"]).is_relative_to(grok_root)
-        ]
-        self.recompute_transaction_seal(journal)
-        journal_path.write_text(
-            json.dumps(journal, sort_keys=True, separators=(",", ":")) + "\n",
-            encoding="utf-8",
-        )
-        shutil.rmtree(grok_root)
+            if operation["kind"] in {"install", "retain"}
+        ))
 
         environment.pop("STATELET_INSTALL_CRASH_AT")
         recovered = self.install(bundle, env=environment)
@@ -2552,6 +2924,40 @@ struct WatchdogHarness {
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
         self.assertIn("Completed interrupted Statelet installation", recovered.stdout)
         self.assertFalse(transaction.exists())
+
+    def test_legacy_v1_journal_with_mixed_v2_digest_is_rejected_as_ambiguous(self) -> None:
+        bundle = self.make_bundle("LegacyMixedDigest")
+        environment = os.environ.copy()
+        environment["STATELET_INSTALL_CRASH_AT"] = "after-files-commit"
+        crashed = self.install(bundle, env=environment)
+        self.assertEqual(crashed.returncode, -9, crashed.stderr)
+
+        transaction = self.home / ".statelet-install-transaction"
+        journal = self.downgrade_transaction_to_genuine_legacy_v1(transaction)
+        app_target = self.home / "Applications/Statelet.app"
+        app_operation = next(
+            operation for operation in journal["operations"]
+            if operation["kind"] == "install" and Path(operation["target"]) == app_target
+        )
+        v2_digest = self.safe_tree_digest(app_target)
+        self.assertNotEqual(app_operation["digest"], v2_digest)
+        app_operation["digest"] = v2_digest
+        app_operation["owned_digest"] = v2_digest
+        self.recompute_transaction_seal(journal)
+        journal_path = transaction / "journal.json"
+        journal_path.write_text(
+            json.dumps(journal, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        journal_path.chmod(0o600)
+
+        environment.pop("STATELET_INSTALL_CRASH_AT")
+        refused = self.install(bundle, env=environment)
+
+        self.assertEqual(refused.returncode, 74, refused.stderr)
+        self.assertIn("interrupted Statelet installation is ambiguous", refused.stderr)
+        self.assertTrue(journal_path.exists())
+        self.assertEqual(self.safe_tree_digest(app_target), v2_digest)
 
     def test_abrupt_kill_after_app_replacement_recovers_then_completes(self) -> None:
         first = self.make_bundle("CrashAppFirst", "first")
@@ -3130,6 +3536,65 @@ struct WatchdogHarness {
         manifest = self.home / "Library" / "Application Support" / "Statelet" / ".legacy-migration-v1.json"
         self.assertTrue(manifest.is_file())
         self.assertEqual(manifest.stat().st_mode & 0o777, 0o600)
+
+    def test_genuine_legacy_v1_migration_manifest_recovers_and_upgrades(self) -> None:
+        legacy = self.home / "Library" / "Application Support" / "CodexPet"
+        legacy_voice = legacy / "voice" / "profile.json"
+        legacy_voice.parent.mkdir(parents=True)
+        legacy_voice.write_bytes(b"retained-legacy-voice")
+        bundle = self.make_bundle("LegacyManifestUpgrade")
+        first = self.install(bundle)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        canonical = self.home / "Library" / "Application Support" / "Statelet"
+        canonical_voice = canonical / "voice" / "profile.json"
+        canonical_voice.write_bytes(b"newer-canonical-voice")
+        manifest = canonical / ".legacy-migration-v1.json"
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertEqual(data.pop("digest_algorithm"), "statelet-safe-tree-v2")
+        data["version"] = 1
+        data["subtrees"]["voice"] = self.legacy_unframed_tree_digest(legacy / "voice")
+        manifest.write_text(
+            json.dumps(data, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        manifest.chmod(0o600)
+
+        reinstalled = self.install(bundle)
+
+        self.assertEqual(reinstalled.returncode, 0, reinstalled.stderr)
+        self.assertEqual(canonical_voice.read_bytes(), b"newer-canonical-voice")
+        upgraded = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertEqual(upgraded["version"], 2)
+        self.assertEqual(upgraded["digest_algorithm"], "statelet-safe-tree-v2")
+
+    def test_unversioned_v2_migration_digest_is_not_accepted_as_legacy(self) -> None:
+        legacy = self.home / "Library" / "Application Support" / "CodexPet"
+        legacy_voice = legacy / "voice" / "profile.json"
+        legacy_voice.parent.mkdir(parents=True)
+        legacy_voice.write_bytes(b"retained-legacy-voice")
+        bundle = self.make_bundle("AmbiguousManifestSchema")
+        first = self.install(bundle)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        canonical = self.home / "Library" / "Application Support" / "Statelet"
+        canonical_voice = canonical / "voice" / "profile.json"
+        canonical_voice.write_bytes(b"newer-canonical-voice")
+        manifest = canonical / ".legacy-migration-v1.json"
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        v2_digest = data["subtrees"]["voice"]
+        data.pop("digest_algorithm")
+        data["version"] = 1
+        manifest.write_text(
+            json.dumps(data, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        manifest.chmod(0o600)
+        self.assertNotEqual(v2_digest, self.legacy_unframed_tree_digest(legacy / "voice"))
+
+        refused = self.install(bundle)
+
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("Refusing to overwrite conflicting Statelet data", refused.stderr)
+        self.assertEqual(canonical_voice.read_bytes(), b"newer-canonical-voice")
 
     def test_completed_migration_preserves_intentional_canonical_subtree_absence(self) -> None:
         legacy = self.home / "Library" / "Application Support" / "CodexPet"

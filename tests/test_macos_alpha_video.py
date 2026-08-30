@@ -13,7 +13,7 @@ import tempfile
 import time
 import unittest
 import warnings
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from pathlib import Path
 from fractions import Fraction
 from unittest import mock
@@ -280,14 +280,13 @@ class MacOSAlphaCommandTests(unittest.TestCase):
         self.assertEqual(command[command.index("-pix_fmt") + 1], "rgb24")
 
     @unittest.skipUnless(
-        alpha.np is not None and alpha.Image is not None and shutil.which("ffmpeg"),
-        "NumPy, Pillow, and ffmpeg are required",
+        alpha.np is not None and shutil.which("ffmpeg"),
+        "NumPy and ffmpeg are required",
     )
     def test_aspect_fill_preserves_square_proportions_for_landscape_and_matching_ratio(self):
         np = alpha.np
-        image_type = alpha.Image
         ffmpeg = shutil.which("ffmpeg")
-        assert np is not None and image_type is not None and ffmpeg is not None
+        assert np is not None and ffmpeg is not None
 
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -305,8 +304,11 @@ class MacOSAlphaCommandTests(unittest.TestCase):
                         255,
                         255,
                     )
-                    source = root / f"{label}.png"
-                    image_type.fromarray(frame, mode="RGB").save(source)
+                    source = root / f"{label}.ppm"
+                    source.write_bytes(
+                        f"P6\n{source_width} {source_height}\n255\n".encode("ascii")
+                        + frame.tobytes()
+                    )
 
                     result = subprocess.run(
                         alpha.build_ffmpeg_decode_command(
@@ -1873,6 +1875,7 @@ class MacOSAlphaCommandTests(unittest.TestCase):
                     info=info,
                     width=4,
                     height=4,
+                    source_snapshot_bytes=37,
                     reserve_bytes=100,
                 )
             self.assertEqual(shared["volume_count"], 3)
@@ -1904,10 +1907,19 @@ class MacOSAlphaCommandTests(unittest.TestCase):
             temp_volume = next(
                 item
                 for item in shared["volumes"]
-                if item["components"] == ["conversion-temp"]
+                if "conversion-temp" in item["components"]
+            )
+            self.assertEqual(
+                temp_volume["components"],
+                ["conversion-temp", "source-snapshot"],
+            )
+            self.assertEqual(temp_volume["preallocated_bytes_at_check"], 37)
+            self.assertEqual(
+                temp_volume["remaining_required_bytes_at_check"],
+                temp_volume["required_bytes"] - 37,
             )
             self.assertGreater(
-                temp_volume["required_bytes"] - 100,
+                temp_volume["required_bytes"] - 100 - 37,
                 raw_simultaneous_bytes,
             )
             self.assertNotIn(str(root), json.dumps(shared))
@@ -1932,6 +1944,7 @@ class MacOSAlphaCommandTests(unittest.TestCase):
                     info=info,
                     width=4,
                     height=4,
+                    source_snapshot_bytes=37,
                     reserve_bytes=100,
                 )
             self.assertEqual(separate["volume_count"], 4)
@@ -1974,6 +1987,7 @@ class MacOSAlphaCommandTests(unittest.TestCase):
                     info=info,
                     width=8,
                     height=6,
+                    source_snapshot_bytes=37,
                     reserve_bytes=256,
                 )
             required_by_device = {
@@ -1988,7 +2002,11 @@ class MacOSAlphaCommandTests(unittest.TestCase):
             )
 
             def exact_disk_usage(path):
-                return mock.Mock(free=required_by_device[locations[Path(path)]])
+                device = locations[Path(path)]
+                required = required_by_device[device]
+                if device == 10:
+                    required -= 37
+                return mock.Mock(free=required)
 
             with mock.patch.object(
                 converter.os, "stat", side_effect=stat_side_effect
@@ -2002,6 +2020,7 @@ class MacOSAlphaCommandTests(unittest.TestCase):
                     info=info,
                     width=8,
                     height=6,
+                    source_snapshot_bytes=37,
                     reserve_bytes=256,
                 )
             self.assertEqual(accepted["total_required_bytes"], measured["total_required_bytes"])
@@ -2025,7 +2044,55 @@ class MacOSAlphaCommandTests(unittest.TestCase):
                     info=info,
                     width=8,
                     height=6,
+                    source_snapshot_bytes=37,
                     reserve_bytes=256,
+                )
+
+    def test_source_snapshot_capacity_preserves_reserve_at_exact_boundary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temporary_location = Path(temp)
+            snapshot_bytes = 37
+            reserve_bytes = 256
+            exact_required = snapshot_bytes + reserve_bytes
+
+            with mock.patch.object(
+                converter.shutil,
+                "disk_usage",
+                return_value=mock.Mock(free=exact_required),
+            ):
+                accepted = converter._check_source_snapshot_disk_capacity(
+                    temporary_location,
+                    snapshot_bytes=snapshot_bytes,
+                    reserve_bytes=reserve_bytes,
+                )
+
+            self.assertEqual(
+                accepted["model"], "source-snapshot-preallocation-v1"
+            )
+            self.assertEqual(accepted["volume_count"], 1)
+            self.assertEqual(accepted["total_required_bytes"], exact_required)
+            self.assertEqual(
+                accepted["total_remaining_required_bytes_at_check"],
+                exact_required,
+            )
+            self.assertEqual(
+                accepted["volumes"][0]["components"], ["source-snapshot"]
+            )
+            self.assertEqual(
+                accepted["volumes"][0]["preallocated_bytes_at_check"], 0
+            )
+
+            with mock.patch.object(
+                converter.shutil,
+                "disk_usage",
+                return_value=mock.Mock(free=exact_required - 1),
+            ), self.assertRaisesRegex(
+                converter.AlphaConversionError, "insufficient free disk space"
+            ):
+                converter._check_source_snapshot_disk_capacity(
+                    temporary_location,
+                    snapshot_bytes=snapshot_bytes,
+                    reserve_bytes=reserve_bytes,
                 )
 
     def test_publication_disk_recheck_counts_only_remaining_target_allocations(self):
@@ -2190,7 +2257,11 @@ class MacOSAlphaCommandTests(unittest.TestCase):
             ), mock.patch.object(
                 converter.shutil,
                 "disk_usage",
-                side_effect=[mock.Mock(free=10**12), mock.Mock(free=0)],
+                side_effect=[
+                    mock.Mock(free=10**12),
+                    mock.Mock(free=10**12),
+                    mock.Mock(free=0),
+                ],
             ), mock.patch.object(
                 converter, "_publish_transaction", publication
             ):
@@ -2218,28 +2289,29 @@ class MacOSAlphaCommandTests(unittest.TestCase):
                     "1000",
                 ]
             )
-            info = alpha.VideoInfo(
-                width=4,
-                height=4,
-                frame_count=1,
-                fps=Fraction(24, 1),
-                duration_seconds=1 / 24,
-                codec_name="h264",
-                pixel_format="yuv420p",
-            )
             with mock.patch.object(
                 converter, "require_image_dependencies"
             ), mock.patch.object(
                 converter, "require_tool", side_effect=lambda _name, value: value
             ), mock.patch.object(
-                converter, "probe_video", return_value=info
+                converter,
+                "_preflight_tool_capabilities",
+                return_value={"toolchain": {}, "capabilities": {}},
             ), mock.patch.object(
-                converter.shutil, "disk_usage", return_value=mock.Mock(free=999)
-            ), mock.patch.object(converter, "_start_process") as start_process:
+                converter, "probe_video"
+            ) as probe_video, mock.patch.object(
+                converter.os, "write", wraps=os.write
+            ) as snapshot_write, mock.patch.object(
+                converter.shutil, "disk_usage", return_value=mock.Mock(free=1005)
+            ), mock.patch.object(
+                converter, "_start_process"
+            ) as start_process:
                 with self.assertRaisesRegex(
                     converter.AlphaConversionError, "insufficient free disk space"
                 ):
                     converter.convert_video(args)
+            probe_video.assert_not_called()
+            snapshot_write.assert_not_called()
             start_process.assert_not_called()
 
     def test_source_size_budget_fails_before_hash_probe_or_decoder(self):
@@ -3065,6 +3137,105 @@ class MacOSAlphaCommandTests(unittest.TestCase):
                 hashlib.sha256(payload).hexdigest(),
             )
 
+    def test_private_source_snapshot_is_verified_private_and_cleaned(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "private-source.MP4"
+            payload = b"descriptor-bound-source"
+            source.write_bytes(payload)
+
+            with converter._private_source_snapshot(
+                source, max_source_bytes=1024, reserve_bytes=1
+            ) as snapshot:
+                snapshot_path = snapshot.path
+                snapshot_parent = snapshot_path.parent
+                self.assertNotEqual(snapshot_path, source)
+                self.assertEqual(snapshot_path.suffix, ".mp4")
+                self.assertEqual(snapshot_path.read_bytes(), payload)
+                self.assertEqual(snapshot.size, len(payload))
+                self.assertEqual(
+                    snapshot.sha256, hashlib.sha256(payload).hexdigest()
+                )
+                self.assertEqual(
+                    snapshot.capacity_preflight["model"],
+                    "source-snapshot-preallocation-v1",
+                )
+                self.assertEqual(
+                    snapshot.capacity_preflight["total_required_bytes"],
+                    len(payload) + 1,
+                )
+                self.assertEqual(stat.S_IMODE(snapshot_path.stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(snapshot_parent.stat().st_mode), 0o700)
+
+            self.assertFalse(snapshot_path.exists())
+            self.assertFalse(snapshot_parent.exists())
+
+    def test_dry_run_and_probe_error_cleanup_private_source_snapshot(self):
+        info = alpha.VideoInfo(
+            width=4,
+            height=4,
+            frame_count=1,
+            fps=Fraction(24, 1),
+            duration_seconds=1 / 24,
+            codec_name="h264",
+            pixel_format="yuv420p",
+        )
+        for probe_fails in (False, True):
+            with self.subTest(
+                probe_fails=probe_fails
+            ), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                source = root / "source.mp4"
+                source.write_bytes(b"source-payload")
+                args = converter.build_parser().parse_args(
+                    [
+                        str(source),
+                        str(root / "output.mov"),
+                        "--report",
+                        str(root / "report.json"),
+                        "--dry-run",
+                    ]
+                )
+                observed_paths: list[Path] = []
+
+                def fake_probe(path, **_kwargs):
+                    snapshot_path = Path(path)
+                    observed_paths.append(snapshot_path)
+                    self.assertNotEqual(snapshot_path, source)
+                    self.assertEqual(snapshot_path.read_bytes(), b"source-payload")
+                    if probe_fails:
+                        raise alpha.ProbeError("unsupported source")
+                    return info
+
+                patches = (
+                    mock.patch.object(converter, "require_image_dependencies"),
+                    mock.patch.object(converter, "require_tool", return_value="tool"),
+                    mock.patch.object(
+                        converter,
+                        "_preflight_tool_capabilities",
+                        return_value={"toolchain": {}, "capabilities": {}},
+                    ),
+                    mock.patch.object(
+                        converter,
+                        "_preflight_resources",
+                        return_value={"passed": True},
+                    ),
+                    mock.patch.object(
+                        converter, "probe_video", side_effect=fake_probe
+                    ),
+                )
+                with ExitStack() as stack:
+                    for patch in patches:
+                        stack.enter_context(patch)
+                    if probe_fails:
+                        with self.assertRaises(alpha.ProbeError):
+                            converter.convert_video(args)
+                    else:
+                        converter.convert_video(args)
+
+                self.assertEqual(len(observed_paths), 1)
+                self.assertFalse(observed_paths[0].exists())
+                self.assertFalse(observed_paths[0].parent.exists())
+
     def test_source_digest_rejects_growth_during_capped_fd_hash(self):
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "source.mp4"
@@ -3136,6 +3307,123 @@ class MacOSAlphaCommandTests(unittest.TestCase):
             elapsed = time.monotonic() - started
 
             self.assertLess(elapsed, 1.0)
+
+    def test_all_source_consumers_use_one_snapshot_across_swap_and_restore(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.mp4"
+            held_source = root / "held-source.mp4"
+            source_payload = b"trusted-source"
+            source.write_bytes(source_payload)
+            args = converter.build_parser().parse_args(
+                [
+                    str(source),
+                    str(root / "output.mov"),
+                    "--report",
+                    str(root / "report.json"),
+                ]
+            )
+            source_info = alpha.VideoInfo(
+                width=4,
+                height=4,
+                frame_count=1,
+                fps=Fraction(24, 1),
+                duration_seconds=1 / 24,
+                codec_name="h264",
+                pixel_format="yuv444p",
+            )
+            intermediate_info = alpha.VideoInfo(
+                width=4,
+                height=4,
+                frame_count=1,
+                fps=Fraction(24, 1),
+                duration_seconds=1 / 24,
+                codec_name="prores",
+                pixel_format="yuva444p10le",
+                codec_profile="4444",
+            )
+            source_consumer_paths: list[Path] = []
+
+            def assert_bound_source(path) -> Path:
+                bound_path = Path(path)
+                source_consumer_paths.append(bound_path)
+                self.assertNotEqual(bound_path, source)
+                self.assertEqual(bound_path.read_bytes(), source_payload)
+                return bound_path
+
+            def fake_probe(path, **_kwargs):
+                candidate = Path(path)
+                if candidate.name.startswith("intermediate"):
+                    return intermediate_info
+                assert_bound_source(candidate)
+                source.rename(held_source)
+                source.write_bytes(b"attacker-controlled-replacement")
+                return source_info
+
+            def fake_cadence(path, _info, *, label, **_kwargs):
+                if label == "source":
+                    assert_bound_source(path)
+                return {"quality_passed": True}
+
+            def fake_background(path, **_kwargs):
+                assert_bound_source(path)
+                source.unlink()
+                held_source.rename(source)
+                return {"quality_passed": True}
+
+            def fake_stream(path, stage, reference_alpha, **_kwargs):
+                assert_bound_source(path)
+                stage.write_bytes(b"intermediate")
+                reference_alpha.write_bytes(b"\0" * 16)
+                return {"frames_checked": 1, "quality_passed": True}
+
+            def fake_avconvert(_source, stage, **_kwargs):
+                stage.write_bytes(b"delivery")
+
+            publication = mock.Mock()
+            with mock.patch.object(
+                converter, "require_image_dependencies"
+            ), mock.patch.object(
+                converter, "require_tool", return_value="tool"
+            ), mock.patch.object(
+                converter,
+                "_preflight_tool_capabilities",
+                return_value={"toolchain": {}, "capabilities": {}},
+            ), mock.patch.object(
+                converter, "probe_video", side_effect=fake_probe
+            ), mock.patch.object(
+                converter, "verify_video_cadence", side_effect=fake_cadence
+            ), mock.patch.object(
+                converter, "_verify_source_background", side_effect=fake_background
+            ), mock.patch.object(
+                converter, "_stream_matte_to_prores", side_effect=fake_stream
+            ), mock.patch.object(
+                converter, "_run_avconvert", side_effect=fake_avconvert
+            ), mock.patch.object(
+                converter,
+                "_verify_alpha_roundtrip",
+                return_value={
+                    "performed": True,
+                    "unsafe": False,
+                    "frames_verified": 1,
+                },
+            ), mock.patch.object(
+                converter, "_publish_transaction", publication
+            ):
+                report = converter.convert_video(args)
+
+            self.assertGreaterEqual(len(source_consumer_paths), 4)
+            self.assertEqual(len(set(source_consumer_paths)), 1)
+            bound_path = source_consumer_paths[0]
+            self.assertFalse(bound_path.exists())
+            self.assertFalse(bound_path.parent.exists())
+            self.assertEqual(source.read_bytes(), source_payload)
+            self.assertEqual(report["source"]["name"], source.name)
+            self.assertEqual(
+                report["artifacts"]["source_sha256"],
+                hashlib.sha256(source_payload).hexdigest(),
+            )
+            publication.assert_called_once()
 
     def test_convert_video_source_mutation_skips_publication_and_preserves_targets(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -3863,12 +4151,12 @@ class MacOSAlphaCommandTests(unittest.TestCase):
         stream.write.assert_not_called()
 
     def test_missing_dependency_error_is_actionable(self):
-        with mock.patch.object(alpha, "np", None), mock.patch.object(alpha, "Image", None):
+        with mock.patch.object(alpha, "np", None):
             with self.assertRaisesRegex(alpha.MissingDependencyError, "NumPy"):
                 alpha.require_image_dependencies()
 
 
-@unittest.skipIf(alpha.np is None or alpha.Image is None, "NumPy and Pillow are required")
+@unittest.skipIf(alpha.np is None, "NumPy is required")
 class MacOSAlphaSyntheticMatteTests(unittest.TestCase):
     def _synthetic_frame(self, *, green_offset: float = 0.0):
         np = alpha.np
@@ -4194,11 +4482,10 @@ class MacOSAlphaTransitionCompositeTests(unittest.TestCase):
 
 @unittest.skipUnless(
     alpha.np is not None
-    and alpha.Image is not None
     and shutil.which("ffmpeg")
     and shutil.which("ffprobe")
     and shutil.which("avconvert"),
-    "NumPy/Pillow, ffmpeg, ffprobe, and macOS avconvert are required",
+    "NumPy, ffmpeg, ffprobe, and macOS avconvert are required",
 )
 class MacOSAlphaIntegrationTests(unittest.TestCase):
     """Exercise the real ffmpeg -> avconvert -> avconvert -> ffmpeg path."""

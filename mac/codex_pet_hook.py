@@ -109,6 +109,9 @@ REVIEW_PATTERN = re.compile(
 HASH_PATTERN = re.compile(r"^[0-9a-f]{24}$")
 OPAQUE_TARGET_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,511}$")
 MAX_RECORD_BYTES = 1_048_576
+MAX_HOOK_INPUT_BYTES = 1_048_576
+MAX_TOOL_FINGERPRINT_BYTES = 262_144
+MAX_REVIEW_COMMAND_BYTES = 16_384
 ACTIVATION_TARGET_WRITE_WARNING = (
     "Statelet hook warning: activation target sidecar write failed"
 )
@@ -154,7 +157,21 @@ def normalize_payload(
 ) -> Dict[str, Any]:
     """Normalize supported provider envelopes without retaining their raw data."""
     selected = provider if provider in VALID_PROVIDERS else agent_provider()
-    normalized = dict(payload)
+    retained_keys = (
+        "hook_event_name",
+        "session_id",
+        "thread_id",
+        "threadId",
+        "conversation_id",
+        "sessionId",
+        "turn_id",
+        "tool_name",
+        "tool_input",
+        "tool_use_id",
+        "subagentType",
+        "subagent_type",
+    )
+    normalized = {key: payload[key] for key in retained_keys if key in payload}
     normalized["_statelet_provider"] = selected
     if selected != "grok":
         return normalized
@@ -230,12 +247,34 @@ def event_state(payload: Dict[str, Any]) -> str:
                 return "waiting"
             if tool_name == "exit_plan_mode":
                 return "review"
-        tool_input = payload.get("tool_input")
-        searchable = tool_name + " " + json.dumps(tool_input, ensure_ascii=False).lower()
+        searchable = tool_name + " " + _review_command_text(
+            payload.get("tool_input")
+        ).lower()
         if REVIEW_PATTERN.search(searchable):
             return "review"
         return "running"
     return "idle"
+
+
+def _review_command_text(tool_input: Any) -> str:
+    """Project only executable command fields for activity classification."""
+    if not isinstance(tool_input, dict):
+        return ""
+    fragments = []
+    for key in ("command", "cmd", "script"):
+        value = tool_input.get(key)
+        if isinstance(value, str):
+            fragments.append(value)
+    arguments = tool_input.get("args")
+    if fragments and isinstance(arguments, list):
+        fragments.extend(
+            str(value)
+            for value in arguments[:128]
+            if isinstance(value, (str, int, float)) and not isinstance(value, bool)
+        )
+    return " ".join(fragments).encode(
+        "utf-8", errors="replace"
+    )[:MAX_REVIEW_COMMAND_BYTES].decode("utf-8", errors="ignore")
 
 
 def session_key(payload: Dict[str, Any]) -> str:
@@ -586,10 +625,20 @@ def _tool_fingerprint(payload: Dict[str, Any]) -> str:
         "tool_name": str(payload.get("tool_name") or ""),
         "tool_input": payload.get("tool_input"),
     }
-    encoded = json.dumps(
-        value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
-    ).encode("utf-8", errors="replace")
-    return hashlib.sha256(encoded).hexdigest()[:24]
+    encoder = json.JSONEncoder(
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    digest = hashlib.sha256()
+    encoded_bytes = 0
+    for fragment in encoder.iterencode(value):
+        encoded = fragment.encode("utf-8", errors="replace")
+        encoded_bytes += len(encoded)
+        if encoded_bytes > MAX_TOOL_FINGERPRINT_BYTES:
+            raise ValueError("hook tool input exceeds the fingerprint size limit")
+        digest.update(encoded)
+    return digest.hexdigest()[:24]
 
 
 def _causally_accept(
@@ -902,13 +951,16 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
 
 def main() -> int:
     try:
-        payload = json.load(sys.stdin)
+        raw = sys.stdin.buffer.read(MAX_HOOK_INPUT_BYTES + 1)
+        if len(raw) > MAX_HOOK_INPUT_BYTES:
+            raise ValueError("hook payload exceeds the input size limit")
+        payload = json.loads(raw.decode("utf-8"))
         if not isinstance(payload, dict):
             raise ValueError("hook payload must be a JSON object")
         write_event(payload, default_state_dir())
-    except Exception as exc:
+    except Exception:
         # Lifecycle display failures must never block or alter a Codex turn.
-        print("Statelet hook warning: {}".format(exc), file=sys.stderr)
+        print("Statelet hook warning: lifecycle event was not recorded", file=sys.stderr)
     # Stop and UserPromptSubmit require valid JSON output when stdout is used.
     print("{}")
     return 0

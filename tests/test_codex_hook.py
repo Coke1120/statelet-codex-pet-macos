@@ -6,6 +6,8 @@ import io
 import json
 import os
 import stat
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -54,6 +56,138 @@ class HookHardeningTests(unittest.TestCase):
         self.assertEqual(hook.event_state(payload), "running")
         payload["tool_input"] = {"command": "git diff --check"}
         self.assertEqual(hook.event_state(payload), "review")
+
+    def test_non_command_tool_content_does_not_trigger_review_state(self) -> None:
+        for tool_name, tool_input in (
+            (
+                "apply_patch",
+                {"patch": "*** Add File: tests/example.py\n+# review later\n"},
+            ),
+            (
+                "write",
+                {"file_path": "tests/example.py", "content": "run pytest later"},
+            ),
+            (
+                "apply_patch",
+                {"args": ["pytest", "tests/test_example.py"]},
+            ),
+        ):
+            with self.subTest(tool_name=tool_name):
+                self.assertEqual(
+                    hook.event_state(
+                        {
+                            "hook_event_name": "PreToolUse",
+                            "tool_name": tool_name,
+                            "tool_input": tool_input,
+                        }
+                    ),
+                    "running",
+                )
+        self.assertEqual(
+            hook.event_state(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "python -m pytest -q"},
+                }
+            ),
+            "review",
+        )
+        self.assertEqual(
+            hook.event_state(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "python", "args": ["-m", "pytest"]},
+                }
+            ),
+            "review",
+        )
+
+    def test_small_tool_fingerprint_preserves_canonical_semantics(self) -> None:
+        payload = {
+            "tool_name": "Bash",
+            "tool_input": {"second": [2, 1], "first": "value"},
+        }
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        self.assertEqual(
+            hook._tool_fingerprint(payload),
+            hook.hashlib.sha256(canonical).hexdigest()[:24],
+        )
+
+    def test_oversized_tool_fingerprint_cannot_mutate_existing_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "sessions"
+            output = hook.write_event(
+                {"session_id": "session", "hook_event_name": "SessionStart"},
+                state_dir,
+            )
+            before = output.read_bytes()
+            with self.assertRaisesRegex(ValueError, "fingerprint size limit"):
+                hook.write_event(
+                    {
+                        "session_id": "session",
+                        "turn_id": "turn",
+                        "hook_event_name": "PermissionRequest",
+                        "tool_name": "Bash",
+                        "tool_input": {
+                            "command": "x" * hook.MAX_TOOL_FINGERPRINT_BYTES
+                        },
+                    },
+                    state_dir,
+                )
+            self.assertEqual(output.read_bytes(), before)
+
+    def test_entrypoint_caps_stdin_before_json_decode(self) -> None:
+        prefix = b'{"session_id":"boundary","hook_event_name":"SessionStart","padding":"'
+        suffix = b'"}'
+        exact = prefix + b"x" * (hook.MAX_HOOK_INPUT_BYTES - len(prefix) - len(suffix)) + suffix
+        self.assertEqual(len(exact), hook.MAX_HOOK_INPUT_BYTES)
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = dict(os.environ)
+            environment["STATELET_STATE_DIR"] = temporary
+            accepted = subprocess.run(
+                [sys.executable, str(ROOT / "mac" / "codex_pet_hook.py")],
+                input=exact,
+                capture_output=True,
+                env=environment,
+                check=False,
+            )
+            self.assertEqual(accepted.returncode, 0)
+            self.assertEqual(json.loads(accepted.stdout), {})
+            activity_records = [
+                path
+                for path in Path(temporary).glob("*.json")
+                if not path.name.endswith(".target.json")
+            ]
+            self.assertEqual(len(activity_records), 1)
+
+        private_marker = b"PRIVATE_OVERSIZED_HOOK_TEXT"
+        oversized = exact + private_marker
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = dict(os.environ)
+            environment["STATELET_STATE_DIR"] = temporary
+            rejected = subprocess.run(
+                [sys.executable, str(ROOT / "mac" / "codex_pet_hook.py")],
+                input=oversized,
+                capture_output=True,
+                env=environment,
+                check=False,
+            )
+            self.assertEqual(rejected.returncode, 0)
+            self.assertEqual(json.loads(rejected.stdout), {})
+            self.assertEqual(
+                rejected.stderr.decode(),
+                "Statelet hook warning: lifecycle event was not recorded\n",
+            )
+            self.assertNotIn(private_marker, rejected.stderr)
+            self.assertLess(len(rejected.stderr), 256)
+            self.assertEqual(list(Path(temporary).glob("*.json")), [])
 
     def test_unknown_event_name_is_not_persisted(self) -> None:
         private_event = "PrivateEvent-secret-value"

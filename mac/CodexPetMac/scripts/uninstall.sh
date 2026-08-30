@@ -135,7 +135,6 @@ moved_paths=()
 committed=0
 codex_hook_updated=0
 grok_hook_updated=0
-targets_mutated=0
 launch_state_mutated=0
 labels=("$aggregator_label" "$player_label")
 plists=("$aggregator_plist" "$player_plist")
@@ -178,7 +177,7 @@ if [[ "$skip_launchctl" -eq 0 ]]; then
   for ((index=0; index<2; index++)); do
     label="${labels[$index]}"
     if job_is_loaded "$label"; then
-      was_loaded[$index]=1
+      was_loaded[index]=1
       launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || { printf 'Could not stop managed LaunchAgent; uninstall was not applied.\n' >&2; exit 72; }
       wait_for_job_state "$label" 0 || { printf 'Managed LaunchAgent remained loaded; uninstall was not applied.\n' >&2; exit 72; }
       launch_state_mutated=1
@@ -187,7 +186,6 @@ if [[ "$skip_launchctl" -eq 0 ]]; then
 fi
 
 move_managed() { local target="$1" name="$2"; if [[ -e "$target" ]]; then local moved="$trash/$name"; mkdir -p "$(dirname "$moved")"; mv "$target" "$moved"; moved_targets+=("$target"); moved_paths+=("$moved"); fi; }
-targets_mutated=1
 [[ "$app_is_managed" -eq 0 ]] || move_managed "$app" app
 move_managed "$component" component
 move_managed "$aggregator_plist" agents/aggregator

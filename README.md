@@ -128,8 +128,7 @@ Optional MP4 transparency conversion also requires:
 
 - `ffmpeg` and `ffprobe`;
 - Apple `/usr/bin/avconvert`; and
-- Python 3.9 with the hash-locked NumPy and Pillow versions in
-  `mac/requirements-alpha.txt`.
+- Python 3.9 with the hash-locked NumPy version in `mac/requirements-alpha.txt`.
 
 ## Build and install
 
@@ -291,8 +290,10 @@ model, reference, language, settings, and runtime inputs and are revalidated at
 launch.
 
 GPT-SoVITS accepts separate user-selected GPT `.ckpt` and SoVITS `.pth` weights,
-reference inputs, and a numeric-loopback API v2 endpoint such as
-`http://127.0.0.1:9880`. Qwen3-TTS accepts a trusted self-contained handover and
+reference inputs, and a pinned-TLS numeric-loopback API v2 endpoint such as
+`https://127.0.0.1:9880`. The profile pins the SHA-256 of the gateway's leaf DER
+certificate on every activation and synthesis request; plain HTTP has no
+fallback. Qwen3-TTS accepts a trusted self-contained handover and
 the Python executable from a trusted local MLX Audio environment. Qwen runs
 locally with offline model-loading flags, accepts Japanese lines of 500
 characters or fewer, and publishes only validated 24 kHz mono PCM16 WAV output.
@@ -313,7 +314,8 @@ providers revalidates the selected profile and refreshes incompatible output;
 the old WAV is retained until its replacement succeeds.
 
 Statelet does not train providers or install their external runtimes. Start
-GPT-SoVITS API v2 locally, provide an already working local Qwen Python and MLX
+GPT-SoVITS API v2 behind its pinned-TLS loopback gateway, provide an already
+working local Qwen Python and MLX
 Audio environment, or prepare the complete VoxCPM2 handover and its Python
 environment. Import only model files you trust, and use voices and reference
 recordings you are authorized to use. See
@@ -324,8 +326,9 @@ recordings you are authorized to use. See
 Statelet is designed for local operation:
 
 - The application and lifecycle publisher contain no telemetry or automatic
-  crash upload. Optional voice generation permits HTTP only to loopback; it
-  rejects remote hosts and redirects.
+  crash upload. Optional GPT voice generation permits only pinned HTTPS on
+  numeric loopback; it rejects remote hosts, redirects, missing pins, and
+  certificate mismatches.
 - Package managers may use the network when you install optional build or media
   conversion dependencies.
 - Lifecycle files exclude prompts, tool output, transcript paths, working

@@ -245,6 +245,40 @@ final class CharacterLibraryStorage {
         )
     }
 
+    /// Removes private import staging trees left by a prior process exit. The
+    /// exact UUID-shaped namespace is reserved by `stageImport`; unrelated or
+    /// symlinked entries are never traversed.
+    func recoverInterruptedImports() throws {
+        var rootStatus = stat()
+        if Darwin.lstat(rootURL.path, &rootStatus) != 0 {
+            guard errno == ENOENT else { throw CharacterLibraryStorageError.invalidFile }
+            return
+        }
+        guard rootStatus.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
+              rootStatus.st_uid == Darwin.geteuid() else {
+            throw CharacterLibraryStorageError.unsafePath
+        }
+        let prefix = ".character-import-"
+        var removedAny = false
+        for url in try FileManager.default.contentsOfDirectory(
+            at: rootURL,
+            includingPropertiesForKeys: nil,
+            options: [.skipsSubdirectoryDescendants]
+        ) {
+            let name = url.lastPathComponent
+            guard name.hasPrefix(prefix) else { continue }
+            let token = String(name.dropFirst(prefix.count))
+            guard token == token.lowercased(), UUID(uuidString: token) != nil else { continue }
+            var status = stat()
+            guard Darwin.lstat(url.path, &status) == 0,
+                  status.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
+                  status.st_uid == Darwin.geteuid() else { continue }
+            try FileManager.default.removeItem(at: url)
+            removedAny = true
+        }
+        if removedAny { try CharacterStorageFiles.syncDirectory(rootURL) }
+    }
+
     func loadGlobalTransitionLibrary() throws -> GlobalTransitionLibrarySnapshot {
         try requireSameRootBasename(globalTransitionLibraryURL)
         guard CharacterStorageFiles.pathExistsNoFollow(globalTransitionLibraryURL) else {
@@ -458,7 +492,12 @@ final class CharacterLibraryStorage {
         }
     }
 
-    func exportCharacter(_ entry: CharacterLibraryEntry, to packageURL: URL) throws {
+    func exportCharacter(
+        _ entry: CharacterLibraryEntry,
+        to packageURL: URL,
+        operationCheck: @escaping CharacterOperationCheck = { try Task.checkCancellation() }
+    ) throws {
+        try operationCheck()
         try requireLocal(packageURL)
         guard packageURL.pathExtension == "statelet-character" else {
             throw CharacterLibraryStorageError.unsafePath
@@ -476,6 +515,7 @@ final class CharacterLibraryStorage {
         var nextIndex = 0
 
         func register(_ original: String, role: CharacterBundleAssetRole) throws -> String {
+            try operationCheck()
             if let existing = bundlePathByOriginal[original] { return existing }
             let source = CharacterLibraryStorage.resolvedMediaURL(original, relativeTo: sourceMapDirectory)
             let sourceKey = "\(role.rawValue):\(source.standardizedFileURL.path)"
@@ -494,24 +534,28 @@ final class CharacterLibraryStorage {
         }
 
         for playlist in loaded.map.states.values {
+            try operationCheck()
             for media in playlist.entries {
                 _ = try register(media.path, role: .movie)
                 if let poster = media.posterPath { _ = try register(poster, role: .poster) }
             }
         }
         for playlist in loaded.map.transitions.values {
+            try operationCheck()
             for transition in playlist.entries {
                 _ = try register(transition.path, role: .movie)
                 if let poster = transition.posterPath { _ = try register(poster, role: .poster) }
             }
         }
         for transition in loaded.map.inStateTransitions.values {
+            try operationCheck()
             _ = try register(transition.path, role: .movie)
             if let poster = transition.posterPath { _ = try register(poster, role: .poster) }
         }
 
         var reports: [(source: URL, path: String, moviePath: String)] = []
         for item in sourceByBundlePath where item.role == .movie {
+            try operationCheck()
             let reportURL = item.source.deletingPathExtension().appendingPathExtension("report.json")
             var status = stat()
             if Darwin.lstat(reportURL.path, &status) == 0 {
@@ -540,18 +584,22 @@ final class CharacterLibraryStorage {
 
         var expectedAggregate: UInt64 = 0
         for item in sourceByBundlePath {
+            try operationCheck()
             let size = try CharacterStorageFiles.regularFileSize(
                 item.source,
                 maximumBytes: Self.maximumBytes(for: item.role),
-                rejectHardLinks: false
+                rejectHardLinks: false,
+                operationCheck: operationCheck
             )
             expectedAggregate = try Self.addToAggregate(size, expectedAggregate)
         }
         for report in reports {
+            try operationCheck()
             let size = try CharacterStorageFiles.regularFileSize(
                 report.source,
                 maximumBytes: CharacterBundleManifest.maximumReportSize,
-                rejectHardLinks: false
+                rejectHardLinks: false,
+                operationCheck: operationCheck
             )
             expectedAggregate = try Self.addToAggregate(size, expectedAggregate)
         }
@@ -567,23 +615,27 @@ final class CharacterLibraryStorage {
         var assets: [CharacterBundleAsset] = []
         var aggregate: UInt64 = 0
         for item in sourceByBundlePath {
+            try operationCheck()
             let destination = staging.appendingPathComponent(item.path)
             let copied = try CharacterStorageFiles.copyRegularFile(
                 from: item.source,
                 to: destination,
                 maximumBytes: Self.maximumBytes(for: item.role),
-                rejectHardLinks: false
+                rejectHardLinks: false,
+                operationCheck: operationCheck
             )
             aggregate = try Self.addToAggregate(copied.size, aggregate)
             assets.append(CharacterBundleAsset(role: item.role, path: item.path, size: copied.size, sha256: copied.sha256))
         }
         for report in reports {
+            try operationCheck()
             let destination = staging.appendingPathComponent(report.path)
             let copied = try CharacterStorageFiles.copyRegularFile(
                 from: report.source,
                 to: destination,
                 maximumBytes: CharacterBundleManifest.maximumReportSize,
-                rejectHardLinks: false
+                rejectHardLinks: false,
+                operationCheck: operationCheck
             )
             aggregate = try Self.addToAggregate(copied.size, aggregate)
             assets.append(CharacterBundleAsset(
@@ -599,6 +651,7 @@ final class CharacterLibraryStorage {
         let assetsByPath = Dictionary(uniqueKeysWithValues: assets.map { ($0.path, $0) })
         let reportsByMovie = Dictionary(grouping: assets.filter { $0.role == .report }) { $0.moviePath! }
         for movie in assets where movie.role == .movie {
+            try operationCheck()
             let report: CharacterBundleAsset?
             if let reportsForMovie = reportsByMovie[movie.path] {
                 guard reportsForMovie.count == 1, let onlyReport = reportsForMovie.first else {
@@ -628,7 +681,8 @@ final class CharacterLibraryStorage {
             let movieAfter = try CharacterStorageFiles.hashRegularFile(
                 movieURL,
                 maximumBytes: CharacterBundleManifest.maximumMovieSize,
-                rejectHardLinks: false
+                rejectHardLinks: false,
+                operationCheck: operationCheck
             )
             guard movieAfter.size == movie.size, movieAfter.sha256 == movie.sha256 else {
                 throw CharacterLibraryStorageError.sourceChanged
@@ -637,7 +691,8 @@ final class CharacterLibraryStorage {
                 let reportAfter = try CharacterStorageFiles.hashRegularFile(
                     reportURL,
                     maximumBytes: CharacterBundleManifest.maximumReportSize,
-                    rejectHardLinks: false
+                    rejectHardLinks: false,
+                    operationCheck: operationCheck
                 )
                 guard reportAfter.size == report.size,
                       reportAfter.sha256 == report.sha256,
@@ -661,7 +716,9 @@ final class CharacterLibraryStorage {
             to: staging.appendingPathComponent("manifest.json"),
             expectedData: nil
         )
+        try operationCheck()
         try CharacterStorageFiles.syncDirectoryTree(staging)
+        try operationCheck()
         try FileManager.default.moveItem(at: staging, to: packageURL)
         try CharacterStorageFiles.syncDirectory(parent)
         succeeded = true
@@ -670,8 +727,10 @@ final class CharacterLibraryStorage {
     func stageImport(
         from packageURL: URL,
         against library: CharacterLibrary,
-        allowLegacyTrust: Bool
+        allowLegacyTrust: Bool,
+        operationCheck: @escaping CharacterOperationCheck = { try Task.checkCancellation() }
     ) throws -> StagedCharacterImport {
+        try operationCheck()
         try requireLocal(packageURL)
         guard library.characters.count < CharacterLibrary.maximumCharacterCount else {
             throw CharacterLibraryStorageError.characterLimitReached
@@ -715,6 +774,7 @@ final class CharacterLibraryStorage {
         var installedByBundlePath: [String: URL] = [:]
         var installedCollisionKeys = Set<String>()
         for asset in manifest.assets where asset.role != .report {
+            try operationCheck()
             let destination = stagedAssets.appendingPathComponent(asset.path)
             let collisionKey = destination.path.precomposedStringWithCanonicalMapping.lowercased()
             guard installedCollisionKeys.insert(collisionKey).inserted else {
@@ -723,6 +783,7 @@ final class CharacterLibraryStorage {
             installedByBundlePath[asset.path] = destination
         }
         for report in manifest.assets where report.role == .report {
+            try operationCheck()
             guard let moviePath = report.moviePath,
                   let movieURL = installedByBundlePath[moviePath] else {
                 throw CharacterLibraryStorageError.unsafePath
@@ -736,6 +797,7 @@ final class CharacterLibraryStorage {
         }
         var aggregate: UInt64 = 0
         for asset in manifest.assets {
+            try operationCheck()
             guard let destination = installedByBundlePath[asset.path] else {
                 throw CharacterLibraryStorageError.unsafePath
             }
@@ -744,7 +806,8 @@ final class CharacterLibraryStorage {
                 rootDescriptor: packageDescriptor,
                 to: destination,
                 maximumBytes: Self.maximumBytes(for: asset.role),
-                rejectHardLinks: true
+                rejectHardLinks: true,
+                operationCheck: operationCheck
             )
             guard copied.size == asset.size, copied.sha256 == asset.sha256 else {
                 throw CharacterLibraryStorageError.sourceChanged
@@ -763,6 +826,7 @@ final class CharacterLibraryStorage {
             (manifest.mediaMap.allTransitionEntries + manifest.mediaMap.allInStateTransitionEntries).map(\.path)
         )
         for movie in manifest.assets where movie.role == .movie {
+            try operationCheck()
             guard let movieURL = installedByBundlePath[movie.path] else {
                 throw CharacterLibraryStorageError.invalidFile
             }
@@ -791,7 +855,8 @@ final class CharacterLibraryStorage {
             let after = try CharacterStorageFiles.hashRegularFile(
                 movieURL,
                 maximumBytes: CharacterBundleManifest.maximumMovieSize,
-                rejectHardLinks: true
+                rejectHardLinks: true,
+                operationCheck: operationCheck
             )
             guard after.size == movie.size, after.sha256 == movie.sha256 else {
                 throw CharacterLibraryStorageError.sourceChanged
@@ -800,7 +865,8 @@ final class CharacterLibraryStorage {
                 let reportAfter = try CharacterStorageFiles.hashRegularFile(
                     reportURL,
                     maximumBytes: CharacterBundleManifest.maximumReportSize,
-                    rejectHardLinks: true
+                    rejectHardLinks: true,
+                    operationCheck: operationCheck
                 )
                 guard reportAfter.size == report.size, reportAfter.sha256 == report.sha256 else {
                     throw CharacterLibraryStorageError.sourceChanged
@@ -818,6 +884,7 @@ final class CharacterLibraryStorage {
             throw CharacterLibraryStorageError.fileTooLarge
         }
         try CharacterStorageFiles.atomicWrite(mapData, to: stagedMap, expectedData: nil)
+        try operationCheck()
         try CharacterStorageFiles.syncDirectoryTree(staging)
 
         succeeded = true
@@ -1109,7 +1176,13 @@ private enum CharacterStorageFiles {
         )
     }
 
-    static func regularFileSize(_ url: URL, maximumBytes: UInt64, rejectHardLinks: Bool) throws -> UInt64 {
+    static func regularFileSize(
+        _ url: URL,
+        maximumBytes: UInt64,
+        rejectHardLinks: Bool,
+        operationCheck: CharacterOperationCheck = {}
+    ) throws -> UInt64 {
+        try operationCheck()
         let descriptor = Darwin.open(url.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         guard descriptor >= 0 else { throw CharacterLibraryStorageError.invalidFile }
         defer { Darwin.close(descriptor) }
@@ -1126,12 +1199,20 @@ private enum CharacterStorageFiles {
         from source: URL,
         to destination: URL,
         maximumBytes: UInt64,
-        rejectHardLinks: Bool
+        rejectHardLinks: Bool,
+        operationCheck: @escaping CharacterOperationCheck = {}
     ) throws -> Digest {
+        try operationCheck()
         let sourceDescriptor = Darwin.open(source.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         guard sourceDescriptor >= 0 else { throw CharacterLibraryStorageError.invalidFile }
         defer { Darwin.close(sourceDescriptor) }
-        return try copyDescriptor(sourceDescriptor, to: destination, maximumBytes: maximumBytes, rejectHardLinks: rejectHardLinks)
+        return try copyDescriptor(
+            sourceDescriptor,
+            to: destination,
+            maximumBytes: maximumBytes,
+            rejectHardLinks: rejectHardLinks,
+            operationCheck: operationCheck
+        )
     }
 
     static func copyRegularFile(
@@ -1139,19 +1220,29 @@ private enum CharacterStorageFiles {
         rootDescriptor: Int32,
         to destination: URL,
         maximumBytes: UInt64,
-        rejectHardLinks: Bool
+        rejectHardLinks: Bool,
+        operationCheck: @escaping CharacterOperationCheck = {}
     ) throws -> Digest {
+        try operationCheck()
         let sourceDescriptor = try openRegularFile(relativePath: relativePath, rootDescriptor: rootDescriptor)
         defer { Darwin.close(sourceDescriptor) }
-        return try copyDescriptor(sourceDescriptor, to: destination, maximumBytes: maximumBytes, rejectHardLinks: rejectHardLinks)
+        return try copyDescriptor(
+            sourceDescriptor,
+            to: destination,
+            maximumBytes: maximumBytes,
+            rejectHardLinks: rejectHardLinks,
+            operationCheck: operationCheck
+        )
     }
 
     private static func copyDescriptor(
         _ source: Int32,
         to destination: URL,
         maximumBytes: UInt64,
-        rejectHardLinks: Bool
+        rejectHardLinks: Bool,
+        operationCheck: CharacterOperationCheck
     ) throws -> Digest {
+        try operationCheck()
         let before = try validatedStatus(source, maximumBytes: maximumBytes, rejectHardLinks: rejectHardLinks, allowEmpty: false)
         try createPrivateAncestors(destination.deletingLastPathComponent())
         let destinationDescriptor = Darwin.open(
@@ -1172,6 +1263,7 @@ private enum CharacterStorageFiles {
         var copied: UInt64 = 0
         var buffer = [UInt8](repeating: 0, count: 1_048_576)
         while copied < UInt64(before.st_size) {
+            try operationCheck()
             let wanted = min(buffer.count, Int(UInt64(before.st_size) - copied))
             let count = Darwin.read(source, &buffer, wanted)
             if count < 0, errno == EINTR { continue }
@@ -1188,6 +1280,7 @@ private enum CharacterStorageFiles {
             }
             copied += UInt64(count)
         }
+        try operationCheck()
         var after = stat()
         guard Darwin.fstat(source, &after) == 0, sameIdentity(before, after),
               Darwin.fsync(destinationDescriptor) == 0 else {

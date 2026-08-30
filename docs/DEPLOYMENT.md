@@ -1,7 +1,7 @@
 # Deploy Statelet on macOS
 
 This guide covers building, installing, upgrading, starting automatically, and
-uninstalling Statelet 1.8.17 (build 31) on macOS 13 or newer.
+uninstalling Statelet 1.8.19 (build 33) on macOS 13 or newer.
 
 Releases through 1.8.4 were source-only. The 1.8.5 tagged release adds an
 ad-hoc-signed personal-update ZIP, manifest, and signature. The maintained
@@ -198,12 +198,12 @@ command -v ffmpeg
 command -v ffprobe
 test -x /usr/bin/avconvert
 "$STATELET_ALPHA_RUNTIME/bin/python3" \
-  -c 'import numpy, PIL; print(numpy.__version__, PIL.__version__)'
+  -c 'import numpy; print(numpy.__version__)'
 ```
 
 The app discovers that `alpha-runtime` automatically. You can instead use
 **Settings → Animations → Setup Guide → Choose Python…** to select another
-Python executable that can import NumPy and Pillow.
+Python executable that can import NumPy.
 
 Developers may configure these environment variables before launching the app:
 

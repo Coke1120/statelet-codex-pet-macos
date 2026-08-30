@@ -5,6 +5,14 @@ import XCTest
 @testable import Statelet
 
 final class StorageLifecycleHardeningTests: XCTestCase {
+    private final class LockedFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage = false
+
+        func set() { lock.withLock { storage = true } }
+        var value: Bool { lock.withLock { storage } }
+    }
+
     private final class LockedState: @unchecked Sendable {
         private let lock = NSLock()
         private var calls = 0
@@ -24,6 +32,124 @@ final class StorageLifecycleHardeningTests: XCTestCase {
         var snapshot: [LifecycleStateReadResult] {
             lock.withLock { results }
         }
+    }
+
+    @MainActor
+    func testOwnedOperationTrackerWaitsForMainActorFinalizer() {
+        let tracker = OwnedOperationTracker()
+        let finalizations = MainThreadFinalizationQueue()
+        XCTAssertTrue(tracker.isQuiescent)
+        let activity = tracker.begin()
+        XCTAssertFalse(tracker.isQuiescent)
+        let started = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let finalized = LockedFlag()
+        let work = DispatchWorkItem {
+            started.signal()
+            release.wait()
+            finalizations.enqueue {
+                finalized.set()
+                activity.finish()
+            }
+        }
+        activity.setCancellation { work.cancel() }
+        DispatchQueue.global().async(execute: work)
+        XCTAssertEqual(started.wait(timeout: .now() + 1), .success)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
+            release.signal()
+        }
+
+        XCTAssertTrue(tracker.cancelAndWaitForQuiescence(
+            timeout: 2,
+            mainThreadWork: finalizations.drain
+        ))
+        XCTAssertTrue(finalized.value)
+        XCTAssertTrue(tracker.isQuiescent)
+    }
+
+    @MainActor
+    func testAlphaConversionCoordinatorPermanentlyRejectsWorkAfterTermination() async {
+        let coordinator = AlphaConversionCoordinator(
+            overallDeadlineSeconds: 1,
+            noProgressDeadlineSeconds: 1,
+            terminationGraceSeconds: 0.05
+        )
+        XCTAssertTrue(coordinator.terminateAndWait(graceSeconds: 0, deadlineSeconds: 0.1))
+        XCTAssertTrue(coordinator.isQuiescentForTermination)
+
+        let result: Result<AlphaConversionResult, Error> = await withCheckedContinuation {
+            continuation in
+            coordinator.convert(
+                sourceURL: URL(fileURLWithPath: "/nonexistent/source.mp4"),
+                outputURL: URL(fileURLWithPath: "/nonexistent/output.mov"),
+                reportURL: URL(fileURLWithPath: "/nonexistent/output.report.json"),
+                width: 320,
+                height: 480,
+                toolchain: AlphaToolchain(
+                    python: URL(fileURLWithPath: "/usr/bin/false"),
+                    converter: URL(fileURLWithPath: "/nonexistent/converter.py"),
+                    ffmpeg: URL(fileURLWithPath: "/usr/bin/false"),
+                    ffprobe: URL(fileURLWithPath: "/usr/bin/false"),
+                    avconvert: URL(fileURLWithPath: "/usr/bin/false")
+                ),
+                invocationChallenge: String(repeating: "a", count: 64),
+                phase: { _ in },
+                completion: { continuation.resume(returning: $0) }
+            )
+        }
+
+        guard case let .failure(error) = result,
+              let failure = error as? AlphaConversionFailure,
+              case .cancelled = failure else {
+            return XCTFail("a terminated conversion coordinator must reject with cancellation")
+        }
+        await Task.yield()
+        XCTAssertFalse(coordinator.isRunning)
+        XCTAssertTrue(coordinator.isQuiescentForTermination)
+    }
+
+    func testAlphaToolchainDiscoveryCancellationRejectsLateProcessLaunch() throws {
+        let cancellation = AlphaToolchainDiscoveryCancellation()
+        cancellation.cancel()
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+
+        XCTAssertFalse(try cancellation.launch(process))
+        XCTAssertTrue(cancellation.cancelAndWaitForQuiescence(timeout: 0.1))
+        XCTAssertFalse(process.isRunning)
+    }
+
+    func testCharacterStorageRecoversOnlyExactPrivateImportStagingDirectories() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let storage = CharacterLibraryStorage(
+            mediaMapURL: root.appendingPathComponent("media-map.json")
+        )
+        let abandoned = root.appendingPathComponent(
+            ".character-import-\(UUID().uuidString.lowercased())",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: abandoned, withIntermediateDirectories: false)
+        try Data("staged".utf8).write(to: abandoned.appendingPathComponent("payload.bin"))
+        let unrelated = root.appendingPathComponent(".character-import-not-a-uuid", isDirectory: true)
+        try FileManager.default.createDirectory(at: unrelated, withIntermediateDirectories: false)
+        let linkTarget = root.appendingPathComponent("link-target", isDirectory: true)
+        try FileManager.default.createDirectory(at: linkTarget, withIntermediateDirectories: false)
+        let linkedStaging = root.appendingPathComponent(
+            ".character-import-\(UUID().uuidString.lowercased())",
+            isDirectory: true
+        )
+        try FileManager.default.createSymbolicLink(
+            at: linkedStaging,
+            withDestinationURL: linkTarget
+        )
+
+        try storage.recoverInterruptedImports()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: abandoned.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: unrelated.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: linkedStaging.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: linkTarget.path))
     }
 
     func testPosterInstallerRejectsSymlinkOversizeMalformedAndLowDisk() throws {

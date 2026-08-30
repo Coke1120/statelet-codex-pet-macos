@@ -36,8 +36,9 @@ import sys
 import tempfile
 import time
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, TextIO
+from typing import Any, Iterable, Iterator, TextIO
 
 
 def _ensure_owned_process_group() -> None:
@@ -250,6 +251,7 @@ def _preflight_resources(
         info=info,
         width=width,
         height=height,
+        source_snapshot_bytes=source_bytes,
         reserve_bytes=min_free_disk_bytes,
     )
     return {
@@ -275,9 +277,16 @@ def _check_peak_disk_capacity(
     info: VideoInfo,
     width: int,
     height: int,
+    source_snapshot_bytes: int,
     reserve_bytes: int,
 ) -> dict[str, Any]:
-    """Aggregate conservative simultaneous allocation peaks by filesystem."""
+    """Aggregate conservative simultaneous allocation peaks by filesystem.
+
+    The source snapshot already exists when the media probe supplies ``info``.
+    It remains part of the simultaneous peak, but its bytes are marked as
+    preallocated so the post-snapshot free-space check does not require them a
+    second time.
+    """
 
     pixels = info.frame_count * width * height
     temp_bytes = sum(
@@ -292,6 +301,11 @@ def _check_peak_disk_capacity(
     )
     allocations: list[tuple[str, Path, int]] = [
         ("conversion-temp", Path(tempfile.gettempdir()), temp_bytes),
+        (
+            "source-snapshot",
+            Path(tempfile.gettempdir()),
+            int(source_snapshot_bytes),
+        ),
         (
             "delivery-stage",
             output_target.parent,
@@ -317,6 +331,7 @@ def _check_peak_disk_capacity(
         allocations,
         reserve_bytes=reserve_bytes,
         model="simultaneous-alpha-pipeline-v1",
+        preallocated_components=frozenset({"source-snapshot"}),
     )
 
 
@@ -329,6 +344,21 @@ def _allocation_with_overhead(payload_bytes: int) -> int:
         - 1
     ) // DISK_ALLOCATION_SAFETY_DENOMINATOR
     return scaled + DISK_ARTIFACT_FIXED_OVERHEAD_BYTES
+
+
+def _check_source_snapshot_disk_capacity(
+    temporary_location: Path,
+    *,
+    snapshot_bytes: int,
+    reserve_bytes: int,
+) -> dict[str, Any]:
+    """Preserve the configured free-space reserve while creating a snapshot."""
+
+    return _check_disk_allocations(
+        [("source-snapshot", temporary_location, int(snapshot_bytes))],
+        reserve_bytes=reserve_bytes,
+        model="source-snapshot-preallocation-v1",
+    )
 
 
 def _check_publication_disk_capacity(
@@ -396,10 +426,16 @@ def _check_disk_allocations(
     *,
     reserve_bytes: int,
     model: str,
+    preallocated_components: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
-    """Aggregate path-private allocation requirements by filesystem device."""
+    """Aggregate path-private allocation requirements by filesystem device.
+
+    ``preallocated_components`` remain in the modeled simultaneous peak, while
+    their bytes are excluded from the free space still required at this check.
+    """
 
     by_device: dict[int, dict[str, Any]] = {}
+    observed_components: set[str] = set()
     try:
         for label, location, required in allocations:
             device = int(os.stat(location).st_dev)
@@ -408,13 +444,19 @@ def _check_disk_allocations(
                 {
                     "location": location,
                     "required_bytes": int(reserve_bytes),
+                    "preallocated_bytes_at_check": 0,
                     "components": [],
                 },
             )
             item["required_bytes"] += int(required)
+            if label in preallocated_components:
+                item["preallocated_bytes_at_check"] += int(required)
             item["components"].append(label)
+            observed_components.add(label)
     except OSError as exc:
         raise AlphaConversionError("unable to inspect available disk space") from exc
+    if preallocated_components - observed_components:
+        raise AlphaConversionError("unable to inspect available disk space")
 
     summaries: list[dict[str, Any]] = []
     for index, (_device, item) in enumerate(sorted(by_device.items()), start=1):
@@ -423,12 +465,16 @@ def _check_disk_allocations(
         except OSError as exc:
             raise AlphaConversionError("unable to inspect available disk space") from exc
         required_bytes = int(item["required_bytes"])
-        if free_bytes < required_bytes:
+        preallocated_bytes = int(item["preallocated_bytes_at_check"])
+        remaining_required_bytes = required_bytes - preallocated_bytes
+        if free_bytes < remaining_required_bytes:
             raise AlphaConversionError("insufficient free disk space for conversion")
         summaries.append(
             {
                 "label": f"volume-{index}",
                 "required_bytes": required_bytes,
+                "remaining_required_bytes_at_check": remaining_required_bytes,
+                "preallocated_bytes_at_check": preallocated_bytes,
                 "free_bytes_at_check": free_bytes,
                 "components": sorted(item["components"]),
             }
@@ -439,6 +485,16 @@ def _check_disk_allocations(
         "total_required_bytes": sum(item["required_bytes"] for item in summaries),
         "maximum_volume_required_bytes": max(
             (item["required_bytes"] for item in summaries), default=0
+        ),
+        "total_remaining_required_bytes_at_check": sum(
+            item["remaining_required_bytes_at_check"] for item in summaries
+        ),
+        "maximum_volume_remaining_required_bytes_at_check": max(
+            (
+                item["remaining_required_bytes_at_check"]
+                for item in summaries
+            ),
+            default=0,
         ),
         "volumes": summaries,
     }
@@ -1212,6 +1268,192 @@ def _sha256_source_file(
                 os.close(descriptor)
             except OSError:
                 pass
+
+
+@dataclass(frozen=True)
+class _SourceSnapshot:
+    path: Path
+    sha256: str
+    size: int
+    capacity_preflight: dict[str, Any]
+
+
+def _source_identity(stat_result: os.stat_result) -> tuple[int, ...]:
+    """Return metadata that must remain stable while binding one source."""
+
+    return tuple(
+        int(getattr(stat_result, field))
+        for field in (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_uid",
+            "st_gid",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+    )
+
+
+def _read_descriptor_sha256(descriptor: int, *, expected_size: int) -> str:
+    """Read back exactly one regular-file payload from its open descriptor."""
+
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    bytes_read = 0
+    while bytes_read < expected_size:
+        chunk = os.read(
+            descriptor, min(1024 * 1024, expected_size - bytes_read)
+        )
+        if not chunk:
+            raise AlphaConversionError("source snapshot verification failed")
+        bytes_read += len(chunk)
+        digest.update(chunk)
+    if os.read(descriptor, 1):
+        raise AlphaConversionError("source snapshot verification failed")
+    return digest.hexdigest()
+
+
+@contextlib.contextmanager
+def _private_source_snapshot(
+    source: Path, *, max_source_bytes: int, reserve_bytes: int
+) -> Iterator[_SourceSnapshot]:
+    """Bind one source descriptor to a private, verified conversion snapshot."""
+
+    temporary: tempfile.TemporaryDirectory[str] | None = None
+    source_descriptor: int | None = None
+    snapshot_descriptor: int | None = None
+    try:
+        temporary = tempfile.TemporaryDirectory(prefix="codex-pet-alpha-source-")
+        temp_dir = Path(temporary.name)
+        os.chmod(temp_dir, 0o700)
+        suffix = source.suffix.lower()
+        if re.fullmatch(r"\.[a-z0-9]{1,16}", suffix) is None:
+            suffix = ".media"
+        snapshot_path = temp_dir / f"source{suffix}"
+
+        source_flags = os.O_RDONLY
+        for flag_name in ("O_CLOEXEC", "O_NONBLOCK", "O_NOFOLLOW"):
+            source_flags |= getattr(os, flag_name, 0)
+        snapshot_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+        for flag_name in ("O_CLOEXEC", "O_NOFOLLOW"):
+            snapshot_flags |= getattr(os, flag_name, 0)
+
+        path_before = os.lstat(source)
+        if (
+            stat.S_ISLNK(path_before.st_mode)
+            or not stat.S_ISREG(path_before.st_mode)
+            or path_before.st_size <= 0
+        ):
+            raise AlphaConversionError(
+                "source video must be a non-empty regular file"
+            )
+        if path_before.st_size > max_source_bytes:
+            raise AlphaConversionError(
+                "source video exceeds the configured size budget"
+            )
+
+        source_descriptor = os.open(source, source_flags)
+        source_before = os.fstat(source_descriptor)
+        if (
+            not stat.S_ISREG(source_before.st_mode)
+            or source_before.st_size <= 0
+            or _source_identity(path_before) != _source_identity(source_before)
+        ):
+            raise AlphaConversionError("source video changed during snapshotting")
+        if source_before.st_size > max_source_bytes:
+            raise AlphaConversionError(
+                "source video exceeds the configured size budget"
+            )
+
+        snapshot_capacity = _check_source_snapshot_disk_capacity(
+            temp_dir,
+            snapshot_bytes=source_before.st_size,
+            reserve_bytes=reserve_bytes,
+        )
+        snapshot_descriptor = os.open(snapshot_path, snapshot_flags, 0o600)
+        os.fchmod(snapshot_descriptor, 0o600)
+        source_digest = hashlib.sha256()
+        bytes_copied = 0
+        while bytes_copied < source_before.st_size:
+            chunk = os.read(
+                source_descriptor,
+                min(1024 * 1024, source_before.st_size - bytes_copied),
+            )
+            if not chunk:
+                raise AlphaConversionError("source video changed during snapshotting")
+            source_digest.update(chunk)
+            bytes_copied += len(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(snapshot_descriptor, view)
+                if written <= 0:
+                    raise AlphaConversionError("unable to create source snapshot")
+                view = view[written:]
+        if os.read(source_descriptor, 1):
+            raise AlphaConversionError("source video changed during snapshotting")
+
+        source_after = os.fstat(source_descriptor)
+        path_after = os.stat(source, follow_symlinks=False)
+        expected_source_identity = _source_identity(source_before)
+        if (
+            _source_identity(source_after) != expected_source_identity
+            or _source_identity(path_after) != expected_source_identity
+        ):
+            raise AlphaConversionError("source video changed during snapshotting")
+
+        os.fsync(snapshot_descriptor)
+        snapshot_stat = os.fstat(snapshot_descriptor)
+        snapshot_path_stat = os.stat(snapshot_path, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(snapshot_stat.st_mode)
+            or snapshot_stat.st_size != source_before.st_size
+            or snapshot_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(snapshot_stat.st_mode) != 0o600
+            or snapshot_stat.st_nlink != 1
+            or _source_identity(snapshot_stat) != _source_identity(snapshot_path_stat)
+        ):
+            raise AlphaConversionError("source snapshot verification failed")
+        snapshot_sha256 = _read_descriptor_sha256(
+            snapshot_descriptor, expected_size=source_before.st_size
+        )
+        if snapshot_sha256 != source_digest.hexdigest():
+            raise AlphaConversionError("source snapshot verification failed")
+
+        os.close(source_descriptor)
+        source_descriptor = None
+        os.close(snapshot_descriptor)
+        snapshot_descriptor = None
+        yield _SourceSnapshot(
+            path=snapshot_path,
+            sha256=snapshot_sha256,
+            size=source_before.st_size,
+            capacity_preflight=snapshot_capacity,
+        )
+    except AlphaConversionError:
+        raise
+    except OSError:
+        raise AlphaConversionError("unable to create source snapshot") from None
+    finally:
+        if source_descriptor is not None:
+            try:
+                os.close(source_descriptor)
+            except OSError:
+                pass
+        if snapshot_descriptor is not None:
+            try:
+                os.close(snapshot_descriptor)
+            except OSError:
+                pass
+        if temporary is not None:
+            try:
+                temporary.cleanup()
+            except OSError:
+                raise AlphaConversionError(
+                    "unable to remove source snapshot"
+                ) from None
 
 
 def _assert_source_unchanged(
@@ -2941,55 +3183,25 @@ def _verify_alpha_roundtrip(
     }
 
 
-def convert_video(
-    args: argparse.Namespace, *, progress: _ProgressReporter | None = None
+def _convert_video_from_snapshot(
+    args: argparse.Namespace,
+    *,
+    progress: _ProgressReporter,
+    original_source: Path,
+    snapshot: _SourceSnapshot,
+    output: Path,
+    report_path: Path,
+    intermediate_target: Path | None,
+    ffprobe: str,
+    ffmpeg: str,
+    avconvert: str,
+    tool_preflight: dict[str, Any],
+    frame_sync_mode: str,
 ) -> dict[str, Any]:
-    """Run conversion and return a path-free report."""
+    """Run conversion with every media consumer bound to one snapshot."""
 
-    progress = progress or _ProgressReporter(False)
-    progress.emit(0, stage="prepare", message="Preparing conversion")
-    require_image_dependencies()
-    source = args.source.expanduser()
-    output = args.output.expanduser()
-    report_path = (args.report or _default_report_path(output)).expanduser()
-    intermediate_target = (
-        args.intermediate_output.expanduser() if args.intermediate_output else None
-    )
-    if args.keep_intermediate and intermediate_target is None:
-        intermediate_target = _default_intermediate_path(output)
-    _recover_publish_transaction(output, intermediate_target, report_path)
-    _check_target_collisions(
-        source,
-        output,
-        report_path,
-        intermediate_target,
-        replace=args.replace,
-    )
-    if (args.width is None) != (args.height is None):
-        raise AlphaConversionError("--width and --height must be supplied together")
-    if args.key_floor >= args.key_ceiling:
-        raise AlphaConversionError("--key-floor must be less than --key-ceiling")
-    if args.key_ceiling > 1.5:
-        raise AlphaConversionError("--key-ceiling must not exceed 1.5")
-
-    progress.emit(2, stage="prepare", message="Checking conversion tools")
-    ffprobe = require_tool("ffprobe", args.ffprobe)
-    ffmpeg = require_tool("ffmpeg", args.ffmpeg)
-    avconvert = require_tool("avconvert", args.avconvert)
-    tool_preflight = _preflight_tool_capabilities(
-        ffmpeg=ffmpeg, ffprobe=ffprobe, avconvert=avconvert
-    )
-    frame_sync_mode = str(
-        tool_preflight["capabilities"].get("ffmpeg_frame_sync", "fps_mode")
-    )
-    _preflight_source_size(source, max_source_bytes=args.max_source_bytes)
-    # Bind the source before ffprobe and any decoder process starts.  The
-    # digest is carried through the report and checked again immediately
-    # before publication so a source edited in place cannot be paired with
-    # artifacts produced from a different byte sequence.
-    source_sha256_before_probe = _sha256_source_file(
-        source, max_source_bytes=args.max_source_bytes
-    )
+    source = snapshot.path
+    source_sha256_before_probe = snapshot.sha256
     progress.emit(5, stage="probe", message="Probing source video")
     info = probe_video(
         source,
@@ -3025,6 +3237,11 @@ def convert_video(
         max_source_fps=args.max_source_fps,
         min_free_disk_bytes=args.min_free_disk_bytes,
     )
+    resource_preflight["source_snapshot"] = {
+        "bytes": snapshot.size,
+        "accounting": "preflighted-before-allocation-and-included-in-peak",
+        "capacity_preflight": snapshot.capacity_preflight,
+    }
     report_contract = _report_contract(args, tool_preflight=tool_preflight)
 
     if args.dry_run:
@@ -3054,7 +3271,7 @@ def convert_video(
             **report_contract,
             "status": "dry-run",
             "source": {
-                "name": _safe_name(source),
+                "name": _safe_name(original_source),
                 "codec": info.codec_name,
                 "profile": info.codec_profile,
                 "pixel_format": info.pixel_format,
@@ -3257,7 +3474,7 @@ def convert_video(
             **report_contract,
             "status": "converted",
             "source": {
-                "name": _safe_name(source),
+                "name": _safe_name(original_source),
                 "codec": info.codec_name,
                 "profile": info.codec_profile,
                 "pixel_format": info.pixel_format,
@@ -3319,7 +3536,7 @@ def convert_video(
             },
             "verification": verification,
             "artifacts": {
-                "source_name": _safe_name(source),
+                "source_name": _safe_name(original_source),
                 "source_sha256": source_sha256_before_probe,
                 "source_sha256_before_probe": source_sha256_before_probe,
                 "source_sha256_before_publication": None,
@@ -3333,7 +3550,7 @@ def convert_video(
             },
         }
         source_sha256_before_publication = _assert_source_unchanged(
-            source,
+            original_source,
             source_sha256_before_probe,
             max_source_bytes=args.max_source_bytes,
         )
@@ -3368,6 +3585,71 @@ def convert_video(
             status="completed",
         )
         return report
+
+
+def convert_video(
+    args: argparse.Namespace, *, progress: _ProgressReporter | None = None
+) -> dict[str, Any]:
+    """Run conversion and return a path-free report."""
+
+    progress = progress or _ProgressReporter(False)
+    progress.emit(0, stage="prepare", message="Preparing conversion")
+    require_image_dependencies()
+    original_source = args.source.expanduser()
+    output = args.output.expanduser()
+    report_path = (args.report or _default_report_path(output)).expanduser()
+    intermediate_target = (
+        args.intermediate_output.expanduser() if args.intermediate_output else None
+    )
+    if args.keep_intermediate and intermediate_target is None:
+        intermediate_target = _default_intermediate_path(output)
+    _recover_publish_transaction(output, intermediate_target, report_path)
+    _check_target_collisions(
+        original_source,
+        output,
+        report_path,
+        intermediate_target,
+        replace=args.replace,
+    )
+    if (args.width is None) != (args.height is None):
+        raise AlphaConversionError("--width and --height must be supplied together")
+    if args.key_floor >= args.key_ceiling:
+        raise AlphaConversionError("--key-floor must be less than --key-ceiling")
+    if args.key_ceiling > 1.5:
+        raise AlphaConversionError("--key-ceiling must not exceed 1.5")
+
+    progress.emit(2, stage="prepare", message="Checking conversion tools")
+    ffprobe = require_tool("ffprobe", args.ffprobe)
+    ffmpeg = require_tool("ffmpeg", args.ffmpeg)
+    avconvert = require_tool("avconvert", args.avconvert)
+    tool_preflight = _preflight_tool_capabilities(
+        ffmpeg=ffmpeg, ffprobe=ffprobe, avconvert=avconvert
+    )
+    frame_sync_mode = str(
+        tool_preflight["capabilities"].get("ffmpeg_frame_sync", "fps_mode")
+    )
+    _preflight_source_size(
+        original_source, max_source_bytes=args.max_source_bytes
+    )
+    with _private_source_snapshot(
+        original_source,
+        max_source_bytes=args.max_source_bytes,
+        reserve_bytes=args.min_free_disk_bytes,
+    ) as snapshot:
+        return _convert_video_from_snapshot(
+            args,
+            progress=progress,
+            original_source=original_source,
+            snapshot=snapshot,
+            output=output,
+            report_path=report_path,
+            intermediate_target=intermediate_target,
+            ffprobe=ffprobe,
+            ffmpeg=ffmpeg,
+            avconvert=avconvert,
+            tool_preflight=tool_preflight,
+            frame_sync_mode=frame_sync_mode,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:

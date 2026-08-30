@@ -116,7 +116,8 @@ class StateletVoiceSkillTests(unittest.TestCase):
                 "id": "10000000-0000-0000-0000-000000000000",
                 "revision": 1,
                 "name": "Test voice",
-                "api_base_url": "http://127.0.0.1:9880",
+                "api_base_url": "https://127.0.0.1:9880",
+                "tls_leaf_certificate_sha256": "c" * 64,
                 "gpt_weight_relative_path": "voice/assets/gpt/test.ckpt",
                 "sovits_weight_relative_path": "voice/assets/sovits/test.pth",
                 "reference_audio_relative_path": "voice/assets/reference/test.wav",
@@ -177,6 +178,23 @@ class StateletVoiceSkillTests(unittest.TestCase):
         library_path.write_text(json.dumps(library), encoding="utf-8")
         with self.assertRaisesRegex(VOICE_VERIFIER.VerificationError, "line schema is invalid"):
             self.verify()
+
+    def test_rejects_http_or_missing_tls_pin_profile(self) -> None:
+        for transport_mutation in ("http", "missing_pin"):
+            with self.subTest(transport_mutation=transport_mutation):
+                self.write_library()
+                library_path = self.root / "voice/dialogue-voice.json"
+                library = json.loads(library_path.read_text(encoding="utf-8"))
+                if transport_mutation == "http":
+                    library["profile"]["api_base_url"] = "http://127.0.0.1:9880"
+                else:
+                    del library["profile"]["tls_leaf_certificate_sha256"]
+                library_path.write_text(json.dumps(library), encoding="utf-8")
+                with self.assertRaisesRegex(
+                    VOICE_VERIFIER.VerificationError,
+                    "voice profile schema is invalid",
+                ):
+                    self.verify()
 
     def test_accepts_decode_defaults_and_reports_legacy_output_policy(self) -> None:
         self.write_library()

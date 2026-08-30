@@ -4,6 +4,120 @@ import XCTest
 @testable import Statelet
 
 final class StateletUpdaterTests: XCTestCase {
+    func testBoundedMetadataRequestAcceptsExactLimitAndHTTPSRedirect() async throws {
+        let directConfiguration = URLSessionConfiguration.ephemeral
+        directConfiguration.protocolClasses = [UpdaterExactFiveURLProtocol.self]
+        let request = URLRequest(url: try XCTUnwrap(URL(string: "https://127.0.0.1/feed")))
+        let (data, _) = try await StateletUpdateBoundedDataRequest(maximumBytes: 5)
+            .perform(request, configuration: directConfiguration)
+        XCTAssertEqual(data, Data([1, 2, 3, 4, 5]))
+
+        let redirectConfiguration = URLSessionConfiguration.ephemeral
+        redirectConfiguration.protocolClasses = [UpdaterHTTPSRedirectURLProtocol.self]
+        let redirected = URLRequest(
+            url: try XCTUnwrap(URL(string: "https://127.0.0.1/start"))
+        )
+        let (redirectedData, response) = try await StateletUpdateBoundedDataRequest(
+            maximumBytes: 5
+        ).perform(redirected, configuration: redirectConfiguration)
+        XCTAssertEqual(redirectedData, Data([1, 2, 3, 4, 5]))
+        XCTAssertEqual(response.url?.path, "/final")
+    }
+
+    func testBoundedMetadataRequestRejectsDeclaredAndChunkedOversize() async throws {
+        for protocolClass in [
+            UpdaterDeclaredSixURLProtocol.self,
+            UpdaterChunkedSixURLProtocol.self,
+        ] {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [protocolClass]
+            let request = URLRequest(
+                url: try XCTUnwrap(URL(string: "https://127.0.0.1/feed"))
+            )
+            do {
+                _ = try await StateletUpdateBoundedDataRequest(maximumBytes: 5)
+                    .perform(request, configuration: configuration)
+                XCTFail("oversized metadata response was accepted")
+            } catch {
+                XCTAssertEqual(error as? StateletUpdaterError, .invalidReleaseFeed)
+            }
+        }
+    }
+
+    func testBoundedArtifactWriterEnforcesSignedSizeOnDisk() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "statelet-bounded-artifact-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let request = URLRequest(url: try XCTUnwrap(URL(string: "https://127.0.0.1/update")))
+
+        let exact = root.appendingPathComponent("exact.zip")
+        let exactConfiguration = URLSessionConfiguration.ephemeral
+        exactConfiguration.protocolClasses = [UpdaterExactFiveURLProtocol.self]
+        _ = try await StateletUpdateBoundedArtifactRequest(
+            expectedBytes: 5,
+            destinationURL: exact,
+            progress: { _ in }
+        ).perform(request, configuration: exactConfiguration)
+        XCTAssertEqual(try Data(contentsOf: exact), Data([1, 2, 3, 4, 5]))
+        let permissions = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: exact.path)[.posixPermissions] as? NSNumber
+        ).intValue
+        XCTAssertEqual(permissions & 0o777, 0o600)
+
+        for (name, protocolClass) in [
+            ("declared.zip", UpdaterDeclaredSixURLProtocol.self),
+            ("chunked.zip", UpdaterChunkedSixURLProtocol.self),
+            ("short.zip", UpdaterShortFourURLProtocol.self),
+        ] {
+            let destination = root.appendingPathComponent(name)
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [protocolClass]
+            do {
+                _ = try await StateletUpdateBoundedArtifactRequest(
+                    expectedBytes: 5,
+                    destinationURL: destination,
+                    progress: { _ in }
+                ).perform(request, configuration: configuration)
+                XCTFail("invalid signed-size artifact was accepted")
+            } catch {
+                XCTAssertEqual(error as? StateletUpdaterError, .artifactSizeMismatch)
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        }
+    }
+
+    func testBoundedRequestsHonorCancellationAndRemovePartialArtifact() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "statelet-cancelled-artifact-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let destination = root.appendingPathComponent("cancelled.zip")
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [UpdaterNeverFinishURLProtocol.self]
+        let request = URLRequest(url: try XCTUnwrap(URL(string: "https://127.0.0.1/update")))
+        let task = Task {
+            try await StateletUpdateBoundedArtifactRequest(
+                expectedBytes: 5,
+                destinationURL: destination,
+                progress: { _ in }
+            ).perform(request, configuration: configuration)
+        }
+        try await Task.sleep(nanoseconds: 20_000_000)
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("cancelled artifact request completed")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+    }
+
     func testPinnedReleaseAuthorityIsImmutableRepositoryAndProductionKey() {
         XCTAssertEqual(StateletReleaseFeed.repository, "Coke1120/statelet-codex-pet-macos")
         XCTAssertEqual(StateletReleaseFeed.repositoryID, 1_329_561_047)
@@ -220,7 +334,7 @@ final class StateletUpdaterTests: XCTestCase {
             verifyProvenance: { _, _, _ in
                 throw StateletUpdaterError.invalidReleaseProvenance
             },
-            download: { _, _ in
+            download: { _, _, _ in
                 downloadCalled = true
                 throw StateletUpdaterError.invalidArtifact
             },
@@ -625,7 +739,7 @@ final class StateletUpdaterTests: XCTestCase {
             },
             fetchAssetData: { _ in Data() },
             verifyProvenance: acceptingProvenance,
-            download: { _, _ in throw StateletUpdaterError.invalidArtifact },
+            download: { _, _, _ in throw StateletUpdaterError.invalidArtifact },
             installer: { _, _ in }
         )
         coordinator.onSnapshot = { snapshot in
@@ -654,7 +768,7 @@ final class StateletUpdaterTests: XCTestCase {
             fetchReleases: { throw URLError(.notConnectedToInternet) },
             fetchAssetData: { _ in Data() },
             verifyProvenance: acceptingProvenance,
-            download: { _, _ in throw StateletUpdaterError.invalidArtifact },
+            download: { _, _, _ in throw StateletUpdaterError.invalidArtifact },
             installer: { _, _ in }
         )
         coordinator.onSnapshot = { snapshot in
@@ -689,7 +803,7 @@ final class StateletUpdaterTests: XCTestCase {
             fetchReleases: { self.releaseFeedJSON(size: payload.count, digest: digest) },
             fetchAssetData: { _ in Data() },
             verifyProvenance: acceptingProvenance,
-            download: { _, _ in
+            download: { _, _, _ in
                 StateletDownloadedUpdate(
                     artifactURL: artifact,
                     bundleURL: bundle,
@@ -754,7 +868,7 @@ final class StateletUpdaterTests: XCTestCase {
             fetchReleases: { self.releaseFeedJSON(size: payload.count, digest: digest) },
             fetchAssetData: { _ in Data() },
             verifyProvenance: acceptingProvenance,
-            download: { _, _ in
+            download: { _, _, _ in
                 StateletDownloadedUpdate(
                     artifactURL: artifact,
                     bundleURL: bundle,
@@ -821,7 +935,7 @@ final class StateletUpdaterTests: XCTestCase {
             fetchReleases: { feed },
             fetchAssetData: { _ in Data() },
             verifyProvenance: acceptingProvenance,
-            download: { _, progress in
+            download: { _, _, progress in
                 progress(0.5)
                 return StateletDownloadedUpdate(artifactURL: artifact, bundleURL: bundle)
             },
@@ -895,7 +1009,7 @@ final class StateletUpdaterTests: XCTestCase {
             fetchReleases: { self.releaseFeedJSON(size: firstPayload.count, digest: firstDigest) },
             fetchAssetData: { _ in Data() },
             verifyProvenance: acceptingProvenance,
-            download: { _, _ in
+            download: { _, _, _ in
                 StateletDownloadedUpdate(
                     artifactURL: firstArtifact,
                     bundleURL: firstBundle,
@@ -935,7 +1049,7 @@ final class StateletUpdaterTests: XCTestCase {
             fetchReleases: { self.releaseFeedJSON(size: retryPayload.count, digest: retryDigest) },
             fetchAssetData: { _ in Data() },
             verifyProvenance: acceptingProvenance,
-            download: { _, _ in
+            download: { _, _, _ in
                 StateletDownloadedUpdate(
                     artifactURL: retryArtifact,
                     bundleURL: retryBundle,
@@ -982,7 +1096,7 @@ final class StateletUpdaterTests: XCTestCase {
             fetchReleases: { self.releaseFeedJSON(size: payload.count, digest: digest) },
             fetchAssetData: { _ in Data() },
             verifyProvenance: acceptingProvenance,
-            download: { _, _ in
+            download: { _, _, _ in
                 StateletDownloadedUpdate(
                     artifactURL: artifact,
                     bundleURL: bundle,
@@ -1239,5 +1353,81 @@ private actor AsyncTestGate {
         isOpen = true
         continuation?.resume()
         continuation = nil
+    }
+}
+
+private class UpdaterTestURLProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    func send(
+        contentLength: Int? = nil,
+        chunks: [Data],
+        finish: Bool = true
+    ) {
+        var headers: [String: String] = [:]
+        if let contentLength { headers["Content-Length"] = String(contentLength) }
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: headers
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        for chunk in chunks { client?.urlProtocol(self, didLoad: chunk) }
+        if finish { client?.urlProtocolDidFinishLoading(self) }
+    }
+
+    override func stopLoading() {}
+}
+
+private final class UpdaterExactFiveURLProtocol: UpdaterTestURLProtocol {
+    override func startLoading() {
+        send(contentLength: 5, chunks: [Data([1, 2]), Data([3, 4, 5])])
+    }
+}
+
+private final class UpdaterDeclaredSixURLProtocol: UpdaterTestURLProtocol {
+    override func startLoading() {
+        send(contentLength: 6, chunks: [Data([1, 2, 3, 4, 5, 6])])
+    }
+}
+
+private final class UpdaterChunkedSixURLProtocol: UpdaterTestURLProtocol {
+    override func startLoading() {
+        send(chunks: [Data([1, 2, 3]), Data([4, 5, 6])])
+    }
+}
+
+private final class UpdaterShortFourURLProtocol: UpdaterTestURLProtocol {
+    override func startLoading() {
+        send(contentLength: 4, chunks: [Data([1, 2, 3, 4])])
+    }
+}
+
+private final class UpdaterNeverFinishURLProtocol: UpdaterTestURLProtocol {
+    override func startLoading() {
+        send(chunks: [Data([1, 2])], finish: false)
+    }
+}
+
+private final class UpdaterHTTPSRedirectURLProtocol: UpdaterTestURLProtocol {
+    override func startLoading() {
+        if request.url?.path == "/start" {
+            let destination = URL(string: "https://127.0.0.1/final")!
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 302,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Location": destination.absoluteString]
+            )!
+            client?.urlProtocol(
+                self,
+                wasRedirectedTo: URLRequest(url: destination),
+                redirectResponse: response
+            )
+            return
+        }
+        send(contentLength: 5, chunks: [Data([1, 2, 3, 4, 5])])
     }
 }

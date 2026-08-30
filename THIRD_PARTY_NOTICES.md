@@ -13,8 +13,6 @@ software. Each component remains subject to its own license.
   lifecycle publisher uses the Python standard library.
 - NumPy is available under the BSD 3-Clause License. The hash-locked alpha
   authoring environment uses NumPy 2.0.2.
-- Pillow is available under the HPND License. The hash-locked alpha authoring
-  environment uses Pillow 11.3.0.
 - FFmpeg and FFprobe are user-installed tools. Their license depends on the
   selected build and enabled components; common builds are licensed under the
   LGPL and may include GPL components. Statelet does not bundle them.

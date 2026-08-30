@@ -47,13 +47,6 @@ if [[ "$skip_launchctl" -eq 0 && "$home_dir" != "$HOME" ]]; then
   exit 2
 fi
 
-info="$app_bundle/Contents/Info.plist"
-app_executable="$app_bundle/Contents/MacOS/Statelet"
-[[ -f "$info" && -x "$app_executable" ]] || { printf 'Invalid Statelet.app bundle.\n' >&2; exit 1; }
-plutil -lint "$info" >/dev/null
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info")" == "com.coke1120.Statelet" ]] || { printf 'Unexpected application bundle identifier.\n' >&2; exit 1; }
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :StateletManaged' "$info")" == "$managed_marker" ]] || { printf 'Application bundle is not a managed Statelet build.\n' >&2; exit 1; }
-
 python_bin=""
 for candidate in /usr/bin/python3 "$(command -v python3 || true)"; do
   [[ -n "$candidate" && -x "$candidate" ]] || continue
@@ -63,6 +56,24 @@ for candidate in /usr/bin/python3 "$(command -v python3 || true)"; do
   if "$resolved_candidate" -c 'import sys; raise SystemExit(sys.version_info < (3, 9))'; then python_bin="$resolved_candidate"; break; fi
 done
 [[ -n "$python_bin" ]] || { printf 'A stable Python 3.9+ interpreter outside the repository and temporary directories is required.\n' >&2; exit 1; }
+app_source_digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$app_bundle" 2>/dev/null)" || {
+  printf 'Refusing an unsafe or unstable Statelet.app source.\n' >&2
+  exit 1
+}
+
+validate_staged_app_bundle() {
+  local candidate="$1" candidate_info candidate_executable
+  candidate_info="$candidate/Contents/Info.plist"
+  candidate_executable="$candidate/Contents/MacOS/Statelet"
+  [[ -d "$candidate" && ! -L "$candidate" ]] || return 1
+  [[ -f "$candidate_info" && ! -L "$candidate_info" ]] || return 1
+  [[ -f "$candidate_executable" && ! -L "$candidate_executable" && -x "$candidate_executable" ]] || return 1
+  plutil -lint "$candidate_info" >/dev/null 2>&1 || return 1
+  [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$candidate_info" 2>/dev/null || true)" == "Statelet" ]] || return 1
+  [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$candidate_info" 2>/dev/null || true)" == "com.coke1120.Statelet" ]] || return 1
+  [[ "$(/usr/libexec/PlistBuddy -c 'Print :StateletManaged' "$candidate_info" 2>/dev/null || true)" == "$managed_marker" ]] || return 1
+  /usr/bin/codesign --verify --deep --strict --verbose=2 "$candidate" >/dev/null 2>&1
+}
 
 applications_dir="$home_dir/Applications"
 app_dest="$applications_dir/Statelet.app"
@@ -274,38 +285,86 @@ for path in paths:
         raise SystemExit(1)
 PY
 }
-migration_attests() {
-  "$python_bin" - "$migration_manifest" "$legacy_marker" "$legacy_support" "$1" "$2" <<'PY'
-import json, os, stat, sys
+migration_manifest_record() {
+  "$python_bin" - "$migration_manifest" "$legacy_marker" "$legacy_support" "$1" <<'PY'
+import json, os, stat, string, sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
-marker, source_root, relative, expected = sys.argv[2:]
+marker, source_root, relative = sys.argv[2:]
+fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
 try:
-    status = path.lstat()
+    before = path.lstat()
     if (
-        not stat.S_ISREG(status.st_mode)
-        or stat.S_ISLNK(status.st_mode)
-        or stat.S_IMODE(status.st_mode) != 0o600
-        or status.st_uid != os.getuid()
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or stat.S_IMODE(before.st_mode) != 0o600
+        or before.st_uid != os.getuid()
+        or before.st_nlink != 1
+        or before.st_size > 16 * 1024 * 1024
     ):
         raise ValueError
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     try:
-        with os.fdopen(descriptor, encoding="utf-8") as handle:
-            data = json.load(handle)
-    except Exception:
+        opened = os.fstat(descriptor)
+        if any(getattr(before, field) != getattr(opened, field) for field in fields):
+            raise ValueError
+        content = bytearray()
+        while True:
+            chunk = os.read(descriptor, min(1024 * 1024, 16 * 1024 * 1024 + 1 - len(content)))
+            if not chunk:
+                break
+            content.extend(chunk)
+            if len(content) > 16 * 1024 * 1024:
+                raise ValueError
+        final = os.fstat(descriptor)
+        if any(getattr(opened, field) != getattr(final, field) for field in fields):
+            raise ValueError
+    finally:
+        os.close(descriptor)
+    rebound = path.lstat()
+    if any(getattr(final, field) != getattr(rebound, field) for field in fields):
         raise ValueError
-    if set(data) != {"version", "source_identity", "source_root", "subtrees"}:
-        raise ValueError
-    if data["version"] != 1 or data["source_identity"] != marker or data["source_root"] != source_root or not isinstance(data["subtrees"], dict):
+    data = json.loads(content.decode("utf-8"))
+    if data.get("source_identity") != marker or data.get("source_root") != source_root or not isinstance(data.get("subtrees"), dict):
         raise ValueError
     if set(data["subtrees"]) - {"media", "voice", "characters", "sessions", "alpha-runtime", "runtime/current_state.json"}:
         raise ValueError
-    raise SystemExit(0 if data["subtrees"].get(relative) == expected else 1)
+    if set(data) == {"version", "source_identity", "source_root", "subtrees"} and data["version"] == 1:
+        algorithm = "statelet-unframed-v1"
+    elif (set(data) == {"version", "digest_algorithm", "source_identity", "source_root", "subtrees"}
+          and data["version"] == 2 and data["digest_algorithm"] == "statelet-safe-tree-v2"):
+        algorithm = data["digest_algorithm"]
+    else:
+        raise ValueError
+    digest = data["subtrees"].get(relative)
+    if not isinstance(digest, str) or len(digest) != 64 or any(character not in string.hexdigits for character in digest):
+        raise ValueError
+    print(f"{algorithm}\t{digest.lower()}")
 except (OSError, ValueError, json.JSONDecodeError):
     raise SystemExit(1)
 PY
+}
+migration_attests() {
+  local relative="$1" expected_v2="$2" source="$3" record algorithm recorded legacy_digest confirmed
+  record="$(migration_manifest_record "$relative")" || return 1
+  algorithm="${record%%$'\t'*}"
+  recorded="${record#*$'\t'}"
+  [[ "$recorded" != "$record" ]] || return 1
+  case "$algorithm" in
+    statelet-safe-tree-v2)
+      [[ "$recorded" == "$expected_v2" ]]
+      ;;
+    statelet-unframed-v1)
+      legacy_digest="$("$python_bin" "$script_dir/merge_hooks.py" \
+        --safe-tree-digest "$source" \
+        --safe-tree-digest-algorithm statelet-unframed-v1 2>/dev/null)" || return 1
+      [[ "$recorded" == "$legacy_digest" ]] || return 1
+      confirmed="$(migration_manifest_record "$relative")" || return 1
+      [[ "$confirmed" == "$record" ]]
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 journal_command() {
@@ -319,30 +378,76 @@ command = sys.argv[3]
 args = sys.argv[4:]
 journal = root / "journal.json"
 
-def digest(path):
-    if path.is_symlink():
-        raise ValueError(f"symbolic link in transaction path: {path}")
-    value = hashlib.sha256()
-    paths = [path] if not path.is_dir() else sorted(path.rglob("*"))
-    for item in paths:
-        status = item.lstat()
-        relative = "." if item == path else item.relative_to(path).as_posix()
-        if stat.S_ISLNK(status.st_mode) or not (stat.S_ISDIR(status.st_mode) or stat.S_ISREG(status.st_mode)):
-            raise ValueError(f"unsafe transaction path: {item}")
-        if stat.S_ISDIR(status.st_mode):
-            value.update(b"D\0" + relative.encode() + b"\0")
-        else:
-            value.update(b"F\0" + relative.encode() + b"\0")
-            descriptor = os.open(item, os.O_RDONLY | os.O_NOFOLLOW)
-            try:
-                while True:
-                    chunk = os.read(descriptor, 1024 * 1024)
-                    if not chunk:
-                        break
-                    value.update(chunk)
-            finally:
-                os.close(descriptor)
-    return value.hexdigest()
+TREE_DIGEST_ALGORITHM = "statelet-safe-tree-v2"
+LEGACY_TREE_DIGEST_ALGORITHM = "statelet-unframed-v1"
+TREE_DIGEST_DOMAIN = b"STATELET-SAFE-TREE-DIGEST\0v2\0"
+HOOK_ATTESTATION_VERSION = 2
+MAX_TREE_ENTRIES = 100_000
+MAX_TREE_FILES = 100_000
+MAX_TREE_BYTES = 32 * 1024 * 1024 * 1024
+transaction_digest_algorithm = None
+
+def current_tree_digest_algorithm():
+    if transaction_digest_algorithm not in {TREE_DIGEST_ALGORITHM, LEGACY_TREE_DIGEST_ALGORITHM}:
+        raise ValueError("transaction digest algorithm is unavailable")
+    return transaction_digest_algorithm
+
+def new_tree_digest(algorithm=None):
+    algorithm = current_tree_digest_algorithm() if algorithm is None else algorithm
+    if algorithm == TREE_DIGEST_ALGORITHM:
+        return hashlib.sha256(TREE_DIGEST_DOMAIN)
+    if algorithm == LEGACY_TREE_DIGEST_ALGORITHM:
+        return hashlib.sha256()
+    raise ValueError("unsupported transaction digest algorithm")
+
+def tree_digest_field(value, tag, content):
+    if len(tag) != 1:
+        raise ValueError("tree digest field tags must be one byte")
+    value.update(tag)
+    value.update(len(content).to_bytes(8, "big"))
+    value.update(content)
+
+def begin_tree_digest_entry(value, entry_type, relative, mode, content_length=None, algorithm=None):
+    algorithm = current_tree_digest_algorithm() if algorithm is None else algorithm
+    if entry_type not in {b"file", b"directory"}:
+        raise ValueError("unsupported tree digest entry type")
+    if algorithm == LEGACY_TREE_DIGEST_ALGORITHM:
+        if entry_type == b"directory" and relative == ".":
+            return
+        marker = b"F" if entry_type == b"file" else b"D"
+        value.update(marker + b"\0" + relative.encode() + b"\0")
+        return
+    if algorithm != TREE_DIGEST_ALGORITHM:
+        raise ValueError("unsupported transaction digest algorithm")
+    value.update(b"E")
+    tree_digest_field(value, b"T", entry_type)
+    tree_digest_field(value, b"P", os.fsencode(relative))
+    tree_digest_field(value, b"M", stat.S_IMODE(mode).to_bytes(4, "big"))
+    if content_length is None:
+        value.update(b"Z")
+        return
+    if content_length < 0:
+        raise ValueError("tree digest content length cannot be negative")
+    value.update(b"C")
+    value.update(content_length.to_bytes(8, "big"))
+
+def finish_tree_digest_file(value, algorithm=None):
+    algorithm = current_tree_digest_algorithm() if algorithm is None else algorithm
+    if algorithm == TREE_DIGEST_ALGORITHM:
+        value.update(b"Z")
+    elif algorithm != LEGACY_TREE_DIGEST_ALGORITHM:
+        raise ValueError("unsupported transaction digest algorithm")
+
+def require_transaction_hook_attestation(attestation):
+    if not isinstance(attestation, dict) or type(attestation.get("exists")) is not bool:
+        raise ValueError("hook attestation schema is invalid")
+    algorithm = current_tree_digest_algorithm()
+    if algorithm == TREE_DIGEST_ALGORITHM:
+        if (attestation.get("version") != HOOK_ATTESTATION_VERSION
+                or attestation.get("digest_algorithm") != TREE_DIGEST_ALGORITHM):
+            raise ValueError("hook attestation schema is invalid")
+    elif "version" in attestation or "digest_algorithm" in attestation:
+        raise ValueError("legacy hook attestation schema is invalid")
 
 def open_directory_chain(base, relative_parts):
     descriptor = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -389,7 +494,9 @@ def rename_swap(source_parent, source_name, target_parent, target_name):
 def entry_digests_and_identity(parent_fd, name, exclusion_sets):
     descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
     status = os.fstat(descriptor)
-    values = [hashlib.sha256() for _ in exclusion_sets]
+    algorithm = current_tree_digest_algorithm()
+    values = [new_tree_digest(algorithm) for _ in exclusion_sets]
+    budget = {"entries": 0, "files": 0, "bytes": 0}
     excluded_parts = [
         {tuple(Path(relative).parts) for relative in excluded}
         for excluded in exclusion_sets
@@ -414,17 +521,36 @@ def entry_digests_and_identity(parent_fd, name, exclusion_sets):
         current = os.fstat(current_fd)
         relative = "/".join(relative_parts)
         if stat.S_ISREG(current.st_mode):
+            budget["entries"] += 1
+            budget["files"] += 1
+            budget["bytes"] += current.st_size
+            if (budget["entries"] > MAX_TREE_ENTRIES or budget["files"] > MAX_TREE_FILES
+                    or budget["bytes"] > MAX_TREE_BYTES):
+                os.close(current_fd)
+                raise ValueError("transaction entry exceeds the safe size limit")
             for value, include in zip(values, included):
-                if include: value.update(b"F\0" + relative.encode() + b"\0")
+                if include:
+                    begin_tree_digest_entry(
+                        value, b"file", relative, current.st_mode, current.st_size, algorithm
+                    )
             try:
                 while chunk := os.read(current_fd, 1024 * 1024):
                     for value, include in zip(values, included):
                         if include: value.update(chunk)
                 validate_stable(current_fd, current)
+                for value, include in zip(values, included):
+                    if include: finish_tree_digest_file(value, algorithm)
             finally: os.close(current_fd)
         elif stat.S_ISDIR(current.st_mode):
+            budget["entries"] += 1
+            if budget["entries"] > MAX_TREE_ENTRIES:
+                os.close(current_fd)
+                raise ValueError("transaction entry exceeds the safe size limit")
             for value, include in zip(values, included):
-                if include: value.update(b"D\0" + relative.encode() + b"\0")
+                if include:
+                    begin_tree_digest_entry(
+                        value, b"directory", relative, current.st_mode, algorithm=algorithm
+                    )
             try:
                 for child_name in sorted(os.listdir(current_fd)):
                     visit(current_fd, child_name, relative_parts + (child_name,))
@@ -435,16 +561,30 @@ def entry_digests_and_identity(parent_fd, name, exclusion_sets):
             raise ValueError("unsafe entry")
     try:
         if stat.S_ISDIR(status.st_mode):
+            for value in values:
+                begin_tree_digest_entry(
+                    value, b"directory", ".", status.st_mode, algorithm=algorithm
+                )
             for child_name in sorted(os.listdir(descriptor)):
                 visit(descriptor, child_name, (child_name,))
             validate_stable(descriptor, status)
         elif stat.S_ISREG(status.st_mode):
             if any(excluded_parts):
                 raise ValueError("file install cannot own descendants")
-            for value in values: value.update(b"F\0.\0")
+            budget["entries"] += 1
+            budget["files"] += 1
+            budget["bytes"] += status.st_size
+            if (budget["entries"] > MAX_TREE_ENTRIES or budget["files"] > MAX_TREE_FILES
+                    or budget["bytes"] > MAX_TREE_BYTES):
+                raise ValueError("transaction entry exceeds the safe size limit")
+            for value in values:
+                begin_tree_digest_entry(
+                    value, b"file", ".", status.st_mode, status.st_size, algorithm
+                )
             while chunk := os.read(descriptor, 1024 * 1024):
                 for value in values: value.update(chunk)
             validate_stable(descriptor, status)
+            for value in values: finish_tree_digest_file(value, algorithm)
         else:
             raise ValueError("unsafe entry")
     finally:
@@ -468,9 +608,16 @@ def attested_file_digest_and_entry(parent_fd, name):
         status = os.fstat(descriptor)
         if not stat.S_ISREG(status.st_mode):
             raise ValueError("attested hook source is not a regular file")
-        digest = hashlib.sha256(b"F\0.\0")
+        if status.st_size > MAX_TREE_BYTES:
+            raise ValueError("attested hook source exceeds the safe size limit")
+        algorithm = current_tree_digest_algorithm()
+        digest = new_tree_digest(algorithm)
+        begin_tree_digest_entry(
+            digest, b"file", ".", status.st_mode, status.st_size, algorithm
+        )
         while chunk := os.read(descriptor, 1024 * 1024):
             digest.update(chunk)
+        finish_tree_digest_file(digest, algorithm)
         final = os.fstat(descriptor)
         if any(getattr(status, field) != getattr(final, field) for field in fields):
             raise ValueError("attested hook source changed while reading")
@@ -883,13 +1030,16 @@ def seal_payload(data):
             "plists": launch.get("plists"),
             "desired": launch.get("desired"),
         }
-    return {
+    payload = {
         "operations": operations,
         "operation_count": len(operations),
         "active_targets": active_targets,
         "handoff": handoff,
         "launch": sealed_launch,
     }
+    if data.get("version") == 3:
+        payload["digest_algorithm"] = data.get("digest_algorithm")
+    return payload
 
 def seal_digest(payload):
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -921,7 +1071,7 @@ def validate_seal(data):
 def validate_required_publication(data, installer_args, support):
     version = data.get("version")
     minimum_arguments = 9 if version == 1 else 10
-    if version not in {1, 2} or len(installer_args) < minimum_arguments:
+    if version not in {1, 2, 3} or len(installer_args) < minimum_arguments:
         raise ValueError("transaction publication contract is invalid")
     active_targets = {
         Path(data["operations"][index]["target"])
@@ -931,7 +1081,7 @@ def validate_required_publication(data, installer_args, support):
     aggregator_plist, player_plist, legacy_aggregator_plist, legacy_player_plist = map(Path, installer_args[4:8])
     hooks = Path(installer_args[8])
     required = {app, component, aggregator_plist, hooks, support / ".legacy-migration-v1.json"}
-    if version == 2:
+    if version in {2, 3}:
         required.add(Path(installer_args[9]))
     forbidden = {legacy_app, legacy_component, legacy_aggregator_plist, legacy_player_plist}
     if not required.issubset(active_targets) or active_targets.intersection(forbidden):
@@ -1145,6 +1295,7 @@ def write(data):
     sync_directory(root)
 
 def load():
+    global transaction_digest_algorithm
     status = root.lstat()
     if not stat.S_ISDIR(status.st_mode) or stat.S_IMODE(status.st_mode) != 0o700 or status.st_uid != os.getuid():
         raise ValueError("transaction directory ownership or mode is unsafe")
@@ -1152,8 +1303,17 @@ def load():
     if not stat.S_ISREG(journal_status.st_mode) or journal_status.st_uid != os.getuid():
         raise ValueError("transaction journal ownership is unsafe")
     data = json.loads(journal.read_text(encoding="utf-8"))
-    if data.get("version") not in {1, 2} or data.get("home") != str(home) or data.get("state") not in {"active", "files-committed", "committed"}:
+    version = data.get("version")
+    if data.get("home") != str(home) or data.get("state") not in {"active", "files-committed", "committed"}:
         raise ValueError("transaction journal identity is invalid")
+    if version in {1, 2}:
+        if "digest_algorithm" in data or command != "recover":
+            raise ValueError("legacy transaction journal schema is invalid")
+        transaction_digest_algorithm = LEGACY_TREE_DIGEST_ALGORITHM
+    elif version == 3 and data.get("digest_algorithm") == TREE_DIGEST_ALGORITHM:
+        transaction_digest_algorithm = TREE_DIGEST_ALGORITHM
+    else:
+        raise ValueError("transaction journal digest schema is invalid")
     return data
 
 def reconcile_grok_adoption(data):
@@ -1183,8 +1343,7 @@ def reconcile_grok_adoption(data):
         raise ValueError("Grok adoption pair is invalid")
     if adoption["phase"] == "prepared":
         attestation = adoption.get("attestation")
-        if not isinstance(attestation, dict) or type(attestation.get("exists")) is not bool:
-            raise ValueError("Grok adoption attestation is invalid")
+        require_transaction_hook_attestation(attestation)
         if adoption["rollback_state"] == "absent":
             private_fds = open_attested_private_directories(attestation.get("private_directories", []))
             try:
@@ -1273,7 +1432,8 @@ if command == "init":
     sync_directory(root.parent)
     (root / "stage").mkdir(mode=0o700)
     (root / "backup").mkdir(mode=0o700)
-    write({"version": 2, "home": str(home), "state": "active", "operations": []})
+    write({"version": 3, "digest_algorithm": TREE_DIGEST_ALGORITHM,
+           "home": str(home), "state": "active", "operations": []})
 elif command == "record":
     kind, source, target, expected = args
     data = load()
@@ -1289,6 +1449,8 @@ elif command == "install-move":
     data = load()
     if data["state"] != "active":
         raise ValueError("inactive transaction")
+    if expected_attestation is not None:
+        require_transaction_hook_attestation(expected_attestation)
     source_path = Path(source)
     target_path = Path(target)
     source_relative = relative_to(source_path, root)
@@ -1354,6 +1516,8 @@ elif command == "backup-move":
     target, source, expected = map(str, args[:3])
     expected_attestation = json.loads(args[3]) if len(args) == 4 else None
     data = load()
+    if expected_attestation is not None:
+        require_transaction_hook_attestation(expected_attestation)
     target_path, source_path = Path(target), Path(source)
     ancestor_indices = prepare_install_ancestor_mutations(data, target_path)
     target_parent, target_name = open_parent(target_path, home)
@@ -1415,6 +1579,7 @@ elif command == "validate-hook-attestation":
     target_path = Path(target)
     relative_to(target_path, home)
     attestation = json.loads(serialized)
+    require_transaction_hook_attestation(attestation)
     if attestation.get("exists") is not False or os.path.lexists(target_path):
         raise ValueError("hook destination changed")
     directory_fields = ("st_dev", "st_ino", "st_mode", "st_uid")
@@ -1448,8 +1613,7 @@ elif command == "adopt-hook-edit":
     relative_to(target_path, home)
     relative_to(staged_path, root / "stage")
     attestation = json.loads(serialized)
-    if type(attestation.get("exists")) is not bool:
-        raise ValueError("hook edit attestation is invalid")
+    require_transaction_hook_attestation(attestation)
     matching = [
         (index, operation)
         for index, operation in enumerate(data["operations"])
@@ -1965,7 +2129,48 @@ backup_attested_hook_target() {
   mkdir -p "$(dirname "$saved")"
   journal_command backup-move "$target" "$saved" "$digest" "$attestation" 2>/dev/null || { printf 'Grok hook configuration changed during installation.\n' >&2; exit 75; }
 }
-install_target() { local staged="$1" target="$2" attestation_file="${3:-}" parent digest attestation=""; parent="$(dirname "$target")"; is_safe_destination_dir "$parent" || { printf 'Installation target parent is unsafe.\n' >&2; exit 74; }; case "$parent" in "$support_dir"|"$support_dir"/*) validate_support_parent_chain "$parent" || { printf 'Installation target parent is unsafe.\n' >&2; exit 74; } ;; esac; digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$staged")"; if [[ -n "$attestation_file" ]]; then attestation="$("$python_bin" -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1], encoding="utf-8")), sort_keys=True, separators=(",", ":")))' "$attestation_file")"; journal_command install-move "$staged" "$target" "$digest" "$attestation" 2>/dev/null; else journal_command install-move "$staged" "$target" "$digest" 2>/dev/null; fi || { printf 'Statelet publication failed safely.\n' >&2; exit 74; }; }
+install_target() {
+  local staged="$1" target="$2" attestation_file="${3:-}" expected_digest="${4:-}"
+  local parent digest attestation=""
+  parent="$(dirname "$target")"
+  is_safe_destination_dir "$parent" || { printf 'Installation target parent is unsafe.\n' >&2; exit 74; }
+  case "$parent" in
+    "$support_dir"|"$support_dir"/*)
+      validate_support_parent_chain "$parent" || { printf 'Installation target parent is unsafe.\n' >&2; exit 74; }
+      ;;
+  esac
+  digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$staged" 2>/dev/null)" || {
+    printf 'Staged Statelet publication changed before installation.\n' >&2
+    exit 75
+  }
+  if [[ -n "$expected_digest" ]]; then
+    [[ "$digest" == "$expected_digest" ]] || {
+      printf 'Staged Statelet.app changed before publication.\n' >&2
+      exit 75
+    }
+    validate_staged_app_bundle "$staged" || {
+      printf 'Staged Statelet.app failed final code-signature validation.\n' >&2
+      exit 75
+    }
+    digest="$expected_digest"
+  fi
+  if [[ -n "$attestation_file" ]]; then
+    attestation="$("$python_bin" -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1], encoding="utf-8")), sort_keys=True, separators=(",", ":")))' "$attestation_file")"
+    journal_command install-move "$staged" "$target" "$digest" "$attestation" 2>/dev/null
+  else
+    journal_command install-move "$staged" "$target" "$digest" 2>/dev/null
+  fi || { printf 'Statelet publication failed safely.\n' >&2; exit 74; }
+}
+validate_app_publication_candidate() {
+  local source_digest staged_digest
+  source_digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$app_bundle" 2>/dev/null)" || return 1
+  staged_digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$stage_app" 2>/dev/null)" || return 1
+  [[ "$source_digest" == "$app_source_digest" \
+    && "$staged_digest" == "$app_source_digest" \
+    && "$stage_app_digest" == "$app_source_digest" \
+    && "$current_stage_app_digest" == "$app_source_digest" ]] || return 1
+  validate_staged_app_bundle "$stage_app"
+}
 ensure_dir() { if [[ -e "$1" || -L "$1" ]]; then is_safe_destination_dir "$1" || { printf 'Refusing unsafe Statelet destination directory.\n' >&2; exit 1; }; else journal_command mkdir-make "$1" 0755 2>/dev/null || { printf 'Statelet directory creation failed safely.\n' >&2; exit 74; }; is_safe_destination_dir "$1" || exit 1; fi; }
 ensure_private_dir() { if [[ -e "$1" || -L "$1" ]]; then is_safe_destination_dir "$1" || { printf 'Refusing unsafe Statelet destination directory.\n' >&2; exit 1; }; else journal_command mkdir-make "$1" 0700 2>/dev/null || { printf 'Statelet directory creation failed safely.\n' >&2; exit 74; }; is_safe_destination_dir "$1" || exit 1; fi; }
 prepare_grok_adoption_for_rollback() {
@@ -1989,7 +2194,22 @@ stage_app="$stage_root/Statelet.app"
 stage_component="$stage_root/Statelet"
 stage_aggregator_plist="$stage_root/$aggregator_label.plist"
 stage_player_plist="$stage_root/$player_label.plist"
-ditto "$app_bundle" "$stage_app"
+"$python_bin" "$script_dir/merge_hooks.py" --safe-copy-source "$app_bundle" --safe-copy-destination "$stage_app" 2>/dev/null || {
+  printf 'Statelet.app could not be snapshotted safely.\n' >&2
+  exit 1
+}
+stage_app_digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$stage_app" 2>/dev/null)" || {
+  printf 'Staged Statelet.app failed integrity validation.\n' >&2
+  exit 1
+}
+[[ "$stage_app_digest" == "$app_source_digest" ]] || {
+  printf 'Statelet.app changed before its private snapshot completed.\n' >&2
+  exit 75
+}
+validate_staged_app_bundle "$stage_app" || {
+  printf 'Staged Statelet.app failed identity or code-signature validation.\n' >&2
+  exit 1
+}
 mkdir -p "$stage_component/python"
 install -m 0644 "$repo_root/mac/codex_pet_state.py" "$stage_component/python/statelet_state.py"
 install -m 0755 "$repo_root/mac/codex_pet_state_aggregator.py" "$stage_component/python/statelet_state_aggregator.py"
@@ -2047,8 +2267,33 @@ for path, payload in ((aggregator_path, aggregator), (player_path, player)):
 PY
 plutil -lint "$stage_aggregator_plist" "$stage_player_plist" >/dev/null
 
+if [[ -n "${STATELET_INSTALL_TEST_APP_SOURCE_GATE:-}" ]]; then
+  gate="${STATELET_INSTALL_TEST_APP_SOURCE_GATE}"
+  [[ "$gate" = "$home_dir"/* ]] || { printf 'Invalid application snapshot test gate.\n' >&2; exit 2; }
+  : > "$gate.ready"
+  attempt=0
+  while [[ "$attempt" -lt 1500 && ! -e "$gate.release" ]]; do /bin/sleep 0.01; attempt=$((attempt + 1)); done
+  [[ -e "$gate.release" ]] || { printf 'Application snapshot test gate timed out.\n' >&2; exit 76; }
+fi
+current_app_source_digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$app_bundle" 2>/dev/null)" || {
+  printf 'Statelet.app source changed during installation.\n' >&2
+  exit 75
+}
+current_stage_app_digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$stage_app" 2>/dev/null)" || {
+  printf 'Staged Statelet.app changed during installation.\n' >&2
+  exit 75
+}
+[[ "$current_app_source_digest" == "$app_source_digest" && "$current_stage_app_digest" == "$app_source_digest" ]] || {
+  printf 'Statelet.app source or private snapshot changed during installation.\n' >&2
+  exit 75
+}
+validate_staged_app_bundle "$stage_app" || {
+  printf 'Staged Statelet.app changed after validation.\n' >&2
+  exit 75
+}
+
 if [[ "$skip_launchctl" -eq 0 ]]; then
-  for ((index=0; index<4; index++)); do if job_is_loaded "${labels[$index]}"; then was_loaded[$index]=1; fi; done
+  for ((index=0; index<4; index++)); do if job_is_loaded "${labels[$index]}"; then was_loaded[index]=1; fi; done
   journal_command launch-init "${labels[@]}" "${plists[@]}" "${was_loaded[@]}" "${desired_loaded[@]}"
   for ((index=0; index<4; index++)); do
     label="${labels[$index]}"
@@ -2125,7 +2370,7 @@ for relative in media voice characters sessions alpha-runtime runtime/current_st
     migration_digests+=("$source_digest")
     migration_present_relatives+=("$relative")
     attested=0
-    if migration_attests "$relative" "$source_digest"; then attested=1; fi
+    if migration_attests "$relative" "$source_digest" "$source"; then attested=1; fi
     if [[ -e "$destination" ]]; then
       destination_digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$destination")" || { printf 'Refusing unsafe Statelet destination data.\n' >&2; exit 1; }
       if [[ "$source_digest" != "$destination_digest" && "$attested" -eq 0 ]]; then
@@ -2161,7 +2406,9 @@ if len(relatives) != len(digests):
     raise SystemExit("invalid migration manifest inputs")
 with path.open("w", encoding="utf-8") as handle:
     json.dump(
-        {"version": 1, "source_identity": identity, "source_root": source_root, "subtrees": dict(zip(relatives, digests))},
+        {"version": 2, "digest_algorithm": "statelet-safe-tree-v2",
+         "source_identity": identity, "source_root": source_root,
+         "subtrees": dict(zip(relatives, digests))},
         handle,
         sort_keys=True,
         separators=(",", ":"),
@@ -2206,6 +2453,10 @@ for ((index=0; index<${#migration_relatives[@]}; index++)); do
   fi
 done
 
+validate_app_publication_candidate || {
+  printf 'Staged Statelet.app changed before destination publication.\n' >&2
+  exit 75
+}
 ensure_dir "$applications_dir"
 ensure_dir "$home_dir/Library"
 ensure_dir "$home_dir/Library/Application Support"
@@ -2220,7 +2471,7 @@ backup_target "$player_plist" agents/player
 [[ ! -e "$legacy_aggregator_plist" ]] || backup_target "$legacy_aggregator_plist" agents/legacy-aggregator
 [[ ! -e "$legacy_player_plist" ]] || backup_target "$legacy_player_plist" agents/legacy-player
 [[ ! -e "$hooks_file" ]] || backup_target "$hooks_file" hooks-quiesced.json
-install_target "$stage_app" "$app_dest"
+install_target "$stage_app" "$app_dest" "" "$app_source_digest"
 if [[ "${STATELET_INSTALL_CRASH_AT:-}" == "after-app" ]]; then kill -KILL $$; fi
 if [[ "${STATELET_INSTALL_FAIL_AT:-${CODEX_PET_INSTALL_FAIL_AT:-}}" == "after-app" ]]; then printf 'Injected installation failure after app replacement.\n' >&2; exit 70; fi
 install_target "$stage_component" "$component_dir"

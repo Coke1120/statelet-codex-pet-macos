@@ -33,14 +33,6 @@ except ImportError as exc:  # pragma: no cover - exercised by host error tests
 else:
     _NUMPY_ERROR = None
 
-try:  # Pillow is part of the supported authoring environment.
-    from PIL import Image
-except ImportError as exc:  # pragma: no cover - exercised by host error tests
-    Image = None  # type: ignore[assignment,misc]
-    _PIL_ERROR = exc
-else:
-    _PIL_ERROR = None
-
 
 class AlphaConversionError(RuntimeError):
     """Base class for errors that should be shown as a concise CLI failure."""
@@ -51,7 +43,7 @@ class MissingToolError(AlphaConversionError):
 
 
 class MissingDependencyError(AlphaConversionError):
-    """NumPy or Pillow is unavailable in the selected Python environment."""
+    """NumPy is unavailable in the selected Python environment."""
 
 
 class ProbeError(AlphaConversionError):
@@ -248,14 +240,9 @@ def _require_numpy() -> Any:
 
 
 def require_image_dependencies() -> None:
-    """Fail early with an actionable message when image dependencies are absent."""
+    """Fail early with an actionable message when NumPy is absent."""
 
     _require_numpy()
-    if Image is None:
-        detail = f": {_PIL_ERROR}" if _PIL_ERROR else ""
-        raise MissingDependencyError(
-            "Pillow is required for offline alpha conversion" + detail
-        )
 
 
 def require_tool(name: str, executable: str | os.PathLike[str] | None = None) -> str:

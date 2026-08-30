@@ -514,15 +514,21 @@ text and manage generated lines.
 If no profile has been saved yet, Dialogue & Voice opens on Voice Setup; otherwise it opens
 on Dialogue and remembers subsequent page changes while Settings remains open.
 
-1. Start GPT-SoVITS API v2 on this Mac. The default endpoint is
-   `http://127.0.0.1:9880`.
-2. In **Voice Setup**, enter a profile name, prompt language, default dialogue
-   language, and the exact transcript of the reference recording.
+1. Start GPT-SoVITS API v2 behind a locally managed TLS service or gateway on
+   this Mac. The default profile endpoint is `https://127.0.0.1:9880`; a plain
+   HTTP API must remain behind the authenticated gateway rather than being the
+   Statelet endpoint.
+2. In **Voice Setup**, enter a profile name, the numeric-loopback HTTPS URL,
+   the 64-hex SHA-256 of the gateway leaf certificate's DER bytes, prompt
+   language, default dialogue language, and the exact transcript of the
+   reference recording. For a PEM leaf certificate, compute the pin with
+   `openssl x509 -in leaf.pem -outform DER | shasum -a 256`.
 3. Still in Voice Setup, import the trained GPT `.ckpt` weight, SoVITS `.pth`
    weight, and reference audio separately. Import only files you trust and
    recordings you are authorized to use.
-4. Save the profile. Statelet rejects non-loopback endpoints, missing managed
-   assets, unsafe paths, symbolic links, and unsupported import extensions.
+4. Save the profile. Statelet rejects HTTP, non-loopback endpoints, absent or
+   malformed certificate pins, missing managed assets, unsafe paths, symbolic
+   links, and unsupported import extensions.
 5. Switch to **Dialogue**, choose the owning Idle, Running, Waiting, or Review
    state, enter a line and its GPT-SoVITS language identifier, then choose
    **Add**. The line is saved before background generation begins.
@@ -554,9 +560,13 @@ dialogue saved before state ownership existed is assigned to Idle.
 
 Statelet calls GPT-SoVITS API v2's local `/set_gpt_weights`,
 `/set_sovits_weights`, and `/tts` endpoints. It does not start, install, train,
-download, or update GPT-SoVITS. The service must be reachable through plain
-HTTP on numeric IPv4 or IPv6 loopback; hostnames, proxies, redirects, and remote
-hosts are refused so sensitive request data cannot leave the local transport.
+download, or update GPT-SoVITS. Every request requires HTTPS on numeric IPv4 or
+IPv6 loopback and authenticates the exact saved SHA-256 of the leaf DER
+certificate, including for a deliberately self-signed local certificate.
+Hostnames, proxies, redirects, remote hosts, missing pins, and certificate
+mismatches are refused. There is no cleartext or bearer-token fallback. A TLS
+gateway must own a trusted upstream connection to GPT-SoVITS; forwarding to a
+replaceable unauthenticated loopback backend would weaken this boundary.
 Dialogue uses a separate speech player; accepted Statelet animation deliveries
 remain silent, so preview or runtime speech does not pause lifecycle animation.
 TTS requests use `cut0`, batch size `1`, disabled parallel/bucket inference,
@@ -564,6 +574,11 @@ zero fragment interval, and the bounded sampling values documented in the
 source so short messages remain contiguous. Statelet versions generated output
 independently from the model fingerprint; after this recipe changes, legacy WAV
 files remain protected until their replacements generate successfully.
+Legacy profiles using HTTP or lacking a certificate pin remain decodable so
+the private voice library is not damaged, but are marked unavailable and cannot
+synthesize until the HTTPS endpoint and pin are entered and the profile is
+saved again. Deliberate certificate rotation likewise requires saving the new
+pin before requests resume.
 
 ### VoxCPM2 setup and recovery
 
@@ -759,7 +774,7 @@ command -v ffmpeg
 command -v ffprobe
 test -x /usr/bin/avconvert
 "$HOME/Library/Application Support/Statelet/alpha-runtime/bin/python3" \
-  -c 'import numpy, PIL'
+  -c 'import numpy'
 ```
 
 Choose **Check Again** after correcting the toolchain. If Python is elsewhere,

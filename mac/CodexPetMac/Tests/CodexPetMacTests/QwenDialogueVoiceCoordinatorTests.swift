@@ -150,6 +150,30 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
         }
     }
 
+    private final class BlockingFinalizationGate: @unchecked Sendable {
+        private let gate = DispatchSemaphore(value: 0)
+        private let onStart: @Sendable () -> Void
+
+        init(onStart: @escaping @Sendable () -> Void) {
+            self.onStart = onStart
+        }
+
+        func wait() {
+            onStart()
+            gate.wait()
+        }
+
+        func release() { gate.signal() }
+    }
+
+    private final class URLRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage: URL?
+
+        func record(_ url: URL) { lock.withLock { storage = url } }
+        var value: URL? { lock.withLock { storage } }
+    }
+
     override func setUp() {
         super.setUp()
         QwenUnexpectedGPTURLProtocol.counter.reset()
@@ -302,7 +326,7 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
         coordinator.start()
         coordinator.configureQwenProfile(
             sourceURL: root.appendingPathComponent("first"),
-            pythonExecutableURL: URL(fileURLWithPath: "/bin/sh")
+            pythonExecutableURL: try authenticatedPythonExecutable()
         )
         await fulfillment(of: [firstStarted], timeout: 5)
         let firstPaths = try XCTUnwrap(
@@ -311,7 +335,7 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
 
         coordinator.configureQwenProfile(
             sourceURL: root.appendingPathComponent("second"),
-            pythonExecutableURL: URL(fileURLWithPath: "/bin/sh")
+            pythonExecutableURL: try authenticatedPythonExecutable()
         )
         await fulfillment(of: [secondStarted], timeout: 5)
         XCTAssertTrue(FileManager.default.fileExists(
@@ -341,6 +365,117 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
     }
 
     @MainActor
+    func testTerminationWaitsForImportCleanupFinalizerAfterPublishedReservation() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let finalizationStarted = expectation(description: "import reached finalization boundary")
+        let finalizationGate = BlockingFinalizationGate {
+            finalizationStarted.fulfill()
+        }
+        let coordinator = DialogueVoiceCoordinator(
+            applicationSupportRoot: root,
+            qwenPackageInstall: { _, supportRoot, token, _ in
+                let paths = try Qwen3TTSPackageInstaller.managedRelativePaths(
+                    destinationToken: token
+                )
+                let marker = supportRoot.appendingPathComponent(
+                    paths.destination,
+                    isDirectory: true
+                ).appendingPathComponent("published-before-finalizer.bin")
+                try FileManager.default.createDirectory(
+                    at: marker.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try Data("private".utf8).write(to: marker)
+                throw DialogueVoiceRuntimeError.cancelled
+            },
+            beforeImportFinalization: { finalizationGate.wait() }
+        )
+        defer {
+            finalizationGate.release()
+            coordinator.shutdown()
+        }
+        coordinator.start()
+        coordinator.configureQwenProfile(
+            sourceURL: root,
+            pythonExecutableURL: try authenticatedPythonExecutable()
+        )
+        await fulfillment(of: [finalizationStarted], timeout: 5)
+
+        let reservation = try XCTUnwrap(qwenReservationPairs(in: coordinator.library).first)
+        let marker = root.appendingPathComponent(
+            reservation.destination,
+            isDirectory: true
+        ).appendingPathComponent("published-before-finalizer.bin")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
+            finalizationGate.release()
+        }
+        XCTAssertTrue(coordinator.shutdownAndWaitForQuiescence(timeout: 2))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertTrue(try DialogueVoiceStore(
+            rootURL: root.appendingPathComponent("voice", isDirectory: true)
+        ).load().pendingCleanupPaths.isEmpty)
+    }
+
+    @MainActor
+    func testRemovingGPTProfilePreservesBlockedVoxImportUntilImporterFinalizes() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gptProfile = try makeGPTProfile(root: root)
+        try save(try DialogueVoiceLibrary(profile: gptProfile), root: root)
+        let importStarted = expectation(description: "Vox import owns its destination")
+        let gate = DispatchSemaphore(value: 0)
+        let markerRecorder = URLRecorder()
+        let coordinator = DialogueVoiceCoordinator(
+            applicationSupportRoot: root,
+            voxSnapshotInstall: { _, supportRoot, token in
+                let paths = try VoxCPM2SnapshotInstaller.managedRelativePaths(
+                    destinationToken: token
+                )
+                let marker = supportRoot.appendingPathComponent(
+                    paths.destination,
+                    isDirectory: true
+                ).appendingPathComponent("in-flight.bin")
+                try FileManager.default.createDirectory(
+                    at: marker.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try Data("private".utf8).write(to: marker)
+                markerRecorder.record(marker)
+                importStarted.fulfill()
+                gate.wait()
+                throw DialogueVoiceRuntimeError.cancelled
+            }
+        )
+        defer {
+            gate.signal()
+            coordinator.shutdown()
+        }
+        coordinator.start()
+        coordinator.configureVoxCPM2Profile(
+            snapshotURL: root,
+            referenceAudioURL: root.appendingPathComponent("reference.wav"),
+            referenceText: "参照音声です。",
+            pythonExecutableURL: try authenticatedPythonExecutable()
+        )
+        await fulfillment(of: [importStarted], timeout: 5)
+        let marker = try XCTUnwrap(markerRecorder.value)
+
+        try coordinator.removeProfile(provider: .gptSovits)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertFalse(coordinator.library.pendingCleanupPaths.isEmpty)
+
+        gate.signal()
+        try await waitUntil(timeout: 5) {
+            coordinator.library.pendingCleanupPaths.isEmpty
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    @MainActor
     func testSuccessfulQwenConfigureKeepsActiveGPTReadyOutput() async throws {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -363,7 +498,7 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
             isDirectory: true
         )
         let runtime = try Qwen3TTSProfileValidator.validatePythonExecutable(
-            at: URL(fileURLWithPath: "/bin/sh")
+            at: authenticatedPythonExecutable()
         )
 
         let coordinator = DialogueVoiceCoordinator(
@@ -394,7 +529,7 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
         coordinator.start()
         coordinator.configureQwenProfile(
             sourceURL: fixtureRoot,
-            pythonExecutableURL: URL(fileURLWithPath: "/bin/sh")
+            pythonExecutableURL: try authenticatedPythonExecutable()
         )
         try await waitUntil(timeout: 5) { coordinator.library.qwenProfile != nil }
 
@@ -436,7 +571,7 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
             isDirectory: true
         )
         let runtime = try Qwen3TTSProfileValidator.validatePythonExecutable(
-            at: URL(fileURLWithPath: "/bin/sh")
+            at: authenticatedPythonExecutable()
         )
         let probeCalls = RequestCounter()
         let synthesisCalls = RequestCounter()
@@ -475,7 +610,7 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
 
         coordinator.configureQwenProfile(
             sourceURL: fixtureRoot,
-            pythonExecutableURL: URL(fileURLWithPath: "/bin/sh")
+            pythonExecutableURL: try authenticatedPythonExecutable()
         )
         try await waitUntil(timeout: 5) { coordinator.library.qwenProfile != nil }
 
@@ -516,6 +651,54 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
         await fulfillment(of: [ready], timeout: 5)
         XCTAssertEqual(qwenCalls.value, 0)
         XCTAssertEqual(coordinator.library.activeProviderKind, .gptSovits)
+    }
+
+    @MainActor
+    func testTerminationWaitsForGenerationCleanupAfterAudioWasPublished() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = try makeGPTProfile(root: root)
+        var library = try DialogueVoiceLibrary(profile: profile)
+        _ = try library.addLine(text: "Published before finalization", language: "en")
+        try save(library, root: root)
+
+        let finalizationStarted = expectation(description: "generation published before finalizer")
+        let finalizationGate = BlockingFinalizationGate {
+            finalizationStarted.fulfill()
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [SuccessfulGPTURLProtocol.self]
+        let coordinator = DialogueVoiceCoordinator(
+            applicationSupportRoot: root,
+            client: GPTSoVITSAPIClient(configuration: configuration),
+            beforeGenerationFinalization: { finalizationGate.wait() }
+        )
+        defer {
+            finalizationGate.release()
+            coordinator.shutdown()
+        }
+        coordinator.start()
+        await fulfillment(of: [finalizationStarted], timeout: 5)
+
+        let generatedRoot = root.appendingPathComponent("voice/generated", isDirectory: true)
+        let publishedBeforeFinalization = try FileManager.default.contentsOfDirectory(
+            at: generatedRoot,
+            includingPropertiesForKeys: nil
+        )
+        XCTAssertFalse(publishedBeforeFinalization.isEmpty)
+
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
+            finalizationGate.release()
+        }
+        XCTAssertTrue(coordinator.shutdownAndWaitForQuiescence(timeout: 2))
+        let remaining = (try? FileManager.default.contentsOfDirectory(
+            at: generatedRoot,
+            includingPropertiesForKeys: nil
+        )) ?? []
+        XCTAssertTrue(remaining.isEmpty)
+        XCTAssertTrue(try DialogueVoiceStore(
+            rootURL: root.appendingPathComponent("voice", isDirectory: true)
+        ).load().pendingCleanupPaths.isEmpty)
     }
 
     @MainActor
@@ -650,7 +833,7 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
             snapshotURL: fixture.sourceSnapshotURL,
             referenceAudioURL: newReferenceURL,
             referenceText: "新しい参照音声です。",
-            pythonExecutableURL: URL(fileURLWithPath: "/bin/sh")
+            pythonExecutableURL: try authenticatedPythonExecutable()
         )
 
         try await waitUntil(timeout: 5) {
@@ -778,7 +961,7 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
             snapshotURL: root.appendingPathComponent("unused-source"),
             referenceAudioURL: root.appendingPathComponent("unused-reference.wav"),
             referenceText: "失敗したスナップショットです。",
-            pythonExecutableURL: URL(fileURLWithPath: "/bin/sh")
+            pythonExecutableURL: try authenticatedPythonExecutable()
         )
         await fulfillment(of: [published], timeout: 5)
         try await waitUntil(timeout: 5) {
@@ -867,7 +1050,7 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
             snapshotURL: root.appendingPathComponent("unused-source"),
             referenceAudioURL: sourceReference,
             referenceText: "失敗した参照音声です。",
-            pythonExecutableURL: URL(fileURLWithPath: "/bin/sh")
+            pythonExecutableURL: try authenticatedPythonExecutable()
         )
         await fulfillment(of: [published], timeout: 5)
         try await waitUntil(timeout: 5) {
@@ -899,7 +1082,7 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
             snapshotURL: root.appendingPathComponent("unused-source"),
             referenceAudioURL: root.appendingPathComponent("unsupported.txt"),
             referenceText: "対応していない形式です。",
-            pythonExecutableURL: URL(fileURLWithPath: "/bin/sh")
+            pythonExecutableURL: try authenticatedPythonExecutable()
         )
 
         XCTAssertTrue(coordinator.library.pendingCleanupPaths.isEmpty)
@@ -932,7 +1115,7 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
             snapshotURL: oldVoxFixture.sourceSnapshotURL,
             referenceAudioURL: newReferenceURL,
             referenceText: "設定済み参照音声です。",
-            pythonExecutableURL: URL(fileURLWithPath: "/bin/sh")
+            pythonExecutableURL: try authenticatedPythonExecutable()
         )
 
         try await waitUntil(timeout: 5) {
@@ -1118,6 +1301,29 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
 
     private func helperURL(_ root: URL) -> URL { root.appendingPathComponent("helper.py") }
 
+    private func authenticatedPythonExecutable() throws -> URL {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        process.arguments = ["--find", "python3"]
+        process.environment = [
+            "DEVELOPER_DIR": "/Library/Developer/CommandLineTools",
+            "PATH": "/usr/bin:/bin",
+        ]
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        guard process.terminationStatus == 0,
+              let raw = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              raw.hasPrefix("/") else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        return URL(fileURLWithPath: raw).resolvingSymlinksInPath().standardizedFileURL
+    }
+
     private func makeQwenProfile(root: URL) throws -> Qwen3TTSVoiceProfile {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let packageRelative = "voice/packages/qwen/test"
@@ -1134,7 +1340,8 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
         for (path, data) in files { try data.write(to: package.appendingPathComponent(path)) }
         let helper = helperURL(root)
         try Data("helper".utf8).write(to: helper)
-        let python = URL(fileURLWithPath: "/bin/sh")
+        let python = try authenticatedPythonExecutable()
+        let pythonIdentity = try Qwen3TTSProfileValidator.validatePythonExecutable(at: python)
         let manifest = try Qwen3TTSPackageManifest(
             referenceAudioRelativePath: files[3].0,
             modelSHA256: sha(files[0].1), configSHA256: sha(files[1].1),
@@ -1142,7 +1349,8 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
         )
         let provisional = try Qwen3TTSVoiceProfile(
             name: "Qwen", packageRootRelativePath: packageRelative,
-            pythonExecutablePath: python.path, pythonExecutableSHA256: sha(try Data(contentsOf: python)),
+            pythonExecutablePath: python.path,
+            pythonExecutableSHA256: pythonIdentity.finalTargetSHA256,
             packageTreeSHA256: try Qwen3TTSProfileValidator.computePackageTreeSHA256(packageRoot: package),
             manifest: manifest, referenceText: "合成テスト用の参照文です。",
             referenceLanguage: "japanese", defaultTextLanguage: "japanese",
@@ -1167,12 +1375,15 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
             try bytes.write(to: url)
         }
         let digests = DialogueVoiceAssetDigests(gptWeight: sha(data[0]), sovitsWeight: sha(data[1]), referenceAudio: sha(data[2]))
-        let endpoint = URL(string: "http://127.0.0.1:9880")!
+        let endpoint = URL(string: "https://127.0.0.1:9880")!
+        let tlsPin = String(repeating: "c", count: 64)
         return try GPTSoVITSVoiceProfile(
-            name: "GPT", apiBaseURL: endpoint, gptWeightRelativePath: paths[0], sovitsWeightRelativePath: paths[1],
+            name: "GPT", apiBaseURL: endpoint, tlsLeafCertificateSHA256: tlsPin,
+            gptWeightRelativePath: paths[0], sovitsWeightRelativePath: paths[1],
             referenceAudioRelativePath: paths[2], referenceText: "Reference", promptLanguage: "en", defaultTextLanguage: "en",
             inputFingerprint: DialogueVoiceProfileFingerprint.compute(
-                apiBaseURL: endpoint, referenceText: "Reference", promptLanguage: "en", defaultTextLanguage: "en", assetDigests: digests
+                apiBaseURL: endpoint, tlsLeafCertificateSHA256: tlsPin,
+                referenceText: "Reference", promptLanguage: "en", defaultTextLanguage: "en", assetDigests: digests
             )
         )
     }
@@ -1200,16 +1411,16 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
         }
         let referenceData = Self.pcmWAV(sampleRate: 32_000, frames: 3_200)
         try referenceData.write(to: reference)
-        let python = URL(fileURLWithPath: "/bin/sh")
+        let python = try authenticatedPythonExecutable()
+        let pythonIdentity = try Qwen3TTSProfileValidator.validatePythonExecutable(at: python)
         let imported = try VoxCPM2SnapshotInstaller(applicationSupportRoot: root)
             .install(sourceURL: snapshot)
-        let pythonDigest = sha(try Data(contentsOf: python))
         let referenceDigest = sha(referenceData)
         let provisional = try VoxCPM2VoiceProfile(
             name: "VoxCPM2", snapshotPath: imported.snapshotRootRelativePath,
             snapshotTreeSHA256: imported.treeSHA256,
             pythonExecutablePath: python.path,
-            pythonExecutableSHA256: pythonDigest,
+            pythonExecutableSHA256: pythonIdentity.finalTargetSHA256,
             referenceAudioRelativePath: referenceRelativePath,
             referenceAudioSHA256: referenceDigest,
             referenceText: "参照音声です。", defaultTextLanguage: "japanese",

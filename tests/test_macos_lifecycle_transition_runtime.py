@@ -473,7 +473,7 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
             ("private func isMediaPathReferenced(_ url:", "private func isMediaPathReferencedByInactiveCharacter"),
             ("private func isMediaPathReferencedByInactiveCharacter(_ url:", "private func mediaMap(_ map:"),
             ("private func mediaMap(_ map:", "private func allCharacterMediaMaps"),
-            ("private func unusedMediaCandidates()", "private func isInsideManagedMedia"),
+            ("private func discoverUnusedMedia()", "private func isInsideManagedMedia"),
         ):
             start = self.app.index(name)
             end = self.app.index(end_marker, start)
@@ -488,11 +488,29 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         self.assertLess(global_check, character_check)
 
     def test_unused_media_cleanup_includes_global_transition_references(self):
-        start = self.app.index("private func unusedMediaCandidates()")
+        start = self.app.index("private func discoverUnusedMedia()")
         end = self.app.index("private func isInsideManagedMedia", start)
         source = self.app[start:end]
         self.assertIn("characterLibraryStorage.globalTransitionLibraryURL", source)
         self.assertIn("globalTransitionLibrary.allEntries", source)
+        self.assertIn("ManagedMediaTrashRevalidator", source)
+        self.assertIn(".captureUnusedLibrary(", source)
+
+    def test_unused_media_discovery_runs_once_off_main_and_revalidates_before_trash(self):
+        cleanup = self.app.index("private func cleanUnusedMedia()")
+        confirmation = self.app.index("private func confirmUnusedMediaCleanup", cleanup)
+        discovery = self.app.index("private func discoverUnusedMedia()", confirmation)
+        cleanup_source = self.app[cleanup:confirmation]
+        confirmation_source = self.app[confirmation:discovery]
+        self.assertIn("Task.detached(priority: .utility)", cleanup_source)
+        self.assertEqual(cleanup_source.count("discoverUnusedMedia()"), 1)
+        self.assertNotIn("discoverUnusedMedia()", confirmation_source)
+        self.assertIn("validateUnusedLibraryUnchanged", confirmation_source)
+        self.assertIn("quarantineLibraryAfterPublish", confirmation_source)
+        self.assertLess(
+            confirmation_source.index("validateUnusedLibraryUnchanged"),
+            confirmation_source.index("quarantineLibraryAfterPublish"),
+        )
 
     def test_transition_removal_revalidates_character_map_and_route_after_confirmation(self):
         start = self.app.index("private func removeTransition")

@@ -665,7 +665,8 @@ final class SettingsWindowControllerTests: XCTestCase {
 
         let profile = try GPTSoVITSVoiceProfile(
             name: "Test Voice",
-            apiBaseURL: try XCTUnwrap(URL(string: "http://127.0.0.1:9880")),
+            apiBaseURL: try XCTUnwrap(URL(string: "https://127.0.0.1:9880")),
+            tlsLeafCertificateSHA256: String(repeating: "c", count: 64),
             gptWeightRelativePath: "voice/assets/gpt/test.ckpt",
             sovitsWeightRelativePath: "voice/assets/sovits/test.pth",
             referenceAudioRelativePath: "voice/assets/reference/test.wav",
@@ -689,6 +690,7 @@ final class SettingsWindowControllerTests: XCTestCase {
                 draft: DialogueVoiceProfileDraft(
                     name: profile.name,
                     apiBaseURL: profile.apiBaseURL.absoluteString,
+                    tlsLeafCertificateSHA256: try XCTUnwrap(profile.tlsLeafCertificateSHA256),
                     promptLanguage: profile.promptLanguage,
                     defaultTextLanguage: profile.defaultTextLanguage,
                     referenceText: profile.referenceText

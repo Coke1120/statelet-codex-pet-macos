@@ -74,7 +74,8 @@ private func runDialogueVoiceSelfTest() throws {
         id: profileID,
         revision: 1,
         name: "Self-test voice",
-        apiBaseURL: URL(string: "http://127.0.0.1:9880")!,
+        apiBaseURL: URL(string: "https://127.0.0.1:9880")!,
+        tlsLeafCertificateSHA256: String(repeating: "b", count: 64),
         gptWeightRelativePath: "voice/assets/gpt/model.ckpt",
         sovitsWeightRelativePath: "voice/assets/sovits/model.pth",
         referenceAudioRelativePath: "voice/assets/reference/reference.wav",
@@ -175,7 +176,22 @@ private func runDialogueVoiceSelfTest() throws {
     try requiresError("remote voice endpoint was accepted") {
         _ = try GPTSoVITSVoiceProfile(
             name: "Remote",
-            apiBaseURL: URL(string: "http://example.com:9880")!,
+            apiBaseURL: URL(string: "https://example.com:9880")!,
+            tlsLeafCertificateSHA256: String(repeating: "b", count: 64),
+            gptWeightRelativePath: "voice/assets/gpt/model.ckpt",
+            sovitsWeightRelativePath: "voice/assets/sovits/model.pth",
+            referenceAudioRelativePath: "voice/assets/reference/reference.wav",
+            referenceText: "Reference",
+            promptLanguage: "en",
+            defaultTextLanguage: "en",
+            inputFingerprint: String(repeating: "a", count: 64)
+        )
+    }
+    try requiresError("cleartext loopback voice endpoint was accepted") {
+        _ = try GPTSoVITSVoiceProfile(
+            name: "Cleartext",
+            apiBaseURL: URL(string: "http://127.0.0.1:9880")!,
+            tlsLeafCertificateSHA256: String(repeating: "b", count: 64),
             gptWeightRelativePath: "voice/assets/gpt/model.ckpt",
             sovitsWeightRelativePath: "voice/assets/sovits/model.pth",
             referenceAudioRelativePath: "voice/assets/reference/reference.wav",

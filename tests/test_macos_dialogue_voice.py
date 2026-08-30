@@ -86,6 +86,7 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
 
         required_accessibility_labels = {
             "GPT-SoVITS API base URL",
+            "GPT-SoVITS TLS leaf certificate SHA-256",
             "Import GPT weight",
             "Import SoVITS weight",
             "Import reference audio",
@@ -126,20 +127,28 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         for kind in (".gptWeight", ".sovitsWeight", ".referenceAudio"):
             self.assertIn(f"onImportVoiceAsset?({kind}, draft)", self.settings)
 
-    def test_http_adapter_is_loopback_only_and_refuses_redirects(self) -> None:
+    def test_pinned_tls_adapter_is_loopback_only_and_refuses_redirects(self) -> None:
         endpoint_policy = re.search(
             r"public enum DialogueVoiceEndpointPolicy[\s\S]*?\n\}",
             self.core,
         )
         self.assertIsNotNone(endpoint_policy, "Shared endpoint policy was not found")
         policy = endpoint_policy.group(0)
-        self.assertIn('components.scheme?.lowercased() == "http"', policy)
+        self.assertIn('components.scheme?.lowercased() == "https"', policy)
         self.assertIn('octets.first == "127"', policy)
         self.assertIn('host == "::1"', policy)
         self.assertNotIn('host == "localhost"', policy)
         self.assertIn("DialogueVoiceEndpointPolicy.validatedLoopbackURL(url)", self.runtime)
         self.assertIn("configuration.connectionProxyDictionary = [:]", self.runtime)
         self.assertIn("DialogueVoiceBoundedRequest", self.runtime)
+        self.assertIn("SecTrustCopyCertificateChain", self.runtime)
+        self.assertIn("SecCertificateCopyData", self.runtime)
+        self.assertIn("expectedLeafCertificateSHA256", self.runtime)
+        self.assertIn("tlsLeafCertificateSHA256: activatedProfile.tlsLeafCertificateSHA256", self.runtime)
+        self.assertGreaterEqual(
+            self.runtime.count("tlsLeafCertificateSHA256: tlsLeafCertificateSHA256"),
+            2,
+        )
         redirect_method = re.search(
             r"willPerformHTTPRedirection[\s\S]*?completionHandler\((?P<decision>[^)]+)\)",
             self.runtime,
@@ -455,7 +464,7 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         self.assertEqual(labels, ["Dialogue", "Voice Setup"])
         self.assertIn('voiceSectionControl.setAccessibilityLabel("Voice section")', self.voice_view)
         self.assertIn("let voiceSectionPickerRow = centeredRow(voiceSectionControl)", self.voice_view)
-        self.assertIn("views: [profileGrid, profileActions]", self.voice_view)
+        self.assertIn("views: [gptTLSHelpLabel, profileGrid, profileActions]", self.voice_view)
         self.assertIn("views: [qwenGrid, qwenActions]", self.voice_view)
         self.assertNotIn("centeredRow(profileGrid)", self.voice_view)
         self.assertNotIn("centeredRow(qwenGrid)", self.voice_view)

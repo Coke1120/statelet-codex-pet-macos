@@ -4,6 +4,7 @@ import CodexPetCore
 struct DialogueVoiceProfileDraft: Equatable {
     var name: String
     var apiBaseURL: String
+    var tlsLeafCertificateSHA256: String
     var promptLanguage: String
     var defaultTextLanguage: String
     var referenceText: String
@@ -91,6 +92,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     private let voxProfilePage = NSStackView()
     private let nameField = NSTextField()
     private let apiBaseURLField = NSTextField()
+    private let tlsLeafCertificateSHA256Field = NSTextField()
     private let promptLanguageField = NSTextField()
     private let defaultTextLanguageField = NSTextField()
     private let referenceTextField = NSTextField()
@@ -98,6 +100,9 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     private let gptWeightLabel = NSTextField(labelWithString: "Not imported")
     private let sovitsWeightLabel = NSTextField(labelWithString: "Not imported")
     private let referenceAudioLabel = NSTextField(labelWithString: "Not imported")
+    private let gptTLSHelpLabel = NSTextField(wrappingLabelWithString:
+        "Use a numeric loopback HTTPS gateway and enter the SHA-256 of its leaf DER certificate. Statelet rejects HTTP and any certificate that does not match this pin."
+    )
     private let importGPTButton = NSButton(title: "Import GPT Weight…", target: nil, action: nil)
     private let importSoVITSButton = NSButton(title: "Import SoVITS Weight…", target: nil, action: nil)
     private let importReferenceAudioButton = NSButton(title: "Import Reference Audio…", target: nil, action: nil)
@@ -178,6 +183,8 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         DialogueVoiceProfileDraft(
             name: nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
             apiBaseURL: apiBaseURLField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
+            tlsLeafCertificateSHA256: tlsLeafCertificateSHA256Field.stringValue
+                .trimmingCharacters(in: .whitespacesAndNewlines),
             promptLanguage: promptLanguageField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
             defaultTextLanguage: defaultTextLanguageField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
             referenceText: referenceTextField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -373,6 +380,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         let profileGrid = profileDetails([
             ("Display name", nameField),
             ("API base URL", apiBaseURLField),
+            ("TLS leaf SHA-256", tlsLeafCertificateSHA256Field),
             ("Prompt language", promptLanguageField),
             ("Default text language", defaultTextLanguageField),
             ("Reference text", referenceTextField),
@@ -409,7 +417,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
 
         configurePage(
             gptProfilePage,
-            views: [profileGrid, profileActions],
+            views: [gptTLSHelpLabel, profileGrid, profileActions],
             accessibilityLabel: "GPT-SoVITS profile setup"
         )
         configurePage(
@@ -425,7 +433,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         configureVoiceSetupCard(
             gptProfileCard,
             title: "GPT-SoVITS",
-            subtitle: "Connect to a loopback GPT-SoVITS API and keep managed copies of the selected model files and reference audio.",
+            subtitle: "Connect through a pinned-TLS loopback GPT-SoVITS gateway and keep managed copies of the selected model files and reference audio.",
             content: gptProfilePage,
             accessibilityLabel: "GPT-SoVITS voice profile card"
         )
@@ -715,7 +723,8 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
 
     private func configureFields() {
         nameField.placeholderString = "Character voice"
-        apiBaseURLField.placeholderString = "http://127.0.0.1:9880"
+        apiBaseURLField.placeholderString = "https://127.0.0.1:9880"
+        tlsLeafCertificateSHA256Field.placeholderString = "64-hex SHA-256 of leaf DER certificate"
         promptLanguageField.placeholderString = "e.g. zh, yue, en, ja"
         defaultTextLanguageField.placeholderString = "e.g. zh, yue, en, ja"
         referenceTextField.placeholderString = "Transcript of the reference audio"
@@ -742,7 +751,8 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         automaticPlaybackCheckbox.setAccessibilityHelp("Play ready dialogue automatically when Statelet enters its owning lifecycle state.")
         for (field, label, help) in [
             (nameField, "Voice profile display name", "A local label for this voice profile."),
-            (apiBaseURLField, "GPT-SoVITS API base URL", "Use a loopback URL such as http://127.0.0.1:9880."),
+            (apiBaseURLField, "GPT-SoVITS API base URL", "Use a numeric loopback HTTPS URL such as https://127.0.0.1:9880."),
+            (tlsLeafCertificateSHA256Field, "GPT-SoVITS TLS leaf certificate SHA-256", "Enter exactly 64 hexadecimal characters for the SHA-256 of the gateway leaf certificate in DER form."),
             (promptLanguageField, "Reference prompt language", "Language identifier accepted by the local GPT-SoVITS API."),
             (defaultTextLanguageField, "Default dialogue text language", "Used when preparing new dialogue lines."),
             (referenceTextField, "Reference audio transcript", "Enter the exact spoken text in the imported reference audio."),
@@ -753,6 +763,9 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             field.setAccessibilityLabel(label)
             field.setAccessibilityHelp(help)
         }
+        gptTLSHelpLabel.textColor = .secondaryLabelColor
+        gptTLSHelpLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        gptTLSHelpLabel.setAccessibilityLabel("GPT-SoVITS pinned TLS requirement")
         for label in [gptWeightLabel, sovitsWeightLabel, referenceAudioLabel] {
             label.lineBreakMode = .byTruncatingMiddle
             label.maximumNumberOfLines = 1
@@ -1072,6 +1085,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     private func applyProfileDraft(_ draft: DialogueVoiceProfileDraft) {
         nameField.stringValue = draft.name
         apiBaseURLField.stringValue = draft.apiBaseURL
+        tlsLeafCertificateSHA256Field.stringValue = draft.tlsLeafCertificateSHA256
         promptLanguageField.stringValue = draft.promptLanguage
         defaultTextLanguageField.stringValue = draft.defaultTextLanguage
         referenceTextField.stringValue = draft.referenceText
@@ -1141,6 +1155,12 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         let draft = profileDraft
         let hasProfileFields = !draft.name.isEmpty
             && !draft.apiBaseURL.isEmpty
+            && draft.tlsLeafCertificateSHA256.count == 64
+            && draft.tlsLeafCertificateSHA256.unicodeScalars.allSatisfy { scalar in
+                (48...57).contains(scalar.value)
+                    || (65...70).contains(scalar.value)
+                    || (97...102).contains(scalar.value)
+            }
             && !draft.promptLanguage.isEmpty
             && !draft.defaultTextLanguage.isEmpty
             && !draft.referenceText.isEmpty

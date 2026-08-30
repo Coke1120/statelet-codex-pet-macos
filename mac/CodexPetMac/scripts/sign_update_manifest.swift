@@ -22,17 +22,23 @@ private enum SigningError: Error, CustomStringConvertible {
     case usage
     case invalidManifest(String)
     case invalidPrivateKey
+    case invalidPublicKey
+    case invalidSignature
     case invalidOutput
     case system(String)
 
     var description: String {
         switch self {
         case .usage:
-            return "usage: sign_update_manifest.swift sign MANIFEST SIGNATURE | public-key"
+            return "usage: sign_update_manifest.swift sign MANIFEST SIGNATURE | verify MANIFEST SIGNATURE PUBLIC_KEY_B64 | public-key"
         case let .invalidManifest(reason):
             return "invalid update manifest: \(reason)"
         case .invalidPrivateKey:
             return "invalid Ed25519 private key"
+        case .invalidPublicKey:
+            return "invalid Ed25519 public key"
+        case .invalidSignature:
+            return "invalid Ed25519 signature"
         case .invalidOutput:
             return "invalid signature output path"
         case let .system(operation):
@@ -165,6 +171,31 @@ private func readPrivateKey() throws -> Curve25519.Signing.PrivateKey {
     return key
 }
 
+private func readPublicKey(_ encoded: String) throws -> Curve25519.Signing.PublicKey {
+    guard !encoded.isEmpty,
+          !encoded.contains(where: { $0.isWhitespace }),
+          let raw = Data(base64Encoded: encoded),
+          raw.count == 32,
+          let key = try? Curve25519.Signing.PublicKey(rawRepresentation: raw)
+    else {
+        throw SigningError.invalidPublicKey
+    }
+    return key
+}
+
+private func readSignature(_ path: String) throws -> Data {
+    let encoded = try readRegularFile(path)
+    guard encoded.count <= 128,
+          let text = String(data: encoded, encoding: .utf8),
+          !text.isEmpty,
+          !text.contains(where: { $0.isWhitespace }),
+          let signature = Data(base64Encoded: text),
+          signature.count == 64 else {
+        throw SigningError.invalidSignature
+    }
+    return signature
+}
+
 private func writePrivateAtomically(_ data: Data, to path: String) throws {
     let outputURL = URL(fileURLWithPath: path)
     let parent = outputURL.deletingLastPathComponent()
@@ -225,6 +256,17 @@ private func run() throws {
             throw SigningError.system("verifying signature")
         }
         try writePrivateAtomically(Data(signature.base64EncodedString().utf8), to: arguments[3])
+        return
+    }
+
+    if arguments.count == 5, arguments[1] == "verify" {
+        let manifest = try readRegularFile(arguments[2])
+        try validateCanonicalManifest(manifest)
+        let signature = try readSignature(arguments[3])
+        let publicKey = try readPublicKey(arguments[4])
+        guard publicKey.isValidSignature(signature, for: manifest) else {
+            throw SigningError.invalidSignature
+        }
         return
     }
 

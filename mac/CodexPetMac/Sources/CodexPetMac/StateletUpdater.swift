@@ -855,6 +855,7 @@ final class StateletUpdateCoordinator {
     typealias AssetDataFetcher = (StateletReleaseAsset) async throws -> Data
     typealias Downloader = (
         StateletReleaseAsset,
+        Int64,
         @escaping (Double) -> Void
     ) async throws -> StateletDownloadedUpdate
     typealias DownloadPreparation = (StateletDownloadedUpdate) async throws -> StateletDownloadedUpdate
@@ -929,9 +930,10 @@ final class StateletUpdateCoordinator {
                     signatureData: signature
                 )
             },
-            download: { asset, progress in
+            download: { asset, expectedSize, progress in
                 try await Self.downloadArtifact(
                     asset: asset,
+                    expectedSize: expectedSize,
                     progress: progress,
                     detachedActivities: detachedActivities
                 )
@@ -1179,7 +1181,10 @@ final class StateletUpdateCoordinator {
             )
             let progressToken = UUID()
             downloadProgressToken = progressToken
-            let downloaded = try await download(candidate.packageAsset) { [weak self] progress in
+            let downloaded = try await download(
+                candidate.packageAsset,
+                authority.expectedSize
+            ) { [weak self] progress in
                 Task { @MainActor in
                     guard let self,
                           self.operation != nil,
@@ -1292,7 +1297,9 @@ final class StateletUpdateCoordinator {
         request.timeoutInterval = 30
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("Statelet-Updater", forHTTPHeaderField: "User-Agent")
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await StateletUpdateBoundedDataRequest(
+            maximumBytes: maximumSize
+        ).perform(request, configuration: .ephemeral)
         guard let http = response as? HTTPURLResponse,
               (200 ..< 300).contains(http.statusCode),
               http.url?.scheme?.lowercased() == "https",
@@ -1361,10 +1368,14 @@ final class StateletUpdateCoordinator {
 
     private static func downloadArtifact(
         asset: StateletReleaseAsset,
+        expectedSize: Int64,
         progress: @escaping (Double) -> Void,
         detachedActivities: StateletUpdateDetachedActivityTracker
     ) async throws -> StateletDownloadedUpdate {
-        guard asset.browserDownloadURL.scheme?.lowercased() == "https", asset.size > 0 else {
+        guard asset.browserDownloadURL.scheme?.lowercased() == "https",
+              asset.size > 0,
+              expectedSize > 0,
+              asset.size == expectedSize else {
             throw StateletUpdaterError.invalidArtifact
         }
         var request = URLRequest(url: asset.browserDownloadURL)
@@ -1372,21 +1383,6 @@ final class StateletUpdateCoordinator {
         request.timeoutInterval = 5 * 60
         request.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
         request.setValue("Statelet-Updater", forHTTPHeaderField: "User-Agent")
-        progress(0)
-        let progressDelegate = StateletUpdateDownloadProgressDelegate(
-            declaredSize: asset.size,
-            progress: progress
-        )
-        let (temporaryURL, response) = try await URLSession.shared.download(
-            for: request,
-            delegate: progressDelegate
-        )
-        try Task.checkCancellation()
-        guard let http = response as? HTTPURLResponse,
-              (200 ..< 300).contains(http.statusCode),
-              http.url?.scheme?.lowercased() == "https" else {
-            throw StateletUpdaterError.invalidArtifact
-        }
         let base = FileManager.default.temporaryDirectory
             .appendingPathComponent("StateletUpdates", isDirectory: true)
         let staging = base.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -1399,40 +1395,35 @@ final class StateletUpdateCoordinator {
         guard detachedActivities.begin(owning: trackedUpdate) else {
             throw CancellationError()
         }
-        let finalization = Task.detached(priority: .utility) {
-            defer { detachedActivities.finish() }
-            try Task.checkCancellation()
-            let manager = FileManager.default
-            do {
+        defer { detachedActivities.finish() }
+        do {
+            try await Task.detached(priority: .utility) {
+                let manager = FileManager.default
                 try manager.createDirectory(at: base, withIntermediateDirectories: true)
                 try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: base.path)
                 try manager.createDirectory(at: staging, withIntermediateDirectories: false)
                 try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: staging.path)
-                try Task.checkCancellation()
-                try manager.moveItem(at: temporaryURL, to: artifact)
-                try Task.checkCancellation()
-                return trackedUpdate
-            } catch {
-                try? manager.removeItem(at: staging)
-                detachedActivities.release(trackedUpdate)
-                throw error
-            }
-        }
-        let result: StateletDownloadedUpdate
-        do {
-            result = try await withTaskCancellationHandler {
-                try await finalization.value
-            } onCancel: {
-                finalization.cancel()
+            }.value
+            try Task.checkCancellation()
+            progress(0)
+            let response = try await StateletUpdateBoundedArtifactRequest(
+                expectedBytes: expectedSize,
+                destinationURL: artifact,
+                progress: progress
+            ).perform(request, configuration: .ephemeral)
+            guard let http = response as? HTTPURLResponse,
+                  (200 ..< 300).contains(http.statusCode),
+                  http.url?.scheme?.lowercased() == "https" else {
+                throw StateletUpdaterError.invalidArtifact
             }
             try Task.checkCancellation()
+            progress(1)
+            return trackedUpdate
         } catch {
             trackedUpdate.removeOwnedStaging()
             detachedActivities.release(trackedUpdate)
             throw error
         }
-        progress(1)
-        return result
     }
 
     private static func expandDownloadedUpdate(
@@ -1498,44 +1489,321 @@ final class StateletUpdateCoordinator {
     }
 }
 
-private final class StateletUpdateDownloadProgressDelegate: NSObject,
-    URLSessionDownloadDelegate,
+final class StateletUpdateBoundedDataRequest: NSObject,
+    URLSessionDataDelegate,
     @unchecked Sendable {
-    private let declaredSize: Int64
-    private let progress: (Double) -> Void
+    private let maximumBytes: Int
     private let lock = NSLock()
-    private var lastReportedProgress = 0.0
+    private var data = Data()
+    private var response: URLResponse?
+    private var continuation: CheckedContinuation<(Data, URLResponse), Error>?
+    private var task: URLSessionDataTask?
+    private var session: URLSession?
+    private var finished = false
 
-    init(declaredSize: Int64, progress: @escaping (Double) -> Void) {
-        self.declaredSize = declaredSize
-        self.progress = progress
+    init(maximumBytes: Int) {
+        self.maximumBytes = maximumBytes
+    }
+
+    func perform(
+        _ request: URLRequest,
+        configuration: URLSessionConfiguration
+    ) async throws -> (Data, URLResponse) {
+        guard maximumBytes > 0 else { throw StateletUpdaterError.invalidReleaseFeed }
+        try Task.checkCancellation()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                lock.lock()
+                self.continuation = continuation
+                let session = URLSession(
+                    configuration: configuration,
+                    delegate: self,
+                    delegateQueue: nil
+                )
+                self.session = session
+                let task = session.dataTask(with: request)
+                self.task = task
+                lock.unlock()
+                if Task.isCancelled { cancel(); return }
+                task.resume()
+            }
+        } onCancel: { self.cancel() }
     }
 
     func urlSession(
         _ session: URLSession,
-        downloadTask: URLSessionDownloadTask,
-        didFinishDownloadingTo location: URL
-    ) {}
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        guard request.url?.scheme?.lowercased() == "https" else {
+            completionHandler(nil)
+            finish(.failure(StateletUpdaterError.invalidReleaseFeed))
+            return
+        }
+        completionHandler(request)
+    }
 
     func urlSession(
         _ session: URLSession,
-        downloadTask: URLSessionDownloadTask,
-        didWriteData bytesWritten: Int64,
-        totalBytesWritten: Int64,
-        totalBytesExpectedToWrite: Int64
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
     ) {
-        let expected = totalBytesExpectedToWrite > 0
-            ? totalBytesExpectedToWrite
-            : declaredSize
-        guard expected > 0 else { return }
-        let fraction = min(max(Double(totalBytesWritten) / Double(expected), 0), 1)
-        lock.lock()
-        guard fraction > lastReportedProgress else {
-            lock.unlock()
+        guard response.expectedContentLength <= 0
+                || response.expectedContentLength <= Int64(maximumBytes) else {
+            completionHandler(.cancel)
+            finish(.failure(StateletUpdaterError.invalidReleaseFeed))
             return
         }
-        lastReportedProgress = fraction
+        lock.lock()
+        self.response = response
         lock.unlock()
-        progress(fraction)
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive chunk: Data) {
+        lock.lock()
+        let fits = chunk.count <= maximumBytes - data.count
+        if fits { data.append(chunk) }
+        lock.unlock()
+        if !fits {
+            dataTask.cancel()
+            finish(.failure(StateletUpdaterError.invalidReleaseFeed))
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: Error?
+    ) {
+        if let error { finish(.failure(error)); return }
+        lock.lock()
+        let response = self.response
+        let data = self.data
+        lock.unlock()
+        guard let response else {
+            finish(.failure(StateletUpdaterError.invalidReleaseFeed))
+            return
+        }
+        finish(.success((data, response)))
+    }
+
+    private func cancel() {
+        lock.lock()
+        let task = self.task
+        lock.unlock()
+        task?.cancel()
+        finish(.failure(CancellationError()))
+    }
+
+    private func finish(_ result: Result<(Data, URLResponse), Error>) {
+        lock.lock()
+        guard !finished, let continuation else { lock.unlock(); return }
+        finished = true
+        self.continuation = nil
+        let session = self.session
+        self.session = nil
+        self.task = nil
+        lock.unlock()
+        continuation.resume(with: result)
+        session?.finishTasksAndInvalidate()
+    }
+}
+
+final class StateletUpdateBoundedArtifactRequest: NSObject,
+    URLSessionDataDelegate,
+    @unchecked Sendable {
+    private let expectedBytes: Int64
+    private let destinationURL: URL
+    private let progress: (Double) -> Void
+    private let lock = NSLock()
+    private var descriptor: Int32 = -1
+    private var receivedBytes: Int64 = 0
+    private var response: URLResponse?
+    private var continuation: CheckedContinuation<URLResponse, Error>?
+    private var task: URLSessionDataTask?
+    private var session: URLSession?
+    private var finished = false
+    private var lastReportedProgress = 0.0
+
+    init(
+        expectedBytes: Int64,
+        destinationURL: URL,
+        progress: @escaping (Double) -> Void
+    ) {
+        self.expectedBytes = expectedBytes
+        self.destinationURL = destinationURL
+        self.progress = progress
+    }
+
+    func perform(
+        _ request: URLRequest,
+        configuration: URLSessionConfiguration
+    ) async throws -> URLResponse {
+        guard expectedBytes > 0, destinationURL.isFileURL else {
+            throw StateletUpdaterError.invalidArtifact
+        }
+        try Task.checkCancellation()
+        let opened = Darwin.open(
+            destinationURL.path,
+            O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+            mode_t(0o600)
+        )
+        guard opened >= 0 else { throw StateletUpdaterError.invalidArtifact }
+        descriptor = opened
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                lock.lock()
+                self.continuation = continuation
+                let session = URLSession(
+                    configuration: configuration,
+                    delegate: self,
+                    delegateQueue: nil
+                )
+                self.session = session
+                let task = session.dataTask(with: request)
+                self.task = task
+                lock.unlock()
+                if Task.isCancelled { cancel(); return }
+                task.resume()
+            }
+        } onCancel: { self.cancel() }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        guard request.url?.scheme?.lowercased() == "https" else {
+            completionHandler(nil)
+            finish(.failure(StateletUpdaterError.invalidArtifact))
+            return
+        }
+        completionHandler(request)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        let declared = response.expectedContentLength
+        guard declared < 0 || declared == expectedBytes else {
+            completionHandler(.cancel)
+            finish(.failure(StateletUpdaterError.artifactSizeMismatch))
+            return
+        }
+        lock.lock()
+        self.response = response
+        lock.unlock()
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive chunk: Data) {
+        var failure: Error?
+        var report: Double?
+        lock.lock()
+        if !finished {
+            let remaining = expectedBytes - receivedBytes
+            if remaining < 0 || Int64(chunk.count) > remaining {
+                failure = StateletUpdaterError.artifactSizeMismatch
+            } else {
+                let written = chunk.withUnsafeBytes { rawBuffer -> Int64 in
+                    guard let baseAddress = rawBuffer.baseAddress else { return 0 }
+                    var offset = 0
+                    while offset < rawBuffer.count {
+                        let result = Darwin.write(
+                            descriptor,
+                            baseAddress.advanced(by: offset),
+                            rawBuffer.count - offset
+                        )
+                        if result <= 0 { return -1 }
+                        offset += result
+                    }
+                    return Int64(offset)
+                }
+                if written != Int64(chunk.count) {
+                    failure = StateletUpdaterError.invalidArtifact
+                } else {
+                    receivedBytes += written
+                    let fraction = min(
+                        max(Double(receivedBytes) / Double(expectedBytes), 0),
+                        1
+                    )
+                    if fraction > lastReportedProgress {
+                        lastReportedProgress = fraction
+                        report = fraction
+                    }
+                }
+            }
+        }
+        lock.unlock()
+        if let report { progress(report) }
+        if let failure {
+            dataTask.cancel()
+            finish(.failure(failure))
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: Error?
+    ) {
+        if let error { finish(.failure(error)); return }
+        lock.lock()
+        let response = self.response
+        let receivedBytes = self.receivedBytes
+        let descriptor = self.descriptor
+        lock.unlock()
+        guard receivedBytes == expectedBytes else {
+            finish(.failure(StateletUpdaterError.artifactSizeMismatch))
+            return
+        }
+        var status = stat()
+        guard descriptor >= 0,
+              Darwin.fsync(descriptor) == 0,
+              Darwin.fstat(descriptor, &status) == 0,
+              status.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              status.st_size == expectedBytes,
+              let response else {
+            finish(.failure(StateletUpdaterError.invalidArtifact))
+            return
+        }
+        finish(.success(response))
+    }
+
+    private func cancel() {
+        lock.lock()
+        let task = self.task
+        lock.unlock()
+        task?.cancel()
+        finish(.failure(CancellationError()))
+    }
+
+    private func finish(_ result: Result<URLResponse, Error>) {
+        lock.lock()
+        guard !finished, let continuation else { lock.unlock(); return }
+        finished = true
+        self.continuation = nil
+        let descriptor = self.descriptor
+        self.descriptor = -1
+        let session = self.session
+        self.session = nil
+        self.task = nil
+        lock.unlock()
+        if descriptor >= 0 { Darwin.close(descriptor) }
+        if case .failure = result {
+            try? FileManager.default.removeItem(at: destinationURL)
+        }
+        continuation.resume(with: result)
+        session?.finishTasksAndInvalidate()
     }
 }

@@ -88,7 +88,7 @@ def safe_managed_path(value: object) -> bool:
     )
 
 
-def numeric_loopback_http_endpoint(value: object) -> bool:
+def numeric_loopback_https_endpoint(value: object) -> bool:
     if not isinstance(value, str):
         return False
     try:
@@ -97,7 +97,7 @@ def numeric_loopback_http_endpoint(value: object) -> bool:
     except ValueError:
         return False
     if (
-        parsed.scheme.lower() != "http"
+        parsed.scheme.lower() != "https"
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
@@ -123,6 +123,7 @@ def validate_profile_schema(profile: object) -> int:
         raise VerificationError("voice profile schema is invalid")
     revision = profile.get("revision")
     fingerprint = profile.get("input_fingerprint")
+    tls_pin = profile.get("tls_leaf_certificate_sha256")
     paths = (
         (profile.get("gpt_weight_relative_path"), "voice/assets/gpt/"),
         (profile.get("sovits_weight_relative_path"), "voice/assets/sovits/"),
@@ -132,7 +133,10 @@ def validate_profile_schema(profile: object) -> int:
         not valid_uuid(profile.get("id"))
         or not positive_integer(revision)
         or not nonblank_string(profile.get("name"), 128)
-        or not numeric_loopback_http_endpoint(profile.get("api_base_url"))
+        or not numeric_loopback_https_endpoint(profile.get("api_base_url"))
+        or not isinstance(tls_pin, str)
+        or len(tls_pin) != 64
+        or any(character not in "0123456789abcdefABCDEF" for character in tls_pin)
         or not all(
             safe_managed_path(path) and path.startswith(prefix)
             for path, prefix in paths

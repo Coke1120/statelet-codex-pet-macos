@@ -172,6 +172,62 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         }
     }
 
+    private final class PinnedRequestRecorder: @unchecked Sendable {
+        struct Entry: Equatable {
+            let path: String
+            let pin: String
+        }
+
+        private let lock = NSLock()
+        private let waveData: Data
+        private var storage: [Entry] = []
+
+        init(waveData: Data) {
+            self.waveData = waveData
+        }
+
+        var entries: [Entry] {
+            lock.lock()
+            defer { lock.unlock() }
+            return storage
+        }
+
+        func perform(
+            request: URLRequest,
+            pin: String
+        ) throws -> (Data, URLResponse) {
+            let url = try XCTUnwrap(request.url)
+            lock.lock()
+            storage.append(Entry(path: url.path, pin: pin))
+            lock.unlock()
+            let isTTS = url.lastPathComponent == "tts"
+            let response = try XCTUnwrap(HTTPURLResponse(
+                url: url,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": isTTS ? "audio/wav" : "application/json"]
+            ))
+            return (isTTS ? waveData : Data("{}".utf8), response)
+        }
+    }
+
+    private final class RequestCallCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage = 0
+
+        var count: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return storage
+        }
+
+        func record() {
+            lock.lock()
+            storage += 1
+            lock.unlock()
+        }
+    }
+
     private final class FakePlayer: DialogueAudioPlaying {
         var playedPaths: [String] = []
         var error: Error?
@@ -272,12 +328,14 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
     private enum FakeError: Error { case playback }
 
     private let lineID = UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
+    private let tlsPin = String(repeating: "c", count: 64)
 
     private func profile() throws -> GPTSoVITSVoiceProfile {
         try GPTSoVITSVoiceProfile(
             id: UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!,
             name: "Test voice",
-            apiBaseURL: try XCTUnwrap(URL(string: "http://127.0.0.1:9880")),
+            apiBaseURL: try XCTUnwrap(URL(string: "https://127.0.0.1:9880")),
+            tlsLeafCertificateSHA256: tlsPin,
             gptWeightRelativePath: "voice/assets/gpt/test.ckpt",
             sovitsWeightRelativePath: "voice/assets/sovits/test.pth",
             referenceAudioRelativePath: "voice/assets/reference/test.wav",
@@ -396,6 +454,113 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         XCTAssertFalse(GPTSoVITSAPIClient.isValidWAV(trailing))
     }
 
+    func testPinnedTLSMatcherRejectsAbsentMalformedAndMismatchedPins() {
+        let leafDER = Data("fixture leaf DER".utf8)
+        let pin = SHA256.hash(data: leafDER)
+            .map { String(format: "%02x", $0) }
+            .joined()
+
+        XCTAssertTrue(DialogueVoicePinnedTLS.matches(
+            leafCertificateDER: leafDER,
+            expectedSHA256: pin
+        ))
+        XCTAssertTrue(DialogueVoicePinnedTLS.matches(
+            leafCertificateDER: leafDER,
+            expectedSHA256: pin.uppercased()
+        ))
+        XCTAssertFalse(DialogueVoicePinnedTLS.matches(
+            leafCertificateDER: nil,
+            expectedSHA256: pin
+        ))
+        XCTAssertFalse(DialogueVoicePinnedTLS.matches(
+            leafCertificateDER: leafDER,
+            expectedSHA256: nil
+        ))
+        XCTAssertFalse(DialogueVoicePinnedTLS.matches(
+            leafCertificateDER: leafDER,
+            expectedSHA256: String(repeating: "0", count: 64)
+        ))
+        XCTAssertFalse(DialogueVoicePinnedTLS.matches(
+            leafCertificateDER: leafDER,
+            expectedSHA256: "not-a-pin"
+        ))
+    }
+
+    func testGPTClientCarriesExactPinAcrossBothWeightRequestsAndTTS() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pinned-gpt-client-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let voiceProfile = try profile()
+        for (path, data) in [
+            (voiceProfile.gptWeightRelativePath, Data("gpt".utf8)),
+            (voiceProfile.sovitsWeightRelativePath, Data("sovits".utf8)),
+            (voiceProfile.referenceAudioRelativePath, pcmWAV()),
+        ] {
+            let url = root.appendingPathComponent(path)
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try data.write(to: url)
+        }
+        let recorder = PinnedRequestRecorder(waveData: pcmWAV())
+        let client = GPTSoVITSAPIClient { request, _, pin, _ in
+            try recorder.perform(request: request, pin: pin)
+        }
+        let line = try DialogueLine(text: "Pinned request", textLanguage: "en")
+
+        _ = try await client.synthesize(
+            profile: voiceProfile,
+            line: line,
+            applicationSupportRoot: root
+        )
+
+        XCTAssertEqual(
+            recorder.entries.map(\.path),
+            ["/set_gpt_weights", "/set_sovits_weights", "/tts"]
+        )
+        XCTAssertEqual(
+            Set(recorder.entries.map(\.pin)),
+            Set([tlsPin])
+        )
+    }
+
+    func testLegacyHTTPOrMissingPinProfileCannotReachRequestPerformer() async throws {
+        let current = try profile()
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(current)) as? [String: Any]
+        )
+        object["api_base_url"] = "http://127.0.0.1:9880"
+        let legacyHTTP = try JSONDecoder().decode(
+            GPTSoVITSVoiceProfile.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+        object["api_base_url"] = "https://127.0.0.1:9880"
+        object.removeValue(forKey: "tls_leaf_certificate_sha256")
+        let missingPin = try JSONDecoder().decode(
+            GPTSoVITSVoiceProfile.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+        let calls = RequestCallCounter()
+        let client = GPTSoVITSAPIClient { _, _, _, _ in
+            calls.record()
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+
+        for rejectedProfile in [legacyHTTP, missingPin] {
+            do {
+                try await client.validateProfile(
+                    rejectedProfile,
+                    applicationSupportRoot: URL(fileURLWithPath: "/unused")
+                )
+                XCTFail("legacy unauthenticated profile was accepted")
+            } catch {
+                XCTAssertEqual(error as? DialogueVoiceRuntimeError, .inferenceUnavailable)
+            }
+        }
+        XCTAssertEqual(calls.count, 0)
+    }
+
     func testQwenWAVValidationRequiresPCM16Mono24000AndBoundedDuration() {
         let valid = qwenPCM24kWAV(sampleFrames: 24_000)
         XCTAssertTrue(Qwen3TTSClient.isValidOutputWAV(valid))
@@ -449,9 +614,13 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         XCTAssertTrue(invocation.deniesNetwork)
     }
 
-    func testNetworkDeniedProcessInvocationUsesOSNetworkSandbox() {
+    func testNetworkDeniedProcessInvocationUsesOSNetworkSandbox() throws {
+        let python = try authenticatedPythonExecutable()
         let invocation = Qwen3TTSProcessInvocation(
-            executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+            executableURL: python,
+            expectedRuntimeIdentity: try Qwen3TTSProfileValidator.validatePythonExecutable(
+                at: python
+            ),
             helperURL: URL(fileURLWithPath: "/tmp/helper.py"),
             currentDirectoryURL: FileManager.default.temporaryDirectory,
             environment: [:], standardInput: Data(), outputURL: URL(fileURLWithPath: "/tmp/out"),
@@ -482,8 +651,12 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
                 .appending("import sys; sys.stdin.buffer.read()\n")
                 .utf8
         ).write(to: helper)
+        let python = try authenticatedPythonExecutable()
         try await Qwen3TTSProcessRunner().run(Qwen3TTSProcessInvocation(
-            executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+            executableURL: python,
+            expectedRuntimeIdentity: try Qwen3TTSProfileValidator.validatePythonExecutable(
+                at: python
+            ),
             helperURL: helper,
             currentDirectoryURL: root,
             environment: ["PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"],
@@ -577,7 +750,7 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         XCTAssertEqual(modelMode, 0o600)
 
         let runtime = try Qwen3TTSProfileValidator.validatePythonExecutable(
-            at: URL(fileURLWithPath: "/bin/sh")
+            at: authenticatedPythonExecutable()
         )
         let provisional = try Qwen3TTSVoiceProfile(
             name: "Synthetic Qwen",
@@ -727,8 +900,12 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         ).write(to: probe)
         let marker = root.appendingPathComponent("not-required")
 
+        let python = try authenticatedPythonExecutable()
         try await Qwen3TTSProcessRunner().run(Qwen3TTSProcessInvocation(
-            executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+            executableURL: python,
+            expectedRuntimeIdentity: try Qwen3TTSProfileValidator.validatePythonExecutable(
+                at: python
+            ),
             helperURL: probe,
             currentDirectoryURL: root,
             environment: ["PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"],
@@ -763,8 +940,12 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         ).write(to: probe)
 
         do {
+            let python = try authenticatedPythonExecutable()
             try await Qwen3TTSProcessRunner().run(Qwen3TTSProcessInvocation(
-                executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+                executableURL: python,
+                expectedRuntimeIdentity: try Qwen3TTSProfileValidator.validatePythonExecutable(
+                    at: python
+                ),
                 helperURL: probe,
                 currentDirectoryURL: root,
                 environment: ["PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"],
@@ -804,9 +985,13 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         ).write(to: probe)
 
         do {
+            let python = try authenticatedPythonExecutable()
             try await Qwen3TTSProcessRunner(processGroupValidator: { _ in false }).run(
                 Qwen3TTSProcessInvocation(
-                    executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+                    executableURL: python,
+                    expectedRuntimeIdentity: try Qwen3TTSProfileValidator.validatePythonExecutable(
+                        at: python
+                    ),
                     helperURL: probe,
                     currentDirectoryURL: root,
                     environment: ["PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"],
@@ -840,8 +1025,12 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
                 .utf8
         ).write(to: probe)
 
+        let python = try authenticatedPythonExecutable()
         let invocation = Qwen3TTSProcessInvocation(
-            executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+            executableURL: python,
+            expectedRuntimeIdentity: try Qwen3TTSProfileValidator.validatePythonExecutable(
+                at: python
+            ),
             helperURL: probe,
             currentDirectoryURL: root,
             environment: ["PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"],
@@ -884,8 +1073,12 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         ).write(to: probe)
 
         do {
+            let python = try authenticatedPythonExecutable()
             try await Qwen3TTSProcessRunner().run(Qwen3TTSProcessInvocation(
-                executableURL: URL(fileURLWithPath: "/usr/bin/python3"),
+                executableURL: python,
+                expectedRuntimeIdentity: try Qwen3TTSProfileValidator.validatePythonExecutable(
+                    at: python
+                ),
                 helperURL: probe,
                 currentDirectoryURL: root,
                 environment: ["PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"],
@@ -905,26 +1098,15 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        let executable = root.appendingPathComponent("python-real")
+        let executable = try authenticatedPythonExecutable()
         let absoluteLauncher = root.appendingPathComponent("python-absolute")
-        try Data("fixture python".utf8).write(to: executable)
-        XCTAssertEqual(chmod(executable.path, 0o700), 0)
         XCTAssertEqual(symlink(executable.path, absoluteLauncher.path), 0)
 
         let regular = try Qwen3TTSProfileValidator.validatePythonExecutable(at: executable)
         let absolute = try Qwen3TTSProfileValidator.validatePythonExecutable(at: absoluteLauncher)
-        let executableToken = try legacyVoiceFileIdentityToken(at: executable)
-        let launcherToken = try legacyVoiceFileIdentityToken(at: absoluteLauncher)
         XCTAssertEqual(regular.invocationPath, executable.path)
         XCTAssertEqual(absolute.invocationPath, absoluteLauncher.path)
-        XCTAssertEqual(
-            regular.stableIdentityToken,
-            "\(executableToken):\(executable.path):\(executableToken)"
-        )
-        XCTAssertEqual(
-            absolute.stableIdentityToken,
-            "\(launcherToken):\(executable.path):\(executableToken)"
-        )
+        XCTAssertNotEqual(regular.stableIdentityToken, absolute.stableIdentityToken)
         XCTAssertEqual(regular.finalTargetSHA256, absolute.finalTargetSHA256)
     }
 
@@ -933,11 +1115,11 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        let executable = root.appendingPathComponent("python-real")
+        let executable = try authenticatedPythonExecutable()
+        let intermediate = root.appendingPathComponent("python-real")
         let launcher = root.appendingPathComponent("python-relative")
-        try Data("fixture python".utf8).write(to: executable)
-        XCTAssertEqual(chmod(executable.path, 0o700), 0)
-        XCTAssertEqual(symlink(executable.lastPathComponent, launcher.path), 0)
+        XCTAssertEqual(symlink(executable.path, intermediate.path), 0)
+        XCTAssertEqual(symlink(intermediate.lastPathComponent, launcher.path), 0)
 
         let regular = try Qwen3TTSProfileValidator.validatePythonExecutable(at: executable)
         let relative = try Qwen3TTSProfileValidator.validatePythonExecutable(at: launcher)
@@ -950,11 +1132,9 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        let executable = root.appendingPathComponent("python-real")
+        let executable = try authenticatedPythonExecutable()
         let launcher = root.appendingPathComponent("python")
         let intermediate = root.appendingPathComponent("python3")
-        try Data("fixture python".utf8).write(to: executable)
-        XCTAssertEqual(chmod(executable.path, 0o700), 0)
         XCTAssertEqual(symlink("python3", launcher.path), 0)
         XCTAssertEqual(symlink(executable.path, intermediate.path), 0)
 
@@ -962,6 +1142,310 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         let venv = try Qwen3TTSProfileValidator.validatePythonExecutable(at: launcher)
         XCTAssertEqual(venv.invocationPath, launcher.path)
         XCTAssertEqual(venv.finalTargetSHA256, regular.finalTargetSHA256)
+    }
+
+    func testQwenPythonRuntimeIdentityRejectsCrossPrincipalWritableEnvironment() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-runtime-authority-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let environment = root.appendingPathComponent("environment", isDirectory: true)
+        let bin = environment.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        let executable = try makeAuthenticatedPythonSymlink(at: bin.appendingPathComponent("python"))
+
+        XCTAssertEqual(chmod(environment.path, 0o770), 0)
+        assertQwenRuntimeUnavailable(at: executable)
+        XCTAssertEqual(chmod(environment.path, 0o700), 0)
+        XCTAssertNoThrow(try Qwen3TTSProfileValidator.validatePythonExecutable(at: executable))
+
+        XCTAssertEqual(chmod(bin.path, 0o770), 0)
+        assertQwenRuntimeUnavailable(at: executable)
+    }
+
+    func testQwenPythonRuntimeIdentityRejectsWritablePyvenvBaseModules() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-pyvenv-authority-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let environment = root.appendingPathComponent("environment", isDirectory: true)
+        let bin = environment.appendingPathComponent("bin", isDirectory: true)
+        let base = root.appendingPathComponent("untrusted-base", isDirectory: true)
+        let baseBin = base.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: baseBin, withIntermediateDirectories: true)
+        let executable = try makeAuthenticatedPythonSymlink(at: bin.appendingPathComponent("python"))
+        try Data("home = \(baseBin.path)\n".utf8).write(
+            to: environment.appendingPathComponent("pyvenv.cfg")
+        )
+
+        XCTAssertEqual(chmod(base.path, 0o770), 0)
+        assertQwenRuntimeUnavailable(at: executable)
+    }
+
+    func testQwenPythonRuntimeIdentityRejectsShebangResolvedTarget() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-final-runtime-authority-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let launcherBin = root.appendingPathComponent("launcher/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: launcherBin, withIntermediateDirectories: true)
+        let target = root.appendingPathComponent("python-wrapper")
+        let launcher = launcherBin.appendingPathComponent("python")
+        try Data("#!/bin/sh\nexec /usr/bin/python3 \"$@\"\n".utf8).write(to: target)
+        XCTAssertEqual(chmod(target.path, 0o700), 0)
+        XCTAssertEqual(symlink(target.path, launcher.path), 0)
+        assertQwenRuntimeUnavailable(at: launcher)
+    }
+
+    func testQwenPythonRuntimeIdentityRejectsCrossPrincipalPTHSearchRoot() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-pth-authority-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let environment = root.appendingPathComponent("environment", isDirectory: true)
+        let bin = environment.appendingPathComponent("bin", isDirectory: true)
+        let version = try authenticatedPythonVersion()
+        let sitePackages = environment
+            .appendingPathComponent("lib/python\(version)/site-packages", isDirectory: true)
+        let external = root.appendingPathComponent("external-modules", isDirectory: true)
+        for directory in [bin, sitePackages, external] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        let executable = try makeAuthenticatedPythonSymlink(at: bin.appendingPathComponent("python"))
+        let base = try authenticatedPythonBaseRoot()
+        try Data(
+            "home = \(base.appendingPathComponent("bin").path)\n"
+                .appending("include-system-site-packages = false\n").utf8
+        ).write(to: environment.appendingPathComponent("pyvenv.cfg"))
+        try Data("\(external.path)\n".utf8).write(
+            to: sitePackages.appendingPathComponent("external-runtime.pth")
+        )
+
+        XCTAssertEqual(chmod(external.path, 0o770), 0)
+        assertQwenRuntimeSearchUnavailable(at: executable)
+        XCTAssertEqual(chmod(external.path, 0o700), 0)
+        XCTAssertNoThrow(try Qwen3TTSProfileValidator.validatedRuntimeSearchPlan(
+            at: executable,
+            environment: ["PATH": "/usr/bin:/bin"],
+            control: runtimeValidationControl(timeout: 5)
+        ))
+    }
+
+    func testQwenRuntimeSearchPlanRespectsVenvSitePolicyAndPTHOrder() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-venv-search-order-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let environment = root.appendingPathComponent("environment", isDirectory: true)
+        let bin = environment.appendingPathComponent("bin", isDirectory: true)
+        let version = try authenticatedPythonVersion()
+        let site = environment.appendingPathComponent(
+            "lib/python\(version)/site-packages",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: site, withIntermediateDirectories: true)
+        let executable = try makeAuthenticatedPythonSymlink(at: bin.appendingPathComponent("python"))
+        let base = try authenticatedPythonBaseRoot()
+        let first = root.appendingPathComponent("pth-first", isDirectory: true)
+        let second = root.appendingPathComponent("pth-second", isDirectory: true)
+        let third = root.appendingPathComponent("pth-third", isDirectory: true)
+        for directory in [first, second, third] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        try Data("\(second.path)\n\(first.path)\n".utf8).write(
+            to: site.appendingPathComponent("10-first.pth")
+        )
+        try Data("import ignored_code\n\(third.path)\n".utf8).write(
+            to: site.appendingPathComponent("20-second.pth")
+        )
+        let configuration = environment.appendingPathComponent("pyvenv.cfg")
+        try Data(
+            "home = \(base.appendingPathComponent("bin").path)\n"
+                .appending("include-system-site-packages = false\n").utf8
+        ).write(to: configuration)
+
+        let excluded = try Qwen3TTSProfileValidator.validatedRuntimeSearchPlan(
+            at: executable,
+            environment: ["PATH": "/usr/bin:/bin"],
+            control: runtimeValidationControl(timeout: 5)
+        )
+        let siteIndex = try XCTUnwrap(excluded.roots.firstIndex(of: site.path))
+        let secondIndex = try XCTUnwrap(excluded.roots.firstIndex(of: second.path))
+        let firstIndex = try XCTUnwrap(excluded.roots.firstIndex(of: first.path))
+        let thirdIndex = try XCTUnwrap(excluded.roots.firstIndex(of: third.path))
+        XCTAssertLessThan(siteIndex, secondIndex)
+        XCTAssertLessThan(secondIndex, firstIndex)
+        XCTAssertLessThan(firstIndex, thirdIndex)
+        let baseSite = base.appendingPathComponent(
+            "lib/python\(version)/site-packages",
+            isDirectory: true
+        )
+        XCTAssertFalse(excluded.roots.contains(baseSite.path))
+
+        try Data(
+            "home = \(base.appendingPathComponent("bin").path)\n"
+                .appending("include-system-site-packages = true\n").utf8
+        ).write(to: configuration)
+        let included = try Qwen3TTSProfileValidator.validatedRuntimeSearchPlan(
+            at: executable,
+            environment: ["PATH": "/usr/bin:/bin"],
+            control: runtimeValidationControl(timeout: 5)
+        )
+        let includedBaseIndex = try XCTUnwrap(included.roots.firstIndex(of: baseSite.path))
+        let includedThirdIndex = try XCTUnwrap(included.roots.firstIndex(of: third.path))
+        XCTAssertLessThan(includedThirdIndex, includedBaseIndex)
+    }
+
+    func testQwenPythonRuntimeRejectsShebangAndXcrunWrappers() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-wrapper-rejection-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let script = root.appendingPathComponent("python-wrapper")
+        let marker = root.appendingPathComponent("wrapper-ran")
+        try Data("#!/bin/sh\ntouch \(marker.path)\n".utf8).write(to: script)
+        XCTAssertEqual(chmod(script.path, 0o700), 0)
+
+        assertQwenRuntimeUnavailable(at: script)
+        assertQwenRuntimeUnavailable(at: URL(fileURLWithPath: "/usr/bin/python3"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    func testQwenPythonRuntimeAuthorityDoesNotTreatUsrLocalAsSealed() {
+        XCTAssertTrue(Qwen3TTSProfileValidator.isSealedSystemRuntimePath("/usr/bin"))
+        XCTAssertTrue(Qwen3TTSProfileValidator.isSealedSystemRuntimePath("/usr/lib/python3"))
+        XCTAssertFalse(Qwen3TTSProfileValidator.isSealedSystemRuntimePath("/usr/local"))
+        XCTAssertFalse(Qwen3TTSProfileValidator.isSealedSystemRuntimePath("/usr/local/bin"))
+    }
+
+    func testQwenPythonRuntimeIdentityRejectsWriteGrantingACLs() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-acl-authority-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let environment = root.appendingPathComponent("environment", isDirectory: true)
+        let bin = environment.appendingPathComponent("bin", isDirectory: true)
+        let library = environment.appendingPathComponent("lib", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+        let executable = try makeAuthenticatedPythonSymlink(at: bin.appendingPathComponent("python"))
+        let module = library.appendingPathComponent("runtime_module.py")
+        try Data("trusted = True\n".utf8).write(to: module)
+
+        try addEveryoneWriteACL(to: environment)
+        assertQwenRuntimeUnavailable(at: executable)
+        try removeFirstACL(from: environment)
+        XCTAssertNoThrow(try Qwen3TTSProfileValidator.validatePythonExecutable(at: executable))
+
+        try addEveryoneWriteACL(to: module)
+        assertQwenRuntimeUnavailable(at: executable)
+        try removeFirstACL(from: module)
+        XCTAssertNoThrow(try Qwen3TTSProfileValidator.validatePythonExecutable(at: executable))
+    }
+
+    func testQwenProcessRunnerRejectsChangedRuntimeBeforeExecutingHelper() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-runtime-prelaunch-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let bin = root.appendingPathComponent("environment/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        let executable = try makeAuthenticatedPythonSymlink(at: bin.appendingPathComponent("python"))
+        let expected = try Qwen3TTSProfileValidator.validatePythonExecutable(at: executable)
+
+        let helper = root.appendingPathComponent("helper.py")
+        let marker = root.appendingPathComponent("helper-ran")
+        try Data("open('helper-ran', 'w').write('unsafe')\n".utf8).write(to: helper)
+        try FileManager.default.removeItem(at: executable)
+        XCTAssertEqual(symlink("/bin/sh", executable.path), 0)
+
+        do {
+            try await Qwen3TTSProcessRunner().run(Qwen3TTSProcessInvocation(
+                executableURL: executable,
+                expectedRuntimeIdentity: expected,
+                helperURL: helper,
+                currentDirectoryURL: root,
+                environment: ["PATH": "/usr/bin:/bin"],
+                standardInput: Data(),
+                outputURL: marker,
+                timeout: 1,
+                requiresOutputFile: false,
+                deniesNetwork: false
+            ))
+            XCTFail("changed runtime was executed")
+        } catch let error as DialogueVoiceRuntimeError {
+            XCTAssertTrue(error == .inputFingerprintMismatch || error == .inferenceUnavailable)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    func testQwenProcessRunnerCancellationBeforeLaunchNeverExecutesHelper() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-prelaunch-cancel-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let python = try authenticatedPythonExecutable()
+        let helper = root.appendingPathComponent("helper.py")
+        let marker = root.appendingPathComponent("helper-ran")
+        try Data("open('helper-ran', 'w').write('unsafe')\n".utf8).write(to: helper)
+        let invocation = Qwen3TTSProcessInvocation(
+            executableURL: python,
+            expectedRuntimeIdentity: try Qwen3TTSProfileValidator.validatePythonExecutable(at: python),
+            helperURL: helper,
+            currentDirectoryURL: root,
+            environment: ["PATH": "/usr/bin:/bin"],
+            standardInput: Data(),
+            outputURL: marker,
+            timeout: 5,
+            requiresOutputFile: false,
+            deniesNetwork: false
+        )
+
+        let task = Task { try await Qwen3TTSProcessRunner().run(invocation) }
+        task.cancel()
+        do {
+            try await task.value
+            XCTFail("cancelled preflight executed the helper")
+        } catch let error as DialogueVoiceRuntimeError {
+            XCTAssertEqual(error, .cancelled)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    func testQwenProcessRunnerTotalDeadlineBoundsSlowRuntimeScan() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-preflight-deadline-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let environment = root.appendingPathComponent("environment", isDirectory: true)
+        let bin = environment.appendingPathComponent("bin", isDirectory: true)
+        let scanRoot = environment.appendingPathComponent("scan", isDirectory: true)
+        try FileManager.default.createDirectory(at: scanRoot, withIntermediateDirectories: true)
+        let python = try makeAuthenticatedPythonSymlink(at: bin.appendingPathComponent("python"))
+        let base = try authenticatedPythonBaseRoot()
+        try Data(
+            "home = \(base.appendingPathComponent("bin").path)\n"
+                .appending("include-system-site-packages = false\n").utf8
+        ).write(to: environment.appendingPathComponent("pyvenv.cfg"))
+        for index in 0..<2_000 {
+            try Data("x".utf8).write(to: scanRoot.appendingPathComponent("entry-\(index)"))
+        }
+        let expected = try Qwen3TTSProfileValidator.validatePythonExecutable(at: python)
+        let helper = root.appendingPathComponent("helper.py")
+        let marker = root.appendingPathComponent("helper-ran")
+        try Data("open('helper-ran', 'w').write('unsafe')\n".utf8).write(to: helper)
+
+        do {
+            try await Qwen3TTSProcessRunner().run(Qwen3TTSProcessInvocation(
+                executableURL: python,
+                expectedRuntimeIdentity: expected,
+                helperURL: helper,
+                currentDirectoryURL: root,
+                environment: ["PATH": "/usr/bin:/bin"],
+                standardInput: Data(),
+                outputURL: marker,
+                timeout: 0.05,
+                requiresOutputFile: false,
+                deniesNetwork: false
+            ))
+            XCTFail("slow preflight exceeded the total deadline and launched")
+        } catch let error as DialogueVoiceRuntimeError {
+            XCTAssertEqual(error, .inferenceUnavailable)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
     }
 
     func testQwenPythonRuntimeIdentityRejectsParentTraversalTargets() throws {
@@ -1016,6 +1500,46 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         assertQwenRuntimeUnavailable(at: firstLoop)
     }
 
+    func testQwenPythonRuntimeAuthorityRejectsCyclicEnvironmentSymlinks() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-authority-cycle-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = try makeAuthenticatedPythonSymlink(
+            at: root.appendingPathComponent("bin/python")
+        )
+        let firstLoop = root.appendingPathComponent("runtime-loop-a")
+        let secondLoop = root.appendingPathComponent("runtime-loop-b")
+        XCTAssertEqual(symlink(secondLoop.lastPathComponent, firstLoop.path), 0)
+        XCTAssertEqual(symlink(firstLoop.lastPathComponent, secondLoop.path), 0)
+
+        assertQwenRuntimeUnavailable(at: executable)
+    }
+
+    func testQwenPythonRuntimeIdentityRejectsExtremeFat64SliceOffsetsWithoutCrash() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-fat64-offset-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        for (index, rawOffset) in [UInt64.max, UInt64(Int.max)].enumerated() {
+            let executable = root.appendingPathComponent("python-fat64-\(index)")
+            var fixture = Data([
+                0xca, 0xfe, 0xba, 0xbf, // FAT_MAGIC_64, big-endian
+                0x00, 0x00, 0x00, 0x01, // one architecture
+                0x00, 0x00, 0x00, 0x00, // CPU type
+                0x00, 0x00, 0x00, 0x00, // CPU subtype
+            ])
+            var bigEndianOffset = rawOffset.bigEndian
+            withUnsafeBytes(of: &bigEndianOffset) { fixture.append(contentsOf: $0) }
+            fixture.append(Data(repeating: 0, count: 16)) // size, align, reserved
+            XCTAssertEqual(fixture.count, 40)
+            try fixture.write(to: executable)
+            XCTAssertEqual(chmod(executable.path, 0o700), 0)
+
+            assertQwenRuntimeUnavailable(at: executable)
+        }
+    }
+
     func testQwenPythonRuntimeIdentityRejectsExcessiveSymlinkDepth() throws {
         let root = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -1035,7 +1559,7 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
     }
 
     func testFingerprintIsStableAndChangesWithEverySynthesisInput() throws {
-        let endpoint = try XCTUnwrap(URL(string: "http://127.0.0.1:9880"))
+        let endpoint = try XCTUnwrap(URL(string: "https://127.0.0.1:9880"))
         let digests = DialogueVoiceAssetDigests(
             gptWeight: String(repeating: "1", count: 64),
             sovitsWeight: String(repeating: "2", count: 64),
@@ -1043,6 +1567,7 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         )
         let baseline = DialogueVoiceProfileFingerprint.compute(
             apiBaseURL: endpoint,
+            tlsLeafCertificateSHA256: tlsPin,
             referenceText: "Reference",
             promptLanguage: "en",
             defaultTextLanguage: "en",
@@ -1053,6 +1578,7 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             baseline,
             DialogueVoiceProfileFingerprint.compute(
                 apiBaseURL: endpoint,
+                tlsLeafCertificateSHA256: tlsPin,
                 referenceText: "Reference",
                 promptLanguage: "en",
                 defaultTextLanguage: "en",
@@ -1063,6 +1589,7 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             baseline,
             DialogueVoiceProfileFingerprint.compute(
                 apiBaseURL: endpoint,
+                tlsLeafCertificateSHA256: tlsPin,
                 referenceText: "Changed",
                 promptLanguage: "en",
                 defaultTextLanguage: "en",
@@ -1073,6 +1600,7 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             baseline,
             DialogueVoiceProfileFingerprint.compute(
                 apiBaseURL: endpoint,
+                tlsLeafCertificateSHA256: tlsPin,
                 referenceText: "Reference",
                 promptLanguage: "en",
                 defaultTextLanguage: "en",
@@ -1081,6 +1609,17 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
                     sovitsWeight: digests.sovitsWeight,
                     referenceAudio: digests.referenceAudio
                 )
+            )
+        )
+        XCTAssertNotEqual(
+            baseline,
+            DialogueVoiceProfileFingerprint.compute(
+                apiBaseURL: endpoint,
+                tlsLeafCertificateSHA256: String(repeating: "d", count: 64),
+                referenceText: "Reference",
+                promptLanguage: "en",
+                defaultTextLanguage: "en",
+                assetDigests: digests
             )
         )
     }
@@ -1463,6 +2002,68 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
     }
 
     @MainActor
+    func testLegacyMissingPinProfileLoadsUnavailableWithoutMakingARequest() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("legacy-unpinned-gpt-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let secureProfile = try profile()
+        for (path, data) in [
+            (secureProfile.gptWeightRelativePath, Data("gpt".utf8)),
+            (secureProfile.sovitsWeightRelativePath, Data("sovits".utf8)),
+            (secureProfile.referenceAudioRelativePath, pcmWAV()),
+        ] {
+            let url = root.appendingPathComponent(path)
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try data.write(to: url)
+        }
+
+        let currentLibrary = try DialogueVoiceLibrary(profile: secureProfile)
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(currentLibrary)) as? [String: Any]
+        )
+        var legacyProfile = try XCTUnwrap(object["profile"] as? [String: Any])
+        legacyProfile.removeValue(forKey: "tls_leaf_certificate_sha256")
+        object["profile"] = legacyProfile
+        let decodedLegacyLibrary = try JSONDecoder().decode(
+            DialogueVoiceLibrary.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+        let store = DialogueVoiceStore(
+            rootURL: root.appendingPathComponent("voice", isDirectory: true)
+        )
+        try store.save(decodedLegacyLibrary)
+
+        let calls = RequestCallCounter()
+        let client = GPTSoVITSAPIClient { _, _, _, _ in
+            calls.record()
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        let coordinator = DialogueVoiceCoordinator(
+            applicationSupportRoot: root,
+            client: client
+        )
+        defer { coordinator.shutdown() }
+        let unavailable = expectation(description: "legacy profile fails closed")
+        coordinator.onChange = { snapshot in
+            if snapshot.library.profileStatus == .unavailable {
+                unavailable.fulfill()
+            }
+        }
+
+        coordinator.start()
+        await fulfillment(of: [unavailable], timeout: 5)
+
+        XCTAssertEqual(calls.count, 0)
+        XCTAssertEqual(coordinator.library.profile?.apiBaseURL.absoluteString, "https://127.0.0.1:9880")
+        XCTAssertNil(coordinator.library.profile?.tlsLeafCertificateSHA256)
+        XCTAssertNil(try store.load().profile?.tlsLeafCertificateSHA256)
+        XCTAssertTrue(coordinator.activityMessage?.contains("legacy profile has no TLS pin") == true)
+    }
+
+    @MainActor
     func testRetryStaleLineWhenProfileIsUnavailableReactivatesAndProcessesIt() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("dialogue-unavailable-retry-tests-\(UUID().uuidString)", isDirectory: true)
@@ -1492,11 +2093,12 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         try pcmWAV().write(to: root.appendingPathComponent(paths.firstOutput))
         try pcmWAV().write(to: root.appendingPathComponent(paths.secondOutput))
 
-        let endpoint = try XCTUnwrap(URL(string: "http://127.0.0.1:9880"))
+        let endpoint = try XCTUnwrap(URL(string: "https://127.0.0.1:9880"))
         let provisionalProfile = try GPTSoVITSVoiceProfile(
             id: UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!,
             name: "Retry voice",
             apiBaseURL: endpoint,
+            tlsLeafCertificateSHA256: tlsPin,
             gptWeightRelativePath: paths.gpt,
             sovitsWeightRelativePath: paths.sovits,
             referenceAudioRelativePath: paths.reference,
@@ -1513,6 +2115,7 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             id: provisionalProfile.id,
             name: provisionalProfile.name,
             apiBaseURL: endpoint,
+            tlsLeafCertificateSHA256: tlsPin,
             gptWeightRelativePath: paths.gpt,
             sovitsWeightRelativePath: paths.sovits,
             referenceAudioRelativePath: paths.reference,
@@ -1521,6 +2124,7 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             defaultTextLanguage: provisionalProfile.defaultTextLanguage,
             inputFingerprint: DialogueVoiceProfileFingerprint.compute(
                 apiBaseURL: endpoint,
+                tlsLeafCertificateSHA256: tlsPin,
                 referenceText: provisionalProfile.referenceText,
                 promptLanguage: provisionalProfile.promptLanguage,
                 defaultTextLanguage: provisionalProfile.defaultTextLanguage,
@@ -1617,11 +2221,12 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         try pcmWAV().write(to: root.appendingPathComponent(paths.reference))
         try pcmWAV().write(to: root.appendingPathComponent(paths.output))
 
-        let endpoint = try XCTUnwrap(URL(string: "http://127.0.0.1:9880"))
+        let endpoint = try XCTUnwrap(URL(string: "https://127.0.0.1:9880"))
         let provisionalProfile = try GPTSoVITSVoiceProfile(
             id: UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!,
             name: "Original voice",
             apiBaseURL: endpoint,
+            tlsLeafCertificateSHA256: tlsPin,
             gptWeightRelativePath: paths.gpt,
             sovitsWeightRelativePath: paths.sovits,
             referenceAudioRelativePath: paths.reference,
@@ -1638,6 +2243,7 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             id: provisionalProfile.id,
             name: provisionalProfile.name,
             apiBaseURL: endpoint,
+            tlsLeafCertificateSHA256: tlsPin,
             gptWeightRelativePath: paths.gpt,
             sovitsWeightRelativePath: paths.sovits,
             referenceAudioRelativePath: paths.reference,
@@ -1646,6 +2252,7 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             defaultTextLanguage: provisionalProfile.defaultTextLanguage,
             inputFingerprint: DialogueVoiceProfileFingerprint.compute(
                 apiBaseURL: endpoint,
+                tlsLeafCertificateSHA256: tlsPin,
                 referenceText: provisionalProfile.referenceText,
                 promptLanguage: provisionalProfile.promptLanguage,
                 defaultTextLanguage: provisionalProfile.defaultTextLanguage,
@@ -1684,6 +2291,7 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         XCTAssertNoThrow(try coordinator.saveProfile(DialogueVoiceProfileDraft(
             name: "Replacement voice",
             apiBaseURL: endpoint.absoluteString,
+            tlsLeafCertificateSHA256: tlsPin,
             promptLanguage: "en",
             defaultTextLanguage: "en",
             referenceText: "Reference"
@@ -1720,11 +2328,12 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         try Data("sovits".utf8).write(to: root.appendingPathComponent(paths.sovits))
         try pcmWAV().write(to: root.appendingPathComponent(paths.reference))
 
-        let endpoint = try XCTUnwrap(URL(string: "http://127.0.0.1:9880"))
+        let endpoint = try XCTUnwrap(URL(string: "https://127.0.0.1:9880"))
         let provisionalProfile = try GPTSoVITSVoiceProfile(
             id: UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!,
             name: "Integration voice",
             apiBaseURL: endpoint,
+            tlsLeafCertificateSHA256: tlsPin,
             gptWeightRelativePath: paths.gpt,
             sovitsWeightRelativePath: paths.sovits,
             referenceAudioRelativePath: paths.reference,
@@ -1741,6 +2350,7 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             id: provisionalProfile.id,
             name: provisionalProfile.name,
             apiBaseURL: endpoint,
+            tlsLeafCertificateSHA256: tlsPin,
             gptWeightRelativePath: paths.gpt,
             sovitsWeightRelativePath: paths.sovits,
             referenceAudioRelativePath: paths.reference,
@@ -1749,6 +2359,7 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             defaultTextLanguage: provisionalProfile.defaultTextLanguage,
             inputFingerprint: DialogueVoiceProfileFingerprint.compute(
                 apiBaseURL: endpoint,
+                tlsLeafCertificateSHA256: tlsPin,
                 referenceText: provisionalProfile.referenceText,
                 promptLanguage: provisionalProfile.promptLanguage,
                 defaultTextLanguage: provisionalProfile.defaultTextLanguage,
@@ -2109,6 +2720,63 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         }
     }
 
+    private func runtimeValidationControl(timeout: TimeInterval) -> QwenRuntimeValidationControl {
+        QwenRuntimeValidationControl(
+            deadlineUptime: ProcessInfo.processInfo.systemUptime + timeout,
+            isCancelled: { false }
+        )
+    }
+
+    private func assertQwenRuntimeSearchUnavailable(
+        at url: URL,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertThrowsError(
+            try Qwen3TTSProfileValidator.validatedRuntimeSearchPlan(
+                at: url,
+                environment: ["PATH": "/usr/bin:/bin"],
+                control: runtimeValidationControl(timeout: 5)
+            ),
+            file: file,
+            line: line
+        ) { error in
+            XCTAssertEqual(
+                error as? DialogueVoiceRuntimeError,
+                .inferenceUnavailable,
+                file: file,
+                line: line
+            )
+        }
+    }
+
+    private func addEveryoneWriteACL(to url: URL) throws {
+        try runACLChmod(arguments: ["+a", "everyone allow write", url.path])
+    }
+
+    private func removeFirstACL(from url: URL) throws {
+        try runACLChmod(arguments: ["-a#", "0", url.path])
+    }
+
+    private func runACLChmod(arguments: [String]) throws {
+        let process = Process()
+        let standardError = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/chmod")
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = standardError
+        do { try process.run() }
+        catch { throw XCTSkip("Extended ACL operations are unavailable on this host") }
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            let detail = String(
+                data: standardError.fileHandleForReading.readDataToEndOfFile(),
+                encoding: .utf8
+            ) ?? "unknown chmod failure"
+            throw XCTSkip("Extended ACL operations are unavailable: \(detail)")
+        }
+    }
+
     private func makeRelativeSymlinkChain(
         count: Int,
         prefix: String,
@@ -2214,6 +2882,65 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         return data
     }
 
+    private func authenticatedPythonExecutable() throws -> URL {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        process.arguments = ["--find", "python3"]
+        process.environment = [
+            "DEVELOPER_DIR": "/Library/Developer/CommandLineTools",
+            "PATH": "/usr/bin:/bin",
+        ]
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        guard process.terminationStatus == 0,
+              let raw = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              raw.hasPrefix("/") else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        return URL(fileURLWithPath: raw).resolvingSymlinksInPath().standardizedFileURL
+    }
+
+    private func authenticatedPythonBaseRoot() throws -> URL {
+        let executable = try authenticatedPythonExecutable()
+        let bin = executable.deletingLastPathComponent()
+        guard bin.lastPathComponent == "bin" else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+        return bin.deletingLastPathComponent().standardizedFileURL
+    }
+
+    private func authenticatedPythonVersion() throws -> String {
+        let library = try authenticatedPythonBaseRoot().appendingPathComponent("lib")
+        let entries = try FileManager.default.contentsOfDirectory(
+            at: library,
+            includingPropertiesForKeys: nil
+        )
+        let versions = entries.compactMap { entry -> String? in
+            guard entry.lastPathComponent.hasPrefix("python") else { return nil }
+            let value = String(entry.lastPathComponent.dropFirst("python".count))
+            let pieces = value.split(separator: ".")
+            return pieces.count == 2 && pieces.allSatisfy { $0.allSatisfy(\.isNumber) }
+                ? value
+                : nil
+        }
+        return try XCTUnwrap(versions.sorted().first)
+    }
+
+    @discardableResult
+    private func makeAuthenticatedPythonSymlink(at url: URL) throws -> URL {
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        XCTAssertEqual(symlink(try authenticatedPythonExecutable().path, url.path), 0)
+        return url
+    }
+
     private func makeQwenFixture(root: URL) throws -> QwenFixture {
         let packageRelative = "voice/packages/qwen/fixture"
         let package = root.appendingPathComponent(packageRelative, isDirectory: true)
@@ -2221,19 +2948,17 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         let config = package.appendingPathComponent("config.json")
         let generator = package.appendingPathComponent("generate.py")
         let reference = package.appendingPathComponent("reference/clean.wav")
-        let python = root.appendingPathComponent("runtime/python")
+        let python = try authenticatedPythonExecutable()
         let helper = root.appendingPathComponent("statelet-helper.py")
-        for directory in [model.deletingLastPathComponent(), reference.deletingLastPathComponent(),
-                          python.deletingLastPathComponent()] {
+        for directory in [model.deletingLastPathComponent(), reference.deletingLastPathComponent()] {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         }
         try Data("model".utf8).write(to: model)
         try Data("config".utf8).write(to: config)
         try Data("handover".utf8).write(to: generator)
         try qwenPCM24kWAV(sampleFrames: 240).write(to: reference)
-        try Data("python".utf8).write(to: python)
         try Data("helper".utf8).write(to: helper)
-        XCTAssertEqual(chmod(python.path, 0o700), 0)
+        let pythonIdentity = try Qwen3TTSProfileValidator.validatePythonExecutable(at: python)
         let manifest = try Qwen3TTSPackageManifest(
             modelRelativePath: "model/model.safetensors",
             configRelativePath: "config.json",
@@ -2246,7 +2971,8 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         )
         let placeholder = try Qwen3TTSVoiceProfile(
             name: "Fixture", packageRootRelativePath: packageRelative,
-            pythonExecutablePath: python.path, pythonExecutableSHA256: digest(python),
+            pythonExecutablePath: python.path,
+            pythonExecutableSHA256: pythonIdentity.finalTargetSHA256,
             packageTreeSHA256: try Qwen3TTSProfileValidator.computePackageTreeSHA256(packageRoot: package),
             manifest: manifest, referenceText: "reference", referenceLanguage: "japanese",
             defaultTextLanguage: "japanese", inputFingerprint: String(repeating: "0", count: 64)
@@ -2260,7 +2986,8 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         let fingerprint = hasher.finalize().map { String(format: "%02x", $0) }.joined()
         let profile = try Qwen3TTSVoiceProfile(
             name: "Fixture", packageRootRelativePath: packageRelative,
-            pythonExecutablePath: python.path, pythonExecutableSHA256: digest(python),
+            pythonExecutablePath: python.path,
+            pythonExecutableSHA256: pythonIdentity.finalTargetSHA256,
             packageTreeSHA256: try Qwen3TTSProfileValidator.computePackageTreeSHA256(packageRoot: package),
             manifest: manifest, referenceText: "reference", referenceLanguage: "japanese",
             defaultTextLanguage: "japanese", inputFingerprint: fingerprint
@@ -2272,19 +2999,14 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         let sourceSnapshot = root.appendingPathComponent("VoxCPM2-Sakamata-ZeroShot-Handover", isDirectory: true)
         let referenceRelativePath = "voice/assets/voxcpm2-reference/reference.wav"
         let reference = root.appendingPathComponent(referenceRelativePath)
-        let python = root.appendingPathComponent("runtime/python3")
+        let python = try authenticatedPythonExecutable()
         let helper = root.appendingPathComponent("voxcpm2-helper.py")
         try FileManager.default.createDirectory(
             at: reference.deletingLastPathComponent(), withIntermediateDirectories: true
         )
-        try FileManager.default.createDirectory(
-            at: python.deletingLastPathComponent(), withIntermediateDirectories: true
-        )
         try makeSyntheticVoxSnapshot(at: sourceSnapshot)
         try pcmWAV().write(to: reference)
-        try Data("python".utf8).write(to: python)
         try Data("helper".utf8).write(to: helper)
-        XCTAssertEqual(chmod(python.path, 0o700), 0)
 
         let imported = try VoxCPM2SnapshotInstaller(applicationSupportRoot: root).install(
             sourceURL: sourceSnapshot,

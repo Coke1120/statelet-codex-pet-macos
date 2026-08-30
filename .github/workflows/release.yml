@@ -13,9 +13,10 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
-  group: statelet-release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+  group: statelet-release-${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -70,6 +71,68 @@ jobs:
             echo "version=$version"
             echo "build=$build"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Require successful exact-commit macOS CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ steps.release.outputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$REPOSITORY" == "Coke1120/statelet-codex-pet-macos" ]]
+          [[ "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+          for attempt in {1..60}; do
+            runs_json="$(gh api --method GET \
+              "repos/$REPOSITORY/actions/workflows/ci.yml/runs" \
+              -f branch=main \
+              -f event=push \
+              -f head_sha="$COMMIT_SHA" \
+              -F per_page=100)"
+            state="$(ACTIONS_RUNS_JSON="$runs_json" EXPECTED_SHA="$COMMIT_SHA" python3 - <<'PY'
+          import json
+          import os
+
+          payload = json.loads(os.environ["ACTIONS_RUNS_JSON"])
+          expected_sha = os.environ["EXPECTED_SHA"]
+          runs = [
+              run
+              for run in payload.get("workflow_runs", [])
+              if run.get("head_sha") == expected_sha
+              and run.get("head_branch") == "main"
+              and run.get("event") == "push"
+          ]
+          if any(run.get("status") == "completed" and run.get("conclusion") == "success" for run in runs):
+              print("success")
+          elif any(run.get("status") != "completed" for run in runs) or not runs:
+              print("pending")
+          else:
+              print("failed")
+          PY
+            )"
+
+            case "$state" in
+              success)
+                printf 'macOS CI succeeded for release commit %s.\n' "$COMMIT_SHA"
+                break
+                ;;
+              failed)
+                printf 'macOS CI completed without success for release commit %s.\n' "$COMMIT_SHA" >&2
+                exit 1
+                ;;
+              pending)
+                if [[ "$attempt" -eq 60 ]]; then
+                  printf 'Timed out waiting for macOS CI on release commit %s.\n' "$COMMIT_SHA" >&2
+                  exit 1
+                fi
+                sleep 30
+                ;;
+              *)
+                printf 'Unexpected macOS CI state: %s\n' "$state" >&2
+                exit 1
+                ;;
+            esac
+          done
 
       - name: Run focused updater tests
         run: >-
@@ -172,7 +235,8 @@ jobs:
           [[ "$(stat -f '%Lp' "$SIGNATURE_PATH")" == "600" ]]
           [[ "$(base64 -D < "$SIGNATURE_PATH" | wc -c | tr -d ' ')" == "64" ]]
 
-      - name: Create or validate stable GitHub release
+      - name: Create or validate draft GitHub release
+        id: github_release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release.outputs.tag }}
@@ -185,7 +249,7 @@ jobs:
           set -euo pipefail
           expected_title="Statelet $VERSION ($BUILD)"
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --verify-tag --latest --generate-notes \
+            gh release create "$TAG" --verify-tag --draft --generate-notes \
               --title "$expected_title"
           fi
 
@@ -200,8 +264,8 @@ jobs:
           import os
 
           release = json.loads(os.environ["RELEASE_JSON"])
-          if release["isDraft"] or release["isPrerelease"]:
-              raise SystemExit("existing release must be non-draft and non-prerelease")
+          if release["isPrerelease"]:
+              raise SystemExit("stable release must not be a prerelease")
           if release["name"] != os.environ["EXPECTED_TITLE"]:
               raise SystemExit("existing release title does not match the signed build")
           allowed = {
@@ -213,9 +277,18 @@ jobs:
           unexpected = actual - allowed
           if unexpected:
               raise SystemExit("release contains unexpected assets: " + ", ".join(sorted(unexpected)))
+          if not release["isDraft"] and actual != allowed:
+              raise SystemExit("published release assets do not exactly match the signed update set")
           PY
 
+          if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" == "true" ]]; then
+            echo "upload_required=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "upload_required=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Upload signed update assets
+        if: steps.github_release.outputs.upload_required == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release.outputs.tag }}
@@ -243,4 +316,126 @@ jobs:
           actual = {asset["name"] for asset in release["assets"]}
           if actual != expected:
               raise SystemExit("post-upload release assets do not exactly match the signed update set")
+          PY
+
+      - name: Verify hosted release bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_REF: ${{ steps.release.outputs.ref }}
+          RELEASE_COMMIT_SHA: ${{ steps.release.outputs.commit_sha }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_BUILD: ${{ steps.release.outputs.build }}
+          ASSET_PATH: ${{ steps.package.outputs.asset_path }}
+          MANIFEST_PATH: ${{ steps.package.outputs.manifest_path }}
+          SIGNATURE_PATH: ${{ steps.package.outputs.signature_path }}
+          UPLOAD_REQUIRED: ${{ steps.github_release.outputs.upload_required }}
+        run: |
+          set -euo pipefail
+          verification_directory="$(mktemp -d "$RUNNER_TEMP/statelet-release-verify.XXXXXX")"
+          for local_path in "$ASSET_PATH" "$MANIFEST_PATH" "$SIGNATURE_PATH"; do
+            asset_name="$(basename "$local_path")"
+            gh release download "$TAG" --dir "$verification_directory" --pattern "$asset_name"
+            if [[ "$UPLOAD_REQUIRED" == "true" ]]; then
+              cmp -- "$local_path" "$verification_directory/$asset_name"
+            fi
+          done
+
+          expected_public_key="AXJpDm8ZsTUvMGS7dzbiNxBIGwehb+ern2ietCTAgIg="
+          hosted_asset="$verification_directory/$(basename "$ASSET_PATH")"
+          hosted_manifest="$verification_directory/$(basename "$MANIFEST_PATH")"
+          hosted_signature="$verification_directory/$(basename "$SIGNATURE_PATH")"
+          "$RUNNER_TEMP/sign-update-manifest" verify \
+            "$hosted_manifest" "$hosted_signature" "$expected_public_key"
+
+          HOSTED_ASSET="$hosted_asset" \
+            HOSTED_MANIFEST="$hosted_manifest" \
+            EXPECTED_REF="$RELEASE_REF" \
+            EXPECTED_COMMIT_SHA="$RELEASE_COMMIT_SHA" \
+            EXPECTED_VERSION="$RELEASE_VERSION" \
+            EXPECTED_BUILD="$RELEASE_BUILD" \
+            EXPECTED_ASSET_NAME="$(basename "$ASSET_PATH")" \
+            python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          asset = Path(os.environ["HOSTED_ASSET"])
+          manifest = json.loads(Path(os.environ["HOSTED_MANIFEST"]).read_text(encoding="utf-8"))
+          expected = {
+              "schema_version": 1,
+              "repository": "Coke1120/statelet-codex-pet-macos",
+              "repository_id": 1329561047,
+              "ref": os.environ["EXPECTED_REF"],
+              "commit_sha": os.environ["EXPECTED_COMMIT_SHA"],
+              "version": os.environ["EXPECTED_VERSION"],
+              "build": int(os.environ["EXPECTED_BUILD"]),
+              "asset_name": os.environ["EXPECTED_ASSET_NAME"],
+          }
+          for key, value in expected.items():
+              if manifest.get(key) != value:
+                  raise SystemExit(f"hosted manifest {key} does not match the release authority")
+          if set(manifest) != set(expected) | {"asset_size", "asset_sha256"}:
+              raise SystemExit("hosted manifest schema does not match update manifest v1")
+          size = asset.stat().st_size
+          digest = hashlib.sha256()
+          with asset.open("rb") as handle:
+              for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                  digest.update(chunk)
+          if size != manifest["asset_size"] or digest.hexdigest() != manifest["asset_sha256"]:
+              raise SystemExit("hosted update asset does not match its signed manifest")
+          PY
+
+      - name: Publish verified release as latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+          BUILD: ${{ steps.release.outputs.build }}
+          ASSET_PATH: ${{ steps.package.outputs.asset_path }}
+          MANIFEST_PATH: ${{ steps.package.outputs.manifest_path }}
+          SIGNATURE_PATH: ${{ steps.package.outputs.signature_path }}
+        run: |
+          set -euo pipefail
+          expected_title="Statelet $VERSION ($BUILD)"
+          release_json="$(gh release view "$TAG" --json assets,isDraft,isPrerelease,name)"
+          RELEASE_JSON="$release_json" \
+            EXPECTED_TITLE="$expected_title" \
+            EXPECTED_ASSET="$(basename "$ASSET_PATH")" \
+            EXPECTED_MANIFEST="$(basename "$MANIFEST_PATH")" \
+            EXPECTED_SIGNATURE="$(basename "$SIGNATURE_PATH")" \
+            python3 - <<'PY'
+          import json
+          import os
+
+          release = json.loads(os.environ["RELEASE_JSON"])
+          if release["isPrerelease"]:
+              raise SystemExit("stable release must not be a prerelease")
+          if release["name"] != os.environ["EXPECTED_TITLE"]:
+              raise SystemExit("release title does not match the signed build")
+          expected = {
+              os.environ["EXPECTED_ASSET"],
+              os.environ["EXPECTED_MANIFEST"],
+              os.environ["EXPECTED_SIGNATURE"],
+          }
+          actual = {asset["name"] for asset in release["assets"]}
+          if actual != expected:
+              raise SystemExit("release assets do not exactly match the signed update set")
+          PY
+
+          gh release edit "$TAG" --draft=false --latest
+
+          final_json="$(gh release view "$TAG" --json assets,isDraft,isPrerelease,name)"
+          RELEASE_JSON="$final_json" EXPECTED_TITLE="$expected_title" python3 - <<'PY'
+          import json
+          import os
+
+          release = json.loads(os.environ["RELEASE_JSON"])
+          if release["isDraft"] or release["isPrerelease"]:
+              raise SystemExit("release publication did not reach stable public state")
+          if release["name"] != os.environ["EXPECTED_TITLE"]:
+              raise SystemExit("published release title does not match the signed build")
+          if len(release["assets"]) != 3:
+              raise SystemExit("published release must contain exactly three signed update assets")
           PY

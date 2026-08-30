@@ -16,8 +16,8 @@ in private local storage. Never commit, bundle, diagnose-upload, or log them.
 2. Choose the provider contract:
    - For GPT-SoVITS, identify one validated GPT epoch, one matching SoVITS
      weight, and one reference recording with its exact transcript and
-     language. Require API v2 on numeric loopback HTTP only. Never load unknown
-     PyTorch checkpoints.
+     language. Require API v2 behind a pinned-TLS service or gateway on numeric
+     loopback HTTPS. Never load unknown PyTorch checkpoints.
    - For Qwen3-TTS, require a trusted self-contained handover and a trusted
      local Python executable whose environment provides MLX Audio. The current
      Statelet profile is Japanese-only and accepts at most 500 characters per
@@ -97,8 +97,8 @@ in private local storage. Never commit, bundle, diagnose-upload, or log them.
   Confirm the request used the current deterministic seed, let Statelet mark
   the profile unavailable, restart only the managed loopback service, allow
   startup to exceed 60 seconds while it is still making progress, and do not
-  retry until the numeric-loopback endpoint answers promptly. Then revalidate
-  and regenerate.
+  retry until the pinned numeric-loopback HTTPS endpoint answers promptly with
+  the saved leaf-certificate pin. Then revalidate and regenerate.
 - Use **Retry** only for `failed` or `stale` lines. Use **Regenerate** for a
   `ready` line whose WAV fails audible acceptance. Run the verifier with
   `--allow-pending` only for diagnosis; final acceptance must omit it.

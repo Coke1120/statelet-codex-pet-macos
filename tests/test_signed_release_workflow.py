@@ -16,11 +16,30 @@ class SignedReleaseWorkflowTests(unittest.TestCase):
     def test_workflow_is_bound_to_protected_main_and_repository_identity(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("runs-on: macos-15", workflow)
+        self.assertIn("actions: read", workflow)
         self.assertIn("git merge-base --is-ancestor", workflow)
         self.assertIn("refs/remotes/origin/main", workflow)
         self.assertIn('ACTUAL_REPOSITORY" == "Coke1120/statelet-codex-pet-macos', workflow)
         self.assertIn('ACTUAL_REPOSITORY_ID" == "1329561047', workflow)
         self.assertIn("refs/tags/$tag^{commit}", workflow)
+        self.assertIn(
+            "format('refs/tags/{0}', inputs.tag) || github.ref",
+            workflow,
+        )
+
+        gate = workflow.split(
+            "- name: Require successful exact-commit macOS CI", 1
+        )[1].split("- name: Run focused updater tests", 1)[0]
+        self.assertIn('"repos/$REPOSITORY/actions/workflows/ci.yml/runs"', gate)
+        self.assertIn('-f branch=main', gate)
+        self.assertIn('-f event=push', gate)
+        self.assertIn('-f head_sha="$COMMIT_SHA"', gate)
+        self.assertIn('run.get("head_sha") == expected_sha', gate)
+        self.assertIn('run.get("conclusion") == "success"', gate)
+        self.assertLess(
+            workflow.index("- name: Require successful exact-commit macOS CI"),
+            workflow.index("- name: Sign and verify update manifest"),
+        )
 
     def test_workflow_uses_only_expected_signed_assets_and_secret(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
@@ -39,6 +58,40 @@ class SignedReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("if unexpected:", workflow)
         self.assertIn('gh release view "$TAG" --json assets', workflow)
         self.assertIn("if actual != expected:", workflow)
+        self.assertIn('gh release create "$TAG" --verify-tag --draft', workflow)
+        self.assertIn("if: steps.github_release.outputs.upload_required == 'true'", workflow)
+        self.assertIn('gh release edit "$TAG" --draft=false --latest', workflow)
+        self.assertIn('gh release download "$TAG"', workflow)
+        self.assertIn('cmp -- "$local_path" "$verification_directory/$asset_name"', workflow)
+        self.assertIn('if [[ "$UPLOAD_REQUIRED" == "true" ]]', workflow)
+        self.assertIn('"$RUNNER_TEMP/sign-update-manifest" verify', workflow)
+        self.assertIn('manifest.get(key) != value', workflow)
+        self.assertIn('digest.hexdigest() != manifest["asset_sha256"]', workflow)
+        self.assertLess(
+            workflow.index("- name: Upload signed update assets"),
+            workflow.index("- name: Verify hosted release bytes"),
+        )
+        self.assertLess(
+            workflow.index("- name: Verify hosted release bytes"),
+            workflow.index("- name: Publish verified release as latest"),
+        )
+        verify_hosted = workflow.split(
+            "- name: Verify hosted release bytes", 1
+        )[1].split("- name: Publish verified release as latest", 1)[0]
+        self.assertNotIn("      if:", verify_hosted)
+        self.assertLess(
+            verify_hosted.index('if [[ "$UPLOAD_REQUIRED" == "true" ]]'),
+            verify_hosted.index('cmp -- "$local_path"'),
+        )
+        self.assertLess(
+            verify_hosted.index('cmp -- "$local_path"'),
+            verify_hosted.index('"$RUNNER_TEMP/sign-update-manifest" verify'),
+        )
+        create_line = next(
+            line for line in workflow.splitlines() if 'gh release create "$TAG"' in line
+        )
+        self.assertIn("--draft", create_line)
+        self.assertNotIn("--latest", create_line)
         self.assertNotIn("gh release delete-asset", workflow)
         self.assertNotIn("Developer ID", workflow)
         self.assertNotIn("STATELET_UPDATE_SIGNING_TEAM_IDENTIFIER", workflow)
@@ -109,6 +162,38 @@ class SignedReleaseWorkflowTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr.decode())
             self.assertEqual(len(base64.b64decode(signature_path.read_bytes(), validate=True)), 64)
             self.assertEqual(signature_path.stat().st_mode & 0o777, 0o600)
+
+            verified = subprocess.run(
+                [
+                    "swift",
+                    str(SIGNER),
+                    "verify",
+                    str(manifest_path),
+                    str(signature_path),
+                    public_key.stdout.decode(),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(verified.returncode, 0, verified.stderr.decode())
+
+            tampered_signature = directory / "tampered.sig"
+            tampered_signature.write_bytes(base64.b64encode(bytes(64)))
+            rejected_signature = subprocess.run(
+                [
+                    "swift",
+                    str(SIGNER),
+                    "verify",
+                    str(manifest_path),
+                    str(tampered_signature),
+                    public_key.stdout.decode(),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertNotEqual(rejected_signature.returncode, 0)
 
             noncanonical = directory / "noncanonical.json"
             noncanonical.write_text(json.dumps(manifest, indent=2), encoding="utf-8")

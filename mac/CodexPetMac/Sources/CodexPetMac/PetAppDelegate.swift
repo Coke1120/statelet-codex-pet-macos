@@ -189,6 +189,12 @@ private struct FailedMP4Batch {
     let sourceURLs: [URL]
 }
 
+private struct UnusedMediaDiscovery: Sendable {
+    let candidates: [URL]
+    let totalBytes: Int64
+    let snapshot: ManagedMediaTrashSnapshot?
+}
+
 private struct ActiveConversionJournal: Codable {
     let state: String
     let characterID: String?
@@ -649,8 +655,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var updateRecoveryBlocked = false
     private var dialogueVoiceCoordinator: DialogueVoiceCoordinator!
     private let toolchainDiscovery = AlphaToolchainDiscovery()
+    private var toolchainDiscoveryCancellation: AlphaToolchainDiscoveryCancellation?
     private var toolchainState: AlphaToolchainState = .checking
     private let conversionCoordinator = AlphaConversionCoordinator()
+    private let mediaMutationActivities = OwnedOperationTracker()
+    private let mediaMutationFinalizations = MainThreadFinalizationQueue()
     private var conversionProfile: AlphaConversionProfile = .fill
     private let launchAtLoginManager = LaunchAtLoginManager()
     private let diagnostics = PetDiagnostics()
@@ -709,15 +718,33 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var characterLibraryReloadDeferred = false
     private var globalTransitionLibraryReloadDeferred = false
     private var pendingCharacterBundleOpenURL: URL?
+    private var isTerminating = false
     private var mediaMutationInProgress = false {
         didSet {
             if oldValue, !mediaMutationInProgress {
+                guard !isTerminating else {
+                    discardDeferredMediaWorkForTermination()
+                    return
+                }
                 applyDeferredMediaMapReloadIfNeeded()
                 applyDeferredCharacterLibraryReloadIfNeeded()
                 applyDeferredGlobalTransitionLibraryReloadIfNeeded()
                 processPendingCharacterBundleOpenIfPossible()
             }
         }
+    }
+
+    private func enterTerminationState() {
+        isTerminating = true
+        toolchainDiscoveryCancellation?.cancel()
+        discardDeferredMediaWorkForTermination()
+    }
+
+    private func discardDeferredMediaWorkForTermination() {
+        mediaMapReloadDeferred = false
+        characterLibraryReloadDeferred = false
+        globalTransitionLibraryReloadDeferred = false
+        pendingCharacterBundleOpenURL = nil
     }
 
     init(preferencesMigrationStatus: PreferencesMigration.Status = .notRun) {
@@ -768,7 +795,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         loadGlobalTransitionLibrary()
         dialogueVoiceCoordinator = DialogueVoiceCoordinator()
         dialogueVoiceCoordinator.onChange = { [weak self] snapshot in
-            guard let self else { return }
+            guard let self, !self.isTerminating else { return }
             self.settingsController?.update(dialogueVoice: snapshot)
             self.refreshStateOwnedDialogue(using: snapshot)
         }
@@ -931,7 +958,10 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             installHealthCheckTimer()
         }
         if options.openSettings {
-            DispatchQueue.main.async { [weak self] in self?.showSettings() }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !self.isTerminating else { return }
+                self.showSettings()
+            }
         }
         recoverInterruptedConversionIfPresent()
         DispatchQueue.main.async { [weak self] in
@@ -940,6 +970,10 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        guard !isTerminating else {
+            sender.reply(toOpenOrPrint: .failure)
+            return
+        }
         let bundles = filenames.map { URL(fileURLWithPath: $0).standardizedFileURL }.filter {
             $0.pathExtension.caseInsensitiveCompare("statelet-character") == .orderedSame
         }
@@ -953,6 +987,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        enterTerminationState()
         transientStateReadRetry?.cancel()
         transientStateReadRetry = nil
         sessionActivityReadRetry?.cancel()
@@ -988,13 +1023,35 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         positionSaveGeneration &+= 1
         positionSaveWorkItem?.cancel()
         positionSaveWorkItem = nil
-        let playerQuiescent = player?.shutdownForTermination() ?? true
-        let conversionQuiescent = conversionCoordinator.terminateAndWait()
+        let toolchainDiscoveryQuiescent = toolchainDiscoveryCancellation?
+            .cancelAndWaitForQuiescence(timeout: 2) ?? true
+        toolchainDiscoveryCancellation = nil
+        let conversionDrainQuiescent = conversionCoordinator.terminateAndWait()
         let voiceQuiescent = dialogueVoiceCoordinator?.shutdownAndWaitForQuiescence() ?? true
+        let mediaMutationDrainQuiescent = mediaMutationActivities
+            .cancelAndWaitForQuiescence(
+                timeout: 5,
+                mainThreadWork: mediaMutationFinalizations.drain
+            )
         let updateCheckQuiescent = updateCoordinator?.shutdownAndWaitForQuiescence() ?? true
+        let mediaMutationFinalizationQuiescent = mediaMutationActivities
+            .cancelAndWaitForQuiescence(
+                timeout: 1,
+                mainThreadWork: mediaMutationFinalizations.drain
+            )
+        let playerQuiescent = player?.shutdownForTermination() ?? true
+        let conversionFinallyQuiescent = conversionCoordinator.isQuiescentForTermination
+        let conversionQuiescent = conversionDrainQuiescent && conversionFinallyQuiescent
+        let mediaMutationFinallyQuiescent = mediaMutationActivities.isQuiescent
+        let mediaMutationQuiescent = mediaMutationDrainQuiescent
+            && mediaMutationFinalizationQuiescent
+            && mediaMutationFinallyQuiescent
         let updaterWorkQuiescent = playerQuiescent
             && conversionQuiescent
             && voiceQuiescent
+            && toolchainDiscoveryQuiescent
+            && mediaMutationQuiescent
+            && !mediaMutationInProgress
             && updateCheckQuiescent
         do {
             if let candidate = try updateCoordinator?.commitScheduledUpdateAtTermination(
@@ -1036,10 +1093,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         positionSessionActivityPanel()
     }
     func windowDidChangeOcclusionState(_ notification: Notification) {
+        guard !isTerminating else { return }
         updateWindowOcclusionSuspension()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard !isTerminating else { return false }
         showSettings()
         return true
     }
@@ -1052,6 +1111,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     @objc private func accessibilityDisplayOptionsChanged() {
+        guard !isTerminating else { return }
         let newValue = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         let motionChanged = newValue != reduceMotion
         if motionChanged {
@@ -1069,6 +1129,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     @objc private func screensDidWake() {
+        guard !isTerminating else { return }
         for step in DisplayWakeRecoveryPolicy.steps {
             switch step {
             case .clearWindowOcclusion:
@@ -1084,6 +1145,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func updateWindowOcclusionSuspension() {
+        guard !isTerminating else { return }
         guard let panel else { return }
         player?.setSuspended(
             !panel.occlusionState.contains(.visible),
@@ -1113,6 +1175,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func installMapWatcher() {
+        guard !isTerminating else {
+            mapWatcher?.stop()
+            mapWatcher = nil
+            return
+        }
         mapWatcher?.stop()
         mapWatcher = StateDirectoryWatcher(fileURL: mediaMapURL)
         mapWatcher.start(emitInitial: false) { [weak self] _ in
@@ -1143,6 +1210,10 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func handleMediaMapReloadRequest() {
+        guard !isTerminating else {
+            mediaMapReloadDeferred = false
+            return
+        }
         guard !mediaMutationInProgress else {
             mediaMapReloadDeferred = true
             return
@@ -1161,6 +1232,10 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func applyDeferredMediaMapReloadIfNeeded() {
+        guard !isTerminating else {
+            mediaMapReloadDeferred = false
+            return
+        }
         guard mediaMapReloadDeferred else { return }
         mediaMapReloadDeferred = false
         handleMediaMapReloadRequest()
@@ -1168,6 +1243,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
 
     private func configureCharacterLibrary() {
         characterLibraryStorage = CharacterLibraryStorage(mediaMapURL: configuredMediaMapURL)
+        do {
+            try characterLibraryStorage.recoverInterruptedImports()
+        } catch {
+            logger.error("event=character_import_recovery_failed action=retain_staging")
+        }
         do {
             let snapshot = try characterLibraryStorage.loadCatalog()
             characterLibrary = snapshot.library
@@ -1185,6 +1265,10 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func handleCharacterLibraryReloadRequest() {
+        guard !isTerminating else {
+            characterLibraryReloadDeferred = false
+            return
+        }
         guard !mediaMutationInProgress else {
             characterLibraryReloadDeferred = true
             return
@@ -1214,12 +1298,20 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func applyDeferredCharacterLibraryReloadIfNeeded() {
+        guard !isTerminating else {
+            characterLibraryReloadDeferred = false
+            return
+        }
         guard characterLibraryReloadDeferred else { return }
         characterLibraryReloadDeferred = false
         handleCharacterLibraryReloadRequest()
     }
 
     private func handleGlobalTransitionLibraryReloadRequest() {
+        guard !isTerminating else {
+            globalTransitionLibraryReloadDeferred = false
+            return
+        }
         guard !mediaMutationInProgress else {
             globalTransitionLibraryReloadDeferred = true
             return
@@ -1234,6 +1326,10 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func applyDeferredGlobalTransitionLibraryReloadIfNeeded() {
+        guard !isTerminating else {
+            globalTransitionLibraryReloadDeferred = false
+            return
+        }
         guard globalTransitionLibraryReloadDeferred else { return }
         globalTransitionLibraryReloadDeferred = false
         handleGlobalTransitionLibraryReloadRequest()
@@ -1348,6 +1444,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func applyConfiguredWindowSize() {
+        guard !isTerminating else { return }
         guard let panel else { return }
         let size = NSSize(width: mediaMap.window.width, height: mediaMap.window.height)
         let resized = WindowFramePolicy.applyingConfiguredSize(size, to: panel.frame)
@@ -1948,6 +2045,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func apply(state: PetState, forceRefresh: Bool = false) {
+        guard !isTerminating else { return }
         let previousProducerState = currentState
         let presentationTrigger = LifecycleTransitionPolicy.trigger(
             previousLifecycleState: lastLifecycleStateForSelection,
@@ -2058,7 +2156,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         to destination: PetState,
         advanceSelection: Bool
     ) -> Bool {
-        guard !reduceMotion,
+        guard !isTerminating,
+              !reduceMotion,
               let mediaMapURL,
               let resolvedTransition = TransitionLibraryResolver.resolve(
                   from: source,
@@ -2153,7 +2252,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         request: PendingLifecycleTransitionAttestation,
         result: Result<CharacterTransitionRuntimeAttestation, Error>
     ) {
-        guard pendingLifecycleTransitionAttestation?.id == request.id,
+        guard !isTerminating,
+              pendingLifecycleTransitionAttestation?.id == request.id,
               transitionSequence == request.id,
               currentState == request.destination,
               temporaryStatePreviewPolicy.previewState == nil,
@@ -2206,7 +2306,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         request: PendingLifecycleTransitionAttestation,
         reason: String
     ) {
-        guard transitionSequence == request.id,
+        guard !isTerminating,
+              transitionSequence == request.id,
               currentState == request.destination,
               temporaryStatePreviewPolicy.previewState == nil,
               activeOneShotPreview == nil else { return }
@@ -2258,7 +2359,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func finishLifecycleTransition(transitionID: UInt64, outcome: String) {
-        guard let active = activeLifecycleTransition,
+        guard !isTerminating,
+              let active = activeLifecycleTransition,
               LifecycleTransitionCompletionDecision.decide(
                   callbackID: transitionID,
                   currentSequence: transitionSequence,
@@ -2401,6 +2503,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         selectionRequest: MediaSelectionRequest? = nil,
         selectionCommitTarget: MediaSelectionCommitTarget = .lifecycle
     ) {
+        guard !isTerminating else { return }
         pendingMediaSelectionCommit = nil
         if stateDialoguePresentation?.state != state {
             let keepSpokenMessage = dialogueVoiceCoordinator.isAutomaticPlaybackActive
@@ -2493,7 +2596,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         baseTransitionID: UInt64,
         state: PetState
     ) -> Bool {
-        guard baseTransitionID == transitionSequence,
+        guard !isTerminating,
+              baseTransitionID == transitionSequence,
               state == effectivePresentationState,
               activeLifecycleTransition == nil,
               pendingLifecycleTransitionAttestation == nil,
@@ -2562,7 +2666,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         request: PendingLifecycleTransitionAttestation,
         result: Result<CharacterTransitionRuntimeAttestation, Error>
     ) {
-        guard let pending = pendingInStateTransitionPrewarm,
+        guard !isTerminating,
+              let pending = pendingInStateTransitionPrewarm,
               pending.baseTransitionID == baseTransitionID,
               pending.request.id == request.id,
               transitionSequence == baseTransitionID,
@@ -2611,7 +2716,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         baseTransitionID: UInt64,
         state: PetState
     ) -> Bool {
-        guard let pending = pendingInStateTransitionPrewarm,
+        guard !isTerminating,
+              let pending = pendingInStateTransitionPrewarm,
               pending.baseTransitionID == baseTransitionID,
               pending.request.id == transitionID,
               transitionSequence == baseTransitionID,
@@ -2685,7 +2791,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         state: PetState,
         event: PlaybackPresentationEvent
     ) {
-        guard transitionID == transitionSequence, state == effectivePresentationState else { return }
+        guard !isTerminating,
+              transitionID == transitionSequence,
+              state == effectivePresentationState else { return }
         pendingPresentationState = nil
         if activeOneShotPreview?.transitionID == transitionID {
             switch event {
@@ -2727,6 +2835,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func presentStateOwnedDialogueIfNeeded(for state: PetState) {
+        guard !isTerminating else { return }
         if stateDialoguePresentation?.state == state {
             ensureStateOwnedDialoguePlayback()
             return
@@ -2756,7 +2865,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func refreshStateOwnedDialogue(using snapshot: DialogueVoiceCoordinatorSnapshot) {
-        guard player != nil,
+        guard !isTerminating,
+              player != nil,
               var presentation = stateDialoguePresentation,
               presentation.state == effectivePresentationState else {
             return
@@ -2781,7 +2891,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func ensureStateOwnedDialoguePlayback() {
-        guard let presentation = stateDialoguePresentation,
+        guard !isTerminating,
+              let presentation = stateDialoguePresentation,
               presentation.state == effectivePresentationState else { return }
         applyStateOwnedDialoguePlaybackResult(
             dialogueVoiceCoordinator.ensureAutomaticPlayback(
@@ -2806,7 +2917,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func markStateOwnedDialogueAudioDelivered(requestID: UUID, line: DialogueLine) {
-        guard var presentation = stateDialoguePresentation,
+        guard !isTerminating,
+              var presentation = stateDialoguePresentation,
               presentation.id == requestID,
               presentation.state == effectivePresentationState,
               presentation.recordAutomaticPlaybackStarted(line) else {
@@ -2818,7 +2930,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func finishStateOwnedDialogueAudio(requestID: UUID, lineID: UUID) {
-        guard var presentation = stateDialoguePresentation,
+        guard !isTerminating,
+              var presentation = stateDialoguePresentation,
               presentation.state == effectivePresentationState else {
             player?.view.showDialogueMessage(nil)
             return
@@ -3291,6 +3404,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     @objc private func showSettings() {
+        guard !isTerminating else { return }
         if settingsController == nil {
             settingsController = makeSettingsController()
             checkConversionTools()
@@ -3384,11 +3498,21 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         controller.onLaunchAtLoginChange = { [weak self] enabled in self?.setLaunchAtLogin(enabled) }
         controller.onAgentSourceChange = { [weak self] mode in self?.setAgentSourceMode(mode) }
         controller.onCleanUnusedMedia = { [weak self] in self?.cleanUnusedMedia() }
-        controller.onCheckForUpdates = { [weak self] in self?.updateCoordinator?.checkNow() }
-        controller.onCancelUpdate = { [weak self] in self?.updateCoordinator?.cancel() }
-        controller.onInstallUpdate = { [weak self] in self?.updateCoordinator?.installReadyUpdate() }
+        controller.onCheckForUpdates = { [weak self] in
+            guard let self, !self.isTerminating else { return }
+            self.updateCoordinator?.checkNow()
+        }
+        controller.onCancelUpdate = { [weak self] in
+            guard let self, !self.isTerminating else { return }
+            self.updateCoordinator?.cancel()
+        }
+        controller.onInstallUpdate = { [weak self] in
+            guard let self, !self.isTerminating else { return }
+            self.updateCoordinator?.installReadyUpdate()
+        }
         controller.onAutomaticInstallChange = { [weak self] enabled in
-            self?.updateCoordinator?.setAutomaticInstall(enabled)
+            guard let self, !self.isTerminating else { return }
+            self.updateCoordinator?.setAutomaticInstall(enabled)
         }
         controller.onImportVoiceAsset = { [weak self] kind, draft in
             self?.chooseVoiceAsset(kind: kind, preserving: draft)
@@ -3526,7 +3650,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func selectCharacter(id: String) {
-        guard !mediaMutationInProgress, id != characterLibrary.activeCharacterID,
+        guard !mediaMutationInProgress, !isTerminating,
+              id != characterLibrary.activeCharacterID,
               let entry = characterLibrary.character(id: id) else { return }
         do {
             let loaded = try characterLibraryStorage.loadMediaMap(for: entry)
@@ -3547,7 +3672,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func createCharacter(name: String) {
-        guard !mediaMutationInProgress else { return }
+        guard !mediaMutationInProgress, !isTerminating else { return }
         let id = UUID().uuidString.lowercased()
         var createdEntry: CharacterLibraryEntry?
         do {
@@ -3591,7 +3716,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func renameCharacter(id: String, name: String) {
-        guard !mediaMutationInProgress else { return }
+        guard !mediaMutationInProgress, !isTerminating else { return }
         do {
             let updated = try characterLibrary.renamingCharacter(id: id, to: name)
             try persistCharacterLibrary(updated)
@@ -3606,7 +3731,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func duplicateCharacter(id: String, name: String) {
-        guard !mediaMutationInProgress, let source = characterLibrary.character(id: id) else { return }
+        guard !mediaMutationInProgress, !isTerminating,
+              let source = characterLibrary.character(id: id) else { return }
         let newID = UUID().uuidString.lowercased()
         var destination: CharacterLibraryEntry?
         do {
@@ -3650,7 +3776,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func deleteCharacter(id: String) {
-        guard !mediaMutationInProgress,
+        guard !mediaMutationInProgress, !isTerminating,
               characterLibrary.characters.count > 1,
               characterLibrary.activeCharacterID == id,
               characterLibrary.character(id: id) != nil else { return }
@@ -3693,7 +3819,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func chooseCharacterBundle() {
-        guard !mediaMutationInProgress, let window = settingsController?.window else { return }
+        guard !mediaMutationInProgress, !isTerminating,
+              let window = settingsController?.window else { return }
         let panel = NSOpenPanel()
         panel.title = "Import Statelet Character"
         panel.prompt = "Import Character"
@@ -3708,7 +3835,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func confirmCharacterBundleImport(_ url: URL) {
-        guard let window = settingsController?.window else { return }
+        guard !isTerminating,
+              let window = settingsController?.window else { return }
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Import Character Bundle?"
@@ -3722,6 +3850,10 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func processPendingCharacterBundleOpenIfPossible() {
+        guard !isTerminating else {
+            pendingCharacterBundleOpenURL = nil
+            return
+        }
         guard characterLibraryStorage != nil,
               panel != nil,
               !mediaMutationInProgress,
@@ -3729,76 +3861,86 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         pendingCharacterBundleOpenURL = nil
         showSettings()
         DispatchQueue.main.async { [weak self] in
-            self?.confirmCharacterBundleImport(url)
+            guard let self, !self.isTerminating else { return }
+            self.confirmCharacterBundleImport(url)
         }
     }
 
     private func importCharacterBundle(_ url: URL, allowLegacyTrust: Bool) {
-        guard !mediaMutationInProgress else { return }
+        guard !mediaMutationInProgress, !isTerminating else { return }
         mediaMutationInProgress = true
         settingsController?.update(activity: .characterWorking("Checking character bundle and media…"))
         let storage = characterLibraryStorage!
         let baselineLibrary = characterLibrary
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            let result = await Task.detached(priority: .userInitiated) {
-                Result {
-                    try storage.stageImport(
-                        from: url,
-                        against: baselineLibrary,
-                        allowLegacyTrust: allowLegacyTrust
-                    )
-                }
-            }.value
-            switch result {
-            case let .failure(error):
-                mediaMutationInProgress = false
-                let detail = (error as? CharacterLibraryStorageError)?.localizedDescription
-                    ?? "The bundle did not satisfy Statelet's character safety contract."
-                settingsController?.update(
-                    activity: .failed(nil, "Character bundle was not imported · \(detail)")
+        let activity = mediaMutationActivities.begin()
+        let owner = self
+        let task = Task.detached(priority: .userInitiated) {
+            let result = Result {
+                try storage.stageImport(
+                    from: url,
+                    against: baselineLibrary,
+                    allowLegacyTrust: allowLegacyTrust
                 )
-                logger.error("event=character_bundle_import_failed")
-            case let .success(staged):
-                do {
-                    let entry = try staged.commit()
-                    do {
-                        let loaded = try characterLibraryStorage.loadMediaMap(for: entry)
-                        let added = try characterLibrary.addingCharacter(
-                            id: entry.id,
-                            name: entry.name
-                        )
-                        let selected = try added.selectingCharacter(id: entry.id)
-                        try persistCharacterLibrary(selected)
-                        activateCharacter(
-                            entry: entry,
-                            map: loaded.map,
-                            encodedData: loaded.encodedData
-                        )
-                        staged.finalize()
-                        mediaMutationInProgress = false
-                        settingsController?.update(
-                            activity: .characterSucceeded("Imported and activated \(entry.name)")
-                        )
-                        logger.info("event=character_bundle_imported")
-                    } catch {
-                        staged.rollback()
-                        throw error
-                    }
-                } catch {
-                    staged.discard()
-                    mediaMutationInProgress = false
-                    settingsController?.update(
-                        activity: .failed(nil, "Character bundle could not be installed. The library was not changed.")
+            }
+            let cancelled = Task.isCancelled
+            owner.mediaMutationFinalizations.enqueue {
+                defer { activity.finish() }
+                if cancelled {
+                    if case let .success(staged) = result { staged.discard() }
+                    owner.mediaMutationInProgress = false
+                    return
+                }
+                switch result {
+                case let .failure(error):
+                    owner.mediaMutationInProgress = false
+                    let detail = (error as? CharacterLibraryStorageError)?.localizedDescription
+                        ?? "The bundle did not satisfy Statelet's character safety contract."
+                    owner.settingsController?.update(
+                        activity: .failed(nil, "Character bundle was not imported · \(detail)")
                     )
-                    logger.error("event=character_bundle_install_failed action=rollback")
+                    owner.logger.error("event=character_bundle_import_failed")
+                case let .success(staged):
+                    do {
+                        let entry = try staged.commit()
+                        do {
+                            let loaded = try owner.characterLibraryStorage.loadMediaMap(for: entry)
+                            let added = try owner.characterLibrary.addingCharacter(
+                                id: entry.id,
+                                name: entry.name
+                            )
+                            let selected = try added.selectingCharacter(id: entry.id)
+                            try owner.persistCharacterLibrary(selected)
+                            owner.activateCharacter(
+                                entry: entry,
+                                map: loaded.map,
+                                encodedData: loaded.encodedData
+                            )
+                            staged.finalize()
+                            owner.mediaMutationInProgress = false
+                            owner.settingsController?.update(
+                                activity: .characterSucceeded("Imported and activated \(entry.name)")
+                            )
+                            owner.logger.info("event=character_bundle_imported")
+                        } catch {
+                            staged.rollback()
+                            throw error
+                        }
+                    } catch {
+                        staged.discard()
+                        owner.mediaMutationInProgress = false
+                        owner.settingsController?.update(
+                            activity: .failed(nil, "Character bundle could not be installed. The library was not changed.")
+                        )
+                        owner.logger.error("event=character_bundle_install_failed action=rollback")
+                    }
                 }
             }
         }
+        activity.setCancellation { task.cancel() }
     }
 
     private func exportCharacterBundle(id: String) {
-        guard !mediaMutationInProgress,
+        guard !mediaMutationInProgress, !isTerminating,
               let entry = characterLibrary.character(id: id),
               let window = settingsController?.window else { return }
         let panel = NSSavePanel()
@@ -3811,32 +3953,38 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             .replacingOccurrences(of: ":", with: "-")
         panel.nameFieldStringValue = "\(safeName).statelet-character"
         panel.beginSheetModal(for: window) { [weak self] response in
-            guard response == .OK, let destination = panel.url, let self else { return }
+            guard response == .OK, let destination = panel.url, let self,
+                  !self.isTerminating else { return }
             self.mediaMutationInProgress = true
             self.settingsController?.update(
                 activity: .characterWorking("Exporting \(entry.name)…")
             )
             let storage = self.characterLibraryStorage!
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                let result = await Task.detached(priority: .userInitiated) {
-                    Result { try storage.exportCharacter(entry, to: destination) }
-                }.value
-                self.mediaMutationInProgress = false
-                switch result {
-                case .success:
-                    self.settingsController?.update(
-                        activity: .characterSucceeded("Exported \(entry.name)")
-                    )
-                    NSWorkspace.shared.activateFileViewerSelecting([destination])
-                    self.logger.info("event=character_bundle_exported")
-                case .failure:
-                    self.settingsController?.update(
-                        activity: .failed(nil, "Character bundle could not be exported. No partial bundle was kept.")
-                    )
-                    self.logger.error("event=character_bundle_export_failed")
+            let activity = self.mediaMutationActivities.begin()
+            let owner = self
+            let task = Task.detached(priority: .userInitiated) {
+                let result = Result { try storage.exportCharacter(entry, to: destination) }
+                let cancelled = Task.isCancelled
+                owner.mediaMutationFinalizations.enqueue {
+                    defer { activity.finish() }
+                    owner.mediaMutationInProgress = false
+                    guard !cancelled else { return }
+                    switch result {
+                    case .success:
+                        owner.settingsController?.update(
+                            activity: .characterSucceeded("Exported \(entry.name)")
+                        )
+                        NSWorkspace.shared.activateFileViewerSelecting([destination])
+                        owner.logger.info("event=character_bundle_exported")
+                    case .failure:
+                        owner.settingsController?.update(
+                            activity: .failed(nil, "Character bundle could not be exported. No partial bundle was kept.")
+                        )
+                        owner.logger.error("event=character_bundle_export_failed")
+                    }
                 }
             }
+            activity.setCancellation { task.cancel() }
         }
     }
 
@@ -3864,30 +4012,47 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func checkConversionTools() {
+        guard !isTerminating else { return }
+        if let activeDiscovery = toolchainDiscoveryCancellation {
+            guard activeDiscovery.cancelAndWaitForQuiescence(timeout: 2) else {
+                toolchainState = .unavailable(
+                    "The previous conversion-tool check did not stop safely. Restart Statelet before checking again."
+                )
+                settingsController?.update(toolchainState: toolchainState)
+                return
+            }
+            toolchainDiscoveryCancellation = nil
+        }
+        let cancellation = AlphaToolchainDiscoveryCancellation()
+        toolchainDiscoveryCancellation = cancellation
         toolchainState = .checking
         settingsController?.update(toolchainState: .checking)
-        toolchainDiscovery.discover { [weak self] state in
-            guard let self else { return }
+        toolchainDiscovery.discover(cancellation: cancellation) { [weak self] state in
+            guard let self, !self.isTerminating,
+                  self.toolchainDiscoveryCancellation === cancellation else { return }
+            self.toolchainDiscoveryCancellation = nil
             self.toolchainState = state
             self.settingsController?.update(toolchainState: state)
         }
     }
 
     private func choosePythonRuntime() {
-        guard let settingsWindow = settingsController?.window else { return }
+        guard !isTerminating,
+              let settingsWindow = settingsController?.window else { return }
         let openPanel = NSOpenPanel()
         openPanel.title = "Choose Python 3"
-        openPanel.message = "Choose a Python executable that can import NumPy and Pillow. Statelet stores this local path in its preferences."
+        openPanel.message = "Choose a Python executable that can import NumPy. Statelet stores this local path in its preferences."
         openPanel.prompt = "Use Python"
         openPanel.canChooseDirectories = false
         openPanel.allowsMultipleSelection = false
         openPanel.beginSheetModal(for: settingsWindow) { [weak self] response in
-            guard response == .OK, let url = openPanel.url else { return }
+            guard response == .OK, let url = openPanel.url, let self,
+                  !self.isTerminating else { return }
             UserDefaults.standard.set(
                 url.standardizedFileURL.path,
                 forKey: AlphaToolchainDiscovery.configuredPythonDefaultsKey
             )
-            self?.checkConversionTools()
+            self.checkConversionTools()
         }
     }
 
@@ -3895,6 +4060,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         kind: DialogueVoiceAssetKind,
         preserving draft: DialogueVoiceProfileDraft
     ) {
+        guard !isTerminating else { return }
         guard let settingsWindow = settingsController?.window else { return }
         let panel = NSOpenPanel()
         panel.canChooseDirectories = false
@@ -3922,8 +4088,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             panel.allowedContentTypes = [.wav]
         }
         panel.beginSheetModal(for: settingsWindow) { [weak self] response in
-            guard response == .OK, let sourceURL = panel.url else { return }
-            self?.dialogueVoiceCoordinator.importAsset(
+            guard response == .OK, let sourceURL = panel.url, let self,
+                  !self.isTerminating else { return }
+            self.dialogueVoiceCoordinator.importAsset(
                 sourceURL: sourceURL,
                 kind: kind,
                 preserving: draft
@@ -3932,6 +4099,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func saveVoiceProfile(_ draft: DialogueVoiceProfileDraft) {
+        guard !isTerminating else { return }
         guard dialogueVoiceCoordinator.library.profile != nil,
               let settingsWindow = settingsController?.window else {
             persistVoiceProfile(draft)
@@ -3950,6 +4118,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func persistVoiceProfile(_ draft: DialogueVoiceProfileDraft) {
+        guard !isTerminating else { return }
         do {
             try dialogueVoiceCoordinator.saveProfile(draft)
         } catch {
@@ -3958,6 +4127,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func confirmVoiceProfileRemoval(_ profile: GPTSoVITSVoiceProfile) {
+        guard !isTerminating else { return }
         guard let settingsWindow = settingsController?.window else { return }
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -3966,16 +4136,18 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         alert.addButton(withTitle: "Remove Voice Profile")
         alert.addButton(withTitle: "Cancel")
         alert.beginSheetModal(for: settingsWindow) { [weak self] response in
-            guard response == .alertFirstButtonReturn else { return }
+            guard response == .alertFirstButtonReturn, let self,
+                  !self.isTerminating else { return }
             do {
-                try self?.dialogueVoiceCoordinator.removeProfile()
+                try self.dialogueVoiceCoordinator.removeProfile()
             } catch {
-                self?.presentSettingsError(error.localizedDescription)
+                self.presentSettingsError(error.localizedDescription)
             }
         }
     }
 
     private func chooseQwenVoiceProfile() {
+        guard !isTerminating else { return }
         guard let settingsWindow = settingsController?.window else { return }
         let packagePanel = NSOpenPanel()
         packagePanel.title = "Import Qwen3-TTS Handover"
@@ -3991,6 +4163,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func chooseQwenPythonRuntime(for packageURL: URL) {
+        guard !isTerminating else { return }
         guard let settingsWindow = settingsController?.window else { return }
         let pythonPanel = NSOpenPanel()
         pythonPanel.title = "Choose Qwen Python Runtime"
@@ -4004,8 +4177,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         // both the launcher and its final interpreter identity.
         pythonPanel.resolvesAliases = false
         pythonPanel.beginSheetModal(for: settingsWindow) { [weak self] response in
-            guard response == .OK, let pythonURL = pythonPanel.url else { return }
-            self?.dialogueVoiceCoordinator.configureQwenProfile(
+            guard response == .OK, let pythonURL = pythonPanel.url, let self,
+                  !self.isTerminating else { return }
+            self.dialogueVoiceCoordinator.configureQwenProfile(
                 sourceURL: packageURL,
                 pythonExecutableURL: pythonURL
             )
@@ -4013,6 +4187,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func chooseVoxCPM2Snapshot(referenceText: String) {
+        guard !isTerminating else { return }
         guard let window = settingsController?.window else { return }
         let panel = NSOpenPanel()
         panel.title = "Choose VoxCPM2 Snapshot"
@@ -4025,6 +4200,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func chooseVoxCPM2Reference(snapshotURL: URL, referenceText: String) {
+        guard !isTerminating else { return }
         guard let window = settingsController?.window else { return }
         let panel = NSOpenPanel()
         panel.title = "Choose VoxCPM2 Reference WAV"
@@ -4038,6 +4214,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func chooseVoxCPM2Python(snapshotURL: URL, referenceURL: URL, referenceText: String) {
+        guard !isTerminating else { return }
         guard let window = settingsController?.window else { return }
         let panel = NSOpenPanel()
         panel.title = "Choose VoxCPM2 Python Runtime"
@@ -4045,8 +4222,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         panel.prompt = "Use Runtime"; panel.canChooseFiles = true; panel.canChooseDirectories = false
         panel.resolvesAliases = false
         panel.beginSheetModal(for: window) { [weak self] response in
-            guard response == .OK, let python = panel.url else { return }
-            self?.dialogueVoiceCoordinator.configureVoxCPM2Profile(
+            guard response == .OK, let python = panel.url, let self,
+                  !self.isTerminating else { return }
+            self.dialogueVoiceCoordinator.configureVoxCPM2Profile(
                 snapshotURL: snapshotURL, referenceAudioURL: referenceURL,
                 referenceText: referenceText, pythonExecutableURL: python
             )
@@ -4054,19 +4232,22 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func confirmVoxCPM2ProfileRemoval(_ profile: VoxCPM2VoiceProfile) {
+        guard !isTerminating else { return }
         guard let window = settingsController?.window else { return }
         let alert = NSAlert(); alert.alertStyle = .warning
         alert.messageText = "Remove \(profile.name)?"
         alert.informativeText = "Statelet removes its managed snapshot, reference, and generated speech. The selected source folder, dialogue text, and other providers remain untouched."
         alert.addButton(withTitle: "Remove VoxCPM2 Profile"); alert.addButton(withTitle: "Cancel")
         alert.beginSheetModal(for: window) { [weak self] response in
-            guard response == .alertFirstButtonReturn else { return }
-            do { try self?.dialogueVoiceCoordinator.removeProfile(provider: .voxcpm2) }
-            catch { self?.presentSettingsError(error.localizedDescription) }
+            guard response == .alertFirstButtonReturn, let self,
+                  !self.isTerminating else { return }
+            do { try self.dialogueVoiceCoordinator.removeProfile(provider: .voxcpm2) }
+            catch { self.presentSettingsError(error.localizedDescription) }
         }
     }
 
     private func selectVoiceProvider(_ provider: DialogueVoiceProviderKind) {
+        guard !isTerminating else { return }
         do {
             try dialogueVoiceCoordinator.selectActiveProvider(provider)
         } catch {
@@ -4075,6 +4256,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func confirmQwenVoiceProfileRemoval(_ profile: Qwen3TTSVoiceProfile) {
+        guard !isTerminating else { return }
         guard let settingsWindow = settingsController?.window else { return }
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -4083,16 +4265,18 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         alert.addButton(withTitle: "Remove Qwen Profile")
         alert.addButton(withTitle: "Cancel")
         alert.beginSheetModal(for: settingsWindow) { [weak self] response in
-            guard response == .alertFirstButtonReturn else { return }
+            guard response == .alertFirstButtonReturn, let self,
+                  !self.isTerminating else { return }
             do {
-                try self?.dialogueVoiceCoordinator.removeProfile(provider: .qwen3TTS)
+                try self.dialogueVoiceCoordinator.removeProfile(provider: .qwen3TTS)
             } catch {
-                self?.presentSettingsError(error.localizedDescription)
+                self.presentSettingsError(error.localizedDescription)
             }
         }
     }
 
     private func addDialogueLine(text: String, language: String, state: PetState) {
+        guard !isTerminating else { return }
         do {
             try dialogueVoiceCoordinator.addLine(text: text, language: language, state: state)
         } catch {
@@ -4103,6 +4287,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private func updateDialogueVoicePlaybackSettings(
         _ settings: DialogueVoicePlaybackSettings
     ) {
+        guard !isTerminating else { return }
         do {
             try dialogueVoiceCoordinator.updatePlaybackSettings(settings)
         } catch {
@@ -4116,6 +4301,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         language: String,
         state: PetState
     ) {
+        guard !isTerminating else { return }
         do {
             try dialogueVoiceCoordinator.updateLine(
                 id: line.id,
@@ -4129,6 +4315,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func confirmDialogueLineDeletion(_ line: DialogueLine) {
+        guard !isTerminating else { return }
         guard let settingsWindow = settingsController?.window else { return }
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -4137,16 +4324,18 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         alert.addButton(withTitle: "Delete")
         alert.addButton(withTitle: "Cancel")
         alert.beginSheetModal(for: settingsWindow) { [weak self] response in
-            guard response == .alertFirstButtonReturn else { return }
+            guard response == .alertFirstButtonReturn, let self,
+                  !self.isTerminating else { return }
             do {
-                try self?.dialogueVoiceCoordinator.deleteLine(id: line.id)
+                try self.dialogueVoiceCoordinator.deleteLine(id: line.id)
             } catch {
-                self?.presentSettingsError(error.localizedDescription)
+                self.presentSettingsError(error.localizedDescription)
             }
         }
     }
 
     private func previewDialogueLine(_ line: DialogueLine) {
+        guard !isTerminating else { return }
         do {
             try dialogueVoiceCoordinator.previewLine(id: line.id)
         } catch {
@@ -4155,6 +4344,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func retryDialogueLine(_ line: DialogueLine) {
+        guard !isTerminating else { return }
         do {
             try dialogueVoiceCoordinator.retryLine(id: line.id)
         } catch {
@@ -4163,6 +4353,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func regenerateDialogueLine(_ line: DialogueLine) {
+        guard !isTerminating else { return }
         do {
             try dialogueVoiceCoordinator.regenerateLine(id: line.id)
         } catch {
@@ -4171,7 +4362,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func chooseMP4(for state: PetState) {
-        guard !mediaMutationInProgress else { return }
+        guard !mediaMutationInProgress, !isTerminating else { return }
         guard let settingsWindow = settingsController?.window else { return }
         guard toolchainState.isReady else {
             presentSettingsError("Conversion tools aren’t ready. Use Setup Guide, then Check Again.")
@@ -4202,7 +4393,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func migrateGlobalTransitionLegacy() {
-        guard !mediaMutationInProgress,
+        guard !mediaMutationInProgress, !isTerminating,
               globalTransitionLibrary.requiresLegacyMigration,
               let settingsWindow = settingsController?.window else { return }
 
@@ -4237,7 +4428,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             guard let self, response == .alertFirstButtonReturn,
                   let storageKey = popup.selectedItem?.representedObject as? String,
                   let route = try? StateTransitionKey(storageKey: storageKey) else { return }
-            guard !self.mediaMutationInProgress,
+            guard !self.mediaMutationInProgress, !self.isTerminating,
                   self.globalTransitionLibrary == expectedLibrary,
                   self.globalTransitionLibraryEncodedData == expectedData else {
                 self.settingsController?.update(
@@ -4263,7 +4454,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         route: SettingsTransitionRoute,
         replacingPath: String? = nil
     ) {
-        guard !mediaMutationInProgress, let settingsWindow = settingsController?.window else { return }
+        guard !mediaMutationInProgress, !isTerminating,
+              let settingsWindow = settingsController?.window else { return }
         guard toolchainState.isReady else {
             presentSettingsError("Conversion tools aren’t ready. Use Setup Guide, then Check Again.")
             return
@@ -4285,7 +4477,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         route: SettingsTransitionRoute,
         replacingPath: String? = nil
     ) {
-        guard !mediaMutationInProgress, let settingsWindow = settingsController?.window else { return }
+        guard !mediaMutationInProgress, !isTerminating,
+              let settingsWindow = settingsController?.window else { return }
         let openPanel = NSOpenPanel()
         openPanel.title = "Choose \(route.displayName) Transition"
         openPanel.prompt = "Import Transition"
@@ -4323,17 +4516,21 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         route: SettingsTransitionRoute,
         replacingPath: String?
     ) {
-        guard !mediaMutationInProgress else { return }
+        guard !mediaMutationInProgress, !isTerminating else { return }
         let destination = transitionActivityState(for: route)
         mediaMutationInProgress = true
-        Task { @MainActor [weak self] in
+        let activity = mediaMutationActivities.begin()
+        let task = Task { @MainActor [weak self] in
+            defer { activity.finish() }
             guard let self else { return }
             var importedCount = 0
             for sourceURL in sourceURLs {
+                guard !Task.isCancelled else { break }
                 var installedDirectoryToRemove: URL?
                 do {
                     let installed = try await prepareVerifiedMovie(sourceURL, allowPortableClaim: true)
                     installedDirectoryToRemove = installed.directory
+                    try Task.checkCancellation()
                     let duration = installed.validation.durationSeconds
                     guard duration.isFinite, duration > 0,
                           duration <= LifecycleTransitionMediaPolicy.maximumDuration else {
@@ -4373,6 +4570,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             mediaMutationInProgress = false
             refreshSettings()
         }
+        activity.setCancellation { task.cancel() }
     }
 
     private func updateTransitionLibrary(
@@ -4418,11 +4616,13 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         route: SettingsTransitionRoute,
         replacingPath: String?
     ) {
+        guard !isTerminating else { return }
         let orderedURLs = replacingPath == nil && !route.isSameState ? sourceURLs : Array(sourceURLs.prefix(1))
         guard let first = orderedURLs.first else { return }
         importTransitionMP4(first, scope: scope, route: route, replacingPath: replacingPath) { [weak self] _ in
             guard replacingPath == nil else { return }
-            self?.importTransitionMP4s(
+            guard let self, !self.isTerminating else { return }
+            self.importTransitionMP4s(
                 Array(orderedURLs.dropFirst()),
                 scope: scope,
                 route: route,
@@ -4439,7 +4639,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         completion: @escaping (Bool) -> Void
     ) {
         let destination = transitionActivityState(for: route)
-        guard !mediaMutationInProgress else {
+        guard !mediaMutationInProgress, !isTerminating else {
             settingsController?.update(
                 activity: .failed(destination, "Transition import unavailable · wait for the current media operation to finish")
             )
@@ -4519,12 +4719,14 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 allowEmptyFrames: true,
                 phase: { [weak self] phase in
                     guard let self,
+                          !self.isTerminating,
                           self.activeTransitionConversionID == conversionID,
                           !self.transitionConversionCancellationRequested else { return }
                     self.settingsController?.update(activity: .converting(destination, phase))
                 },
                 progress: { [weak self] progress in
                     guard let self,
+                          !self.isTerminating,
                           self.activeTransitionConversionID == conversionID,
                           !self.transitionConversionCancellationRequested else { return }
                     self.settingsController?.update(
@@ -4534,12 +4736,35 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 },
                 completion: { [weak self] result in
                     guard let self else { return }
-                    Task { @MainActor in
+                    guard !self.isTerminating else {
+                        self.abandonTransitionConversionForTermination(
+                            conversionID: conversionID,
+                            outputURL: outputURL,
+                            reportURL: reportURL
+                        )
+                        completion(false)
+                        return
+                    }
+                    let activity = self.mediaMutationActivities.begin()
+                    let task = Task { @MainActor in
+                        defer { activity.finish() }
+                        guard !self.isTerminating else {
+                            self.abandonTransitionConversionForTermination(
+                                conversionID: conversionID,
+                                outputURL: outputURL,
+                                reportURL: reportURL
+                            )
+                            completion(false)
+                            return
+                        }
                         guard self.activeTransitionConversionID == conversionID else {
                             try? FileManager.default.removeItem(at: outputURL)
                             try? FileManager.default.removeItem(at: reportURL)
                             completion(false)
                             return
+                        }
+                        if Task.isCancelled {
+                            self.transitionConversionCancellationRequested = true
                         }
                         if self.transitionConversionCancellationRequested {
                             let outputAbsent = self.removeCancelledTransitionArtifact(outputURL)
@@ -4620,6 +4845,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                         self.refreshSettings()
                         completion(succeeded)
                     }
+                    activity.setCancellation { task.cancel() }
                 }
             )
         }
@@ -4630,7 +4856,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         route: SettingsTransitionRoute,
         path: String
     ) {
-        guard !reduceMotion else { return }
+        guard !isTerminating, !reduceMotion else { return }
         let destination = transitionActivityState(for: route)
         let entry: MediaEntry?
         let libraryURL: URL
@@ -4707,7 +4933,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             guard route == .global else { return }
             entryExists = globalTransitionLibrary.universalPlaylist?.entry(path: path) != nil
         }
-        guard !mediaMutationInProgress, entryExists else { return }
+        guard !mediaMutationInProgress, !isTerminating, entryExists else { return }
         guard let window = settingsController?.window else { return }
         let requestedCharacterID = characterLibrary.activeCharacterID
         let requestedMapURL = mediaMapURL.standardizedFileURL
@@ -4725,7 +4951,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         alert.beginSheetModal(for: window) { [weak self] response in
             guard let self, response != .alertThirdButtonReturn else { return }
             if scope == .global {
-                guard !self.mediaMutationInProgress,
+                guard !self.mediaMutationInProgress, !self.isTerminating,
                       self.globalTransitionLibraryEncodedData == requestedGlobalData,
                       self.globalTransitionLibrary.universalPlaylist?.entry(path: path) != nil else {
                     self.settingsController?.update(activity: .failed(destination, "The Global transition changed before removal. Nothing was removed."))
@@ -4742,7 +4968,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 return
             }
             let catalogSnapshot = try? self.characterLibraryStorage.loadCatalog()
-            guard !self.mediaMutationInProgress,
+            guard !self.mediaMutationInProgress, !self.isTerminating,
                   catalogSnapshot?.library == self.characterLibrary,
                   catalogSnapshot?.encodedData == self.characterLibraryEncodedData,
                   self.characterLibrary.activeCharacterID == requestedCharacterID,
@@ -4919,7 +5145,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         destination: PetState,
         mutation: () throws -> TransitionLibraryMutation
     ) {
-        guard !mediaMutationInProgress else { return }
+        guard !mediaMutationInProgress, !isTerminating else { return }
         do {
             if scope == .global {
                 let current = try characterLibraryStorage.loadGlobalTransitionLibrary()
@@ -4943,7 +5169,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func importMP4s(_ sourceURLs: [URL], for state: PetState) {
-        guard !mediaMutationInProgress else {
+        guard !mediaMutationInProgress, !isTerminating else {
             settingsController?.update(activity: .failed(state, "Nothing imported · wait for the current media operation to finish"))
             return
         }
@@ -4979,7 +5205,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         initialFailures: [MP4ImportFailure] = [],
         totalCount: Int? = nil
     ) {
-        guard !sourceURLs.isEmpty else { return }
+        guard !sourceURLs.isEmpty, !isTerminating else { return }
         do {
             try prepareMediaDirectory()
         } catch {
@@ -5015,6 +5241,18 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         notices: [MP4ImportNotice],
         batchID: UUID
     ) {
+        guard !isTerminating else {
+            finishMP4Batch(
+                state: state,
+                total: totalCount,
+                imported: imported,
+                failures: failures,
+                notices: notices,
+                cancelled: true,
+                batchID: batchID
+            )
+            return
+        }
         guard activeMP4BatchID == batchID else { return }
         if mp4BatchCancellationRequested {
             finishMP4Batch(
@@ -5097,7 +5335,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             invocationChallenge: invocationChallenge,
             profile: conversionProfile,
             phase: { [weak self] phase in
-                guard let self else { return }
+                guard let self, !self.isTerminating else { return }
                 self.settingsController?.update(
                     activity: .converting(state, "Clip \(position) of \(sourceURLs.count): \(phase)"),
                     progressValue: self.batchProgress(
@@ -5108,7 +5346,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 )
             },
             progress: { [weak self] progress in
-                guard let self, self.activeMP4BatchID == batchID else { return }
+                guard let self, !self.isTerminating,
+                      self.activeMP4BatchID == batchID else { return }
                 let clipPercent = min(96, progress.percent * 0.96)
                 self.settingsController?.update(
                     activity: .converting(
@@ -5124,6 +5363,21 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             },
             completion: { [weak self] result in
                 guard let self else { return }
+                guard !self.isTerminating else {
+                    try? FileManager.default.removeItem(at: outputURL)
+                    try? FileManager.default.removeItem(at: reportURL)
+                    self.clearConversionJournal()
+                    self.finishMP4Batch(
+                        state: state,
+                        total: totalCount,
+                        imported: imported,
+                        failures: failures,
+                        notices: notices,
+                        cancelled: true,
+                        batchID: batchID
+                    )
+                    return
+                }
                 switch result {
                 case let .failure(error):
                     self.updateConversionFailureDiagnostic(from: error)
@@ -5173,8 +5427,25 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                             clipPercent: 97
                         )
                     )
-                    Task { @MainActor in
-                        let validation = await Task.detached(priority: .userInitiated) {
+                    let activity = self.mediaMutationActivities.begin()
+                    let task = Task { @MainActor in
+                        defer { activity.finish() }
+                        guard !self.isTerminating else {
+                            try? FileManager.default.removeItem(at: conversion.outputURL)
+                            try? FileManager.default.removeItem(at: conversion.reportURL)
+                            self.clearConversionJournal()
+                            self.finishMP4Batch(
+                                state: state,
+                                total: totalCount,
+                                imported: imported,
+                                failures: failures,
+                                notices: notices,
+                                cancelled: true,
+                                batchID: batchID
+                            )
+                            return
+                        }
+                        let validator = Task.detached(priority: .userInitiated) {
                             try Self.validateLocallyAttestedMovie(
                                 outputURL: conversion.outputURL,
                                 reportURL: conversion.reportURL,
@@ -5182,14 +5453,20 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                                 invocationChallenge: invocationChallenge,
                                 expectedInitialReportData: conversion.reportData
                             )
-                        }.result
+                        }
+                        let validation = await withTaskCancellationHandler {
+                            await validator.result
+                        } onCancel: {
+                            validator.cancel()
+                        }
                             guard self.activeMP4BatchID == batchID else {
                                 try? FileManager.default.removeItem(at: conversion.outputURL)
                                 try? FileManager.default.removeItem(at: conversion.reportURL)
                                 self.clearConversionJournal()
                                 return
                             }
-                            if self.mp4BatchCancellationRequested {
+                            if Task.isCancelled || self.isTerminating
+                                || self.mp4BatchCancellationRequested {
                                 try? FileManager.default.removeItem(at: conversion.outputURL)
                                 try? FileManager.default.removeItem(at: conversion.reportURL)
                                 self.clearConversionJournal()
@@ -5287,6 +5564,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                                 batchID: batchID
                             )
                     }
+                    activity.setCancellation { task.cancel() }
                 }
             }
         )
@@ -5429,9 +5707,24 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func retryLastFailedMP4Batch() {
-        guard !mediaMutationInProgress,
+        guard !mediaMutationInProgress, !isTerminating,
               let batch = lastFailedMP4Batch else { return }
         importMP4s(batch.sourceURLs, for: batch.state)
+    }
+
+    private func abandonTransitionConversionForTermination(
+        conversionID: UUID,
+        outputURL: URL,
+        reportURL: URL
+    ) {
+        _ = removeCancelledTransitionArtifact(outputURL)
+        _ = removeCancelledTransitionArtifact(reportURL)
+        _ = removeCancelledTransitionArtifact(conversionJournalURL)
+        guard activeTransitionConversionID == conversionID else { return }
+        activeTransitionConversionID = nil
+        activeTransitionConversionDestination = nil
+        transitionConversionCancellationRequested = false
+        mediaMutationInProgress = false
     }
 
     private func batchProgress(index: Int, total: Int, clipPercent: Double) -> Double {
@@ -5491,6 +5784,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func recoverInterruptedConversionIfPresent() {
+        guard !isTerminating else { return }
         let journalURL = conversionJournalURL
         var journalStatus = stat()
         guard Darwin.lstat(journalURL.path, &journalStatus) == 0 else { return }
@@ -5510,7 +5804,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
               Self.isValidInvocationChallenge(journal.invocationChallenge) else { return }
         let mediaDirectory = configuredMediaMapURL.deletingLastPathComponent()
         mediaMutationInProgress = true
-        Task { @MainActor [weak self] in
+        let activity = mediaMutationActivities.begin()
+        let task = Task { @MainActor [weak self] in
+            defer { activity.finish() }
             guard let self else { return }
             let outputURL = mediaDirectory.appendingPathComponent(journal.outputBasename)
             let reportURL = mediaDirectory.appendingPathComponent(journal.reportBasename)
@@ -5523,6 +5819,10 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                     expectedInitialReportData: nil
                 )
             }.result
+            guard !Task.isCancelled else {
+                self.mediaMutationInProgress = false
+                return
+            }
             switch validation {
                 case .failure:
                     // Failed validation does not prove that these names remain
@@ -5657,6 +5957,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 }
             self.mediaMutationInProgress = false
         }
+        activity.setCancellation { task.cancel() }
     }
 
     private func recoveryOwner(for journal: ActiveConversionJournal) throws -> ConversionRecoveryOwner {
@@ -5842,7 +6143,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func chooseTransparentMovie(for state: PetState) {
-        guard !mediaMutationInProgress else { return }
+        guard !mediaMutationInProgress, !isTerminating else { return }
         guard let settingsWindow = settingsController?.window else { return }
         let openPanel = NSOpenPanel()
         openPanel.title = "Choose Portable MOVs for \(state.rawValue.capitalized)"
@@ -5863,7 +6164,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         replacingPath: String? = nil,
         userConfirmedPortableTrust: Bool = false
     ) {
-        guard !sourceURLs.isEmpty else { return }
+        guard !sourceURLs.isEmpty, !isTerminating else { return }
         guard userConfirmedPortableTrust else {
             guard let settingsWindow = settingsController?.window else { return }
             let alert = NSAlert()
@@ -5884,11 +6185,14 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             return
         }
         mediaMutationInProgress = true
-        Task { @MainActor [weak self] in
+        let activity = mediaMutationActivities.begin()
+        let task = Task { @MainActor [weak self] in
+            defer { activity.finish() }
             guard let self else { return }
             var imported = 0
             var failures: [MP4ImportFailure] = []
             for (index, sourceURL) in sourceURLs.enumerated() {
+                guard !Task.isCancelled else { break }
                 self.settingsController?.update(
                     activity: .working(
                         state,
@@ -5900,6 +6204,10 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                         sourceURL,
                         allowPortableClaim: userConfirmedPortableTrust
                     )
+                    guard !Task.isCancelled else {
+                        try? FileManager.default.removeItem(at: installed.directory)
+                        break
+                    }
                     do {
                         if let replacingPath {
                             try self.installRelinkedMediaEntry(
@@ -5954,6 +6262,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             }
             refreshSettings()
         }
+        activity.setCancellation { task.cancel() }
     }
 
     private func prepareVerifiedMovie(
@@ -6174,6 +6483,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func playOnce(state libraryState: PetState, path: String) {
+        guard !isTerminating else { return }
         guard !reduceMotion else {
             presentSettingsError("Play Once is unavailable while macOS Reduce Motion is on.")
             return
@@ -6275,6 +6585,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func changePlaybackMode(for state: PetState, to mode: MediaPlaybackMode) {
+        guard !isTerminating else { return }
         do {
             let updated = try mediaMap.changingPlaybackMode(for: state, to: mode)
             try publishMediaMap(updated)
@@ -6289,6 +6600,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         for state: PetState,
         to policy: MediaPlaylistAdvancePolicy
     ) {
+        guard !isTerminating else { return }
         do {
             let updated = try mediaMap.settingAdvanceOn(for: state, to: policy)
             try publishMediaMap(updated)
@@ -6307,6 +6619,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         path: String,
         to destinationIndex: Int
     ) {
+        guard !isTerminating else { return }
         do {
             let updated = try mediaMap.movingEntry(
                 for: state,
@@ -6322,7 +6635,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func relinkMedia(for state: PetState, path: String) {
-        guard !mediaMutationInProgress else { return }
+        guard !mediaMutationInProgress, !isTerminating else { return }
         guard let settingsWindow = settingsController?.window,
               let entry = mediaMap.playlist(for: state)?.entry(path: path) else { return }
         let currentURL = mediaMap.resolvedURL(for: entry, relativeTo: mediaMapURL)
@@ -6344,6 +6657,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func setFixedEntry(for state: PetState, path: String) {
+        guard !isTerminating else { return }
         do {
             let updated = try mediaMap.settingFixedEntry(for: state, path: path)
             try publishMediaMap(updated)
@@ -6356,7 +6670,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func choosePoster(for state: PetState, path: String) {
-        guard !mediaMutationInProgress else { return }
+        guard !mediaMutationInProgress, !isTerminating else { return }
         guard let settingsWindow = settingsController?.window else { return }
         guard mediaMap.playlist(for: state)?.entry(path: path) != nil else {
             presentSettingsError("That animation is no longer in the selected state.")
@@ -6369,12 +6683,27 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         openPanel.allowedContentTypes = [.png, .jpeg, .heic]
         openPanel.allowsMultipleSelection = false
         openPanel.beginSheetModal(for: settingsWindow) { [weak self] response in
-            guard response == .OK, let sourceURL = openPanel.url, let self else { return }
+            guard response == .OK, let sourceURL = openPanel.url, let self,
+                  !self.isTerminating else { return }
             self.mediaMutationInProgress = true
             self.settingsController?.update(activity: .working(state, "Copying Reduce Motion poster…"))
-            DispatchQueue.global(qos: .userInitiated).async {
+            let activity = self.mediaMutationActivities.begin()
+            let task = Task.detached(priority: .userInitiated) { [weak self] in
+                guard let self else {
+                    activity.finish()
+                    return
+                }
                 let copied = Result { try self.copyPosterIntoMediaDirectory(sourceURL) }
-                DispatchQueue.main.async {
+                let cancelled = Task.isCancelled
+                self.mediaMutationFinalizations.enqueue {
+                    defer { activity.finish() }
+                    if cancelled {
+                        if case let .success(installed) = copied {
+                            try? FileManager.default.removeItem(at: installed.url)
+                        }
+                        self.mediaMutationInProgress = false
+                        return
+                    }
                     switch copied {
                     case let .success(installed):
                         do {
@@ -6392,11 +6721,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                     }
                 }
             }
+            activity.setCancellation { task.cancel() }
         }
     }
 
     private func removePoster(for state: PetState, path: String) {
-        guard !mediaMutationInProgress,
+        guard !mediaMutationInProgress, !isTerminating,
               let entry = mediaMap.playlist(for: state)?.entry(path: path) else { return }
         do {
             let replacement = try MediaEntry(
@@ -6470,7 +6800,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         path: String,
         mode: ManagedMediaRemovalMode
     ) {
-        guard !mediaMutationInProgress else { return }
+        guard !mediaMutationInProgress, !isTerminating else { return }
         switch mode {
         case .libraryOnly:
             do {
@@ -6551,8 +6881,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 )
                 return
             }
-            DispatchQueue.global(qos: .utility).async { [weak self] in
-                guard let self else { return }
+            let activity = mediaMutationActivities.begin()
+            let task = Task.detached(priority: .utility) { [weak self] in
+                guard let self else {
+                    activity.finish()
+                    return
+                }
                 let quarantine: ManagedMediaTrashQuarantine
                 do {
                     quarantine = try ManagedMediaTrashRevalidator.quarantineLibraryAfterPublish(
@@ -6564,7 +6898,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                         canonicalRoot: self.canonicalManagedMediaRoot
                     )
                 } catch {
-                    DispatchQueue.main.async {
+                    self.mediaMutationFinalizations.enqueue {
+                        defer { activity.finish() }
                         self.mediaMutationInProgress = false
                         do {
                             try ManagedMediaTrashRevalidator.validateLibraryReadyForMapRestore(
@@ -6601,7 +6936,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                     moved = 0
                     failed = quarantine.itemCount
                 }
-                DispatchQueue.main.async {
+                self.mediaMutationFinalizations.enqueue {
+                    defer { activity.finish() }
                     self.mediaMutationInProgress = false
                     self.handleMediaMapReloadRequest()
                     if failed == 0 {
@@ -6623,6 +6959,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                     self.refreshSettings()
                 }
             }
+            activity.setCancellation { task.cancel() }
         }
     }
 
@@ -6970,15 +7307,38 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func cleanUnusedMedia() {
-        guard !mediaMutationInProgress else { return }
-        let candidates: [URL]
-        do {
-            candidates = try unusedMediaCandidates()
-        } catch {
-            presentSettingsError("Statelet could not safely inspect the Media folder.")
-            return
+        guard !mediaMutationInProgress, !isTerminating else { return }
+        mediaMutationInProgress = true
+        settingsController?.update(
+            activity: .working(currentState, "Inspecting managed media for unused files…")
+        )
+        let activity = mediaMutationActivities.begin()
+        let task = Task.detached(priority: .utility) { [weak self] in
+            guard let self else {
+                activity.finish()
+                return
+            }
+            let result = Result { try self.discoverUnusedMedia() }
+            let cancelled = Task.isCancelled
+            self.mediaMutationFinalizations.enqueue {
+                defer { activity.finish() }
+                self.mediaMutationInProgress = false
+                guard !cancelled else { return }
+                switch result {
+                case .failure:
+                    self.presentSettingsError("Statelet could not safely inspect the Media folder.")
+                case let .success(discovery):
+                    self.confirmUnusedMediaCleanup(discovery)
+                }
+            }
         }
-        guard !candidates.isEmpty else {
+        activity.setCancellation { task.cancel() }
+    }
+
+    private func confirmUnusedMediaCleanup(_ discovery: UnusedMediaDiscovery) {
+        guard !isTerminating else { return }
+        let candidates = discovery.candidates
+        guard !candidates.isEmpty, let cleanupSnapshot = discovery.snapshot else {
             let alert = NSAlert()
             alert.messageText = "No Unused Media"
             alert.informativeText = "Every managed media file is currently referenced, or no safe cleanup candidates were found."
@@ -6991,13 +7351,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             return
         }
 
-        let totalBytes = candidates.reduce(Int64(0)) { total, url in
-            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-            return total + Int64(size)
-        }
         let names = candidates.prefix(8).map(\.lastPathComponent).joined(separator: "\n")
         let extra = candidates.count > 8 ? "\n…and \(candidates.count - 8) more" : ""
-        let formattedSize = ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
+        let formattedSize = ByteCountFormatter.string(
+            fromByteCount: discovery.totalBytes,
+            countStyle: .file
+        )
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Move \(candidates.count) Unused File\(candidates.count == 1 ? "" : "s") to Trash?"
@@ -7005,73 +7364,67 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         alert.addButton(withTitle: "Move to Trash")
         alert.addButton(withTitle: "Cancel")
         let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
-            guard response == .alertFirstButtonReturn, let self else { return }
-            let currentCandidates = (try? self.unusedMediaCandidates()) ?? []
-            let approved = Set(candidates.map { $0.standardizedFileURL.path })
-            let targets = currentCandidates.filter { approved.contains($0.standardizedFileURL.path) }
-            guard !targets.isEmpty else {
-                self.refreshDiagnosticsSnapshot()
-                return
-            }
-            let cleanupSnapshot: ManagedMediaTrashSnapshot
-            do {
-                let libraryMaps = try self.allCharacterMediaMaps()
-                cleanupSnapshot = try ManagedMediaTrashRevalidator.captureUnusedLibrary(
-                    targetURLs: targets,
-                    maps: libraryMaps.map { _, map, mapURL in
-                        ManagedMediaTrashMap(url: mapURL, map: map)
-                    },
-                    catalogURL: self.characterLibraryStorage.catalogURL,
-                    globalTransitionLibrary: self.managedMediaTrashGlobalTransitionLibrary,
-                    canonicalRoot: self.canonicalManagedMediaRoot
-                )
-            } catch {
-                self.presentSettingsError("The media libraries changed before cleanup. No files were moved.")
-                self.refreshDiagnosticsSnapshot()
-                return
-            }
+            guard response == .alertFirstButtonReturn, let self,
+                  !self.mediaMutationInProgress,
+                  !self.isTerminating else { return }
             self.mediaMutationInProgress = true
             self.settingsController?.update(
-                activity: .working(self.currentState, "Moving \(targets.count) unused media file\(targets.count == 1 ? "" : "s") to Trash…")
+                activity: .working(
+                    self.currentState,
+                    "Moving \(candidates.count) unused media file\(candidates.count == 1 ? "" : "s") to Trash…"
+                )
             )
-            DispatchQueue.global(qos: .utility).async {
-                var moved = 0
-                var failed = 0
+            let root = self.canonicalManagedMediaRoot
+            let publishedMap = ManagedMediaTrashMap(url: self.mediaMapURL, map: self.mediaMap)
+            let activity = self.mediaMutationActivities.begin()
+            let task = Task.detached(priority: .utility) { [weak self] in
+                guard let self else {
+                    activity.finish()
+                    return
+                }
+                let outcome: (moved: Int, failed: Int)
                 do {
+                    try Task.checkCancellation()
                     try ManagedMediaTrashRevalidator.validateUnusedLibraryUnchanged(
                         snapshot: cleanupSnapshot,
-                        canonicalRoot: self.canonicalManagedMediaRoot
+                        canonicalRoot: root
                     )
-                    let quarantine = try ManagedMediaTrashRevalidator.quarantineLibraryAfterPublish(
-                        snapshot: cleanupSnapshot,
-                        publishedMap: ManagedMediaTrashMap(
-                            url: self.mediaMapURL,
-                            map: self.mediaMap
-                        ),
-                        canonicalRoot: self.canonicalManagedMediaRoot
-                    )
+                    let quarantine = try ManagedMediaTrashRevalidator
+                        .quarantineLibraryAfterPublish(
+                            snapshot: cleanupSnapshot,
+                            publishedMap: publishedMap,
+                            canonicalRoot: root
+                        )
                     try FileManager.default.trashItem(
                         at: quarantine.directoryURL,
                         resultingItemURL: nil
                     )
-                    moved = targets.count
+                    outcome = (quarantine.itemCount, 0)
                 } catch {
-                    failed = targets.count
+                    outcome = (0, candidates.count)
                 }
-                DispatchQueue.main.async {
+                self.mediaMutationFinalizations.enqueue {
+                    defer { activity.finish() }
                     self.mediaMutationInProgress = false
-                    if failed == 0 {
+                    if outcome.failed == 0 {
                         self.settingsController?.update(
-                            activity: .succeeded(self.currentState, "Moved \(moved) unused file\(moved == 1 ? "" : "s") to Trash")
+                            activity: .succeeded(
+                                self.currentState,
+                                "Moved \(outcome.moved) unused file\(outcome.moved == 1 ? "" : "s") to Trash"
+                            )
                         )
                     } else {
                         self.settingsController?.update(
-                            activity: .failed(self.currentState, "Moved \(moved); \(failed) file\(failed == 1 ? "" : "s") could not be moved")
+                            activity: .failed(
+                                self.currentState,
+                                "Moved \(outcome.moved); \(outcome.failed) file\(outcome.failed == 1 ? "" : "s") could not be moved"
+                            )
                         )
                     }
                     self.refreshDiagnosticsSnapshot()
                 }
             }
+            activity.setCancellation { task.cancel() }
         }
         if let window = settingsController?.window {
             alert.beginSheetModal(for: window, completionHandler: completion)
@@ -7080,7 +7433,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         }
     }
 
-    private func unusedMediaCandidates() throws -> [URL] {
+    private func discoverUnusedMedia() throws -> UnusedMediaDiscovery {
+        try Task.checkCancellation()
         let canonicalRoot = canonicalManagedMediaRoot
         let canonicalMap = canonicalRoot.appendingPathComponent("media-map.json").standardizedFileURL
         let configuredMap = configuredMediaMapURL.standardizedFileURL
@@ -7101,6 +7455,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         )
         let globalLibraryURL = characterLibraryStorage.globalTransitionLibraryURL
         for entry in globalTransitionLibrary.allEntries {
+            try Task.checkCancellation()
             let movie = globalTransitionLibrary.resolvedURL(
                 for: entry,
                 relativeTo: globalLibraryURL
@@ -7121,7 +7476,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 referenced.insert(poster.path)
             }
         }
-        for (character, map, mapURL) in try allCharacterMediaMaps() {
+        let libraryMaps = try allCharacterMediaMaps()
+        for (character, map, mapURL) in libraryMaps {
+            try Task.checkCancellation()
             referenced.insert(
                 character.resolvedMapURL(relativeTo: configuredMediaMapURL)
                     .resolvingSymlinksInPath().standardizedFileURL.path
@@ -7151,9 +7508,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             includingPropertiesForKeys: keys,
             options: [.skipsPackageDescendants],
             errorHandler: { _, _ in false }
-        ) else { return [] }
+        ) else {
+            return UnusedMediaDiscovery(candidates: [], totalBytes: 0, snapshot: nil)
+        }
         var candidates: [URL] = []
         for case let rawURL as URL in enumerator {
+            try Task.checkCancellation()
             let values = try rawURL.resourceValues(forKeys: Set(keys))
             guard values.isRegularFile == true, values.isSymbolicLink != true else { continue }
             let url = rawURL.resolvingSymlinksInPath().standardizedFileURL
@@ -7164,7 +7524,33 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             guard allowedExtension || lowercaseName.hasSuffix(".report.json") else { continue }
             candidates.append(url)
         }
-        return candidates.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+        let sorted = candidates.sorted {
+            $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending
+        }
+        let totalBytes = try sorted.reduce(Int64(0)) { total, url in
+            try Task.checkCancellation()
+            let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+            return total + Int64(size)
+        }
+        let snapshot: ManagedMediaTrashSnapshot?
+        if sorted.isEmpty {
+            snapshot = nil
+        } else {
+            snapshot = try ManagedMediaTrashRevalidator.captureUnusedLibrary(
+                targetURLs: sorted,
+                maps: libraryMaps.map { _, map, mapURL in
+                    ManagedMediaTrashMap(url: mapURL, map: map)
+                },
+                catalogURL: characterLibraryStorage.catalogURL,
+                globalTransitionLibrary: managedMediaTrashGlobalTransitionLibrary,
+                canonicalRoot: canonicalRoot
+            )
+        }
+        return UnusedMediaDiscovery(
+            candidates: sorted,
+            totalBytes: totalBytes,
+            snapshot: snapshot
+        )
     }
 
     private func isInsideManagedMedia(_ url: URL, root: URL) -> Bool {
@@ -7248,6 +7634,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     @objc private func quit() { NSApp.terminate(nil) }
 
     private func prepareRelaunchForReadyUpdate() -> Bool {
+        guard !isTerminating else { return false }
         do {
             try StateletAppRelauncher.scheduleRelaunch()
         } catch {

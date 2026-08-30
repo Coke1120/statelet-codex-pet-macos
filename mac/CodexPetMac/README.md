@@ -291,7 +291,7 @@ remain for recovery.
 The app bundle includes the maintained converter source, but not a private
 Python runtime or Homebrew binaries. Settings therefore reports conversion-tool
 readiness honestly. It requires `ffmpeg`, `ffprobe`, Apple's `avconvert`, and a
-Python 3 executable with NumPy and Pillow; set `STATELET_ALPHA_PYTHON` before
+Python 3 executable with NumPy; set `STATELET_ALPHA_PYTHON` before
 launch when the desired Python is not found automatically.
 
 Version 1.5.0 renamed the former **Help** pane to **Prompts**. The current
@@ -367,7 +367,7 @@ The probe rejects explicit non-square sample aspect ratios. Source audio is
 stripped and reported, while first/last post-matte differences are recorded as
 an informational loop-seam notice; neither notice relaxes a delivery gate.
 
-The converter needs `ffmpeg`, `ffprobe`, Apple's `avconvert`, NumPy, and Pillow.
+The converter needs `ffmpeg`, `ffprobe`, Apple's `avconvert`, and NumPy.
 Probe the planned pipeline first:
 
 ```bash

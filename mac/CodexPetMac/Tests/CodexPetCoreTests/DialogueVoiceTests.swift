@@ -8,13 +8,15 @@ final class DialogueVoiceTests: XCTestCase {
 
     private let profileID = UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!
     private let lineID = UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
+    private let tlsPin = String(repeating: "c", count: 64)
 
-    private func profile(revision: Int = 1, endpoint: String = "http://127.0.0.1:9880") throws -> GPTSoVITSVoiceProfile {
+    private func profile(revision: Int = 1, endpoint: String = "https://127.0.0.1:9880") throws -> GPTSoVITSVoiceProfile {
         try GPTSoVITSVoiceProfile(
             id: profileID,
             revision: revision,
             name: "Test Voice",
             apiBaseURL: try XCTUnwrap(URL(string: endpoint)),
+            tlsLeafCertificateSHA256: tlsPin,
             gptWeightRelativePath: "voice/assets/gpt/test.ckpt",
             sovitsWeightRelativePath: "voice/assets/sovits/test.pth",
             referenceAudioRelativePath: "voice/assets/reference/test.wav",
@@ -716,7 +718,8 @@ final class DialogueVoiceTests: XCTestCase {
         XCTAssertThrowsError(try GPTSoVITSVoiceProfile(
             id: profileID,
             name: "Voice",
-            apiBaseURL: try XCTUnwrap(URL(string: "http://127.0.0.1:9880")),
+            apiBaseURL: try XCTUnwrap(URL(string: "https://127.0.0.1:9880")),
+            tlsLeafCertificateSHA256: tlsPin,
             gptWeightRelativePath: "models/test.ckpt",
             sovitsWeightRelativePath: "models/test.pth",
             referenceAudioRelativePath: "references/test.wav",
@@ -777,7 +780,8 @@ final class DialogueVoiceTests: XCTestCase {
             id: profileID,
             revision: 2,
             name: "Replacement Voice",
-            apiBaseURL: try XCTUnwrap(URL(string: "http://127.0.0.1:9880")),
+            apiBaseURL: try XCTUnwrap(URL(string: "https://127.0.0.1:9880")),
+            tlsLeafCertificateSHA256: tlsPin,
             gptWeightRelativePath: replacementGPTPath,
             sovitsWeightRelativePath: "voice/assets/sovits/replacement.pth",
             referenceAudioRelativePath: "voice/assets/reference/replacement.wav",
@@ -883,7 +887,8 @@ final class DialogueVoiceTests: XCTestCase {
             XCTAssertThrowsError(try GPTSoVITSVoiceProfile(
                 id: profileID,
                 name: "Voice",
-                apiBaseURL: try XCTUnwrap(URL(string: "http://127.0.0.1:9880")),
+                apiBaseURL: try XCTUnwrap(URL(string: "https://127.0.0.1:9880")),
+                tlsLeafCertificateSHA256: tlsPin,
                 gptWeightRelativePath: path,
                 sovitsWeightRelativePath: "models/test.pth",
                 referenceAudioRelativePath: "references/test.wav",
@@ -895,19 +900,82 @@ final class DialogueVoiceTests: XCTestCase {
         }
 
         for endpoint in [
-            "https://127.0.0.1:9880",
+            "http://127.0.0.1:9880",
             "http://192.168.1.20:9880",
-            "http://example.com",
-            "http://localhost:9880",
-            "http://127.0.0.1:9880/api",
-            "http://user@127.0.0.1:9880",
+            "https://example.com",
+            "https://localhost:9880",
+            "https://127.0.0.1:9880/api",
+            "https://user@127.0.0.1:9880",
         ] {
             XCTAssertThrowsError(try profile(endpoint: endpoint), "accepted \(endpoint)") {
                 XCTAssertEqual($0 as? DialogueVoiceError, .invalidEndpoint)
             }
         }
-        XCTAssertNoThrow(try profile(endpoint: "http://[::1]:9880"))
-        XCTAssertNoThrow(try profile(endpoint: "http://127.0.0.2:9880"))
+        XCTAssertNoThrow(try profile(endpoint: "https://[::1]:9880"))
+        XCTAssertNoThrow(try profile(endpoint: "https://127.0.0.2:9880"))
+    }
+
+    func testProfileRequiresAndNormalizesTLSLeafCertificatePin() throws {
+        let uppercasePin = String(repeating: "AB", count: 32)
+        let normalized = try GPTSoVITSVoiceProfile(
+            name: "Pinned Voice",
+            apiBaseURL: try XCTUnwrap(URL(string: "https://127.0.0.1:9880")),
+            tlsLeafCertificateSHA256: uppercasePin,
+            gptWeightRelativePath: "models/test.ckpt",
+            sovitsWeightRelativePath: "models/test.pth",
+            referenceAudioRelativePath: "references/test.wav",
+            referenceText: "Reference",
+            promptLanguage: "zh",
+            defaultTextLanguage: "zh",
+            inputFingerprint: String(repeating: "a", count: 64)
+        )
+        XCTAssertEqual(normalized.tlsLeafCertificateSHA256, uppercasePin.lowercased())
+
+        for pin in ["", String(repeating: "a", count: 63), String(repeating: "g", count: 64)] {
+            XCTAssertThrowsError(try GPTSoVITSVoiceProfile(
+                name: "Bad pin",
+                apiBaseURL: try XCTUnwrap(URL(string: "https://127.0.0.1:9880")),
+                tlsLeafCertificateSHA256: pin,
+                gptWeightRelativePath: "models/test.ckpt",
+                sovitsWeightRelativePath: "models/test.pth",
+                referenceAudioRelativePath: "references/test.wav",
+                referenceText: "Reference",
+                promptLanguage: "zh",
+                defaultTextLanguage: "zh",
+                inputFingerprint: String(repeating: "a", count: 64)
+            )) {
+                XCTAssertEqual($0 as? DialogueVoiceError, .invalidProfile)
+            }
+        }
+    }
+
+    func testLegacyHTTPAndMissingPinProfilesDecodeAndRoundTripWithoutUpgrade() throws {
+        let original = try profile()
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(original)) as? [String: Any]
+        )
+        object["api_base_url"] = "http://127.0.0.1:9880"
+        let legacyHTTP = try JSONDecoder().decode(
+            GPTSoVITSVoiceProfile.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+        XCTAssertEqual(legacyHTTP.apiBaseURL.absoluteString, "http://127.0.0.1:9880")
+        XCTAssertEqual(legacyHTTP.tlsLeafCertificateSHA256, tlsPin)
+
+        object["api_base_url"] = "https://127.0.0.1:9880"
+        object.removeValue(forKey: "tls_leaf_certificate_sha256")
+        let missingPin = try JSONDecoder().decode(
+            GPTSoVITSVoiceProfile.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+        XCTAssertEqual(missingPin.apiBaseURL.absoluteString, "https://127.0.0.1:9880")
+        XCTAssertNil(missingPin.tlsLeafCertificateSHA256)
+        let roundTripped = try JSONDecoder().decode(
+            GPTSoVITSVoiceProfile.self,
+            from: JSONEncoder().encode(missingPin)
+        )
+        XCTAssertEqual(roundTripped, missingPin)
+        XCTAssertNil(roundTripped.tlsLeafCertificateSHA256)
     }
 
     func testRejectsBlankOversizeTextAndInvalidDecodedState() throws {
