@@ -1,7 +1,7 @@
 # Statelet lifecycle and media reference
 
-This reference documents the internal contracts behind Statelet 1.8.20 (build
-34), the native Codex and Grok Build lifecycle companion for macOS. Start with
+This reference documents the internal contracts behind Statelet 1.8.21 (build
+35), the native Codex and Grok Build lifecycle companion for macOS. Start with
 [Deployment](DEPLOYMENT.md) for installation or [Using Statelet](USAGE.md) for
 daily operation.
 

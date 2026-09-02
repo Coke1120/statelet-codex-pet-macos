@@ -3,6 +3,28 @@
 All notable changes to Statelet are documented here. Versions follow semantic
 versioning for the public source release.
 
+## [1.8.21] - 2026-09-03
+
+### Changed
+
+- Modernized Settings window following macOS System Settings (HIG) inset grouped form patterns.
+- Added native tinted squircle icon badges with white SF Symbols to the Settings navigation sidebar.
+- Standardized horizontal setting rows with clean title/subtitle hierarchy and subtle hairline dividers.
+- Restructured General and Appearance panes with clean action rows replacing loose button grids.
+
+### Added
+
+- Added `AGENTS.md` operational and architectural reference guide for AI coding assistants.
+
+### Distribution notes
+
+- Version 1.8.21 supersedes 1.8.20 with macOS Settings design elevation and operational documentation;
+  existing private media, voice, models, credentials, logs, prompts, and
+  runtime data remain local and excluded from releases.
+- The package remains ad-hoc signed for owner-authorized personal updates. It
+  is not Developer ID signed, notarized, or presented as an Apple-authorized
+  public binary.
+
 ## [1.8.20] - 2026-08-30
 
 ### Security
@@ -624,6 +646,7 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
+[1.8.21]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.21
 [1.8.20]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.20
 [1.8.19]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.19
 [1.8.18]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.18
