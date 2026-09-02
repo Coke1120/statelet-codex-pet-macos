@@ -621,6 +621,19 @@ private enum SettingsSection: String, CaseIterable {
         case .diagnostics: return "stethoscope"
         }
     }
+
+    var badgeColor: NSColor {
+        switch self {
+        case .general: return .systemGray
+        case .appearance: return .systemBlue
+        case .animations: return .systemGreen
+        case .voice: return .systemOrange
+        case .prompts: return .systemPurple
+        case .recommendation: return .systemTeal
+        case .help: return .systemIndigo
+        case .diagnostics: return .systemRed
+        }
+    }
 }
 
 private enum SettingsSidebarItem {
@@ -1540,14 +1553,17 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             label.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
         }
         let surfaceStack = NSStackView(views: [
-            backgroundEnabledCheckbox,
+            makeSettingsRow(title: "Background Surface", subtitle: "Backing layer behind pet character", control: backgroundEnabledCheckbox),
+            makeRowSeparator(),
             makeAppearanceRow(title: "Color", control: backgroundColorWell),
+            makeRowSeparator(),
             makeAppearanceRow(title: "Opacity", control: backgroundOpacitySlider, value: backgroundOpacityLabel),
+            makeRowSeparator(),
             makeAppearanceRow(title: "Corner radius", control: cornerRadiusSlider, value: cornerRadiusLabel),
         ])
         surfaceStack.orientation = .vertical
         surfaceStack.alignment = .leading
-        surfaceStack.spacing = 9
+        surfaceStack.spacing = 8
         let surfaceBox = makeSection(title: "Surface", content: surfaceStack)
 
         borderEnabledCheckbox.target = self
@@ -1571,14 +1587,17 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             label.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
         }
         let borderStack = NSStackView(views: [
-            borderEnabledCheckbox,
+            makeSettingsRow(title: "Window Border", subtitle: "Border outline around pet window", control: borderEnabledCheckbox),
+            makeRowSeparator(),
             makeAppearanceRow(title: "Color", control: borderColorWell),
+            makeRowSeparator(),
             makeAppearanceRow(title: "Opacity", control: borderOpacitySlider, value: borderOpacityLabel),
+            makeRowSeparator(),
             makeAppearanceRow(title: "Width", control: borderWidthSlider, value: borderWidthLabel),
         ])
         borderStack.orientation = .vertical
         borderStack.alignment = .leading
-        borderStack.spacing = 9
+        borderStack.spacing = 8
         let borderBox = makeSection(title: "Border", content: borderStack)
 
         stateLabelEnabledCheckbox.target = self
@@ -1604,16 +1623,21 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         badgeHelp.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         badgeHelp.textColor = .secondaryLabelColor
         let badgeStack = NSStackView(views: [
-            stateLabelEnabledCheckbox,
-            stateLabelAutomaticColorCheckbox,
+            makeSettingsRow(title: "State Badge", subtitle: "Show current lifecycle label on pet", control: stateLabelEnabledCheckbox),
+            makeRowSeparator(),
+            makeSettingsRow(title: "Automatic Color", subtitle: "Match system accent and contrast", control: stateLabelAutomaticColorCheckbox),
+            makeRowSeparator(),
             makeAppearanceRow(title: "Custom color", control: stateLabelColorWell),
+            makeRowSeparator(),
             makeAppearanceRow(title: "Position", control: stateLabelPositionPopup),
+            makeRowSeparator(),
             makeAppearanceRow(title: "Size", control: stateLabelSizePopup),
+            makeRowSeparator(),
             badgeHelp,
         ])
         badgeStack.orientation = .vertical
         badgeStack.alignment = .leading
-        badgeStack.spacing = 9
+        badgeStack.spacing = 8
         let badgeBox = makeSection(title: "Current State Label", content: badgeStack)
 
         fpsEnabledCheckbox.target = self
@@ -1632,14 +1656,17 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         fpsHelp.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         fpsHelp.textColor = .secondaryLabelColor
         let fpsStack = NSStackView(views: [
-            fpsEnabledCheckbox,
+            makeSettingsRow(title: "Playback FPS", subtitle: "Show target and nominal frame rate", control: fpsEnabledCheckbox),
+            makeRowSeparator(),
             makeAppearanceRow(title: "Color", control: fpsColorWell),
+            makeRowSeparator(),
             makeAppearanceRow(title: "Size", control: fpsSizePopup),
+            makeRowSeparator(),
             fpsHelp,
         ])
         fpsStack.orientation = .vertical
         fpsStack.alignment = .leading
-        fpsStack.spacing = 9
+        fpsStack.spacing = 8
         let fpsBox = makeSection(title: "Playback FPS", content: fpsStack)
 
         activityBackgroundColorWell.target = self
@@ -1678,15 +1705,20 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         resetActivityAppearance.controlSize = .small
         let activityStack = NSStackView(views: [
             makeAppearanceRow(title: "Contrast", control: activityContrastPopup),
+            makeRowSeparator(),
             makeAppearanceRow(title: "Background", control: activityBackgroundColorWell),
+            makeRowSeparator(),
             makeAppearanceRow(title: "Opacity", control: activityOpacitySlider, value: activityOpacityLabel),
+            makeRowSeparator(),
             activityAppearancePreview,
+            makeRowSeparator(),
+            makeSettingsRow(title: "Appearance Preset", control: resetActivityAppearance),
+            makeRowSeparator(),
             activityHelp,
-            resetActivityAppearance,
         ])
         activityStack.orientation = .vertical
         activityStack.alignment = .leading
-        activityStack.spacing = 9
+        activityStack.spacing = 8
         let activityBox = makeSection(title: "Agent Activity Popup", content: activityStack)
 
         dialogueBackgroundColorWell.target = self
@@ -1726,15 +1758,20 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         dialogueHelp.textColor = .secondaryLabelColor
         let dialogueStack = NSStackView(views: [
             makeAppearanceRow(title: "Contrast", control: dialogueContrastPopup),
+            makeRowSeparator(),
             makeAppearanceRow(title: "Background", control: dialogueBackgroundColorWell),
+            makeRowSeparator(),
             makeAppearanceRow(title: "Text", control: dialogueTextColorWell),
+            makeRowSeparator(),
             makeAppearanceRow(title: "Opacity", control: dialogueOpacitySlider, value: dialogueOpacityLabel),
+            makeRowSeparator(),
             dialogueAppearancePreview,
+            makeRowSeparator(),
             dialogueHelp,
         ])
         dialogueStack.orientation = .vertical
         dialogueStack.alignment = .leading
-        dialogueStack.spacing = 9
+        dialogueStack.spacing = 8
         let dialogueBox = makeSection(title: "Dialogue Bubble", content: dialogueStack)
 
         let reset = NSButton(title: "Reset Appearance", target: self, action: #selector(resetAppearance))
@@ -1780,10 +1817,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         launchAtLoginCheckbox.action = #selector(launchAtLoginChanged)
         launchAtLoginLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         launchAtLoginLabel.textColor = .secondaryLabelColor
-        let startupStack = NSStackView(views: [launchAtLoginCheckbox, launchAtLoginLabel])
+        let startupStack = NSStackView(views: [
+            makeSettingsRow(
+                title: "Login Startup",
+                subtitle: "Start Statelet companion automatically upon user login",
+                control: launchAtLoginCheckbox
+            ),
+            makeRowSeparator(),
+            launchAtLoginLabel,
+        ])
         startupStack.orientation = .vertical
         startupStack.alignment = .leading
-        startupStack.spacing = 5
+        startupStack.spacing = 6
         let startupBox = makeSection(title: "Startup", content: startupStack)
 
         agentSourceControl.target = self
@@ -1798,14 +1843,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         )
         agentSourceHelp.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         agentSourceHelp.textColor = .secondaryLabelColor
-        let agentSourceStack = NSStackView(views: [agentSourceControl, agentSourceHelp])
+        let agentSourceStack = NSStackView(views: [agentSourceControl, makeRowSeparator(), agentSourceHelp])
         agentSourceStack.orientation = .vertical
         agentSourceStack.alignment = .leading
-        agentSourceStack.spacing = 7
+        agentSourceStack.spacing = 8
         let agentSourceBox = makeSection(title: "Agent Source", content: agentSourceStack)
 
-        let sizeTitle = NSTextField(labelWithString: "Pet size")
-        sizeTitle.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
         sizeSlider.target = self
         sizeSlider.action = #selector(sizeChanged)
         sizeSlider.isContinuous = false
@@ -1842,31 +1885,41 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         )
         resetActivityPosition.alignment = .left
 
-        let petWindowStack = NSStackView(views: [sizeTitle, sizeControls, alwaysOnTopCheckbox, alwaysOnTopHelp, clickThroughCheckbox, clickHelp, fullScreenCheckbox, resetPosition, resetActivityPosition])
+        let petWindowStack = NSStackView(views: [
+            makeSettingsRow(title: "Pet Size", subtitle: "Canvas width and proportional height", control: sizeControls),
+            makeRowSeparator(),
+            makeSettingsRow(title: "Window Floating", subtitle: "Stay above other application windows", control: alwaysOnTopCheckbox),
+            alwaysOnTopHelp,
+            makeRowSeparator(),
+            makeSettingsRow(title: "Mouse Interaction", subtitle: "Ignore clicks on pet surface", control: clickThroughCheckbox),
+            clickHelp,
+            makeRowSeparator(),
+            makeSettingsRow(title: "Mission Control Spaces", subtitle: "Display alongside full screen apps", control: fullScreenCheckbox),
+            makeRowSeparator(),
+            makeSettingsRow(title: "Window Position", subtitle: "Restore pet to default screen corner", control: resetPosition),
+            makeRowSeparator(),
+            makeSettingsRow(title: "Activity Panel Position", subtitle: "Re-anchor activity popup to pet sidecar", control: resetActivityPosition),
+        ])
         petWindowStack.orientation = .vertical
         petWindowStack.alignment = .leading
-        petWindowStack.spacing = 9
+        petWindowStack.spacing = 8
         let petWindowBox = makeSection(title: "Pet Window", content: petWindowStack)
 
         reduceMotionLabel.font = .systemFont(ofSize: NSFont.systemFontSize)
         let openAccessibility = NSButton(title: "Open Accessibility Settings…", target: self, action: #selector(openAccessibilitySettings))
-        let motionStack = NSStackView(views: [reduceMotionLabel, openAccessibility])
+        let motionStack = NSStackView(views: [
+            makeSettingsRow(title: "Motion Policy", subtitle: "System Reduce Motion preference", control: openAccessibility),
+            makeRowSeparator(),
+            reduceMotionLabel,
+        ])
         motionStack.orientation = .vertical
         motionStack.alignment = .leading
-        motionStack.spacing = 10
+        motionStack.spacing = 8
         let motionBox = makeSection(title: "Motion and Accessibility", content: motionStack)
 
         let revealMedia = NSButton(title: "Show Media Folder", target: self, action: #selector(revealMediaFolder))
         let revealMap = NSButton(title: "Show Media Map", target: self, action: #selector(revealMap))
         let revealApp = NSButton(title: "Show App in Finder", target: self, action: #selector(revealApp))
-        let localButtons = NSGridView(views: [
-            [revealApp, revealMedia],
-            [revealMap, NSView()],
-        ])
-        localButtons.rowSpacing = 8
-        localButtons.columnSpacing = 8
-        localButtons.column(at: 0).xPlacement = .leading
-        localButtons.column(at: 1).xPlacement = .leading
         let launchHelp = NSTextField(wrappingLabelWithString: "Open Statelet from Finder → Home → Applications. The installed app starts at login and intentionally uses the menu bar instead of a Dock icon.")
         launchHelp.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         launchHelp.textColor = .secondaryLabelColor
@@ -1875,10 +1928,19 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         )
         managedMediaLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         managedMediaLabel.textColor = .secondaryLabelColor
-        let localStack = NSStackView(views: [launchHelp, managedMediaLabel, localButtons])
+        let localStack = NSStackView(views: [
+            makeSettingsRow(title: "Application", subtitle: "Installed Statelet.app bundle", control: revealApp),
+            makeRowSeparator(),
+            makeSettingsRow(title: "Managed Media", subtitle: "Directory for local animation assets", control: revealMedia),
+            makeRowSeparator(),
+            makeSettingsRow(title: "Media Map", subtitle: "JSON configuration for pet characters", control: revealMap),
+            makeRowSeparator(),
+            launchHelp,
+            managedMediaLabel,
+        ])
         localStack.orientation = .vertical
         localStack.alignment = .leading
-        localStack.spacing = 9
+        localStack.spacing = 8
         let localBox = makeSection(title: "App and Local Data", content: localStack)
 
         let header = makePageHeader(
@@ -2252,14 +2314,16 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         card.layer?.cornerCurve = .continuous
         card.layer?.cornerRadius = SettingsVisualMetrics.cardCornerRadius
         card.layer?.masksToBounds = true
+        card.layer?.borderWidth = 0.5
+        card.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.25).cgColor
         card.setAccessibilityElement(true)
         card.setAccessibilityRole(.group)
         card.setAccessibilityLabel(title)
         card.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         let titleLabel = NSTextField(labelWithString: title)
-        titleLabel.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
-        titleLabel.textColor = .labelColor
+        titleLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        titleLabel.textColor = .secondaryLabelColor
         titleLabel.setAccessibilityElement(false)
         titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
@@ -2272,6 +2336,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         cardStack.spacing = SettingsVisualMetrics.cardContentSpacing
         cardStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         card.addSubview(cardStack)
+        if let stack = content as? NSStackView {
+            for subview in stack.arrangedSubviews {
+                subview.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            }
+        }
         NSLayoutConstraint.activate([
             cardStack.topAnchor.constraint(equalTo: card.topAnchor, constant: SettingsVisualMetrics.cardInset),
             cardStack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: SettingsVisualMetrics.cardInset),
@@ -2281,6 +2350,73 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             content.widthAnchor.constraint(equalTo: cardStack.widthAnchor),
         ])
         return card
+    }
+
+    private func makeRowSeparator() -> NSBox {
+        let separator = NSBox()
+        separator.boxType = .separator
+        separator.translatesAutoresizingMaskIntoConstraints = false
+        return separator
+    }
+
+    private func makeSettingsRow(
+        title: String,
+        subtitle: String? = nil,
+        control: NSView,
+        trailingValue: NSTextField? = nil
+    ) -> NSView {
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = .systemFont(ofSize: NSFont.systemFontSize)
+        titleLabel.textColor = .labelColor
+        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let labelContainer = NSStackView()
+        labelContainer.translatesAutoresizingMaskIntoConstraints = false
+        labelContainer.orientation = .vertical
+        labelContainer.alignment = .leading
+        labelContainer.spacing = 2
+        labelContainer.addArrangedSubview(titleLabel)
+
+        if let subtitle, !subtitle.isEmpty {
+            let subLabel = NSTextField(wrappingLabelWithString: subtitle)
+            subLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+            subLabel.textColor = .secondaryLabelColor
+            subLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            labelContainer.addArrangedSubview(subLabel)
+        }
+
+        control.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(labelContainer)
+        row.addSubview(control)
+
+        var rightAnchor = row.trailingAnchor
+        if let trailingValue {
+            trailingValue.translatesAutoresizingMaskIntoConstraints = false
+            row.addSubview(trailingValue)
+            NSLayoutConstraint.activate([
+                trailingValue.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+                trailingValue.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+                trailingValue.widthAnchor.constraint(greaterThanOrEqualToConstant: 44),
+            ])
+            rightAnchor = trailingValue.leadingAnchor
+        }
+
+        NSLayoutConstraint.activate([
+            labelContainer.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            labelContainer.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            labelContainer.topAnchor.constraint(greaterThanOrEqualTo: row.topAnchor, constant: 4),
+            labelContainer.bottomAnchor.constraint(lessThanOrEqualTo: row.bottomAnchor, constant: -4),
+            labelContainer.trailingAnchor.constraint(lessThanOrEqualTo: control.leadingAnchor, constant: -12),
+            control.trailingAnchor.constraint(equalTo: trailingValue != nil ? rightAnchor : row.trailingAnchor, constant: trailingValue != nil ? -8 : 0),
+            control.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            row.heightAnchor.constraint(greaterThanOrEqualToConstant: 32),
+        ])
+
+        return row
     }
 
     private func makeScrollablePane(for pane: NSView) -> (scroll: NSScrollView, document: NSView) {
@@ -2314,20 +2450,31 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private func makeAppearanceRow(title: String, control: NSView, value: NSTextField? = nil) -> NSStackView {
         let label = NSTextField(labelWithString: title)
         label.alignment = .left
-        label.widthAnchor.constraint(equalToConstant: 110).isActive = true
+        label.font = .systemFont(ofSize: NSFont.systemFontSize)
+        label.textColor = .labelColor
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        control.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         if control is NSSlider {
             control.widthAnchor.constraint(greaterThanOrEqualToConstant: 130).isActive = true
-            control.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         }
-        var views: [NSView] = [label, control]
+
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        var views: [NSView] = [label, spacer, control]
         if let value {
-            value.widthAnchor.constraint(equalToConstant: 64).isActive = true
+            value.alignment = .right
+            value.widthAnchor.constraint(equalToConstant: 54).isActive = true
             views.append(value)
         }
         let row = NSStackView(views: views)
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 10
+        row.spacing = 8
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         return row
     }
 
@@ -3243,19 +3390,32 @@ extension SettingsWindowController: NSTableViewDataSource, NSTableViewDelegate {
                     label.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
                 ])
             } else {
+                let badge = NSView()
+                badge.identifier = NSUserInterfaceItemIdentifier("SettingsSidebarBadge")
+                badge.translatesAutoresizingMaskIntoConstraints = false
+                badge.wantsLayer = true
+                badge.layer?.cornerCurve = .continuous
+                badge.layer?.cornerRadius = 5
+                badge.layer?.masksToBounds = true
+
                 let imageView = NSImageView()
                 imageView.translatesAutoresizingMaskIntoConstraints = false
                 imageView.imageScaling = .scaleProportionallyDown
-                imageView.contentTintColor = .secondaryLabelColor
+                imageView.contentTintColor = .white
                 imageView.setAccessibilityElement(false)
+                badge.addSubview(imageView)
                 cell.imageView = imageView
-                cell.addSubview(imageView)
+                cell.addSubview(badge)
                 NSLayoutConstraint.activate([
-                    imageView.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
-                    imageView.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-                    imageView.widthAnchor.constraint(equalToConstant: 16),
-                    imageView.heightAnchor.constraint(equalToConstant: 16),
-                    label.leadingAnchor.constraint(equalTo: imageView.trailingAnchor, constant: 8),
+                    badge.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 6),
+                    badge.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                    badge.widthAnchor.constraint(equalToConstant: 22),
+                    badge.heightAnchor.constraint(equalToConstant: 22),
+                    imageView.centerXAnchor.constraint(equalTo: badge.centerXAnchor),
+                    imageView.centerYAnchor.constraint(equalTo: badge.centerYAnchor),
+                    imageView.widthAnchor.constraint(equalToConstant: 14),
+                    imageView.heightAnchor.constraint(equalToConstant: 14),
+                    label.leadingAnchor.constraint(equalTo: badge.trailingAnchor, constant: 9),
                     label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
                     label.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
                 ])
@@ -3275,8 +3435,12 @@ extension SettingsWindowController: NSTableViewDataSource, NSTableViewDelegate {
             cell.textField?.font = .systemFont(ofSize: NSFont.systemFontSize)
             cell.textField?.textColor = .labelColor
             cell.setAccessibilityElement(false)
-            cell.imageView?.image = item.section.flatMap {
-                NSImage(systemSymbolName: $0.symbolName, accessibilityDescription: nil)
+            if let section = item.section {
+                let badge = cell.subviews.first { $0.identifier?.rawValue == "SettingsSidebarBadge" }
+                badge?.layer?.backgroundColor = section.badgeColor.cgColor
+                let config = NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
+                cell.imageView?.image = NSImage(systemSymbolName: section.symbolName, accessibilityDescription: nil)?
+                    .withSymbolConfiguration(config)
             }
         }
         return cell
