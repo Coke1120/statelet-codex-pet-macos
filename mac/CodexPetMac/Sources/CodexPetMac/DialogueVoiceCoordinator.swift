@@ -112,9 +112,80 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         String
     ) throws -> DialogueVoiceInstalledAsset
 
+    typealias VoxProfileSave = @Sendable (DialogueVoiceLibrary, DialogueVoiceStore) throws -> Void
+
+    private enum VoxCPM2ImportStage: String, Sendable {
+        case snapshot
+        case referenceAudio = "reference_audio"
+        case pythonRuntime = "python_runtime"
+        case cleanupJournal = "cleanup_journal"
+        case profile
+
+        func failureMessage(for error: DialogueVoiceRuntimeError) -> String {
+            switch self {
+            case .snapshot:
+                switch error {
+                case .invalidSource:
+                    return "Choose a complete local VoxCPM2 snapshot folder that is not a symbolic link."
+                case .sourceTooLarge:
+                    return "The selected VoxCPM2 snapshot exceeds Statelet’s safe import limit."
+                case .sourceChanged:
+                    return "The selected VoxCPM2 snapshot changed while it was being imported. Choose the unchanged complete handover and try again."
+                case .cancelled:
+                    return "The VoxCPM2 snapshot import was cancelled."
+                default:
+                    return "Statelet could not import the complete VoxCPM2 snapshot into private local storage."
+                }
+            case .referenceAudio:
+                switch error {
+                case .invalidSource:
+                    return "Choose a regular local VoxCPM2 reference WAV that is not a symbolic link."
+                case .unsupportedFileType:
+                    return "The VoxCPM2 reference audio must be a WAV file."
+                case .sourceTooLarge:
+                    return "The selected VoxCPM2 reference WAV exceeds Statelet’s safe import limit."
+                case .sourceChanged:
+                    return "The selected VoxCPM2 reference WAV changed while it was being imported. Choose the unchanged file and try again."
+                case .invalidReferenceAudio:
+                    return "Choose a VoxCPM2 reference WAV that macOS can decode and that is no longer than 60 seconds."
+                case .cancelled:
+                    return "The VoxCPM2 reference-audio import was cancelled."
+                default:
+                    return "Statelet could not import the VoxCPM2 reference WAV into private local storage."
+                }
+            case .pythonRuntime:
+                switch error {
+                case .sourceChanged:
+                    return "The selected VoxCPM2 Python runtime changed while Statelet was authenticating it. Choose the unchanged runtime and try again."
+                case .cancelled:
+                    return "The VoxCPM2 Python-runtime validation was cancelled."
+                default:
+                    return "The selected VoxCPM2 Python runtime could not be authenticated. Choose the trusted environment that provides VoxCPM2 and try again."
+                }
+            case .cleanupJournal:
+                return "Statelet could not reserve durable cleanup ownership for the VoxCPM2 import. No private model files were copied."
+            case .profile:
+                switch error {
+                case .sourceChanged, .inputFingerprintMismatch, .invalidManagedPath:
+                    return "Statelet could not bind the VoxCPM2 profile to unchanged managed inputs. Re-import the complete handover and reference WAV, then try again."
+                case .invalidReferenceAudio:
+                    return "The imported VoxCPM2 reference WAV could not be accepted for this profile."
+                case .cancelled:
+                    return "The VoxCPM2 profile setup was cancelled."
+                default:
+                    return "Statelet could not create the VoxCPM2 profile from the imported snapshot, reference audio, transcript, and Python runtime."
+                }
+            }
+        }
+    }
+
     private enum VoxCPM2ProfileImportResult: Sendable {
         case success(VoxCPM2VoiceProfile)
-        case failure(DialogueVoiceRuntimeError, installedPaths: [String])
+        case failure(
+            stage: VoxCPM2ImportStage,
+            error: DialogueVoiceRuntimeError,
+            installedPaths: [String]
+        )
     }
 
     private let logger = Logger(subsystem: StateletIdentity.bundleIdentifier, category: "dialogue-voice")
@@ -133,6 +204,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     private let managedFileRemove: ManagedFileRemove
     private let voxSnapshotInstall: VoxSnapshotInstall
     private let voxReferenceInstall: VoxReferenceInstall
+    private let voxProfileSave: VoxProfileSave
     private let detachedActivities = OwnedOperationTracker()
     private let mainThreadFinalizations = MainThreadFinalizationQueue()
     private let beforeImportFinalization: @Sendable () -> Void
@@ -210,6 +282,9 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                 destinationToken: token
             )
         },
+        voxProfileSave: @escaping VoxProfileSave = { library, store in
+            try store.save(library)
+        },
         randomIndex: @escaping @Sendable (Int) -> Int = { upperBound in
             Int.random(in: 0..<upperBound)
         },
@@ -233,6 +308,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         self.managedFileRemove = managedFileRemove
         self.voxSnapshotInstall = voxSnapshotInstall
         self.voxReferenceInstall = voxReferenceInstall
+        self.voxProfileSave = voxProfileSave
         self.randomIndex = randomIndex
         self.sleepForInterval = sleepForInterval
         self.beforeImportFinalization = beforeImportFinalization
@@ -580,19 +656,41 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             snapshotPaths = try VoxCPM2SnapshotInstaller.managedRelativePaths(
                 destinationToken: snapshotToken
             )
-            referencePaths = try DialogueVoiceAssetInstaller.managedRelativePaths(
-                kind: .voxcpm2ReferenceAudio,
-                destinationToken: referenceToken,
-                fileExtension: referenceAudioURL.pathExtension.lowercased()
-            )
         } catch let error as DialogueVoiceRuntimeError {
-            activityMessage = error.localizedDescription
-            logger.error("event=voxcpm2_import_rejected code=\(error.safeCode, privacy: .public)")
+            activityMessage = VoxCPM2ImportStage.snapshot.failureMessage(for: error)
+            logger.error("event=voxcpm2_import_failed stage=\(VoxCPM2ImportStage.snapshot.rawValue, privacy: .public) code=\(error.safeCode, privacy: .public)")
             notify()
             return
         } catch {
-            activityMessage = "The VoxCPM2 import paths are invalid."
-            logger.error("event=voxcpm2_import_rejected code=INVALID_MANAGED_PATH")
+            activityMessage = VoxCPM2ImportStage.snapshot.failureMessage(for: .invalidManagedPath)
+            logger.error("event=voxcpm2_import_failed stage=\(VoxCPM2ImportStage.snapshot.rawValue, privacy: .public) code=INVALID_MANAGED_PATH")
+            notify()
+            return
+        }
+        let referenceExtension = referenceAudioURL.pathExtension.lowercased()
+        guard DialogueVoiceAssetKind.voxcpm2ReferenceAudio.allowedExtensions.contains(
+            referenceExtension
+        ) else {
+            let error = DialogueVoiceRuntimeError.unsupportedFileType
+            activityMessage = VoxCPM2ImportStage.referenceAudio.failureMessage(for: error)
+            logger.error("event=voxcpm2_import_failed stage=\(VoxCPM2ImportStage.referenceAudio.rawValue, privacy: .public) code=\(error.safeCode, privacy: .public)")
+            notify()
+            return
+        }
+        do {
+            referencePaths = try DialogueVoiceAssetInstaller.managedRelativePaths(
+                kind: .voxcpm2ReferenceAudio,
+                destinationToken: referenceToken,
+                fileExtension: referenceExtension
+            )
+        } catch let error as DialogueVoiceRuntimeError {
+            activityMessage = VoxCPM2ImportStage.referenceAudio.failureMessage(for: error)
+            logger.error("event=voxcpm2_import_failed stage=\(VoxCPM2ImportStage.referenceAudio.rawValue, privacy: .public) code=\(error.safeCode, privacy: .public)")
+            notify()
+            return
+        } catch {
+            activityMessage = VoxCPM2ImportStage.referenceAudio.failureMessage(for: .invalidManagedPath)
+            logger.error("event=voxcpm2_import_failed stage=\(VoxCPM2ImportStage.referenceAudio.rawValue, privacy: .public) code=INVALID_MANAGED_PATH")
             notify()
             return
         }
@@ -608,7 +706,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             }
         } catch {
             activityMessage = "The VoxCPM2 import could not prepare private reference storage."
-            logger.error("event=voxcpm2_import_rejected code=COPY_FAILED")
+            logger.error("event=voxcpm2_import_failed stage=\(VoxCPM2ImportStage.referenceAudio.rawValue, privacy: .public) code=COPY_FAILED")
             notify()
             return
         }
@@ -625,8 +723,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             library = updated
         } catch {
             persistenceBlocked = true
-            activityMessage = "The VoxCPM2 import could not reserve durable cleanup ownership."
-            logger.error("event=voxcpm2_snapshot_import_failed code=STORE_FAILURE")
+            activityMessage = VoxCPM2ImportStage.cleanupJournal.failureMessage(for: .copyFailed)
+            logger.error("event=voxcpm2_import_failed stage=\(VoxCPM2ImportStage.cleanupJournal.rawValue, privacy: .public) code=STORE_FAILURE")
             notify()
             return
         }
@@ -650,56 +748,86 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                     )
                     do {
                         let runtime = try Qwen3TTSProfileValidator.validatePythonExecutable(at: pythonExecutableURL)
-                        let previous = previousVoxProfile
-                        let provisional = try VoxCPM2VoiceProfile(
-                            id: previous?.id ?? UUID(), revision: (previous?.revision ?? 0) + 1,
-                            name: previous?.name ?? "VoxCPM2 Voice",
-                            snapshotPath: snapshot.snapshotRootRelativePath,
-                            snapshotTreeSHA256: snapshot.treeSHA256,
-                            pythonExecutablePath: runtime.invocationPath,
-                            pythonExecutableSHA256: runtime.finalTargetSHA256,
-                            referenceAudioRelativePath: reference.relativePath,
-                            referenceAudioSHA256: reference.contentDigest, referenceText: referenceText,
-                            inputFingerprint: String(repeating: "0", count: 64)
-                        )
-                        result = .success(try VoxCPM2VoiceProfile(
-                            id: provisional.id, revision: provisional.revision, name: provisional.name,
-                            snapshotPath: provisional.snapshotPath, snapshotTreeSHA256: provisional.snapshotTreeSHA256,
-                            pythonExecutablePath: provisional.pythonExecutablePath,
-                            pythonExecutableSHA256: provisional.pythonExecutableSHA256,
-                            referenceAudioRelativePath: provisional.referenceAudioRelativePath,
-                            referenceAudioSHA256: provisional.referenceAudioSHA256,
-                            referenceText: provisional.referenceText,
-                            defaultTextLanguage: provisional.defaultTextLanguage, parameters: provisional.parameters,
-                            inputFingerprint: Qwen3TTSProfileValidator.computeInputFingerprint(
-                                components: provisional.inputFingerprintComponents)
-                        ))
+                        do {
+                            let previous = previousVoxProfile
+                            let provisional = try VoxCPM2VoiceProfile(
+                                id: previous?.id ?? UUID(), revision: (previous?.revision ?? 0) + 1,
+                                name: previous?.name ?? "VoxCPM2 Voice",
+                                snapshotPath: snapshot.snapshotRootRelativePath,
+                                snapshotTreeSHA256: snapshot.treeSHA256,
+                                pythonExecutablePath: runtime.invocationPath,
+                                pythonExecutableSHA256: runtime.finalTargetSHA256,
+                                referenceAudioRelativePath: reference.relativePath,
+                                referenceAudioSHA256: reference.contentDigest, referenceText: referenceText,
+                                inputFingerprint: String(repeating: "0", count: 64)
+                            )
+                            result = .success(try VoxCPM2VoiceProfile(
+                                id: provisional.id, revision: provisional.revision, name: provisional.name,
+                                snapshotPath: provisional.snapshotPath, snapshotTreeSHA256: provisional.snapshotTreeSHA256,
+                                pythonExecutablePath: provisional.pythonExecutablePath,
+                                pythonExecutableSHA256: provisional.pythonExecutableSHA256,
+                                referenceAudioRelativePath: provisional.referenceAudioRelativePath,
+                                referenceAudioSHA256: provisional.referenceAudioSHA256,
+                                referenceText: provisional.referenceText,
+                                defaultTextLanguage: provisional.defaultTextLanguage, parameters: provisional.parameters,
+                                inputFingerprint: Qwen3TTSProfileValidator.computeInputFingerprint(
+                                    components: provisional.inputFingerprintComponents)
+                            ))
+                        } catch let error as DialogueVoiceRuntimeError {
+                            result = .failure(
+                                stage: .profile,
+                                error: error,
+                                installedPaths: [
+                                    snapshot.snapshotRootRelativePath,
+                                    reference.relativePath,
+                                ]
+                            )
+                        } catch {
+                            result = .failure(
+                                stage: .profile,
+                                error: .profileRejected,
+                                installedPaths: [
+                                    snapshot.snapshotRootRelativePath,
+                                    reference.relativePath,
+                                ]
+                            )
+                        }
                     } catch let error as DialogueVoiceRuntimeError {
-                        result = .failure(error, installedPaths: [
-                            snapshot.snapshotRootRelativePath,
-                            reference.relativePath,
-                        ])
+                        result = .failure(
+                            stage: .pythonRuntime,
+                            error: error,
+                            installedPaths: [
+                                snapshot.snapshotRootRelativePath,
+                                reference.relativePath,
+                            ]
+                        )
                     } catch {
-                        result = .failure(.profileRejected, installedPaths: [
-                            snapshot.snapshotRootRelativePath,
-                            reference.relativePath,
-                        ])
+                        result = .failure(
+                            stage: .pythonRuntime,
+                            error: .inferenceUnavailable,
+                            installedPaths: [
+                                snapshot.snapshotRootRelativePath,
+                                reference.relativePath,
+                            ]
+                        )
                     }
                 } catch let error as DialogueVoiceRuntimeError {
                     result = .failure(
-                        error,
+                        stage: .referenceAudio,
+                        error: error,
                         installedPaths: [snapshot.snapshotRootRelativePath]
                     )
                 } catch {
                     result = .failure(
-                        .profileRejected,
+                        stage: .referenceAudio,
+                        error: .copyFailed,
                         installedPaths: [snapshot.snapshotRootRelativePath]
                     )
                 }
             } catch let error as DialogueVoiceRuntimeError {
-                result = .failure(error, installedPaths: [])
+                result = .failure(stage: .snapshot, error: error, installedPaths: [])
             } catch {
-                result = .failure(.profileRejected, installedPaths: [])
+                result = .failure(stage: .snapshot, error: .copyFailed, installedPaths: [])
             }
             beforeImportFinalization()
             self.mainThreadFinalizations.enqueue {
@@ -711,7 +839,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                         profile.snapshotPath,
                         profile.referenceAudioRelativePath,
                     ]
-                    case let .failure(_, installedPaths): installedPaths
+                    case let .failure(_, _, installedPaths): installedPaths
                     }
                     let cleanup = abandonedPaths.isEmpty
                         ? self.retryPendingCleanup()
@@ -727,14 +855,15 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                 }
                 self.activeImportTask = nil
                 switch result {
-                case let .failure(error, installedPaths):
+                case let .failure(stage, error, installedPaths):
                     let cleanup = installedPaths.isEmpty
                         ? self.retryPendingCleanup()
                         : self.deferCleanup(paths: installedPaths)
                     self.activityMessage = self.cleanupAwareMessage(
-                        error.localizedDescription,
+                        stage.failureMessage(for: error),
                         outcome: cleanup
                     )
+                    self.logger.error("event=voxcpm2_import_failed stage=\(stage.rawValue, privacy: .public) code=\(error.safeCode, privacy: .public)")
                 case let .success(profile):
                     do {
                         try self.activateImportedVoxCPM2Profile(
@@ -764,9 +893,11 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                                 outcome: cleanup
                             )
                         } else {
-                            self.persistenceBlocked = true
                             self.activityMessage = "VoxCPM2 profile storage is unreadable, so the imported private assets were preserved to avoid data loss. Restore the voice library before editing settings again."
                         }
+                        // Readback preserves any committed profile and assets,
+                        // but cannot establish durability after a failed save.
+                        self.persistenceBlocked = true
                         self.logger.error("event=voxcpm2_profile_save_failed code=STORE_FAILURE")
                     }
                 }
@@ -814,7 +945,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             try updated.replaceConfiguredProfile(profile)
         }
         try updated.enqueueCleanup(paths: replacedAssets)
-        try store.save(updated)
+        try voxProfileSave(updated, store)
         library = updated
         let cleanup = retryPendingCleanup()
         activityMessage = cleanupAwareMessage(
@@ -1236,10 +1367,19 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     func regenerateLine(id: UUID) throws {
         assertMainThread()
         guard !persistenceBlocked else { throw DialogueVoiceError.storeFailure }
-        guard let line = library.lines.first(where: { $0.id == id }) else {
-            throw DialogueVoiceError.lineNotFound
+        _ = try commit {
+            let previous = $0
+            let line = try $0.regenerateLine(id: id)
+            try $0.enqueueCleanup(paths: obsoleteOutputPaths(before: previous, after: $0))
+            return line
         }
-        try updateLine(id: id, text: line.text, language: line.textLanguage, state: line.state)
+        let cleanup = retryPendingCleanup()
+        activityMessage = cleanupAwareMessage(
+            "Dialogue queued for fresh voice generation.",
+            outcome: cleanup
+        )
+        notify()
+        processNextQueuedLine()
     }
 
     func deleteLine(id: UUID) throws {
@@ -1786,7 +1926,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                         ? "Voice assets are valid, but the pinned HTTPS GPT-SoVITS gateway is unavailable or this legacy profile has no TLS pin. Restore the gateway and save the profile again."
                         : provider == .qwen3TTS
                         ? "The Qwen voice package is valid, but its local Python runtime is unavailable. Restore the selected runtime and validate again."
-                        : "The VoxCPM2 inputs are pinned, but synthesis is unavailable until the bundled offline helper is installed.",
+                        : "The VoxCPM2 inputs are pinned, but its offline probe could not validate the runtime. Verify the selected Python runtime and managed model package, then restart Statelet or switch providers and use VoxCPM2 again.",
                     outcome: cleanup
                 )
                 logger.error("event=profile_unavailable code=INFERENCE_UNAVAILABLE")

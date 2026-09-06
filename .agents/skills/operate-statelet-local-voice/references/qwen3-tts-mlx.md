@@ -78,7 +78,7 @@ public diagnostics.
   Python executable from its working MLX Audio environment. Do not select a
   shell, a generic system Python, or an environment that has not generated a
   local smoke sample successfully.
-- `Local service unavailable` with a working runtime: confirm the stored path
+- `Local runtime unavailable` with a working runtime: confirm the stored path
   is the virtual environment launcher rather than its resolved bare
   interpreter. Then run the bundled silent dependency probe with that launcher
   under the same offline environment; it must exit zero with empty stdout and

@@ -5,6 +5,38 @@ import XCTest
 
 @MainActor
 final class SettingsWindowControllerTests: XCTestCase {
+    func testAnimationRecoveryOpensRequestedStateAfterLeavingTransitionsForAnotherPane() throws {
+        let suite = "statelet-recovery-navigation-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let controller = SettingsWindowController(defaults: defaults)
+        let window = try XCTUnwrap(controller.window)
+        defer { window.close() }
+        controller.update(snapshot: SettingsSnapshot(
+            mediaMap: try MediaMap(), mediaMapURL: URL(fileURLWithPath: "/tmp/media-map.json"),
+            publisherSummary: "Test", reduceMotion: false
+        ))
+        controller.showAnimations(for: .idle)
+        let sidebar = try Self.settingsSidebar(in: window)
+        let modes = try XCTUnwrap(Self.descendants(of: window.contentView)
+            .compactMap { $0 as? NSSegmentedControl }
+            .first { $0.accessibilityLabel() == "Animation library mode" })
+        modes.selectedSegment = 1
+        NSApp.sendAction(try XCTUnwrap(modes.action), to: modes.target, from: modes)
+        try Self.selectSidebar(in: sidebar, label: "Help & Updates")
+
+        controller.showAnimations(for: .waiting)
+        XCTAssertEqual(sidebar.selectedRow, try Self.sidebarRow(in: sidebar, label: "Animations"))
+        XCTAssertEqual(modes.selectedSegment, 0)
+        let buttons = Self.descendants(of: window.contentView).compactMap { $0 as? NSButton }
+        XCTAssertTrue(buttons.contains {
+            $0.accessibilityLabel()?.contains("Waiting, 0 clips, editing") == true && $0.state == .on
+        })
+        XCTAssertFalse(buttons.contains {
+            $0.accessibilityLabel()?.contains("Idle, 0 clips, editing") == true
+        })
+    }
+
     func testSettingsWindowSizeStoreRoundTripsAndRejectsMalformedValues() throws {
         let suiteName = "statelet-settings-window-size-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -274,11 +306,15 @@ final class SettingsWindowControllerTests: XCTestCase {
         })
         var widthChangeCount = 0
         var heightChangeCount = 0
-        let widthObservation = widthConstraint.observe(\.constant, options: [.new]) { _, _ in
+        var widthChanges: [String] = []
+        var heightChanges: [String] = []
+        let widthObservation = widthConstraint.observe(\.constant, options: [.old, .new]) { _, change in
             widthChangeCount += 1
+            widthChanges.append("\(String(describing: change.oldValue)) -> \(String(describing: change.newValue))")
         }
-        let heightObservation = heightConstraint.observe(\.constant, options: [.new]) { _, _ in
+        let heightObservation = heightConstraint.observe(\.constant, options: [.old, .new]) { _, change in
             heightChangeCount += 1
+            heightChanges.append("\(String(describing: change.oldValue)) -> \(String(describing: change.newValue))")
         }
         defer {
             widthObservation.invalidate()
@@ -321,8 +357,8 @@ final class SettingsWindowControllerTests: XCTestCase {
 
         XCTAssertEqual(window.frame.width, initialFrame.width + 40, accuracy: 1)
         XCTAssertEqual(window.frame.height, initialFrame.height + 30, accuracy: 1)
-        XCTAssertEqual(widthChangeCount, 1)
-        XCTAssertEqual(heightChangeCount, 1)
+        XCTAssertEqual(widthChangeCount, 1, "Width changes: \(widthChanges)")
+        XCTAssertEqual(heightChangeCount, 1, "Height changes: \(heightChanges)")
         XCTAssertEqual(
             try XCTUnwrap(SettingsWindowSizeStore.restored(from: defaults)),
             baselinePersistedSize
@@ -338,6 +374,38 @@ final class SettingsWindowControllerTests: XCTestCase {
         let persistedSize = try XCTUnwrap(SettingsWindowSizeStore.restored(from: defaults))
         XCTAssertEqual(persistedSize.width, Self.contentSize(of: window).width, accuracy: 1)
         XCTAssertEqual(persistedSize.height, Self.contentSize(of: window).height, accuracy: 1)
+    }
+
+    func testUnchangedWindowFrameAndResizeCallbacksDoNotRewriteContentConstraints() throws {
+        let suiteName = "statelet-settings-idempotent-resize-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        SettingsWindowSizeStore.persist(NSSize(width: 900, height: 600), to: defaults)
+        let controller = SettingsWindowController(defaults: defaults)
+        let window = try XCTUnwrap(controller.window)
+        defer { window.close() }
+        let contentView = try XCTUnwrap(window.contentView)
+        let dimensions = contentView.constraints.filter {
+            $0.isActive && $0.priority == .required && $0.relation == .equal
+                && $0.firstItem === contentView && $0.secondItem == nil
+                && ($0.firstAttribute == .width || $0.firstAttribute == .height)
+        }
+        XCTAssertEqual(dimensions.count, 2)
+        var assignments: [String] = []
+        let observations = dimensions.map { constraint in
+            constraint.observe(\.constant, options: [.old, .new]) { observed, change in
+                assignments.append("\(observed.firstAttribute.rawValue): \(String(describing: change.oldValue)) -> \(String(describing: change.newValue))")
+            }
+        }
+        defer { observations.forEach { $0.invalidate() } }
+        let frame = window.frame
+
+        window.setFrame(frame, display: false)
+        window.setFrame(frame, display: false, animate: false)
+        XCTAssertEqual(controller.windowWillResize(window, to: frame.size), frame.size)
+
+        XCTAssertTrue(assignments.isEmpty, "Unchanged size assignments: \(assignments)")
+        XCTAssertEqual(window.frame, frame)
     }
 
     func testSettingsResizeHandlesAnchorOppositeEdgesAndClampMinimumAndVisibleScreen() throws {

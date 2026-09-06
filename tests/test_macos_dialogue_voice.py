@@ -3,8 +3,12 @@
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -724,12 +728,241 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
             self.assertIn('local_files_only=True', source)
             self.assertIn('load_denoiser=False', source)
             self.assertIn('optimize=False', source)
+            self.assertIn('os.dup2(sink_fd, 1)', source)
+            self.assertIn('os.dup2(sink_fd, 2)', source)
+            self.assertIn('os.write(_FAILURE_FD, _FAILURE_SENTINEL)', source)
+            self.assertIn('os.register_at_fork(after_in_child=close_failure_fd_in_fork_child)', source)
+            self.assertIn('os._exit(1)', source)
+            self.assertNotIn('sys.stderr.write(', source)
+        self.assertIn('random.seed(seed)', generator)
+        self.assertIn('np.random.seed(seed % (2 ** 32))', generator)
+        self.assertIn('torch.manual_seed(seed)', generator)
+        self.assertIn('mps.manual_seed(seed)', generator)
+        self.assertIn('cuda.manual_seed_all(seed)', generator)
+        self.assertNotIn('seed=request["seed"]', generator)
         self.assertIn('VoxCPM.from_pretrained', probe)
         self.assertIn('model.tts_model.sample_rate', probe)
         self.assertIn('48000', probe)
         self.assertIn('deny network-outbound', self.runtime)
         self.assertIn('invocation.deniesNetwork', self.runtime)
         self.assertIn('probe_output', self.runtime)
+
+    def test_voxcpm2_helpers_silence_dependency_output_and_emit_only_failure_sentinel(
+        self,
+    ) -> None:
+        helper_root = ROOT / "mac" / "CodexPetMac" / "Resources" / "VoxCPM2"
+        noisy_voxcpm = r'''
+import os
+import sys
+import warnings
+
+def noise(label):
+    print(label + " stdout")
+    print(label + " stderr", file=sys.stderr)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.write(1, (label + " fd1\n").encode())
+    os.write(2, (label + " fd2\n").encode())
+    warnings.warn(label + " warning")
+
+noise("import")
+
+class _TTSModel:
+    sample_rate = 48000
+    device = "mps:0"
+
+class _Model:
+    tts_model = _TTSModel()
+
+    def generate(self, **kwargs):
+        noise("generate")
+        import random
+        import numpy
+        import torch
+        assert "seed" not in kwargs
+        assert random.getstate() == random.Random(1112).getstate()
+        assert numpy.random.seed_value == 1112
+        assert torch.manual_seed_value == 1112
+        assert torch.mps.manual_seed_value == 1112
+        assert torch.cuda.manual_seed_value == 1112
+        return [0.0, 0.1]
+
+class VoxCPM:
+    @classmethod
+    def from_pretrained(cls, _path, **kwargs):
+        noise("load")
+        assert kwargs == {
+            "local_files_only": True,
+            "load_denoiser": False,
+            "optimize": False,
+            "device": "auto",
+        }
+        if os.environ.get("STATELET_FAKE_VOX_FAIL") == "1":
+            raise RuntimeError("private model path must not escape")
+        return _Model()
+'''
+        fake_numpy = r'''
+class _Random:
+    seed_value = None
+
+    def seed(self, value):
+        self.seed_value = value
+
+random = _Random()
+'''
+        fake_torch = r'''
+manual_seed_value = None
+
+def manual_seed(value):
+    global manual_seed_value
+    manual_seed_value = value
+
+class _MPS:
+    manual_seed_value = None
+
+    def manual_seed(self, value):
+        self.manual_seed_value = value
+
+class _MPSBackend:
+    @staticmethod
+    def is_available():
+        return True
+
+class _Backends:
+    mps = _MPSBackend()
+
+class _CUDA:
+    manual_seed_value = None
+
+    @staticmethod
+    def is_available():
+        return True
+
+    def manual_seed_all(self, value):
+        self.manual_seed_value = value
+
+mps = _MPS()
+backends = _Backends()
+cuda = _CUDA()
+'''
+        noisy_soundfile = r'''
+import os
+import sys
+
+def write(path, _wav, sample_rate, subtype):
+    print("soundfile stdout")
+    print("soundfile stderr", file=sys.stderr)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.write(1, b"soundfile fd1\n")
+    os.write(2, b"soundfile fd2\n")
+    assert sample_rate == 48000
+    assert subtype == "PCM_16"
+    with open(path, "wb") as handle:
+        handle.write(b"fake-wave")
+'''
+        with tempfile.TemporaryDirectory(prefix="statelet-vox-helper-") as raw_root:
+            root = Path(raw_root)
+            (root / "voxcpm.py").write_text(noisy_voxcpm, encoding="utf-8")
+            (root / "numpy.py").write_text(fake_numpy, encoding="utf-8")
+            (root / "torch.py").write_text(fake_torch, encoding="utf-8")
+            (root / "soundfile.py").write_text(noisy_soundfile, encoding="utf-8")
+            snapshot = root / "snapshot"
+            model = snapshot / "model"
+            model.mkdir(parents=True)
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(root)
+
+            for helper_name in ("voxcpm2_probe.py", "voxcpm2_generate.py"):
+                helper = helper_root / helper_name
+                success_output = root / (helper_name + ".success")
+                if helper_name == "voxcpm2_probe.py":
+                    request = {
+                        "snapshot_root": str(snapshot),
+                        "model_root": str(model),
+                        "probe_output": str(success_output),
+                    }
+                else:
+                    request = {
+                        "snapshot_root": str(snapshot),
+                        "model_root": str(model),
+                        "prompt_wav_path": str(root / "reference.wav"),
+                        "reference_wav_path": str(root / "reference.wav"),
+                        "reference_text": "reference",
+                        "text": "test",
+                        "output_file": str(success_output),
+                        "cfg_value": 2,
+                        "inference_timesteps": 10,
+                        "seed": 1112,
+                        "load_denoiser": False,
+                        "optimize": False,
+                    }
+                success = subprocess.run(
+                    [sys.executable, str(helper)],
+                    input=json.dumps(request).encode("utf-8"),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=environment,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(success.returncode, 0, helper_name)
+                self.assertEqual(success.stdout, b"", helper_name)
+                self.assertEqual(success.stderr, b"", helper_name)
+                if helper_name == "voxcpm2_probe.py":
+                    self.assertEqual(
+                        json.loads(success_output.read_text(encoding="utf-8")),
+                        {"schema": 1, "device": "mps", "sample_rate": 48000},
+                    )
+                else:
+                    self.assertEqual(success_output.read_bytes(), b"fake-wave")
+
+                failed_request = dict(request)
+                failed_output = root / (helper_name + ".failed")
+                failed_request[
+                    "probe_output" if helper_name == "voxcpm2_probe.py" else "output_file"
+                ] = str(failed_output)
+                failing_environment = dict(environment)
+                failing_environment["STATELET_FAKE_VOX_FAIL"] = "1"
+                failure = subprocess.run(
+                    [sys.executable, str(helper)],
+                    input=json.dumps(failed_request).encode("utf-8"),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=failing_environment,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertNotEqual(failure.returncode, 0, helper_name)
+                self.assertEqual(failure.stdout, b"", helper_name)
+                self.assertEqual(failure.stderr, b"VOXCPM2_FAILED\n", helper_name)
+                self.assertFalse(failed_output.exists(), helper_name)
+
+                if helper_name == "voxcpm2_generate.py":
+                    for suffix, seed in (
+                        ("boolean", True),
+                        ("negative", -1),
+                        ("overflow", 2 ** 63),
+                        ("float", 1.5),
+                        ("null", None),
+                    ):
+                        invalid_request = dict(request)
+                        invalid_output = root / (helper_name + f".invalid-seed-{suffix}")
+                        invalid_request["output_file"] = str(invalid_output)
+                        invalid_request["seed"] = seed
+                        invalid = subprocess.run(
+                            [sys.executable, str(helper)],
+                            input=json.dumps(invalid_request).encode("utf-8"),
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            env=environment,
+                            timeout=10,
+                            check=False,
+                        )
+                        self.assertNotEqual(invalid.returncode, 0, suffix)
+                        self.assertEqual(invalid.stdout, b"", suffix)
+                        self.assertEqual(invalid.stderr, b"VOXCPM2_FAILED\n", suffix)
+                        self.assertFalse(invalid_output.exists(), suffix)
 
     def test_voxcpm2_setup_exposes_complete_snapshot_and_runtime_contract(self) -> None:
         self.assertIn('VoxCPM2', self.voice_view)

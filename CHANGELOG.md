@@ -3,6 +3,50 @@
 All notable changes to Statelet are documented here. Versions follow semantic
 versioning for the public source release.
 
+## [Unreleased]
+
+### Fixed
+
+- Background process readers no longer race a Foundation pipe read against
+  handle closure, preventing a startup crash during Codex title resolution
+  and the equivalent voice/conversion cleanup failure.
+- Updates and rollback replace the canonical hook component atomically, keeping
+  cached hook commands usable throughout installation. Newly registered hooks
+  also return harmlessly when their interpreter or script is unavailable.
+- Rejected older or conflicting lifecycle publications no longer keep an
+  expired accepted state marked Live. Statelet retains its revision barrier
+  and falls back to Idle when the accepted publisher heartbeat expires.
+- Missing animation media now offers a readable recovery card and an
+  **Animations…** button that opens the affected state's clip library. Empty
+  maps receive the same guidance with Reduce Motion enabled; valid static
+  posters remain supported.
+- A newer unavailable-media request cancels an older animation preload before
+  returning, preventing its queued playback or delayed callback from replacing
+  the current recovery state.
+- Repeated AppKit sizing callbacks no longer rewrite unchanged Settings window
+  constraints, avoiding redundant layout invalidations during resizing.
+- Local Python runtime validation checks the final directory behind chained
+  package symlinks, including module ownership and write permissions.
+- VoxCPM2 import and generation handle supported Python runtime layouts,
+  offline model loading, deterministic seeds, provider-specific failures and
+  bounded subprocess cleanup. An uncertain profile save retains committed
+  assets and blocks further edits until restart.
+- Regenerating unchanged dialogue retains the previous WAV through failure,
+  cancellation, retry and restart, then cleans it up after a valid replacement
+  is persisted. Editing the text or invalidating the profile still prevents
+  stale audio from being used.
+
+### Changed
+
+- Added behavioral lifecycle and recovery-navigation coverage, aligned local
+  verification with CI's explicit playback integration suite, and clarified
+  first-run, local-voice and personal-update guidance.
+- Performance measurements normalize and validate transition clips and posters
+  as well as state clips when constructing the isolated media map.
+- Successful standby-player promotion emits the presentation timing event used
+  by the performance harness, measured from the original playback request.
+- Added a prioritized roadmap and structured bug, feature and PR templates.
+
 ## [1.8.21] - 2026-09-03
 
 ### Changed

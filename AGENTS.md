@@ -127,6 +127,7 @@ statelet-codex-pet-macos/
 ### Prerequisites
 - macOS 13 (Ventura) or newer
 - Xcode Command Line Tools (`swift --version` >= 5.9)
+- Full Xcode with XCTest and a logged-in, GUI-capable Mac for the complete Swift and AVPlayer test suites
 - Python 3.9+ with hash-locked alpha dependencies (for authoring/tests)
 - `ffmpeg`, `ffprobe`, and `/usr/bin/avconvert` (for media tests)
 
@@ -139,6 +140,12 @@ pip install --require-hashes -r mac/requirements-alpha.txt
 
 ### Complete Test & Verification Suite
 Run these verification commands before opening a pull request:
+
+The canonical complete gate is [Release verification](docs/DEPLOYMENT.md#release-verification).
+Activate the hash-locked Python environment and select full Xcode (for example,
+`export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`) before running
+the commands below. Record unavailable or unexpectedly skipped checks as
+incomplete validation; plain `swift test` does not enable AVPlayer integration.
 
 1. **Python Test Suite (Zero Skips Permitted in CI)**:
    ```bash
@@ -204,7 +211,7 @@ Agents modifying Statelet must strictly adhere to the following non-negotiable i
 
 ### 1. Privacy & Zero-Telemetry Boundary
 - Statelet contains **no telemetry, no analytics, and no remote crash reporting**.
-- **Never make external network calls** from the app or aggregator. The sole network exception is local voice generation via loopback HTTPS (`https://127.0.0.1:<port>`) with pinned leaf TLS certificates.
+- **Keep lifecycle aggregation and private media processing local.** The existing app updater makes bounded HTTPS requests for GitHub release metadata and artifacts, including automatic checks; it must retain pinned Ed25519 manifest verification, repository/commit/version binding, artifact verification, and safe installation. These requests must not include private runtime data. The aggregator must not make network calls. Local GPT-SoVITS generation uses loopback HTTPS (`https://127.0.0.1:<port>`) with pinned leaf TLS certificates; Qwen and VoxCPM2 helpers remain offline. These are specific existing capabilities, not permission to add arbitrary network integrations.
 - **Never log, persist, or expose sensitive user data**: Prompt text, tool input/output, file paths, repository URLs, transcript contents, account credentials, and voice dialogue lines must never be written to logs, diagnostics, or shared state files.
 - The `Copy Diagnostics` action in Settings must output strictly sanitized counts and categories, never raw paths or session IDs.
 
@@ -226,13 +233,13 @@ Agents modifying Statelet must strictly adhere to the following non-negotiable i
 
 ## 6. Agent Skills Reference
 
-Specialized skills are maintained under [`.agents/skills/`](file:///Users/leoho/Documents/Github/statelet-codex-pet-macos/.agents/skills):
+Specialized skills are maintained under [`.agents/skills/`](.agents/skills/):
 
 | Skill Name | Location | Intended Purpose |
 | --- | --- | --- |
-| `author-statelet-animation` | [`.agents/skills/author-statelet-animation/SKILL.md`](file:///Users/leoho/Documents/Github/statelet-codex-pet-macos/.agents/skills/author-statelet-animation/SKILL.md) | Authoring, converting (`#00FF00` green-screen MP4 to HEVC-with-alpha MOV), validating conversion reports, importing verified media, and diagnosing frozen frame playback. |
-| `craft-video-generation-prompts` | [`.agents/skills/craft-video-generation-prompts/SKILL.md`](file:///Users/leoho/Documents/Github/statelet-codex-pet-macos/.agents/skills/craft-video-generation-prompts/SKILL.md) | Formulating, refining, and validating video-generation prompts (e.g. Gemini, Veo) with motion constraints, seamless loop instructions, and chroma backgrounds. |
-| `operate-statelet-local-voice` | [`.agents/skills/operate-statelet-local-voice/SKILL.md`](file:///Users/leoho/Documents/Github/statelet-codex-pet-macos/.agents/skills/operate-statelet-local-voice/SKILL.md) | Configuring, migrating, synthesizing, and validating local GPT-SoVITS, Qwen3-TTS (MLX), or VoxCPM2 voice models without leaking private weights or recordings. |
+| `author-statelet-animation` | [`.agents/skills/author-statelet-animation/SKILL.md`](.agents/skills/author-statelet-animation/SKILL.md) | Authoring, converting (`#00FF00` green-screen MP4 to HEVC-with-alpha MOV), validating conversion reports, importing verified media, and diagnosing frozen frame playback. |
+| `craft-video-generation-prompts` | [`.agents/skills/craft-video-generation-prompts/SKILL.md`](.agents/skills/craft-video-generation-prompts/SKILL.md) | Formulating, refining, and validating video-generation prompts (e.g. Gemini, Veo) with motion constraints, seamless loop instructions, and chroma backgrounds. |
+| `operate-statelet-local-voice` | [`.agents/skills/operate-statelet-local-voice/SKILL.md`](.agents/skills/operate-statelet-local-voice/SKILL.md) | Configuring, migrating, synthesizing, and validating local GPT-SoVITS, Qwen3-TTS (MLX), or VoxCPM2 voice models without leaking private weights or recordings. |
 
 Before performing tasks related to media authoring, prompt engineering, or voice models, consult the corresponding skill documentation.
 
@@ -242,4 +249,5 @@ Before performing tasks related to media authoring, prompt engineering, or voice
 
 - **Documentation Integrity**: Preserve existing comments and docstrings. Do not strip or alter copyright notices, headers, or existing explanations.
 - **Codebase Memory Graph**: When `codebase-memory-mcp` is active, prefer MCP tools (`search_graph`, `trace_path`, `get_code_snippet`) for navigating Swift and Python symbols. When MCP is inactive or unavailable, fall back cleanly to file inspection and ripgrep.
-- **Clickable Symbol & File Links**: In agent responses, always format files and code symbols as clickable Markdown links with `file://` URIs (e.g., [`PetPlayer.swift`](file:///Users/leoho/Documents/Github/statelet-codex-pet-macos/mac/CodexPetMac/Sources/CodexPetMac/PetPlayer.swift) or [`MediaPlaylist`](file:///Users/leoho/Documents/Github/statelet-codex-pet-macos/mac/CodexPetMac/Sources/CodexPetCore/MediaPlaylist.swift)).
+- **Clickable Symbol & File Links**: Use repository-relative Markdown links in checked-in documentation. In agent responses, use clickable links supported by the host application, resolving local paths from the actual checkout rather than embedding one maintainer's home directory.
+- **Project Priorities**: Consult [ROADMAP.md](ROADMAP.md) before expanding scope. Keep acceptance criteria and verification evidence tied to the user-visible outcome; preserve unrelated pending work.

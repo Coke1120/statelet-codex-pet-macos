@@ -63,6 +63,7 @@ GROK_HOOK_EVENTS = (
     "StopFailure",
 )
 GROK_NOTIFICATION_MATCHERS = ("permission_prompt", "idle_prompt")
+INSTALLER_FIXTURE_TIMEOUT = 120
 
 
 class MacPetPackagingTests(unittest.TestCase):
@@ -143,8 +144,11 @@ class MacPetPackagingTests(unittest.TestCase):
         process: subprocess.Popen,
         gate: Path,
         *,
-        timeout: float = 60,
+        timeout: float = INSTALLER_FIXTURE_TIMEOUT,
     ) -> None:
+        # These functional filesystem transactions include many subprocesses and
+        # can overlap a full Swift build. Allow fixture setup time without changing
+        # any production installer deadline or the gate's synchronization contract.
         ready = Path(f"{gate}.ready")
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -164,7 +168,31 @@ class MacPetPackagingTests(unittest.TestCase):
             stdout, stderr = process.communicate(timeout=5)
         self.fail(f"installer did not reach test gate {gate}: {stdout}{stderr}")
 
-    def journal_command(self, root: Path, command: str, *args: str) -> subprocess.CompletedProcess[str]:
+    def finish_test_installer(self, process: subprocess.Popen) -> tuple[str, str]:
+        # This is fixture completion, not a production deadline. Full packaging
+        # verification can overlap local model inference and filesystem pressure.
+        try:
+            return process.communicate(timeout=INSTALLER_FIXTURE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                stdout, stderr = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                try:
+                    stdout, stderr = process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    # A descendant may still hold a capture descriptor. Do not
+                    # turn a failed fixture into an unbounded test-runner wait.
+                    for stream in (process.stdout, process.stderr):
+                        if stream is not None:
+                            stream.close()
+                    self.fail("installer fixture did not release its output after termination")
+            self.fail(f"installer fixture did not complete: {stdout}{stderr}")
+
+    def journal_command(
+        self, root: Path, command: str, *args: str, env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         source = INSTALL_SCRIPT.read_text(encoding="utf-8")
         start = source.index("import ctypes,", source.index("journal_command()"))
         end = source.index("\nPY\n}", start)
@@ -174,6 +202,7 @@ class MacPetPackagingTests(unittest.TestCase):
             check=False,
             capture_output=True,
             text=True,
+            env=env,
         )
 
     def safe_tree_digest(self, path: Path) -> str:
@@ -1289,6 +1318,7 @@ struct WatchdogHarness {
                     "-lCodexPetCore",
                     str(STATELET_IDENTITY),
                     str(ALPHA_COORDINATOR),
+                    str(PACKAGE / "Sources" / "CodexPetMac" / "ProcessPipeReader.swift"),
                     str(harness),
                     "-Xlinker",
                     "-rpath",
@@ -1808,6 +1838,194 @@ struct WatchdogHarness {
         journal = json.loads((transaction / "journal.json").read_text(encoding="utf-8"))
         self.assertEqual(journal["operations"][-1]["digest"], expected)
 
+    def test_upgrade_keeps_cached_unguarded_hook_available_through_migration(self) -> None:
+        first = self.make_bundle("CachedHookFirst", "first")
+        installed = self.install(first)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        hook = self.home / "Library/Application Support/Statelet/Statelet/python/statelet_hook.py"
+        # An active agent can retain the old two-argument command even after its
+        # on-disk configuration has been quiesced or upgraded to a guarded command.
+        cached_command = shlex.join([sys.executable, str(hook)])
+        second = self.make_bundle("CachedHookSecond", "second")
+        gate = self.home / "cached-hook-migration-gate"
+        environment = os.environ.copy()
+        environment.update({
+            "HOME": str(self.home),
+            "STATELET_STATE_DIR": str(self.home / "Library/Application Support/Statelet/sessions"),
+            "STATELET_INSTALL_TEST_MIGRATION_GATE": str(gate),
+        })
+        process = subprocess.Popen(
+            ["bash", str(INSTALL_SCRIPT), "--home", str(self.home), "--app-bundle", str(second), "--skip-launchctl"],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment,
+        )
+        self.wait_for_test_gate(process, gate)
+        try:
+            cached = subprocess.run(
+                cached_command, shell=True, input=json.dumps({
+                    "session_id": "cached-hook-fixture", "hook_event_name": "PreToolUse", "tool_name": "shell_command",
+                }), capture_output=True, text=True, env=environment, timeout=5,
+            )
+        finally:
+            Path(f"{gate}.release").touch()
+            stdout, stderr = self.finish_test_installer(process)
+
+        self.assertEqual(cached.returncode, 0, cached.stderr)
+        self.assertEqual(cached.stderr, "")
+        self.assertEqual(cached.stdout.strip(), "{}")
+        self.assertEqual(process.returncode, 0, stdout + stderr)
+        self.assertTrue(hook.is_file())
+        self.assertFalse((self.home / ".statelet-install-transaction").exists())
+
+    def component_exchange_fixture(self) -> tuple[Path, Path, Path, str, str]:
+        transaction = self.home / ".statelet-install-transaction"
+        initialized = self.journal_command(transaction, "init")
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        component = self.home / "Library/Application Support/Statelet/Statelet"
+        stage = transaction / "stage/Statelet"
+        for directory, generation in ((component, "old"), (stage, "new")):
+            (directory / "python").mkdir(parents=True)
+            (directory / "MANAGED_BY_STATELET").write_text(MANAGED_MARKER + "\n", encoding="utf-8")
+            (directory / "python/statelet_hook.py").write_text(
+                f"# {generation} fixture\nprint('{{}}')\n", encoding="utf-8",
+            )
+        return transaction, component, stage, self.safe_tree_digest(component), self.safe_tree_digest(stage)
+
+    def assert_cached_component_hook(self, component: Path) -> None:
+        cached = subprocess.run(
+            shlex.join([sys.executable, str(component / "python/statelet_hook.py")]),
+            shell=True, input="{}", capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual((cached.returncode, cached.stdout, cached.stderr), (0, "{}\n", ""))
+
+    def test_component_exchange_recovers_every_publication_orientation_without_a_hook_gap(self) -> None:
+        for crash_point, live_generation in (
+            ("before-component-staging", "old"),
+            ("after-component-staging", "old"),
+            ("after-component-exchange", "new"),
+        ):
+            with self.subTest(crash_point=crash_point):
+                transaction, component, stage, old_digest, new_digest = self.component_exchange_fixture()
+                environment = dict(os.environ, STATELET_INSTALL_CRASH_AT=crash_point)
+                crashed = self.journal_command(
+                    transaction, "component-exchange", str(stage), str(component),
+                    str(transaction / "backup/component"), new_digest, old_digest, env=environment,
+                )
+                self.assertEqual(crashed.returncode, -9, crashed.stderr)
+                self.assert_cached_component_hook(component)
+                self.assertEqual(self.safe_tree_digest(component), old_digest if live_generation == "old" else new_digest)
+                recovered = self.journal_command(transaction, "recover", str(component), str(component.parent))
+                self.assertEqual(recovered.returncode, 0, recovered.stderr)
+                self.assert_cached_component_hook(component)
+                self.assertEqual(self.safe_tree_digest(component), old_digest)
+                self.assertFalse(transaction.exists())
+                shutil.rmtree(component)
+
+    def test_component_exchange_rollback_is_restartable_without_a_hook_gap(self) -> None:
+        for crash_point in ("after-component-rollback-exchange", "after-component-rollback-restaged"):
+            with self.subTest(crash_point=crash_point):
+                transaction, component, stage, old_digest, new_digest = self.component_exchange_fixture()
+                exchanged = self.journal_command(
+                    transaction, "component-exchange", str(stage), str(component),
+                    str(transaction / "backup/component"), new_digest, old_digest,
+                )
+                self.assertEqual(exchanged.returncode, 0, exchanged.stderr)
+                self.assert_cached_component_hook(component)
+                environment = dict(os.environ, STATELET_INSTALL_CRASH_AT=crash_point)
+                crashed = self.journal_command(
+                    transaction, "recover", str(component), str(component.parent), env=environment,
+                )
+                self.assertEqual(crashed.returncode, -9, crashed.stderr)
+                self.assert_cached_component_hook(component)
+                self.assertEqual(self.safe_tree_digest(component), old_digest)
+                recovered = self.journal_command(transaction, "recover", str(component), str(component.parent))
+                self.assertEqual(recovered.returncode, 0, recovered.stderr)
+                self.assert_cached_component_hook(component)
+                self.assertEqual(self.safe_tree_digest(component), old_digest)
+                self.assertFalse(transaction.exists())
+                shutil.rmtree(component)
+
+    def test_component_exchange_recovery_rejects_recreated_same_content_identity(self) -> None:
+        transaction, component, stage, old_digest, new_digest = self.component_exchange_fixture()
+        exchanged = self.journal_command(
+            transaction, "component-exchange", str(stage), str(component),
+            str(transaction / "backup/component"), new_digest, old_digest,
+        )
+        self.assertEqual(exchanged.returncode, 0, exchanged.stderr)
+        displaced = self.home / "displaced-component"
+        component.rename(displaced)
+        shutil.copytree(displaced, component)
+        self.assertEqual(self.safe_tree_digest(component), new_digest)
+        recovered = self.journal_command(transaction, "recover", str(component), str(component.parent))
+        self.assertNotEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("component exchange orientation is ambiguous", recovered.stderr)
+        self.assertTrue(transaction.exists())
+        self.assertEqual(self.safe_tree_digest(transaction / "backup/component"), old_digest)
+        self.assertEqual(self.safe_tree_digest(component), new_digest)
+
+    def test_component_exchange_recovery_rejects_unpaired_journal_marker(self) -> None:
+        transaction, component, stage, old_digest, new_digest = self.component_exchange_fixture()
+        exchanged = self.journal_command(
+            transaction, "component-exchange", str(stage), str(component),
+            str(transaction / "backup/component"), new_digest, old_digest,
+        )
+        self.assertEqual(exchanged.returncode, 0, exchanged.stderr)
+        journal_path = transaction / "journal.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        journal["operations"][0].pop("component_exchange")
+        journal_path.write_text(json.dumps(journal), encoding="utf-8")
+        recovered = self.journal_command(transaction, "recover", str(component), str(component.parent))
+        self.assertNotEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("component exchange pair is invalid", recovered.stderr)
+        self.assertTrue(transaction.exists())
+        self.assertEqual(self.safe_tree_digest(transaction / "backup/component"), old_digest)
+        self.assertEqual(self.safe_tree_digest(component), new_digest)
+
+    def test_component_exchange_recovery_rejects_replaced_parent_without_touching_either_tree(self) -> None:
+        for replacement in ("directory", "symlink"):
+            with self.subTest(replacement=replacement):
+                transaction, component, stage, old_digest, new_digest = self.component_exchange_fixture()
+                exchanged = self.journal_command(
+                    transaction, "component-exchange", str(stage), str(component),
+                    str(transaction / "backup/component"), new_digest, old_digest,
+                )
+                self.assertEqual(exchanged.returncode, 0, exchanged.stderr)
+                relocated = self.home / "relocated-support"
+                component.parent.rename(relocated)
+                replacement_parent = self.base / ("replacement-" + replacement)
+                shutil.copytree(relocated, replacement_parent)
+                if replacement == "symlink":
+                    component.parent.symlink_to(replacement_parent, target_is_directory=True)
+                else:
+                    replacement_parent.rename(component.parent)
+                recovered = self.journal_command(transaction, "recover", str(component), str(component.parent))
+                self.assertNotEqual(recovered.returncode, 0, recovered.stderr)
+                self.assertTrue(transaction.exists())
+                self.assertEqual(self.safe_tree_digest(transaction / "backup/component"), old_digest)
+                self.assertEqual(self.safe_tree_digest(relocated / "Statelet"), new_digest)
+                live_copy = replacement_parent if replacement == "symlink" else component.parent
+                self.assertEqual(self.safe_tree_digest(live_copy / "Statelet"), new_digest)
+                shutil.rmtree(self.home)
+                self.home.mkdir()
+
+    def test_component_exchange_marker_is_rejected_in_a_legacy_journal(self) -> None:
+        transaction, component, stage, old_digest, new_digest = self.component_exchange_fixture()
+        exchanged = self.journal_command(
+            transaction, "component-exchange", str(stage), str(component),
+            str(transaction / "backup/component"), new_digest, old_digest,
+        )
+        self.assertEqual(exchanged.returncode, 0, exchanged.stderr)
+        journal_path = transaction / "journal.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        journal["version"] = 2
+        journal.pop("digest_algorithm")
+        journal_path.write_text(json.dumps(journal), encoding="utf-8")
+        recovered = self.journal_command(transaction, "recover", str(component), str(component.parent))
+        self.assertNotEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("component exchange pair is invalid", recovered.stderr)
+        self.assertTrue(transaction.exists())
+        self.assertEqual(self.safe_tree_digest(transaction / "backup/component"), old_digest)
+        self.assertEqual(self.safe_tree_digest(component), new_digest)
+
     def test_install_rejects_app_source_executable_swap_after_private_snapshot(self) -> None:
         bundle = self.make_bundle("SourceExecutableSwap", "trusted")
         executable = bundle / "Contents" / "MacOS" / "Statelet"
@@ -2060,6 +2278,7 @@ struct WatchdogHarness {
             / "statelet_hook.py"
         )
         managed_command = shlex.join([sys.executable, str(installed_hook)])
+        guarded_managed_command = managed_command + " >/dev/null 2>&1 || :"
         original = {
             "unrelated": {"keep": True},
             "hooks": {
@@ -2125,7 +2344,7 @@ struct WatchdogHarness {
             self.assertNotIn("matcher", group)
             self.assertEqual(handler["type"], "command")
             self.assertEqual(handler["timeout"], 3)
-            self.assertEqual(handler["command"], managed_command)
+            self.assertEqual(handler["command"], guarded_managed_command)
             all_managed.append(handler)
         notifications = [
             (group.get("matcher"), item)
@@ -2139,7 +2358,7 @@ struct WatchdogHarness {
             [matcher for matcher, _ in notifications],
             list(GROK_NOTIFICATION_MATCHERS),
         )
-        self.assertTrue(all(item["command"] == managed_command for _, item in notifications))
+        self.assertTrue(all(item["command"] == guarded_managed_command for _, item in notifications))
         self.assertEqual(len(all_managed) + len(notifications), len(GROK_HOOK_EVENTS) + 2)
         self.assertNotIn("StopCancelled", installed["hooks"])
         self.assertIn("keep-notification", first.read_text(encoding="utf-8"))
@@ -2744,6 +2963,7 @@ struct WatchdogHarness {
         board_hook.parent.mkdir(parents=True)
         board_hook.write_text("# existing board-compatible lifecycle hook\n", encoding="utf-8")
         board_command = shlex.join(["/usr/bin/python3", str(board_hook)])
+        guarded_board_command = board_command + " >/dev/null 2>&1 || :"
         hooks_file = self.home / ".codex" / "hooks.json"
         hooks_file.parent.mkdir(parents=True)
         hooks_file.write_text(
@@ -2770,7 +2990,7 @@ struct WatchdogHarness {
                 for item in group.get("hooks", [])
                 if isinstance(item, dict) and "statelet_hook.py" in str(item.get("command"))
             ]
-            self.assertEqual(commands, [board_command], event)
+            self.assertEqual(commands, [guarded_board_command], event)
         self.assertTrue(board_hook.exists())
 
         removed = subprocess.run(
@@ -2790,7 +3010,7 @@ struct WatchdogHarness {
                 for item in group.get("hooks", [])
                 if isinstance(item, dict) and "statelet_hook.py" in str(item.get("command"))
             ]
-            self.assertEqual(commands, [board_command], event)
+            self.assertEqual(commands, [guarded_board_command], event)
 
     def test_legacy_application_support_hook_is_replaced_by_canonical_hook(self) -> None:
         bundle = self.make_bundle("LegacySharedHook")
@@ -3951,22 +4171,11 @@ struct WatchdogHarness {
             text=True,
             env=environment,
         )
-        import time
-        deadline = time.monotonic() + 20
-        while time.monotonic() < deadline and not Path(f"{gate}.ready").exists():
-            time.sleep(0.01)
-        if not Path(f"{gate}.ready").exists():
-            process.terminate()
-            try:
-                _, stderr = process.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                _, stderr = process.communicate(timeout=5)
-            self.fail(f"parent descriptor gate was not reached: {stderr}")
+        self.wait_for_test_gate(process, gate)
         applications.rename(held_directory)
         applications.symlink_to(external, target_is_directory=True)
         Path(f"{gate}.release").touch()
-        _, stderr = process.communicate(timeout=15)
+        _, stderr = self.finish_test_installer(process)
 
         self.assertEqual(sentinel.read_bytes(), b"external-unchanged")
         self.assertFalse((external / "Statelet.app").exists())

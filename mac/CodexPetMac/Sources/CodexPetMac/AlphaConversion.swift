@@ -1025,6 +1025,14 @@ enum AlphaPlaybackProcessValidator {
         let stdoutPipe = Pipe()
         let output = LockedDataBuffer(limit: maximumResponseBytes)
         let readGroup = DispatchGroup()
+        guard let stdoutReader = ProcessPipeReader(handle: stdoutPipe.fileHandleForReading) else {
+            throw AlphaPlaybackProcessError.launchFailed
+        }
+        defer {
+            stdoutReader.stop()
+            readGroup.wait()
+            try? stdoutPipe.fileHandleForReading.close()
+        }
         process.executableURL = executable
         process.arguments = ["--statelet-playback-smoke-helper", url.path]
         process.environment = [
@@ -1041,12 +1049,7 @@ enum AlphaPlaybackProcessValidator {
         }
         readGroup.enter()
         DispatchQueue.global(qos: .utility).async {
-            let handle = stdoutPipe.fileHandleForReading
-            while true {
-                let chunk = handle.availableData
-                guard !chunk.isEmpty else { break }
-                output.append(chunk)
-            }
+            stdoutReader.drain { output.append($0) }
             readGroup.leave()
         }
 
@@ -1067,14 +1070,11 @@ enum AlphaPlaybackProcessValidator {
                 Thread.sleep(forTimeInterval: 0.01)
             }
             if !process.isRunning { process.waitUntilExit() }
-            if readGroup.wait(timeout: .now() + 0.5) == .timedOut {
-                try? stdoutPipe.fileHandleForReading.close()
-            }
+            _ = readGroup.wait(timeout: .now() + 0.5)
             throw AlphaPlaybackProcessError.timedOut
         }
         process.waitUntilExit()
         if readGroup.wait(timeout: .now() + 1) == .timedOut {
-            try? stdoutPipe.fileHandleForReading.close()
             throw AlphaPlaybackProcessError.invalidResponse
         }
         guard process.terminationStatus == 0 else {
@@ -1326,6 +1326,17 @@ final class AlphaConversionCoordinator {
         let progressProtocol = LockedProgressProtocolState()
         let terminalFailure = LockedTerminalConversionFailure()
         let readGroup = DispatchGroup()
+        guard let stdoutReader = ProcessPipeReader(handle: stdoutPipe.fileHandleForReading),
+              let stderrReader = ProcessPipeReader(handle: stderrPipe.fileHandleForReading) else {
+            return .failure(AlphaConversionFailure.launchFailed)
+        }
+        defer {
+            stdoutReader.stop()
+            stderrReader.stop()
+            readGroup.wait()
+            try? stdoutPipe.fileHandleForReading.close()
+            try? stderrPipe.fileHandleForReading.close()
+        }
 
         process.executableURL = toolchain.python
         var arguments = [
@@ -1378,10 +1389,7 @@ final class AlphaConversionCoordinator {
         DispatchQueue.global(qos: .utility).async {
             var lineBuffer = Data()
             var parser = AlphaConversionProgressParser()
-            let handle = stdoutPipe.fileHandleForReading
-            while true {
-                let chunk = handle.availableData
-                guard !chunk.isEmpty else { break }
+            stdoutReader.drain { chunk in
                 stdout.append(chunk)
                 lineBuffer.append(chunk)
                 if lineBuffer.count > Self.maximumProgressLineBytes {
@@ -1419,12 +1427,7 @@ final class AlphaConversionCoordinator {
         }
         readGroup.enter()
         DispatchQueue.global(qos: .utility).async {
-            let handle = stderrPipe.fileHandleForReading
-            while true {
-                let chunk = handle.availableData
-                guard !chunk.isEmpty else { break }
-                stderr.append(chunk)
-            }
+            stderrReader.drain { stderr.append($0) }
             readGroup.leave()
         }
         let startedAt = Date()
@@ -1467,11 +1470,10 @@ final class AlphaConversionCoordinator {
             }
             Thread.sleep(forTimeInterval: 0.1)
         }
-        if readGroup.wait(timeout: .now() + 2) == .timedOut {
-            try? stdoutPipe.fileHandleForReading.close()
-            try? stderrPipe.fileHandleForReading.close()
-            _ = readGroup.wait(timeout: .now() + 1)
-        }
+        _ = readGroup.wait(timeout: .now() + 2)
+        stdoutReader.stop()
+        stderrReader.stop()
+        readGroup.wait()
 
         if let timeoutFailure {
             return .failure(timeoutFailure)

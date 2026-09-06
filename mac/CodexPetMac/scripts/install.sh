@@ -844,7 +844,100 @@ def validate_handed_off_install(operation):
     finally:
         os.close(parent)
 
+def component_exchange_pairs(data):
+    """Recognize only the canonical adjacent pair used for a live hook upgrade."""
+    operations = data.get("operations", [])
+    indices = [index for index, operation in enumerate(operations)
+               if isinstance(operation, dict) and "component_exchange" in operation]
+    if not indices:
+        return {}
+    if data.get("version") != 3 or len(indices) != 2 or indices[1] != indices[0] + 1:
+        raise ValueError("component exchange pair is invalid")
+    backup, install = (operations[index] for index in indices)
+    target = home / "Library/Application Support/Statelet/Statelet"
+    if (backup.get("kind") != "backup" or install.get("kind") != "install"
+            or any(operation.get("component_exchange") != "v1"
+                   or operation.get("target") != str(target)
+                   or "adopted" in operation for operation in (backup, install))
+            or backup.get("source") != str(root / "backup/component")
+            or install.get("source") != str(root / "stage/Statelet")
+            or backup.get("target_parent") != install.get("target_parent")
+            or install.get("owned_digest") != install.get("digest")
+            or install.get("owned_exclusions") != []
+            or any(operation.get("private_directories") != [] for operation in (backup, install))
+            or any(not isinstance(operation.get("digest"), str)
+                   or len(operation["digest"]) != 64
+                   or any(character not in "0123456789abcdef" for character in operation["digest"])
+                   for operation in (backup, install))):
+        raise ValueError("component exchange pair is invalid")
+    identities = [backup.get("source_parent"), backup.get("target_parent"),
+                  backup.get("source_entry"), install.get("source_parent"),
+                  install.get("target_entry")]
+    if (any(not isinstance(value, list) or len(value) != 2
+            or any(type(part) is not int or part < 0 for part in value) for value in identities)
+            or backup["source_entry"] == install["target_entry"]
+            or any(index not in indices and operation.get("target") == str(target)
+                   for index, operation in enumerate(operations))):
+        raise ValueError("component exchange identity is invalid")
+    return {indices[1]: indices[0]}
+
+def component_exchange_orientation(backup, install, parents):
+    """Accept the three durable orientations without guessing from contents alone."""
+    staged_parent, backup_parent, target_parent = parents
+    for parent, expected in zip(parents, (install["source_parent"], backup["source_parent"],
+                                         install["target_parent"])):
+        if entry_identity(os.fstat(parent)) != expected:
+            raise ValueError("component exchange parent changed")
+    entries = []
+    for parent, name in zip(parents, ("Statelet", "component", "Statelet")):
+        try:
+            status = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            entries.append(None)
+            continue
+        if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.getuid():
+            raise ValueError("component exchange entry is unsafe")
+        entries.append(entry_digest_and_identity(parent, name))
+    old = (backup["digest"], backup["source_entry"])
+    new = (install["digest"], install["target_entry"])
+    orientations = {"initial": [new, None, old], "staged": [None, new, old],
+                    "exchanged": [None, old, new]}
+    for orientation, expected in orientations.items():
+        if entries == expected:
+            return orientation
+    raise ValueError("component exchange orientation is ambiguous")
+
+def component_exchange_test_point(name):
+    if os.environ.get("STATELET_INSTALL_CRASH_AT") == name:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+def restore_component_exchange(backup, install):
+    staged_parent, _ = open_parent(Path(install["source"]), root)
+    backup_parent, _ = open_parent(Path(backup["source"]), root)
+    target_parent, _ = open_parent(Path(install["target"]), home)
+    parents = (staged_parent, backup_parent, target_parent)
+    try:
+        orientation = component_exchange_orientation(backup, install, parents)
+        if orientation == "exchanged":
+            # A cached two-argument hook command must also survive rollback.
+            rename_swap(backup_parent, "component", target_parent, "Statelet")
+            os.fsync(backup_parent); os.fsync(target_parent)
+            if component_exchange_orientation(backup, install, parents) != "staged":
+                raise ValueError("component rollback exchange changed")
+            component_exchange_test_point("after-component-rollback-exchange")
+            orientation = "staged"
+        if orientation == "staged":
+            rename_exclusive(backup_parent, "component", staged_parent, "Statelet")
+            os.fsync(backup_parent); os.fsync(staged_parent)
+            component_exchange_test_point("after-component-rollback-restaged")
+        if component_exchange_orientation(backup, install, parents) != "initial":
+            raise ValueError("component rollback is incomplete")
+    finally:
+        for parent in parents:
+            os.close(parent)
+
 def validate_operation_contract(data, allowed_targets):
+    component_exchange_pairs(data)
     adopted = []
     for operation in data.get("operations", []):
         if not isinstance(operation, dict):
@@ -1441,6 +1534,62 @@ elif command == "record":
         raise ValueError("invalid transaction operation")
     data["operations"].append({"kind": kind, "source": source, "target": target, "digest": expected})
     write(data)
+elif command == "component-exchange":
+    if len(args) != 5:
+        raise ValueError("invalid component exchange arguments")
+    source, target, saved, expected_new, expected_old = args
+    if (Path(source) != root / "stage/Statelet" or Path(saved) != root / "backup/component"
+            or Path(target) != home / "Library/Application Support/Statelet/Statelet"):
+        raise ValueError("noncanonical component exchange")
+    data = load()
+    if data["state"] != "active" or strict_install_ancestors(data["operations"], Path(target)):
+        raise ValueError("invalid component exchange ownership")
+    staged_parent, _ = open_parent(Path(source), root)
+    backup_parent, _ = open_parent(Path(saved), root)
+    target_parent, _ = open_parent(Path(target), home)
+    parents = (staged_parent, backup_parent, target_parent)
+    try:
+        new_digest, new_identity = entry_digest_and_identity(staged_parent, "Statelet")
+        old_digest, old_identity = entry_digest_and_identity(target_parent, "Statelet")
+        if new_digest != expected_new or old_digest != expected_old:
+            raise ValueError("component exchange digest changed")
+        backup = {"kind": "backup", "source": saved, "target": target, "digest": expected_old,
+                  "source_parent": entry_identity(os.fstat(backup_parent)),
+                  "target_parent": entry_identity(os.fstat(target_parent)), "source_entry": old_identity,
+                  "private_directories": [], "component_exchange": "v1"}
+        install = {"kind": "install", "source": source, "target": target, "digest": expected_new,
+                   "source_parent": entry_identity(os.fstat(staged_parent)),
+                   "target_parent": entry_identity(os.fstat(target_parent)), "target_entry": new_identity,
+                   "owned_digest": expected_new, "owned_exclusions": [],
+                   "private_directories": [], "component_exchange": "v1"}
+        data["operations"].extend((backup, install))
+        component_exchange_pairs(data)
+        if component_exchange_orientation(backup, install, parents) != "initial":
+            raise ValueError("component exchange initial state changed")
+        # Record both identities before either move. Recovery can distinguish a
+        # crash before staging, before exchange, or after exchange without ever
+        # removing the canonical hook pathname.
+        write(data)
+        component_exchange_test_point("before-component-staging")
+        rename_exclusive(staged_parent, "Statelet", backup_parent, "component")
+        os.fsync(staged_parent); os.fsync(backup_parent)
+        if component_exchange_orientation(backup, install, parents) != "staged":
+            raise ValueError("component exchange staging changed")
+        component_exchange_test_point("after-component-staging")
+        rename_swap(backup_parent, "component", target_parent, "Statelet")
+        os.fsync(backup_parent); os.fsync(target_parent)
+        component_exchange_test_point("after-component-exchange")
+        if component_exchange_orientation(backup, install, parents) != "exchanged":
+            raise ValueError("component exchange publication changed")
+        reopened, _ = open_parent(Path(target), home)
+        try:
+            if entry_identity(os.fstat(reopened)) != install["target_parent"]:
+                raise ValueError("component exchange destination parent changed")
+        finally:
+            os.close(reopened)
+    finally:
+        for parent in parents:
+            os.close(parent)
 elif command == "install-move":
     if len(args) not in {3, 4}:
         raise ValueError("invalid install arguments")
@@ -1847,7 +1996,9 @@ elif command == "recover":
         validate_file_transaction(data, validate_handoff_contract(data, Path(support)))
     if data["state"] == "active" and not data.get("files_restored", False):
         recovered_operations = 0
-        for operation in reversed(data["operations"]):
+        exchange_pairs = component_exchange_pairs(data)
+        for operation_index in reversed(range(len(data["operations"]))):
+            operation = data["operations"][operation_index]
             kind = operation.get("kind")
             source = Path(operation.get("source", ""))
             target = Path(operation.get("target", ""))
@@ -1855,6 +2006,14 @@ elif command == "recover":
             if not target.is_absolute() or str(target) not in allowed_exact:
                 raise ValueError(f"transaction target is outside the installer allowlist: {target}")
             if operation.get("adopted") is True:
+                continue
+            if operation_index in exchange_pairs:
+                restore_component_exchange(data["operations"][exchange_pairs[operation_index]], operation)
+                recovered_operations += 1
+                if recovered_operations == 1 and os.environ.get("STATELET_INSTALL_CRASH_DURING_RECOVERY") == "1":
+                    os.kill(os.getpid(), signal.SIGKILL)
+                continue
+            if operation_index in exchange_pairs.values():
                 continue
             if kind == "mkdir":
                 target_parent, target_name = open_parent(target, home)
@@ -2334,7 +2493,8 @@ if [[ -n "${STATELET_INSTALL_TEST_GROK_QUIESCED_GATE:-}" ]]; then
   while [[ "$attempt" -lt 1500 && ! -e "$gate.release" ]]; do /bin/sleep 0.01; attempt=$((attempt + 1)); done
   [[ -e "$gate.release" ]] || { printf 'Grok quiesced test gate timed out.\n' >&2; exit 76; }
 fi
-backup_target "$component_dir" component
+# Keep the current component readable even for hook commands cached by an
+# already-running agent. It is exchanged atomically at final publication.
 [[ "$legacy_component_is_managed" -eq 0 ]] || backup_target "$legacy_component" legacy/component
 # Drain already-running managed hooks for the largest configured timeout,
 # bounded to 10 seconds. The final post-publication digest check remains
@@ -2474,7 +2634,17 @@ backup_target "$player_plist" agents/player
 install_target "$stage_app" "$app_dest" "" "$app_source_digest"
 if [[ "${STATELET_INSTALL_CRASH_AT:-}" == "after-app" ]]; then kill -KILL $$; fi
 if [[ "${STATELET_INSTALL_FAIL_AT:-${CODEX_PET_INSTALL_FAIL_AT:-}}" == "after-app" ]]; then printf 'Injected installation failure after app replacement.\n' >&2; exit 70; fi
-install_target "$stage_component" "$component_dir"
+if [[ -e "$component_dir" ]]; then
+  validate_support_parent_chain "$support_dir" || { printf 'Component parent is unsafe.\n' >&2; exit 74; }
+  component_digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$component_dir")"
+  stage_component_digest="$("$python_bin" "$script_dir/merge_hooks.py" --safe-tree-digest "$stage_component")"
+  journal_command component-exchange "$stage_component" "$component_dir" "$backup_root/component" \
+    "$stage_component_digest" "$component_digest" 2>/dev/null || {
+      printf 'Statelet component publication failed safely.\n' >&2; exit 74;
+    }
+else
+  install_target "$stage_component" "$component_dir"
+fi
 install_target "$stage_aggregator_plist" "$aggregator_plist"
 if [[ "$install_player" -eq 1 ]]; then install_target "$stage_player_plist" "$player_plist"; fi
 install_target "$stage_hooks" "$hooks_file"

@@ -535,6 +535,53 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
     }
 
     @MainActor
+    func testUnavailableRequestCancelsPendingDirectReplacementBeforeReturning() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("statelet-direct-supersession-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let movieURL = directory.appendingPathComponent("movie.mov")
+        try Self.writeTestMovie(to: movieURL)
+        let entry = try MediaEntry(path: movieURL.lastPathComponent, loop: false)
+
+        for (unreadable, reduceMotion) in [(false, false), (true, false), (false, true)] {
+            let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
+            let controller = PetPlayerController(view: view)
+            defer { controller.clearTransientPresentation() }
+            var obsoleteEvents: [UInt64] = []
+            controller.onPresentationEvent = { id, _, _ in obsoleteEvents.append(id) }
+            controller.setSuspended(true, for: .windowOccluded)
+            XCTAssertEqual(controller.show(
+                state: .running, entry: entry, url: movieURL, posterURL: nil,
+                transitionID: 97, startedAt: DispatchTime.now().uptimeNanoseconds
+            ), .preparing)
+            let obsoletePlayer = try XCTUnwrap(view.destinationPlayerLayer.player as? AVQueuePlayer)
+            XCTAssertFalse(obsoletePlayer.items().isEmpty)
+
+            // Supersede synchronously while the old item is still preparing.
+            // Unavailable media must cancel its work just like another movie.
+            controller.setReduceMotion(reduceMotion)
+            XCTAssertEqual(controller.show(
+                state: .waiting,
+                entry: unreadable ? entry : nil,
+                url: unreadable ? directory.appendingPathComponent("missing.mov") : nil,
+                posterURL: nil,
+                transitionID: 98, startedAt: DispatchTime.now().uptimeNanoseconds
+            ), .failed)
+            XCTAssertTrue(obsoletePlayer.items().isEmpty, "superseded standby must release its item")
+            XCTAssertNil(view.destinationPlayerLayer.player)
+            XCTAssertEqual(controller.presentationStatus, .placeholder(.waiting))
+
+            controller.setSuspended(false, for: .windowOccluded)
+            Self.pumpMainRunLoop(for: 0.2)
+            XCTAssertEqual(controller.currentState, .waiting)
+            XCTAssertNil(controller.currentURL)
+            XCTAssertEqual(controller.presentationStatus, .placeholder(.waiting))
+            XCTAssertTrue(obsoleteEvents.isEmpty, "superseded callbacks must not change the new presentation")
+        }
+    }
+
+    @MainActor
     func testReduceMotionWithoutPosterRetainsExistingPresentation() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("statelet-reduce-retention-\(UUID().uuidString)", isDirectory: true)

@@ -946,6 +946,19 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         hasShownWindow = true
     }
 
+    /// Recovery navigation always opens the requested state's clip library,
+    /// even when Settings last displayed transitions or a different pane.
+    func showAnimations(for state: PetState) {
+        selectedAnimationState = state
+        animationsMode.selectedSegment = 0
+        changeAnimationsMode()
+        if let row = Self.sidebarRow(for: .animations) {
+            sidebarTableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        }
+        changePane()
+        show()
+    }
+
     func update(snapshot: SettingsSnapshot) {
         self.snapshot = snapshot
         publisherLabel.stringValue = snapshot.publisherSummary
@@ -2042,7 +2055,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         let quickStart = makeSection(
             title: "First launch",
-            content: NSTextField(wrappingLabelWithString: "Open the Statelet menu-bar icon and choose Settings. Start with Animations → Idle, import a verified MP4 that you own or are authorized to use, then restart any selected agent that was already running when Statelet was installed. If click-through is enabled, the menu-bar icon remains the recovery path.")
+            content: NSTextField(wrappingLabelWithString: "Open the Statelet menu-bar icon and choose Settings. Start with Animations → Idle. Add an authorized green-screen MP4 to convert, or add a verified transparent MOV. Confirm visible playback, then restart any selected agent that was already running when Statelet was installed. If click-through is enabled, the menu-bar icon remains the recovery path.")
         )
         let lifecycle = makeSection(
             title: "Lifecycle states",
@@ -2944,8 +2957,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func updateWindowSizingPreferences(for size: NSSize) {
-        windowContentWidthConstraint?.constant = size.width
-        windowContentHeightConstraint?.constant = size.height
+        // AppKit may replay the current size through multiple frame setters
+        // and resize callbacks. Avoid invalidating constraints for a no-op.
+        if let constraint = windowContentWidthConstraint, constraint.constant != size.width {
+            constraint.constant = size.width
+        }
+        if let constraint = windowContentHeightConstraint, constraint.constant != size.height {
+            constraint.constant = size.height
+        }
         updateSplitPreferredContentSizes(for: size)
     }
 

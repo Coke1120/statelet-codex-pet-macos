@@ -3,9 +3,10 @@
 Statelet has a reproducible, local-only harness for CPU, memory, and lifecycle
 presentation latency. The harness reports machine-readable JSON and does not
 include executable, media, home-directory, or temporary paths. This repository
-does not contain a completed live benchmark or claim that the current build
-passes these targets; run the harness locally against the exact build and media
-being evaluated.
+records candidate-specific observations in the
+[stabilization qualification](PRODUCTION_READINESS.md). Those observations do
+not qualify other builds or media; run the harness locally against the exact
+build and media being evaluated.
 
 ## Default budgets
 

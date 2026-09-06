@@ -26,6 +26,81 @@ an Apple-authorized public binary.
 > are authorized to use. Until at least an Idle clip is configured, the panel
 > can appear blank while the menu-bar controls remain available.
 
+Start with [Build and install](#build-and-install), then [First run](#first-run).
+Use [the full guide](docs/USAGE.md) for everyday controls and recovery.
+Contributors can find current priorities in the [roadmap](ROADMAP.md).
+
+## Requirements
+
+Building and installing from source requires:
+
+- macOS 13 or newer;
+- Xcode Command Line Tools with Swift 5.9 or newer; and
+- a stable Python 3.9 or newer interpreter outside the checkout and temporary
+  directories.
+
+The installed app requires macOS 13+ and the installed lifecycle publisher's
+stable Python interpreter. Full Xcode with XCTest is needed for the complete
+development test suite; it is not needed merely to run the installed app.
+The current personal-update package is for Apple Silicon (`arm64`).
+
+Optional MP4 transparency conversion also requires:
+
+- `ffmpeg` and `ffprobe`;
+- Apple `/usr/bin/avconvert`; and
+- Python 3.9 with the hash-locked NumPy version in `mac/requirements-alpha.txt`.
+
+## Build and install
+
+Run these commands from the repository root:
+
+```bash
+bash mac/CodexPetMac/scripts/build_app.sh
+codesign --verify --deep --strict mac/CodexPetMac/dist/Statelet.app
+bash mac/CodexPetMac/scripts/install.sh
+open "$HOME/Applications/Statelet.app"
+```
+
+The installer places `Statelet.app` in `~/Applications`, installs the local
+state publisher, adds two marked LaunchAgents, merges lifecycle commands into
+`~/.codex/hooks.json`, and installs additive global Grok registrations at
+`~/.grok/hooks/statelet.json` without replacing unrelated hooks. Restart Codex
+and any active Grok session once after the first install so they load the hook
+configuration.
+
+Statelet is an `LSUIElement` accessory app, so it intentionally has no Dock
+icon. Use the Statelet orbit icon in the menu bar to open Settings, disable
+click-through, reveal files, repair managed startup, or quit.
+
+For installation modes, upgrades, autostart behavior, installed files, and the
+public-distribution boundary, read [Deployment](docs/DEPLOYMENT.md).
+
+## First run
+
+1. Open the Statelet menu-bar icon and choose **Settings…** (`Command-,`).
+2. In **General**, keep **Agent Source** on Combined or choose Codex or Grok.
+3. Open **Animations** and select **Idle**.
+4. Choose the import path for your authorized media:
+   - For an MP4, drag it onto the Idle drop zone or choose
+     **Add Clip… → Import MP4s…**. If tools are missing, use the in-app Setup Guide
+     or [prepare the optional toolchain](docs/DEPLOYMENT.md#prepare-mp4-conversion-tools).
+   - For an existing transparent MOV, choose **Add Clip… → Portable MOVs…**.
+     Keep its matching verification report beside it when available and follow
+     the import validation/trust prompts.
+5. Wait for import verification to finish, then confirm that the Idle animation
+   is visible. If the panel is blank, open Settings from the menu-bar icon and
+   check the selected character, Idle library and import status.
+6. Restart Codex or Grok Build if it was already running during the first installation.
+7. Start a normal agent turn and confirm the lifecycle state and activity rail
+   respond. Configure the other three state libraries for distinct animations.
+
+Dialogue, voice models and transition clips are optional; configure them after
+the basic animation and lifecycle signal work.
+
+Statelet keeps the current animation visible while a batch converts. It appends
+each successful clip atomically and reports later failures without discarding
+earlier results.
+
 ## Highlights
 
 - Shows `idle`, `running`, `waiting`, and `review` as distinct animation states.
@@ -115,61 +190,6 @@ heartbeat, playlist, and filesystem contracts. Developers can use the
 [local performance harness](docs/PERFORMANCE.md) for path-free CPU, memory,
 soak, and warm state-switch evidence.
 
-## Requirements
-
-The app and lifecycle publisher require:
-
-- macOS 13 or newer;
-- Xcode Command Line Tools with Swift 5.9 or newer; and
-- a stable Python 3.9 or newer interpreter outside the checkout and temporary
-  directories.
-
-Optional MP4 transparency conversion also requires:
-
-- `ffmpeg` and `ffprobe`;
-- Apple `/usr/bin/avconvert`; and
-- Python 3.9 with the hash-locked NumPy version in `mac/requirements-alpha.txt`.
-
-## Build and install
-
-Run these commands from the repository root:
-
-```bash
-bash mac/CodexPetMac/scripts/build_app.sh
-codesign --verify --deep --strict mac/CodexPetMac/dist/Statelet.app
-bash mac/CodexPetMac/scripts/install.sh
-open "$HOME/Applications/Statelet.app"
-```
-
-The installer places `Statelet.app` in `~/Applications`, installs the local
-state publisher, adds two marked LaunchAgents, merges lifecycle commands into
-`~/.codex/hooks.json`, and installs additive global Grok registrations at
-`~/.grok/hooks/statelet.json` without replacing unrelated hooks. Restart Codex
-and any active Grok session once after the first install so they load the hook
-configuration.
-
-Statelet is an `LSUIElement` accessory app, so it intentionally has no Dock
-icon. Use the Statelet orbit icon in the menu bar to open Settings, disable
-click-through, reveal files, repair managed startup, or quit.
-
-For installation modes, upgrades, autostart behavior, installed files, and the
-public-distribution boundary, read [Deployment](docs/DEPLOYMENT.md).
-
-## First run
-
-1. Open the Statelet menu-bar icon and choose **Settings…** (`Command-,`).
-2. In **General**, keep **Agent Source** on Combined or choose Codex or Grok.
-3. Open **Animations** and select **Idle**.
-4. Drag one or more local `.mp4` files onto the Idle drop zone, or choose
-   **Add Clip… → Import MP4s…**.
-5. If conversion tools are missing, follow the in-app Setup Guide or
-   [prepare the optional toolchain](docs/DEPLOYMENT.md#prepare-mp4-conversion-tools).
-6. Restart Codex or Grok Build if it was already running during the first installation.
-
-Statelet keeps the current animation visible while a batch converts. It appends
-each successful clip atomically and reports later failures without discarding
-earlier results.
-
 ## Lifecycle states
 
 | State | Meaning |
@@ -252,9 +272,8 @@ playlists and assets; they never include or modify the Global library. A
 configured variant plays once before Statelet commits the destination
 animation; source clips are limited to 4 seconds, are accelerated when needed
 to finish on screen within 1.5 seconds, and must carry a current
-alpha-validation report. During a real lifecycle handoff,
-For distinct-state handoffs, Statelet retains the outgoing animation until the
-transition's first frame is display-ready, composites the transparent
+alpha-validation report. For distinct-state handoffs, Statelet retains the
+outgoing animation until the transition's first frame is display-ready, composites the transparent
 transition above it, and starts the destination animation's hidden player below
 the foreground so it is ready for an atomic swap. For same-state clip-end
 rotation, Statelet prewarms both hidden players before the current clip ends and
@@ -329,6 +348,10 @@ Statelet is designed for local operation:
   crash upload. Optional GPT voice generation permits only pinned HTTPS on
   numeric loopback; it rejects remote hosts, redirects, missing pins, and
   certificate mismatches.
+- The app checks GitHub for release metadata and downloads update artifacts over
+  HTTPS, including automatic checks. Update requests do not include prompts,
+  task titles, local media or voice data. Signed manifests and artifact checks
+  bind accepted updates to this repository. Lifecycle aggregation stays local.
 - Package managers may use the network when you install optional build or media
   conversion dependencies.
 - Lifecycle files exclude prompts, tool output, transcript paths, working
@@ -370,8 +393,11 @@ a public report.
   VoxCPM2 handover with a working Python environment.
 - MP4 conversion needs additional local tools and can take several minutes
   because every accepted delivery passes Apple round-trip and all-frame checks.
-- Statelet exposes four lifecycle states and one active decoder.
-- Clip changes are hard cuts; there is no cross-fade or weighted playlist mode.
+- Statelet exposes four lifecycle states. Ordinary playback uses one active
+  decoder; configured layered transitions temporarily prepare additional players.
+- Ordinary playlist changes are hard cuts. Configured transition clips have
+  their own layered fade choreography; there is no general cross-fade or
+  weighted playlist mode.
 - The FPS label reports intended playback FPS and the source track's nominal
   FPS. It does not measure rendered frame rate.
 - Temporary State, Next Clip cursors, and Play Once are process-local controls;
@@ -411,31 +437,15 @@ preserved Application Support data to Trash.
 
 ## Development
 
-```bash
-PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY'
-import unittest
+Follow [Contributing](CONTRIBUTING.md) to prepare the development environment,
+then run the canonical [release verification gate](docs/DEPLOYMENT.md#release-verification).
+It runs the complete Python suite without skips, Swift unit tests, explicitly
+enabled AVPlayer integration, the core self-test, app build, strict codesign,
+private-content checks and example JSON validation. Plain `swift test` alone
+does not enable the AVPlayer integration suite.
 
-suite = unittest.defaultTestLoader.discover(
-    "tests", pattern="test_*.py"
-)
-result = unittest.TextTestRunner(verbosity=2).run(suite)
-if result.skipped:
-    raise SystemExit(f"Python tests skipped: {result.skipped}")
-raise SystemExit(0 if result.wasSuccessful() else 1)
-PY
-
-swift run -c release --package-path mac/CodexPetMac codex-pet-core-self-test
-swift test -c release --package-path mac/CodexPetMac
-bash mac/CodexPetMac/scripts/build_app.sh
-codesign --verify --deep --strict mac/CodexPetMac/dist/Statelet.app
-python3 -m json.tool mac/CodexPetMac/Examples/media-map.json >/dev/null
-```
-
-Install the optional alpha authoring toolchain before running the complete
-Python suite; release verification treats every skipped test as a failure. See
-[Deployment](docs/DEPLOYMENT.md#release-verification) for the complete release
-gate and [the lifecycle and media reference](docs/MACOS_COMPANION.md) for
-implementation contracts.
+See [the lifecycle and media reference](docs/MACOS_COMPANION.md) for implementation
+contracts and [the roadmap](ROADMAP.md) for priorities and acceptance criteria.
 
 ## License and project status
 

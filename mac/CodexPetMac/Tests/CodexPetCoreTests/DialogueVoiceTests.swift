@@ -471,6 +471,128 @@ final class DialogueVoiceTests: XCTestCase {
         XCTAssertEqual(migrated.lines[0].outputRelativePath, "voice/generated/current.wav")
     }
 
+    func testRegenerationMarkerIsOnlyEncodedWhileRetainingAnOutput() throws {
+        var library = try libraryWithQueuedLine()
+        let ticket = try library.beginGeneration(for: lineID)
+        let ready = try library.completeGeneration(ticket: ticket, outputPath: "voice/generated/original.wav")
+        let originalData = try JSONEncoder().encode(ready)
+        let originalObject = try XCTUnwrap(JSONSerialization.jsonObject(with: originalData) as? [String: Any])
+        XCTAssertNil(originalObject["retains_output_for_regeneration"])
+        XCTAssertEqual(try JSONDecoder().decode(DialogueLine.self, from: originalData), ready)
+
+        let regenerating = try library.regenerateLine(id: lineID)
+        let regenerationData = try JSONEncoder().encode(regenerating)
+        let regenerationObject = try XCTUnwrap(JSONSerialization.jsonObject(with: regenerationData) as? [String: Any])
+        XCTAssertEqual(regenerationObject["retains_output_for_regeneration"] as? Bool, true)
+        XCTAssertEqual(try JSONDecoder().decode(DialogueLine.self, from: regenerationData), regenerating)
+
+        let replacement = try library.beginGeneration(for: lineID)
+        let completed = try library.completeGeneration(ticket: replacement, outputPath: "voice/generated/replacement.wav")
+        let completedObject = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(completed)) as? [String: Any])
+        XCTAssertNil(completedObject["retains_output_for_regeneration"])
+    }
+
+    func testRegenerationRetainsOutputThroughFailureCancellationRetryAndSuccess() throws {
+        var library = try libraryWithQueuedLine()
+        let originalTicket = try library.beginGeneration(for: lineID)
+        let path = "voice/generated/original.wav"
+        let original = try library.completeGeneration(ticket: originalTicket, outputPath: path)
+
+        let queued = try library.regenerateLine(id: lineID)
+        XCTAssertEqual(queued.revision, original.revision + 1)
+        XCTAssertEqual(queued.state, original.state)
+        XCTAssertEqual(queued.text, original.text)
+        XCTAssertEqual(queued.textLanguage, original.textLanguage)
+        XCTAssertTrue(queued.retainsOutputForRegeneration)
+        XCTAssertEqual(queued.generatedProfileRevision, original.generatedProfileRevision)
+        XCTAssertEqual(queued.generatedSynthesisPolicyVersion, original.generatedSynthesisPolicyVersion)
+
+        for failureCode in ["INFERENCE_UNAVAILABLE", "CANCELLED"] {
+            let attempt = try library.beginGeneration(for: lineID)
+            XCTAssertEqual(library.lines[0].outputRelativePath, path)
+            XCTAssertTrue(library.referencedManagedPaths.contains(path))
+            XCTAssertThrowsError(try library.enqueueCleanup(paths: [path]))
+            XCTAssertThrowsError(try library.outputURL(for: lineID, relativeTo: URL(fileURLWithPath: "/tmp/root")))
+            _ = try library.failGeneration(ticket: attempt, failureCode: failureCode)
+            XCTAssertEqual(library.lines[0].status, .stale)
+            XCTAssertEqual(library.lines[0].outputRelativePath, path)
+            _ = try library.retryLine(id: lineID)
+            let next = try library.beginGeneration(for: lineID)
+            XCTAssertGreaterThan(next.lineRevision, attempt.lineRevision)
+            XCTAssertThrowsError(try library.completeGeneration(ticket: attempt, outputPath: "voice/generated/late.wav"))
+            XCTAssertThrowsError(try library.failGeneration(ticket: attempt, failureCode: "CANCELLED"))
+            _ = try library.failGeneration(ticket: next, failureCode: failureCode)
+            _ = try library.retryLine(id: lineID)
+        }
+
+        let successfulTicket = try library.beginGeneration(for: lineID)
+        _ = try library.completeGeneration(ticket: successfulTicket, outputPath: "voice/generated/replacement.wav")
+        XCTAssertEqual(library.lines[0].status, .ready)
+        XCTAssertFalse(library.lines[0].retainsOutputForRegeneration)
+        XCTAssertFalse(library.referencedManagedPaths.contains(path))
+        XCTAssertNoThrow(try library.enqueueCleanup(paths: [path]))
+    }
+
+    func testRegenerationSurvivesPersistedRecoveryAndProfileReactivation() throws {
+        var library = try libraryWithQueuedLine()
+        let original = try library.beginGeneration(for: lineID)
+        let path = "voice/generated/original.wav"
+        _ = try library.completeGeneration(ticket: original, outputPath: path)
+        _ = try library.regenerateLine(id: lineID)
+        let interrupted = try library.beginGeneration(for: lineID)
+        library = try JSONDecoder().decode(DialogueVoiceLibrary.self, from: JSONEncoder().encode(library))
+        try library.setProfileStatus(.validating)
+        XCTAssertEqual(try library.recoverInterruptedGenerations(), 1)
+        XCTAssertEqual(library.lines[0].status, .stale)
+        XCTAssertTrue(library.lines[0].retainsOutputForRegeneration)
+        XCTAssertEqual(try library.activateValidatedProfile(), 1)
+        _ = try library.beginGeneration(for: lineID)
+        XCTAssertEqual(library.lines[0].outputRelativePath, path)
+        XCTAssertTrue(library.referencedManagedPaths.contains(path))
+        XCTAssertTrue(library.pendingCleanupPaths.isEmpty)
+        XCTAssertThrowsError(try library.completeGeneration(ticket: interrupted, outputPath: "voice/generated/late.wav"))
+    }
+
+    func testEditingOrInvalidatingRegenerationDropsItsRetentionIntent() throws {
+        var original = try libraryWithQueuedLine()
+        let ticket = try original.beginGeneration(for: lineID)
+        let path = "voice/generated/original.wav"
+        _ = try original.completeGeneration(ticket: ticket, outputPath: path)
+        _ = try original.regenerateLine(id: lineID)
+        let regenerating = try original.beginGeneration(for: lineID)
+
+        var edited = original
+        _ = try edited.editLine(id: lineID, text: "A changed line", language: "en", state: .waiting)
+        XCTAssertFalse(edited.lines[0].retainsOutputForRegeneration)
+        XCTAssertNil(edited.lines[0].outputRelativePath)
+        _ = try edited.beginGeneration(for: lineID)
+        XCTAssertThrowsError(try edited.completeGeneration(ticket: regenerating, outputPath: "voice/generated/late.wav"))
+        XCTAssertNoThrow(try edited.enqueueCleanup(paths: [path]))
+
+        var invalidated = original
+        try invalidated.setProfileStatus(.invalid, invalidatingOutputs: true)
+        XCTAssertFalse(invalidated.lines[0].retainsOutputForRegeneration)
+        XCTAssertThrowsError(try invalidated.outputURL(for: lineID, relativeTo: URL(fileURLWithPath: "/tmp/root")))
+        _ = try invalidated.activateValidatedProfile()
+        XCTAssertNil(invalidated.lines[0].outputRelativePath)
+        XCTAssertNoThrow(try invalidated.enqueueCleanup(paths: [path]))
+        _ = try invalidated.beginGeneration(for: lineID)
+        XCTAssertThrowsError(try invalidated.completeGeneration(ticket: regenerating, outputPath: "voice/generated/late.wav"))
+        XCTAssertThrowsError(try invalidated.failGeneration(ticket: regenerating, failureCode: "CANCELLED"))
+
+        var reselected = original
+        try reselected.selectActiveProvider(.gptSovits)
+        _ = try reselected.beginGeneration(for: lineID)
+        XCTAssertThrowsError(try reselected.completeGeneration(ticket: regenerating, outputPath: "voice/generated/late.wav"))
+        XCTAssertThrowsError(try reselected.failGeneration(ticket: regenerating, failureCode: "CANCELLED"))
+
+        var replaced = original
+        try replaced.replaceActiveProfile(profile(revision: 2))
+        XCTAssertFalse(replaced.lines[0].retainsOutputForRegeneration)
+        XCTAssertNil(replaced.lines[0].outputRelativePath)
+        XCTAssertNoThrow(try replaced.enqueueCleanup(paths: [path]))
+    }
+
     func testPreviousDeterministicPolicyOutputBecomesStaleAfterSeedPin() throws {
         XCTAssertEqual(DialogueSynthesisPolicy.currentVersion, 3)
 

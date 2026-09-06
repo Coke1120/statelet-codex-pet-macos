@@ -678,6 +678,7 @@ class CharacterStorageHarnessTests(unittest.TestCase):
                     "-lCodexPetCore",
                     str(IDENTITY),
                     str(ALPHA),
+                    str(MAC_SOURCES / "CodexPetMac" / "ProcessPipeReader.swift"),
                     str(STORAGE),
                     str(harness),
                     "-Xlinker",

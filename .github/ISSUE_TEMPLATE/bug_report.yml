@@ -1,0 +1,71 @@
+name: Bug report
+description: Report a reproducible problem with Statelet on macOS.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the behavior using sample data. Do not attach private media, model weights, reference audio, dialogue, task titles, prompts, credentials, full logs, or absolute home paths.
+        Report suspected vulnerabilities through the [security policy](https://github.com/Coke1120/statelet-codex-pet-macos/security/policy), rather than this public form.
+  - type: input
+    id: version
+    attributes:
+      label: Statelet version and build
+      description: Find this in Settings → Help & Updates. For a source build, include the commit.
+      placeholder: "1.8.21 (35)"
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: macOS version and Mac architecture
+      placeholder: "macOS version; Apple Silicon or Intel"
+    validations:
+      required: true
+  - type: dropdown
+    id: installation
+    attributes:
+      label: Installation method
+      options:
+        - Source build and installer
+        - In-app update
+        - Personal release package
+        - Other or unsure
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - First run or installation
+        - Lifecycle or session activity
+        - Animation import or playback
+        - Dialogue or local voice
+        - Settings or window behavior
+        - Updates or recovery
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Include Codex/Grok versions or the selected voice provider when relevant. Use invented names and sample text.
+      placeholder: |
+        1. Open …
+        2. Choose …
+        3. Observe …
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+      description: Explain what should happen, what happened, how often, and any workaround.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Optional sanitized diagnostics
+      description: Use Statelet's Copy Diagnostics action and review the text before sharing. Do not paste full logs. Screenshots must have private content removed.

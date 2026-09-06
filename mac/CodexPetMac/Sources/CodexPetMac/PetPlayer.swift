@@ -136,7 +136,10 @@ final class PetPlayerView: NSView {
     private(set) var destinationPlayerLayer = AVPlayerLayer()
     let lifecycleTransitionPlayerLayer = AVPlayerLayer()
     private let posterView = NSImageView()
+    private let placeholderCard = NSVisualEffectView()
     private let placeholderLabel = NSTextField(wrappingLabelWithString: "")
+    private let mediaSettingsButton = NSButton(title: "Animations…", target: nil, action: nil)
+    private var mediaRecoveryState: PetState?
     private let stateBadge = PetStateBadgeView()
     private let fpsBadge = NSView()
     private let fpsBadgeLabel = NSTextField(labelWithString: "")
@@ -172,6 +175,7 @@ final class PetPlayerView: NSView {
     var onPetClick: (() -> Void)?
     var onResizeEnded: ((NSSize) -> Void)?
     var onTemporaryStateSelection: ((PetState?) -> Void)?
+    var onOpenAnimationSettings: ((PetState) -> Void)?
 
     var isFPSBadgeEnabled: Bool { fpsBadgeIsEnabled }
     var hasVisiblePoster: Bool { !posterView.isHidden && posterView.image != nil }
@@ -220,13 +224,30 @@ final class PetPlayerView: NSView {
         posterView.isHidden = true
         addSubview(posterView)
 
+        placeholderCard.material = .hudWindow
+        placeholderCard.blendingMode = .behindWindow
+        placeholderCard.state = .active
+        placeholderCard.wantsLayer = true
+        placeholderCard.layer?.cornerRadius = 12
+        placeholderCard.layer?.masksToBounds = true
+        placeholderCard.isHidden = true
+        placeholderCard.identifier = NSUserInterfaceItemIdentifier("mediaRecoveryCard")
+        addSubview(placeholderCard)
+
         placeholderLabel.alignment = .center
-        placeholderLabel.textColor = NSColor.secondaryLabelColor
+        placeholderLabel.textColor = NSColor.labelColor
         placeholderLabel.font = NSFont.systemFont(ofSize: 12)
-        placeholderLabel.isHidden = true
-        placeholderLabel.maximumNumberOfLines = 3
+        placeholderLabel.maximumNumberOfLines = 0
         placeholderLabel.lineBreakMode = .byWordWrapping
-        addSubview(placeholderLabel)
+        placeholderCard.addSubview(placeholderLabel)
+        mediaSettingsButton.bezelStyle = .rounded
+        mediaSettingsButton.controlSize = .small
+        mediaSettingsButton.target = self
+        mediaSettingsButton.action = #selector(openAnimationSettings)
+        mediaSettingsButton.identifier = NSUserInterfaceItemIdentifier("mediaRecoverySettings")
+        mediaSettingsButton.setAccessibilityLabel("Open animation settings")
+        mediaSettingsButton.toolTip = "Open the animation library for this state. Settings is also available from the Statelet menu-bar icon."
+        placeholderCard.addSubview(mediaSettingsButton)
 
         stateBadge.translatesAutoresizingMaskIntoConstraints = true
         addSubview(stateBadge)
@@ -259,21 +280,10 @@ final class PetPlayerView: NSView {
         destinationPlayerLayer.frame = bounds
         lifecycleTransitionPlayerLayer.frame = bounds
         posterView.frame = bounds
-        let placeholderBounds = bounds.insetBy(dx: 16, dy: 16)
-        placeholderLabel.preferredMaxLayoutWidth = placeholderBounds.width
-        let placeholderHeight = min(
-            placeholderBounds.height,
-            max(placeholderLabel.fittingSize.height, 1)
-        )
-        placeholderLabel.frame = NSRect(
-            x: placeholderBounds.minX,
-            y: placeholderBounds.midY - placeholderHeight / 2,
-            width: placeholderBounds.width,
-            height: placeholderHeight
-        )
         layoutFPSBadge()
         layoutStateBadge()
         layoutQuickControls()
+        layoutPlaceholder()
         layoutDialogueBubble()
     }
 
@@ -535,7 +545,7 @@ final class PetPlayerView: NSView {
             ceil(fittingSize.height + verticalPadding * 2)
         )
         let x = margin + max(0, (availableWidth - bubbleWidth) / 2)
-        let occupiedFrames = [stateBadge, fpsBadge, quickControls]
+        let occupiedFrames = [stateBadge, fpsBadge, quickControls, placeholderCard]
             .filter { !$0.isHidden && !$0.frame.isEmpty }
             .map(\.frame)
         let candidateYPositions = ([margin] + occupiedFrames.map { $0.maxY + overlayGap })
@@ -747,9 +757,50 @@ final class PetPlayerView: NSView {
         )
     }
 
-    func showPlaceholder(_ message: String?) {
+    func showPlaceholder(_ message: String?, recoveryState: PetState? = nil) {
         placeholderLabel.stringValue = message ?? ""
-        placeholderLabel.isHidden = message == nil
+        placeholderCard.isHidden = message == nil
+        quickControls.isHidden = message != nil && recoveryState != nil
+        mediaRecoveryState = message == nil ? nil : recoveryState
+        mediaSettingsButton.isHidden = mediaRecoveryState == nil
+        needsLayout = true
+    }
+
+    private func layoutPlaceholder() {
+        // Informational placeholders keep the normal controls available.
+        // Reserve their space before centering the card, including small pets.
+        let availableMaxX = quickControls.isHidden
+            ? bounds.maxX - 12
+            : quickControls.frame.minX - 8
+        let availableWidth = max(0, availableMaxX - 12)
+        let width = min(280, availableWidth)
+        let contentWidth = max(0, width - 24)
+        placeholderLabel.preferredMaxLayoutWidth = contentWidth
+        let buttonHeight: CGFloat = mediaSettingsButton.isHidden ? 0 : 26
+        let gap: CGFloat = mediaSettingsButton.isHidden ? 0 : 10
+        let textHeight = min(
+            ceil(placeholderLabel.fittingSize.height),
+            max(0, bounds.height - 48 - buttonHeight - gap)
+        )
+        let height = textHeight + buttonHeight + gap + 24
+        placeholderCard.frame = NSRect(
+            x: 12 + (availableWidth - width) / 2,
+            y: max(12, (bounds.height - height) / 2),
+            width: width,
+            height: height
+        )
+        placeholderLabel.frame = NSRect(
+            x: 12, y: 12 + buttonHeight + gap,
+            width: contentWidth, height: textHeight
+        )
+        mediaSettingsButton.frame = NSRect(
+            x: 12, y: 12, width: contentWidth, height: buttonHeight
+        )
+    }
+
+    @objc private func openAnimationSettings() {
+        guard !placeholderCard.isHidden, let state = mediaRecoveryState else { return }
+        onOpenAnimationSettings?(state)
     }
 
     /// Shows the current lifecycle-state message without coupling the view to
@@ -998,10 +1049,14 @@ final class PetPlayerView: NSView {
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard !isHidden, bounds.contains(point) else { return nil }
+        if !placeholderCard.isHidden, !mediaSettingsButton.isHidden,
+           mediaSettingsButton.convert(mediaSettingsButton.bounds, to: self).contains(point) {
+            return mediaSettingsButton
+        }
         // NSStackView's fitting frame can be narrower than an arranged
         // button's visible 40-point bezel. Test the button bounds first so the
         // entire physical target remains clickable at every edge.
-        for button in [nextClipButton, temporaryStateButton] where !button.isHidden {
+        for button in [nextClipButton, temporaryStateButton] where !quickControls.isHidden && !button.isHidden {
             let target = button.convert(button.bounds, to: self)
             if target.contains(point) { return button }
         }
@@ -1402,7 +1457,13 @@ final class PetPlayerController {
         advancePlaylistWhenEnded: Bool = false
     ) -> PlaybackStartDisposition {
         cancelLifecycleHandoff(notifyFailure: false)
+        // Every request supersedes pending media, including unavailable-media
+        // and Reduce Motion fallbacks that return before preparing a new item.
+        cancelDirectReplacement()
         if reduceMotion {
+            if entry == nil, url == nil, posterURL == nil {
+                return softFailure(state: state, reason: .unmapped)
+            }
             return showReducedMotion(state: state, posterURL: posterURL)
         }
         guard let entry, let url else {
@@ -1412,7 +1473,6 @@ final class PetPlayerController {
             return softFailure(state: state, reason: .unreadable)
         }
 
-        cancelDirectReplacement()
         view.hideFPSBadge()
         let replacementPlayer = AVQueuePlayer()
         replacementPlayer.actionAtItemEnd = .none
@@ -1906,6 +1966,8 @@ final class PetPlayerController {
         view.showPoster(nil)
         view.showPlaceholder(nil)
         view.updateAccessibility(state: replacement.state, reducedMotion: false)
+        let duration = Self.elapsedMilliseconds(since: replacement.startedAt)
+        logger.info("event=display_ready transition_id=\(replacement.id, privacy: .public) state=\(replacement.state.rawValue, privacy: .public) duration_ms=\(duration, format: .fixed(precision: 3), privacy: .public)")
         onPresentationEvent?(replacement.id, replacement.state, .ready)
     }
 
@@ -1926,7 +1988,10 @@ final class PetPlayerController {
         if currentURL == nil, !view.hasVisiblePoster {
             currentState = replacement.state
             presentationStatus = .placeholder(replacement.state)
-            view.showPlaceholder("\(replacement.state.rawValue)\nMedia could not be decoded")
+            view.showPlaceholder(
+                "\(replacement.state.rawValue)\nMedia could not be decoded",
+                recoveryState: replacement.state
+            )
         } else {
             presentationStatus = .retained(requested: replacement.state, displayed: currentState)
         }
@@ -2875,7 +2940,10 @@ final class PetPlayerController {
         currentPresentationIsOneShot = false
         presentationStatus = .placeholder(transition.state)
         view.showPoster(nil)
-        view.showPlaceholder("\(transition.state.rawValue)\n\(reason.userMessage(for: transition.state))")
+        view.showPlaceholder(
+            "\(transition.state.rawValue)\n\(reason.userMessage(for: transition.state))",
+            recoveryState: transition.state
+        )
         view.hideFPSBadge()
         view.updateAccessibility(
             state: transition.state,
@@ -3112,7 +3180,10 @@ final class PetPlayerController {
             currentPresentationIsOneShot = false
             presentationStatus = .placeholder(state)
             view.showPoster(nil)
-            view.showPlaceholder("\(state.rawValue)\n\(reason.userMessage(for: state))")
+            view.showPlaceholder(
+                "\(state.rawValue)\n\(reason.userMessage(for: state))\nUse Animations below or Settings in the Statelet menu bar.",
+                recoveryState: state
+            )
             view.hideFPSBadge()
             view.updateAccessibility(
                 state: state,

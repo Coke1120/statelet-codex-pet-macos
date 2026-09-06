@@ -337,7 +337,10 @@ producer for Developer-ID-free in-app updates. It runs for `v*` tags (or a
 manual dispatch naming an existing `v*` tag), fetches the complete repository
 history, and refuses to sign unless the tag commit is an ancestor of
 `origin/main` and the immutable GitHub repository name and numeric ID match the
-values pinned by Statelet.
+values pinned by Statelet. It also requires successful `macOS CI` for a `main`
+push at that exact commit before signing. Wait for that CI result before
+pushing the release tag; a successful check on an earlier commit or a pull
+request merge ref is not a substitute.
 
 The repository secret `STATELET_UPDATE_SIGNING_PRIVATE_KEY_B64` contains the
 raw Ed25519 private key. It must never be printed, committed, placed in release
@@ -386,9 +389,27 @@ public binary distribution.
 
 ## Release verification
 
-Run the affected checks from the repository root:
+This is the canonical complete local gate for pull requests and releases. Run
+it from the repository root after preparing the hash-locked alpha environment
+in [CONTRIBUTING.md](../CONTRIBUTING.md#development-setup), with that environment
+activated. Focused tests are useful during development, but do not replace this
+gate for a release.
+
+Full `swift test` requires Xcode with XCTest. Command Line Tools alone can build
+the app and run `codex-pet-core-self-test`, but may not provide XCTest. Select
+your full Xcode installation for this shell (adjust the path if necessary):
 
 ```bash
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+xcrun --find swift
+```
+
+Run on a logged-in, GUI-capable Mac with `ffmpeg`, `ffprobe`, and Apple's
+`avconvert` available. AVPlayer integration must be enabled explicitly:
+
+```bash
+(
+set -euo pipefail
 PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY'
 import unittest
 
@@ -402,16 +423,35 @@ raise SystemExit(0 if result.wasSuccessful() else 1)
 PY
 
 swift run -c release --package-path mac/CodexPetMac codex-pet-core-self-test
-swift test -c release --package-path mac/CodexPetMac
+swift test -c release --package-path mac/CodexPetMac --skip PetPlayerPlaybackIntegrationTests
+STATELET_RUN_AVPLAYER_INTEGRATION=1 swift test -c release \
+  --package-path mac/CodexPetMac --filter PetPlayerPlaybackIntegrationTests
 bash mac/CodexPetMac/scripts/build_app.sh
 codesign --verify --deep --strict mac/CodexPetMac/dist/Statelet.app
+if git ls-files | grep -Ei '^(private-assets|private-media|prompts|esp32-p4|vendor)/|\.(mp4|mov|m4v|webm|mkv|avi|gif|hevc|prores[^/]*|safetensors|ckpt|pth|wav|flac|mp3|m4a|aac|ogg)$'; then
+  echo "Excluded private, hardware, or media content is tracked." >&2
+  exit 1
+fi
 python3 -m json.tool mac/CodexPetMac/Examples/media-map.json >/dev/null
 git diff --check
+)
 ```
 
-Prepare the alpha toolchain before running this gate. Test discovery includes
-every `tests/test_*.py` module, including the alpha and native AppKit layout
-suites, and the release gate fails if any test is skipped.
+Python discovery includes every `tests/test_*.py` module, including the alpha
+and native AppKit layout suites, and fails if any Python test is skipped. Check
+both Swift summaries as well: unexpected skipped tests or unavailable GUI
+coverage must be recorded as incomplete validation.
 
-Full `swift test` requires Xcode with XCTest. Command Line Tools alone can build
-the app and run `codex-pet-core-self-test`, but may not provide XCTest.
+Record the commit, version/build, macOS version, architecture, test results, and
+any unrun checks with the release decision. Hosted CI currently tests on
+`macos-14`, while the release workflow builds on `macos-15`; those runs do not
+establish runtime coverage for the minimum supported macOS 13 or every Mac
+architecture. Record separate smoke results when claiming that coverage.
+
+The workflow verifies the hosted signature, manifest bindings, asset hashes,
+and exact asset set before publishing a new release. Complete acceptance on an
+installed copy as well: verify its version/build and strict code signature, lifecycle
+updates, animation playback, Settings, relaunch, and managed startup. For an
+upgrade, confirm existing media, settings, and other hooks are preserved. Add a
+real local generation/playback check when a release changes voice behavior.
+Keep private media, dialogue, logs, and account data out of the release record.

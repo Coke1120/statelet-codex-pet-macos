@@ -375,6 +375,141 @@ class MacPerformanceHarnessTests(unittest.TestCase):
             )
             self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
 
+    def test_isolated_map_preserves_all_transition_routes_and_adjacent_reports(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            media = root / "source" / "media"
+            media.mkdir(parents=True)
+            for name in ("first.mov", "second.mov", "first.report.json", "second.report.json", "poster.png"):
+                (media / name).write_bytes(b"synthetic local fixture")
+            entry = {"path": "media/first.mov", "poster_path": "media/poster.png", "loop": False, "playback_rate": 0.75}
+            playlist = {
+                "mode": "sequential",
+                "advance_on": "state_entry",
+                "fixed_path": "media/second.mov",
+                "entries": [entry, {"path": "media/second.mov", "loop": False}],
+            }
+            payload = {
+                "version": 1,
+                "window": {"width": 320, "height": 480},
+                "states": {"idle": entry},
+                "transitions": {"idle_to_running": playlist, "running_to_idle": entry},
+                "in_state_transitions": {state: entry for state in measure_runtime.VALID_STATES},
+            }
+            source = root / "source" / "media-map.json"
+            original = json.dumps(payload)
+            source.write_text(original, encoding="utf-8")
+            destination = root / "isolated" / "media-map.json"
+            measure_runtime.isolated_media_map(source.resolve(), destination)
+            isolated = json.loads(destination.read_text(encoding="utf-8"))
+            route = isolated["transitions"]["idle_to_running"]
+            self.assertEqual(route["fixed_path"], str((media / "second.mov").resolve()))
+            self.assertEqual(route["mode"], "sequential")
+            self.assertEqual(route["advance_on"], "state_entry")
+            self.assertEqual(isolated["window"], payload["window"])
+            self.assertEqual(set(isolated["in_state_transitions"]), set(measure_runtime.VALID_STATES))
+            entries = route["entries"] + [isolated["transitions"]["running_to_idle"]]
+            entries += list(isolated["in_state_transitions"].values())
+            for normalized in entries:
+                movie = Path(normalized["path"])
+                self.assertTrue(movie.is_absolute())
+                self.assertTrue(movie.is_file())
+                self.assertTrue(movie.with_suffix(".report.json").is_file())
+                if "poster_path" in normalized:
+                    self.assertEqual(normalized["poster_path"], str((media / "poster.png").resolve()))
+                    self.assertEqual(normalized["playback_rate"], 0.75)
+            self.assertEqual(isolated["states"]["idle"]["poster_path"], str((media / "poster.png").resolve()))
+            self.assertEqual(source.read_text(encoding="utf-8"), original)
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
+
+    def test_transition_inputs_reject_missing_symlinked_and_nonregular_assets_before_writing(self) -> None:
+        for group in ("transitions", "in_state_transitions"):
+            for asset in ("movie", "poster", "report"):
+                for invalid_kind in ("missing", "symlink", "directory"):
+                    with self.subTest(group=group, asset=asset, invalid_kind=invalid_kind), tempfile.TemporaryDirectory() as temporary:
+                        root = Path(temporary)
+                        files = {"movie": root / "clip.mov", "poster": root / "poster.png", "report": root / "clip.report.json"}
+                        for name, path in files.items():
+                            if name != asset:
+                                path.write_bytes(b"synthetic local fixture")
+                        invalid = files[asset]
+                        if invalid_kind == "symlink":
+                            target = root / "target"
+                            target.write_bytes(b"synthetic local fixture")
+                            invalid.symlink_to(target)
+                        elif invalid_kind == "directory":
+                            invalid.mkdir()
+                        key = "idle_to_running" if group == "transitions" else "idle"
+                        payload = {"version": 1, "states": {}, group: {key: {"path": "clip.mov", "poster_path": "poster.png"}}}
+                        source = root / "source.json"
+                        source.write_text(json.dumps(payload), encoding="utf-8")
+                        destination = root / "isolated.json"
+                        destination.write_bytes(b"previous fixture")
+                        with self.assertRaises(measure_runtime.HarnessError):
+                            measure_runtime.isolated_media_map(source.resolve(), destination)
+                        self.assertEqual(destination.read_bytes(), b"previous fixture")
+
+    def test_transition_playlist_checks_unselected_variant_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("first.mov", "first.report.json", "second.mov"):
+                (root / name).write_bytes(b"synthetic local fixture")
+            source = root / "source.json"
+            source.write_text(json.dumps({
+                "version": 1,
+                "states": {},
+                "transitions": {"idle_to_running": {
+                    "mode": "fixed", "fixed_path": "first.mov",
+                    "entries": [{"path": "first.mov"}, {"path": "second.mov"}],
+                }},
+            }), encoding="utf-8")
+            destination = root / "isolated.json"
+            with self.assertRaises(measure_runtime.HarnessError):
+                measure_runtime.isolated_media_map(source.resolve(), destination)
+            self.assertFalse(destination.exists())
+
+    def test_isolated_map_rejects_unsupported_transition_shapes(self) -> None:
+        invalid_groups = [
+            {"transitions": []},
+            {"transitions": {"idle_to_idle": {"path": "clip.mov"}}},
+            {"transitions": {"idle_to_unknown": {"path": "clip.mov"}}},
+            {"transitions": {"idle_to_running": {"entries": []}}},
+            {"transitions": {"idle_to_running": {"entries": None}}},
+            {"transitions": {"idle_to_running": {"entries": [{"path": "clip.mov"}], "fixed_path": "other.mov"}}},
+            {"transitions": {"idle_to_running": {"entries": [{"path": "clip.mov"}], "mode": "unsupported"}}},
+            {"transitions": {"idle_to_running": {"path": 3}}},
+            {"transitions": {"idle_to_running": {"path": "clip.mov", "poster_path": 3}}},
+            {"transitions": {"idle_to_running": {"path": "https://example.test/clip.mov"}}},
+            {"in_state_transitions": []},
+            {"in_state_transitions": {"unknown": {"path": "clip.mov"}}},
+            {"in_state_transitions": {"idle": {"entries": [{"path": "clip.mov"}]}}},
+            {"in_state_transitions": {"idle": {"path": ""}}},
+            {"in_state_transitions": {"idle": {"path": "clip\u0000.mov"}}},
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("clip.mov", "clip.report.json", "other.mov", "other.report.json"):
+                (root / name).write_bytes(b"synthetic local fixture")
+            source = root / "source.json"
+            destination = root / "isolated.json"
+            for group in invalid_groups:
+                with self.subTest(group=group):
+                    source.write_text(json.dumps({"version": 1, "states": {}, **group}), encoding="utf-8")
+                    with self.assertRaises(measure_runtime.HarnessError):
+                        measure_runtime.isolated_media_map(source.resolve(), destination)
+                    self.assertFalse(destination.exists())
+
+    def test_optional_transition_groups_remain_optional(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.json"
+            destination = root / "isolated.json"
+            for groups in ({}, {"transitions": None, "in_state_transitions": None}, {"transitions": {}, "in_state_transitions": {}}):
+                payload = {"version": 1, "states": {}, **groups}
+                source.write_text(json.dumps(payload), encoding="utf-8")
+                measure_runtime.isolated_media_map(source.resolve(), destination)
+                self.assertEqual(json.loads(destination.read_text(encoding="utf-8")), payload)
+
 
 if __name__ == "__main__":
     unittest.main()

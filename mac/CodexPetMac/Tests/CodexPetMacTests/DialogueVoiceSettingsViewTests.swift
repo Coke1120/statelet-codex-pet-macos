@@ -40,6 +40,75 @@ final class DialogueVoiceSettingsViewTests: XCTestCase {
     }
 
     @MainActor
+    func testVoxRuntimeFailureIsVisibleAndAccessible() throws {
+        let view = DialogueVoiceSettingsView(
+            frame: NSRect(x: 0, y: 0, width: 900, height: 700)
+        )
+        let message = "The selected VoxCPM2 Python runtime could not be authenticated."
+        view.update(snapshot: DialogueVoiceCoordinatorSnapshot(
+            library: try DialogueVoiceLibrary(),
+            draft: DialogueVoiceProfileDraft(
+                name: "",
+                apiBaseURL: "https://127.0.0.1:9880",
+                tlsLeafCertificateSHA256: String(repeating: "c", count: 64),
+                promptLanguage: "japanese",
+                defaultTextLanguage: "japanese",
+                referenceText: ""
+            ),
+            importedAssets: DialogueVoiceImportedAssets(),
+            activityMessage: message
+        ))
+
+        let activity = try XCTUnwrap(Self.descendants(of: view).compactMap { $0 as? NSTextField }
+            .first { $0.accessibilityLabel() == "Dialogue voice activity" })
+        XCTAssertFalse(activity.isHidden)
+        XCTAssertEqual(activity.stringValue, message)
+        XCTAssertEqual(activity.accessibilityHelp(), message)
+        XCTAssertEqual(activity.maximumNumberOfLines, 0)
+    }
+
+    @MainActor
+    func testActiveUnavailableVoxUsesRuntimeStatusInsteadOfServiceStatus() throws {
+        let digest = String(repeating: "a", count: 64)
+        let profile = try VoxCPM2VoiceProfile(
+            name: "VoxCPM2 Voice",
+            snapshotPath: "voice/packages/voxcpm2/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            snapshotTreeSHA256: digest,
+            pythonExecutablePath: "/usr/bin/python3",
+            pythonExecutableSHA256: digest,
+            referenceAudioRelativePath: "voice/assets/voxcpm2-reference/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.wav",
+            referenceAudioSHA256: digest,
+            referenceText: "参照音声です。",
+            inputFingerprint: digest
+        )
+        let library = try DialogueVoiceLibrary(
+            voxcpm2Profile: profile,
+            activeProviderKind: .voxcpm2,
+            profileStatus: .unavailable
+        )
+        let view = DialogueVoiceSettingsView(
+            frame: NSRect(x: 0, y: 0, width: 900, height: 700)
+        )
+        view.update(snapshot: DialogueVoiceCoordinatorSnapshot(
+            library: library,
+            draft: DialogueVoiceProfileDraft(
+                name: "",
+                apiBaseURL: "https://127.0.0.1:9880",
+                tlsLeafCertificateSHA256: String(repeating: "c", count: 64),
+                promptLanguage: "japanese",
+                defaultTextLanguage: "japanese",
+                referenceText: ""
+            ),
+            importedAssets: DialogueVoiceImportedAssets(),
+            activityMessage: nil
+        ))
+
+        let status = try XCTUnwrap(Self.descendants(of: view).compactMap { $0 as? NSTextField }
+            .first { $0.accessibilityLabel() == "VoxCPM2 provider status" })
+        XCTAssertEqual(status.stringValue, "Active · Local runtime unavailable")
+    }
+
+    @MainActor
     func testConsecutiveAddsPreserveSubmittedStateAndLanguage() throws {
         let view = DialogueVoiceSettingsView(frame: NSRect(x: 0, y: 0, width: 900, height: 700))
         var library = try DialogueVoiceLibrary()

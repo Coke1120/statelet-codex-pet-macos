@@ -1,0 +1,31 @@
+name: Feature request
+description: Describe a user problem and how we would know it is solved.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the [roadmap](https://github.com/Coke1120/statelet-codex-pet-macos/blob/main/ROADMAP.md) and existing issues first. Statelet currently prioritizes a reliable native macOS experience. Keep examples free of private data.
+  - type: textarea
+    id: problem
+    attributes:
+      label: User problem
+      description: Who encounters this, during which task, and what is difficult today?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe the observable result, with one concrete example of success.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Current workaround and alternatives
+      description: Include why existing controls or a smaller change do not meet the need.
+  - type: textarea
+    id: scope
+    attributes:
+      label: Suggested scope
+      description: Optional implementation idea, compatibility needs, and what can wait.

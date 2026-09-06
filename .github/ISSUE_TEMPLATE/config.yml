@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security reporting
+    url: https://github.com/Coke1120/statelet-codex-pet-macos/security/policy
+    about: Follow the private vulnerability reporting instructions; do not disclose vulnerabilities in public issues.
+  - name: Setup and recovery guide
+    url: https://github.com/Coke1120/statelet-codex-pet-macos/blob/main/docs/USAGE.md
+    about: First-run setup, animation import, local voice, and recovery controls.

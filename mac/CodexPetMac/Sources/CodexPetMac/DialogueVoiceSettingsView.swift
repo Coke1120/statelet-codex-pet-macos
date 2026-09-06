@@ -251,7 +251,8 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         profileStatusLabel.stringValue = providerStatusTitle(
             configured: library.profile != nil,
             active: library.activeProviderKind == .gptSovits,
-            activeStatus: library.profileStatus
+            activeStatus: library.profileStatus,
+            provider: .gptSovits
         )
         applyProviderStatusAppearance(
             profileStatusLabel,
@@ -818,7 +819,7 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             (deleteButton, #selector(deleteLine), "Delete selected dialogue line", "Delete the selected line after confirmation by the app."),
             (previewButton, #selector(previewLine), "Preview selected dialogue line", "Play the selected line when generated audio is ready."),
             (retryButton, #selector(retryLine), "Retry selected dialogue line", "Retry a failed generation without creating another line."),
-            (regenerateButton, #selector(regenerateLine), "Regenerate selected dialogue line", "Discard the selected line's generated result and request a fresh one."),
+            (regenerateButton, #selector(regenerateLine), "Regenerate selected dialogue line", "Request fresh audio while keeping the previous file until its replacement is ready."),
             (automaticPlaybackCheckbox, #selector(playbackSettingsChanged), "Automatic voice playback", "Play ready dialogue automatically when Statelet enters its owning lifecycle state."),
         ]
         for (button, action, label, help) in actions {
@@ -1204,23 +1205,32 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         status.rawValue.prefix(1).uppercased() + status.rawValue.dropFirst()
     }
 
-    private func profileStatusTitle(_ status: DialogueVoiceProfileStatus) -> String {
+    private func profileStatusTitle(
+        _ status: DialogueVoiceProfileStatus,
+        provider: DialogueVoiceProviderKind
+    ) -> String {
         switch status {
         case .notConfigured: return "Not configured"
         case .validating: return "Validating"
         case .ready: return "Ready"
         case .invalid: return "Invalid — re-import required"
-        case .unavailable: return "Local service unavailable"
+        case .unavailable:
+            return provider == .gptSovits
+                ? "Local service unavailable"
+                : "Local runtime unavailable"
         }
     }
 
     private func providerStatusTitle(
         configured: Bool,
         active: Bool,
-        activeStatus: DialogueVoiceProfileStatus
+        activeStatus: DialogueVoiceProfileStatus,
+        provider: DialogueVoiceProviderKind
     ) -> String {
         guard configured else { return "Not configured" }
-        return active ? "Active · \(profileStatusTitle(activeStatus))" : "Configured"
+        return active
+            ? "Active · \(profileStatusTitle(activeStatus, provider: provider))"
+            : "Configured"
     }
 
     private func applyProviderStatusAppearance(
@@ -1272,7 +1282,8 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         qwenStatusLabel.stringValue = providerStatusTitle(
             configured: true,
             active: isActive,
-            activeStatus: profileStatus
+            activeStatus: profileStatus,
+            provider: .qwen3TTS
         )
         applyProviderStatusAppearance(
             qwenStatusLabel,
@@ -1306,7 +1317,8 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         voxStatusLabel.stringValue = providerStatusTitle(
             configured: true,
             active: isActive,
-            activeStatus: profileStatus
+            activeStatus: profileStatus,
+            provider: .voxcpm2
         )
         applyProviderStatusAppearance(
             voxStatusLabel,

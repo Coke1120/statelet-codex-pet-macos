@@ -17,15 +17,23 @@ No animation media is bundled. Add at least one Idle clip:
 1. Open **Settings → Animations**.
 2. Select **Idle**.
 3. Drag one or more local `.mp4` files from Finder onto the Idle drop zone, or
-   choose **Add Clip… → Import MP4s…**.
-4. Resolve any toolchain warning using the Setup Guide.
-5. Wait for conversion and verification to finish.
+   choose **Add Clip… → Import MP4s…**. For an existing transparent MOV, choose
+   **Add Clip… → Portable MOVs…** instead; keep its matching verification report
+   beside it when available and follow the import validation/trust prompts.
+4. For MP4 conversion, resolve any toolchain warning using the Setup Guide.
+5. Wait for import verification to finish and confirm visible Idle playback.
+   If the panel is blank, use the menu-bar Settings action to check the selected
+   character, Idle library and import status.
 
 Restart Codex or Grok Build once if Statelet was installed while it was already running.
 
 In **Settings → General → Agent Source**, choose Combined (the default), Codex,
 or Grok. The choice changes the aggregate lifecycle and activity rail
 immediately without deleting the other provider's local records.
+
+Start a normal agent turn and confirm the state and activity rail respond. Add
+clips to the other three state libraries for distinct animations. Dialogue,
+voice setup and transitions are optional additions after this basic check.
 
 ## Lifecycle behavior
 
@@ -609,7 +617,9 @@ VoxCPM2 uses the same WAV/reference audio for `prompt_wav_path` and
 asynchronous, cancellable, and bounded; an old ready WAV remains until a new
 48 kHz mono PCM16 result passes structural validation and atomic publication.
 On Apple Silicon, MPS is deliberately promoted to float32 for stability and
-can be slow or memory-intensive. A `Ready` status proves software validation,
+can be slow or memory-intensive. Saved-profile validation at app launch also
+loads the model. Each validation or generation helper exits when its job ends,
+releasing its model allocation. A `Ready` status proves software validation,
 not audible quality: use **Preview** and assess the private audio locally.
 
 Removing VoxCPM2 removes its managed snapshot, reference, and generated speech

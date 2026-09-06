@@ -870,6 +870,253 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
     }
 
     @MainActor
+    func testVoxRegenerationKeepsReadyWAVUntilSuccessfulRetryIsPersisted() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = try makeVoxProfile(root: root).profile
+        var library = try DialogueVoiceLibrary(voxcpm2Profile: profile, activeProviderKind: .voxcpm2)
+        let line = try library.addLine(text: "再生成のテストです", language: "japanese")
+        let originalTicket = try library.beginGeneration(for: line.id)
+        let oldPath = "voice/generated/regeneration-original.wav"
+        let oldURL = root.appendingPathComponent(oldPath)
+        try FileManager.default.createDirectory(at: oldURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Self.voxWAV(frames: 480).write(to: oldURL)
+        _ = try library.completeGeneration(ticket: originalTicket, outputPath: oldPath)
+        try save(library, root: root)
+
+        let firstStarted = expectation(description: "regeneration starts")
+        let secondStarted = expectation(description: "retry starts")
+        let gate = CancellationInsensitiveGenerationGate()
+        let removals = ManagedRemovalRecorder()
+        let store = DialogueVoiceStore(rootURL: root.appendingPathComponent("voice", isDirectory: true))
+        let coordinator = DialogueVoiceCoordinator(
+            applicationSupportRoot: root,
+            voxcpm2Client: VoxCPM2Client(
+                helperExecutableURL: helperURL(root), probeExecutableURL: helperURL(root)
+            ) { invocation in
+                let body = try JSONSerialization.jsonObject(with: invocation.standardInput) as? [String: Any]
+                if body?["probe_output"] != nil {
+                    try Data(#"{"schema":1,"device":"cpu","sample_rate":48000}"#.utf8).write(to: invocation.outputURL)
+                    return
+                }
+                let attempt = await gate.wait { attempt in
+                    if attempt == 1 { firstStarted.fulfill() }
+                    if attempt == 2 { secondStarted.fulfill() }
+                }
+                if attempt == 1 { throw DialogueVoiceRuntimeError.inferenceUnavailable }
+                try Self.voxWAV(frames: 960).write(to: invocation.outputURL)
+            },
+            managedFileRemove: { path, root, maximumBytes in
+                _ = removals.record(path)
+                if path == oldPath {
+                    let persisted = try store.load()
+                    let replacement = try XCTUnwrap(persisted.lines.first)
+                    XCTAssertEqual(replacement.status, .ready)
+                    XCTAssertNotEqual(replacement.outputRelativePath, oldPath)
+                    XCTAssertTrue(VoxCPM2Client.isValidOutputWAV(try Data(
+                        contentsOf: root.appendingPathComponent(try XCTUnwrap(replacement.outputRelativePath))
+                    )))
+                }
+                return try DialogueVoiceAssetInstaller.removeManagedFile(relativePath: path, root: root, maximumBytes: maximumBytes)
+            }
+        )
+        defer {
+            gate.release(1)
+            gate.release(2)
+            coordinator.shutdown()
+        }
+        coordinator.start()
+        try await waitUntil(timeout: 5) { coordinator.library.profileStatus == .ready }
+        try coordinator.regenerateLine(id: line.id)
+        await fulfillment(of: [firstStarted], timeout: 5)
+        XCTAssertEqual(try store.load().lines.first?.outputRelativePath, oldPath)
+        XCTAssertTrue(coordinator.library.referencedManagedPaths.contains(oldPath))
+        XCTAssertFalse(coordinator.library.pendingCleanupPaths.contains(oldPath))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: oldURL.path))
+        XCTAssertTrue(removals.recordedPaths.isEmpty)
+
+        gate.release(1)
+        try await waitUntil(timeout: 5) {
+            coordinator.library.lines.first?.status == .stale && coordinator.library.profileStatus == .unavailable
+        }
+        XCTAssertEqual(try store.load().lines.first?.outputRelativePath, oldPath)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: oldURL.path))
+        try coordinator.retryLine(id: line.id)
+        await fulfillment(of: [secondStarted], timeout: 5)
+        XCTAssertEqual(try store.load().lines.first?.outputRelativePath, oldPath)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: oldURL.path))
+        XCTAssertTrue(removals.recordedPaths.isEmpty)
+
+        gate.release(2)
+        try await waitUntil(timeout: 5) { coordinator.library.lines.first?.status == .ready }
+        XCTAssertEqual(removals.recordedPaths, [oldPath])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: oldURL.path))
+        XCTAssertTrue(try store.load().pendingCleanupPaths.isEmpty)
+    }
+
+    @MainActor
+    func testCancelledRegenerationKeepsReadyWAVAcrossCoordinatorRestart() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = try makeQwenProfile(root: root)
+        var library = try DialogueVoiceLibrary(qwenProfile: profile, activeProviderKind: .qwen3TTS)
+        let line = try library.addLine(text: "再起動のテストです", language: "japanese")
+        let originalTicket = try library.beginGeneration(for: line.id)
+        let oldPath = "voice/generated/restart-original.wav"
+        let oldURL = root.appendingPathComponent(oldPath)
+        try FileManager.default.createDirectory(at: oldURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Self.pcmWAV(sampleRate: 24_000, frames: 2_400).write(to: oldURL)
+        _ = try library.completeGeneration(ticket: originalTicket, outputPath: oldPath)
+        try save(library, root: root)
+
+        let firstStarted = expectation(description: "first regeneration starts")
+        let secondStarted = expectation(description: "restart regeneration starts")
+        let gate = CancellationInsensitiveGenerationGate()
+        let coordinator = DialogueVoiceCoordinator(
+            applicationSupportRoot: root,
+            qwenClient: Qwen3TTSClient(helperExecutableURL: helperURL(root), probeExecutableURL: helperURL(root)) { invocation in
+                guard invocation.requiresOutputFile else { return }
+                let attempt = await gate.wait { attempt in
+                    if attempt == 1 { firstStarted.fulfill() }
+                    if attempt == 2 { secondStarted.fulfill() }
+                }
+                if attempt == 1 { throw CancellationError() }
+                try Self.pcmWAV(sampleRate: 24_000, frames: 4_800).write(to: invocation.outputURL)
+            }
+        )
+        defer {
+            gate.release(1)
+            gate.release(2)
+            coordinator.shutdown()
+        }
+        coordinator.start()
+        try await waitUntil(timeout: 5) { coordinator.library.profileStatus == .ready }
+        try coordinator.regenerateLine(id: line.id)
+        await fulfillment(of: [firstStarted], timeout: 5)
+        gate.release(1)
+        try await waitUntil(timeout: 5) { coordinator.library.lines.first?.status == .stale }
+        XCTAssertEqual(coordinator.library.lines.first?.outputRelativePath, oldPath)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: oldURL.path))
+        coordinator.shutdown()
+        coordinator.start()
+        await fulfillment(of: [secondStarted], timeout: 5)
+        XCTAssertEqual(coordinator.library.lines.first?.outputRelativePath, oldPath)
+        XCTAssertTrue(coordinator.library.referencedManagedPaths.contains(oldPath))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: oldURL.path))
+        gate.release(2)
+        try await waitUntil(timeout: 5) { coordinator.library.lines.first?.status == .ready }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: oldURL.path))
+        XCTAssertFalse(coordinator.library.lines.first?.retainsOutputForRegeneration ?? true)
+    }
+
+    @MainActor
+    func testFailedVoxPythonImportUsesProviderSpecificMessageAndPreservesOtherProfiles() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gptProfile = try makeGPTProfile(root: root)
+        let qwenProfile = try makeQwenProfile(root: root)
+        let originalLibrary = try DialogueVoiceLibrary(
+            profile: gptProfile,
+            qwenProfile: qwenProfile,
+            activeProviderKind: .qwen3TTS
+        )
+        try save(originalLibrary, root: root)
+
+        let importedPaths = ManagedRemovalRecorder()
+        let referenceData = Self.pcmWAV(sampleRate: 32_000, frames: 3_200)
+        let referenceDigest = sha(referenceData)
+        let coordinator = DialogueVoiceCoordinator(
+            applicationSupportRoot: root,
+            qwenClient: Qwen3TTSClient(
+                helperExecutableURL: helperURL(root),
+                probeExecutableURL: helperURL(root)
+            ) { _ in },
+            voxSnapshotInstall: { _, supportRoot, token in
+                let paths = try VoxCPM2SnapshotInstaller.managedRelativePaths(
+                    destinationToken: token
+                )
+                for path in [paths.destination, paths.staging] {
+                    _ = importedPaths.record(path)
+                    let payload = supportRoot.appendingPathComponent(path, isDirectory: true)
+                        .appendingPathComponent("payload.bin")
+                    try FileManager.default.createDirectory(
+                        at: payload.deletingLastPathComponent(),
+                        withIntermediateDirectories: true
+                    )
+                    try Data("private-snapshot".utf8).write(to: payload)
+                }
+                return VoxCPM2ImportedSnapshot(
+                    snapshotRootRelativePath: paths.destination,
+                    treeSHA256: String(repeating: "a", count: 64)
+                )
+            },
+            voxReferenceInstall: { sourceURL, supportRoot, token in
+                let paths = try DialogueVoiceAssetInstaller.managedRelativePaths(
+                    kind: .voxcpm2ReferenceAudio,
+                    destinationToken: token,
+                    fileExtension: sourceURL.pathExtension.lowercased()
+                )
+                for path in [paths.destination, paths.staging] {
+                    _ = importedPaths.record(path)
+                    let destination = supportRoot.appendingPathComponent(path)
+                    try FileManager.default.createDirectory(
+                        at: destination.deletingLastPathComponent(),
+                        withIntermediateDirectories: true
+                    )
+                    try referenceData.write(to: destination)
+                }
+                return DialogueVoiceInstalledAsset(
+                    relativePath: paths.destination,
+                    contentDigest: referenceDigest
+                )
+            }
+        )
+        defer { coordinator.shutdown() }
+        coordinator.start()
+        try await waitUntil(timeout: 5) {
+            coordinator.library.profileStatus == .ready
+        }
+
+        coordinator.configureVoxCPM2Profile(
+            snapshotURL: root.appendingPathComponent("unused-vox-source", isDirectory: true),
+            referenceAudioURL: root.appendingPathComponent("unused-reference.wav"),
+            referenceText: "参照音声です。",
+            pythonExecutableURL: root.appendingPathComponent("missing-python")
+        )
+
+        try await waitUntil(timeout: 5) {
+            coordinator.activityMessage?.contains("VoxCPM2 Python runtime") == true
+                && coordinator.library.pendingCleanupPaths.isEmpty
+        }
+        let message = try XCTUnwrap(coordinator.activityMessage)
+        XCTAssertFalse(message.localizedCaseInsensitiveContains("GPT"))
+        XCTAssertFalse(message.localizedCaseInsensitiveContains("HTTPS"))
+        XCTAssertFalse(message.localizedCaseInsensitiveContains("certificate"))
+        XCTAssertEqual(coordinator.library.profile, gptProfile)
+        XCTAssertEqual(coordinator.library.qwenProfile, qwenProfile)
+        XCTAssertEqual(coordinator.library.activeProviderKind, .qwen3TTS)
+        XCTAssertNil(coordinator.library.voxcpm2Profile)
+
+        let persisted = try DialogueVoiceStore(
+            rootURL: root.appendingPathComponent("voice", isDirectory: true)
+        ).load()
+        XCTAssertEqual(persisted.profile, gptProfile)
+        XCTAssertEqual(persisted.qwenProfile, qwenProfile)
+        XCTAssertEqual(persisted.activeProviderKind, .qwen3TTS)
+        XCTAssertNil(persisted.voxcpm2Profile)
+        XCTAssertTrue(persisted.pendingCleanupPaths.isEmpty)
+
+        let managedPaths = importedPaths.recordedPaths
+        XCTAssertEqual(managedPaths.count, 4)
+        XCTAssertTrue(managedPaths.contains { $0.contains(".partial") })
+        for path in managedPaths {
+            XCTAssertFalse(FileManager.default.fileExists(
+                atPath: root.appendingPathComponent(path).path
+            ))
+        }
+    }
+
+    @MainActor
     func testFailedVoxSetupPersistsCleanupOwnershipUntilRetrySucceeds() async throws {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1086,8 +1333,56 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
         )
 
         XCTAssertTrue(coordinator.library.pendingCleanupPaths.isEmpty)
+        XCTAssertEqual(
+            coordinator.activityMessage,
+            "The VoxCPM2 reference audio must be a WAV file."
+        )
         XCTAssertNoThrow(try coordinator.addLine(text: "保存できます。", language: "japanese"))
         XCTAssertEqual(coordinator.library.lines.count, 1)
+    }
+
+    @MainActor
+    func testCommittedVoxProfileSaveFailurePreservesAssetsAndBlocksFurtherEdits() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try makeVoxProfile(root: root)
+        let reference = root.appendingPathComponent("fixtures/import-reference.wav")
+        try Self.pcmWAV(sampleRate: 32_000, frames: 3_200).write(to: reference)
+        let coordinator = DialogueVoiceCoordinator(
+            applicationSupportRoot: root,
+            voxProfileSave: { library, store in
+                // Model a successful atomic replacement followed by failed
+                // directory fsync: readback succeeds but durability is unknown.
+                try store.save(library)
+                throw DialogueVoiceError.storeFailure
+            }
+        )
+        defer { coordinator.shutdown() }
+        coordinator.start()
+        coordinator.configureVoxCPM2Profile(
+            snapshotURL: fixture.sourceSnapshotURL,
+            referenceAudioURL: reference,
+            referenceText: "保存後の確認です。",
+            pythonExecutableURL: try authenticatedPythonExecutable()
+        )
+        try await waitUntil(timeout: 5) {
+            coordinator.activityMessage?.contains("storage durability") == true
+        }
+
+        let store = DialogueVoiceStore(rootURL: root.appendingPathComponent("voice"))
+        let committed = try store.load()
+        let profile = try XCTUnwrap(committed.voxcpm2Profile)
+        XCTAssertEqual(coordinator.library, committed)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(profile.snapshotPath).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(profile.referenceAudioRelativePath).path))
+        XCTAssertFalse(committed.pendingCleanupPaths.contains(profile.snapshotPath))
+        XCTAssertFalse(committed.pendingCleanupPaths.contains(profile.referenceAudioRelativePath))
+
+        XCTAssertThrowsError(try coordinator.addLine(text: "保存してはいけません。", language: "japanese")) { error in
+            XCTAssertEqual(error as? DialogueVoiceError, .storeFailure)
+        }
+        XCTAssertEqual(coordinator.library, committed)
+        XCTAssertEqual(try store.load(), committed)
     }
 
     @MainActor

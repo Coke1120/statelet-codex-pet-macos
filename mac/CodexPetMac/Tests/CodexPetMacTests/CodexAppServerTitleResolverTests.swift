@@ -30,6 +30,10 @@ private actor AsyncGate {
 }
 
 final class CodexAppServerTitleResolverTests: XCTestCase {
+    // Functional fixtures include external Python startup and scheduling; explicit
+    // timeout and cancellation tests retain their own deadline budgets.
+    private static let protocolFixtureTimeout: TimeInterval = 5
+
     func testSanitizerNormalizesCollapsesAndBoundsTitles() {
         XCTAssertEqual(CodexAppServerTitleResolver.sanitize("  Cafe\u{301}\n\twork\u{200B}  "), "Café work")
         XCTAssertEqual(CodexAppServerTitleResolver.sanitize("A\u{200B}\u{030A}"), "Å")
@@ -424,7 +428,7 @@ final class CodexAppServerTitleResolverTests: XCTestCase {
         let result = try await CodexAppServerProcessRunner.run(
             executable: script,
             threadIDs: ["thread-1"],
-            timeout: 1.5,
+            timeout: Self.protocolFixtureTimeout,
             maximumOutputBytes: 1_048_576,
             trustPolicy: .testOnlyAllowUnsignedExecutable
         )
@@ -456,7 +460,7 @@ final class CodexAppServerTitleResolverTests: XCTestCase {
             _ = try await CodexAppServerProcessRunner.run(
                 executable: executable,
                 threadIDs: ["private-thread-id"],
-                timeout: 1,
+                timeout: Self.protocolFixtureTimeout,
                 maximumOutputBytes: 1024,
                 trustPolicy: .testOnlyAllowUnsignedExecutable,
                 prelaunchHook: { resolvedExecutable in
@@ -493,7 +497,7 @@ final class CodexAppServerTitleResolverTests: XCTestCase {
         let result = try await CodexAppServerProcessRunner.run(
             executable: script,
             threadIDs: ["thread-1"],
-            timeout: 1.5,
+            timeout: Self.protocolFixtureTimeout,
             maximumOutputBytes: 1_048_576,
             trustPolicy: .testOnlyAllowUnsignedExecutable
         )
@@ -510,7 +514,7 @@ final class CodexAppServerTitleResolverTests: XCTestCase {
         let result = try await CodexAppServerProcessRunner.run(
             executable: script,
             threadIDs: ["thread-1"],
-            timeout: 1.5,
+            timeout: Self.protocolFixtureTimeout,
             maximumOutputBytes: 1_048_576,
             trustPolicy: .testOnlyAllowUnsignedExecutable
         )
@@ -529,7 +533,7 @@ final class CodexAppServerTitleResolverTests: XCTestCase {
         let result = try await CodexAppServerProcessRunner.run(
             executable: script,
             threadIDs: ["stale-thread", "loaded-thread"],
-            timeout: 1.5,
+            timeout: Self.protocolFixtureTimeout,
             maximumOutputBytes: 1_048_576,
             trustPolicy: .testOnlyAllowUnsignedExecutable
         )
@@ -561,7 +565,7 @@ final class CodexAppServerTitleResolverTests: XCTestCase {
                 _ = try await CodexAppServerProcessRunner.run(
                     executable: script,
                     threadIDs: ["expected"],
-                    timeout: 1,
+                    timeout: Self.protocolFixtureTimeout,
                     maximumOutputBytes: 1_048_576,
                     trustPolicy: .testOnlyAllowUnsignedExecutable
                 )
@@ -580,7 +584,7 @@ final class CodexAppServerTitleResolverTests: XCTestCase {
             _ = try await CodexAppServerProcessRunner.run(
                 executable: script,
                 threadIDs: ["thread-1"],
-                timeout: 1,
+                timeout: Self.protocolFixtureTimeout,
                 maximumOutputBytes: 1_048_576,
                 trustPolicy: .testOnlyAllowUnsignedExecutable
             )
@@ -598,7 +602,7 @@ final class CodexAppServerTitleResolverTests: XCTestCase {
                 _ = try await CodexAppServerProcessRunner.run(
                     executable: script,
                     threadIDs: ["thread-1"],
-                    timeout: 1,
+                    timeout: Self.protocolFixtureTimeout,
                     maximumOutputBytes: 1_048_576,
                     trustPolicy: .testOnlyAllowUnsignedExecutable
                 )
@@ -618,7 +622,7 @@ final class CodexAppServerTitleResolverTests: XCTestCase {
             _ = try await CodexAppServerProcessRunner.run(
                 executable: script,
                 threadIDs: ["thread-1"],
-                timeout: 1,
+                timeout: Self.protocolFixtureTimeout,
                 maximumOutputBytes: 1_048_576,
                 trustPolicy: .testOnlyAllowUnsignedExecutable
             )
@@ -633,17 +637,17 @@ final class CodexAppServerTitleResolverTests: XCTestCase {
         print(json.dumps({'id':2,'result':{'thread':{'id':'wrong','name':'No'}}}),flush=True)
         """)
         await XCTAssertThrowsAsync(.protocolViolation) {
-            _ = try await CodexAppServerProcessRunner.run(executable: mismatched, threadIDs: ["expected"], timeout: 1, maximumOutputBytes: 1_048_576, trustPolicy: .testOnlyAllowUnsignedExecutable)
+            _ = try await CodexAppServerProcessRunner.run(executable: mismatched, threadIDs: ["expected"], timeout: Self.protocolFixtureTimeout, maximumOutputBytes: 1_048_576, trustPolicy: .testOnlyAllowUnsignedExecutable)
         }
 
         let malformed = try makePythonExecutable("import sys; print('{bad json',flush=True); sys.stdin.read()")
         await XCTAssertThrowsAsync(.protocolViolation) {
-            _ = try await CodexAppServerProcessRunner.run(executable: malformed, threadIDs: ["x"], timeout: 1, maximumOutputBytes: 1_048_576, trustPolicy: .testOnlyAllowUnsignedExecutable)
+            _ = try await CodexAppServerProcessRunner.run(executable: malformed, threadIDs: ["x"], timeout: Self.protocolFixtureTimeout, maximumOutputBytes: 1_048_576, trustPolicy: .testOnlyAllowUnsignedExecutable)
         }
 
         let oversized = try makePythonExecutable("import sys; sys.stdout.write('x'*2048); sys.stdout.flush(); sys.stdin.read()")
         await XCTAssertThrowsAsync(.protocolViolation) {
-            _ = try await CodexAppServerProcessRunner.run(executable: oversized, threadIDs: ["x"], timeout: 1, maximumOutputBytes: 1024, trustPolicy: .testOnlyAllowUnsignedExecutable)
+            _ = try await CodexAppServerProcessRunner.run(executable: oversized, threadIDs: ["x"], timeout: Self.protocolFixtureTimeout, maximumOutputBytes: 1024, trustPolicy: .testOnlyAllowUnsignedExecutable)
         }
     }
 
@@ -659,7 +663,7 @@ final class CodexAppServerTitleResolverTests: XCTestCase {
         let result = try await CodexAppServerProcessRunner.run(
             executable: script,
             threadIDs: ["x"],
-            timeout: 5,
+            timeout: Self.protocolFixtureTimeout,
             maximumOutputBytes: 1_048_576,
             trustPolicy: .testOnlyAllowUnsignedExecutable
         )
@@ -702,6 +706,66 @@ final class CodexAppServerTitleResolverTests: XCTestCase {
             XCTFail("unexpected error: \(type(of: error))")
         }
         assertProcessDoesNotExist(cancellationPID)
+    }
+
+    func testTimeoutReturnsWhenDescendantRetainsOutputStreams() async throws {
+        let fixture = try makeRetainedOutputFixture()
+        let started = ProcessInfo.processInfo.systemUptime
+        await XCTAssertThrowsAsync(.timeout) {
+            _ = try await CodexAppServerProcessRunner.run(
+                executable: fixture.script, threadIDs: ["x"], timeout: 2,
+                maximumOutputBytes: 1024, trustPolicy: .testOnlyAllowUnsignedExecutable
+            )
+        }
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - started, 4)
+        assertProcessDoesNotExist(try await waitForPID(fixture.parentPID))
+        let descendant = try await waitForPID(fixture.childPID)
+        XCTAssertEqual(Darwin.kill(descendant, 0), 0, "fixture must keep output open past cleanup")
+    }
+
+    func testCancellationReturnsWhenDescendantRetainsOutputStreams() async throws {
+        let fixture = try makeRetainedOutputFixture()
+        let task = Task {
+            try await CodexAppServerProcessRunner.run(
+                executable: fixture.script, threadIDs: ["x"], timeout: 5,
+                maximumOutputBytes: 1024, trustPolicy: .testOnlyAllowUnsignedExecutable
+            )
+        }
+        let parent = try await waitForPID(fixture.parentPID)
+        let descendant = try await waitForPID(fixture.childPID)
+        let started = ProcessInfo.processInfo.systemUptime
+        task.cancel()
+        await XCTAssertThrowsAsync(.cancelled) { _ = try await task.value }
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - started, 2)
+        assertProcessDoesNotExist(parent)
+        XCTAssertEqual(Darwin.kill(descendant, 0), 0, "fixture must keep output open past cleanup")
+    }
+
+    private func makeRetainedOutputFixture() throws -> (script: URL, parentPID: URL, childPID: URL) {
+        let directory = try temporaryDirectory()
+        let parentPID = directory.appendingPathComponent("parent-pid")
+        let childPID = directory.appendingPathComponent("child-pid")
+        // This child deliberately leaves the server's process group. Its open
+        // stdout/stderr reproduce a reader blocked after the leader is reaped.
+        let script = try makePythonExecutable("""
+        import os,time
+        child = os.fork()
+        if child == 0:
+            os.setsid()
+            with open(\(pythonLiteral(childPID.path)),'w') as marker:
+                marker.write(str(os.getpid()))
+            while True: time.sleep(0.05)
+        with open(\(pythonLiteral(parentPID.path)),'w') as marker:
+            marker.write(str(os.getpid()))
+        while True: time.sleep(0.05)
+        """, directory: directory)
+        addTeardownBlock {
+            if let text = try? String(contentsOf: childPID),
+               let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 0 {
+                _ = Darwin.kill(pid, SIGKILL)
+            }
+        }
+        return (script, parentPID, childPID)
     }
 
     func testResolverShutdownWaitsForActiveRunnerToReapChildAndRejectsFutureWork() async throws {

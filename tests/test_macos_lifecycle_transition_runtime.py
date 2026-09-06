@@ -536,13 +536,13 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         end = self.app.index("private func recordPublicationRejection", start)
         source = self.app[start:end]
         observed = source.index("lastPublishedSnapshot = state")
-        ordering = source.index("StatePublicationOrderPolicy.decide(")
-        accepted = source.index("lastAcceptedPublishedSnapshot = state")
-        self.assertLess(observed, ordering)
-        self.assertLess(ordering, accepted)
+        evaluation = source.index("LifecyclePublicationPolicy.evaluate(")
+        accepted = source.index("lastAcceptedPublishedSnapshot = update.acceptedSnapshot")
+        self.assertLess(observed, evaluation)
+        self.assertLess(evaluation, accepted)
         self.assertIn("lastAccepted: lastAcceptedPublishedSnapshot", source)
-        self.assertIn("guard ordering.shouldAccept else", source)
-        self.assertIn('recordPublicationRejection(ordering.rejectionReason ?? "order_rejected")', source)
+        self.assertIn("case let .rejectOrder(ordering, acceptedFreshness):", source)
+        self.assertIn("recordPublicationRejection(ordering.rawValue)", source)
 
     def test_transient_missing_or_corrupt_reads_preserve_accepted_revision_barrier(self):
         start = self.app.index("private func applyLifecycleStateReadResult(")
@@ -557,24 +557,26 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         start = self.app.index("private func applyLifecycleState(_ state:")
         end = self.app.index("private func recordPublicationRejection", start)
         source = self.app[start:end]
-        accepted = source.index("lastAcceptedPublishedSnapshot = state")
+        accepted = source.index("lastAcceptedPublishedSnapshot = update.acceptedSnapshot")
         playback = source.index("apply(state: state.state)", accepted)
         self.assertLess(accepted, playback)
         self.assertNotIn("forceRefresh: true", source[accepted:playback + 32])
         self.assertIn("previousLifecycleState == incomingState", self.app)
         self.assertIn("? .sameStateHeartbeat", self.app)
 
-    def test_duplicate_publication_recovers_only_while_snapshot_is_fresh(self):
+    def test_publication_effects_apply_core_recovery_and_expiry_decisions(self):
         start = self.app.index("private func applyLifecycleState(_ state:")
         end = self.app.index("private func recordPublicationRejection", start)
         source = self.app[start:end]
-        freshness = source.index("let freshness = freshnessPolicy.freshness(")
-        duplicate = source.index("ordering == .rejectEqualRevisionDuplicate", freshness)
-        fresh_gate = source.index("freshness == .fresh", duplicate)
-        reject = source.index("rejectPublisher(freshness == .futureSkew ? .futureSkew : .stale)")
-        self.assertLess(freshness, duplicate)
-        self.assertLess(duplicate, fresh_gate)
-        self.assertLess(fresh_gate, reject)
+        self.assertIn("publisherIsLive: publisherHealth == .live", source)
+        self.assertIn("temporaryPreview: temporaryStatePreviewPolicy", source)
+        self.assertIn("temporaryStatePreviewPolicy = update.temporaryPreview", source)
+        self.assertIn("case .accept, .recover:", source)
+        self.assertIn("if let previousPreview = update.relinquishedPreview", source)
+        self.assertIn("case let .rejectFreshness(freshness):", source)
+        self.assertIn("rejectPublisher(freshness == .futureSkew ? .futureSkew : .stale)", source)
+        self.assertIn("if acceptedFreshness != .fresh", source)
+        self.assertIn("rejectPublisher(acceptedFreshness == .futureSkew ? .futureSkew : .stale)", source)
 
     def test_return_to_live_presents_current_accepted_real_state(self):
         start = self.app.index("private func stopTemporaryStatePreview(")

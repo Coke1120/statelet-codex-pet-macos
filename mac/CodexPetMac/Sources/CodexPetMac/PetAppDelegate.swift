@@ -860,6 +860,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         player.view.onAdvanceClip = { [weak self] in
             self?.advanceCurrentClip(reason: "pet_button")
         }
+        player.view.onOpenAnimationSettings = { [weak self] state in
+            guard let self, !self.isTerminating else { return }
+            self.showSettings()
+            self.settingsController?.showAnimations(for: state)
+        }
         player.view.onPetClick = { [weak self] in
             self?.advanceCurrentClip(reason: "pet_click")
         }
@@ -1942,63 +1947,24 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
 
     private func applyLifecycleState(_ state: CurrentState) {
         lastPublishedSnapshot = state
-        let ordering = StatePublicationOrderPolicy.decide(
+        let update = LifecyclePublicationPolicy.evaluate(
             lastAccepted: lastAcceptedPublishedSnapshot,
-            incoming: state
+            incoming: state,
+            now: Date().timeIntervalSince1970,
+            publisherIsLive: publisherHealth == .live,
+            currentState: currentState,
+            temporaryPreview: temporaryStatePreviewPolicy,
+            freshnessPolicy: freshnessPolicy
         )
-        guard ordering.shouldAccept else {
-            let freshness = freshnessPolicy.freshness(
-                of: state,
-                now: Date().timeIntervalSince1970
-            )
-            // A health read of the same immutable snapshot is normally a
-            // no-op. If the path disappeared or was malformed in between,
-            // however, the identical snapshot is authoritative recovery and
-            // must restore live presentation without consuming a new cursor.
-            if ordering == .rejectEqualRevisionDuplicate
-                || ordering == .rejectLegacyTimestampDuplicate,
-               freshness == .fresh {
-                lastPublicationRejectionReason = nil
-                if publisherHealth != .live || currentState != state.state {
-                    let previousPreview = temporaryStatePreviewPolicy.previewState
-                    let outcome = temporaryStatePreviewPolicy.receiveLifecycleState(state.state)
-                    if previousPreview != nil,
-                       case .presentingLifecycle = outcome {
-                        relinquishTemporaryStatePreview(
-                            previousPreview: previousPreview,
-                            reason: "publisher_recovered"
-                        )
-                    }
-                    setPublisherHealth(.live)
-                    apply(state: state.state)
-                } else {
-                    updateStatusMenu()
-                    refreshSettings()
-                }
-            } else if ![
-                StatePublicationOrderDecision.rejectEqualRevisionDuplicate,
-                .rejectLegacyTimestampDuplicate,
-            ].contains(ordering) {
-                recordPublicationRejection(ordering.rejectionReason ?? "order_rejected")
-                updateStatusMenu()
-                refreshSettings()
-            } else {
-                lastPublicationRejectionReason = freshness.rawValue
-                rejectPublisher(freshness == .futureSkew ? .futureSkew : .stale)
-            }
-            return
-        }
-        switch freshnessPolicy.freshness(of: state, now: Date().timeIntervalSince1970) {
-        case .fresh:
-            lastAcceptedPublishedSnapshot = state
+        lastAcceptedPublishedSnapshot = update.acceptedSnapshot
+        temporaryStatePreviewPolicy = update.temporaryPreview
+        switch update.action {
+        case .accept, .recover:
             lastPublicationRejectionReason = nil
-            let previousPreview = temporaryStatePreviewPolicy.previewState
-            let outcome = temporaryStatePreviewPolicy.receiveLifecycleState(state.state)
-            if previousPreview != nil,
-               case .presentingLifecycle = outcome {
+            if let previousPreview = update.relinquishedPreview {
                 relinquishTemporaryStatePreview(
                     previousPreview: previousPreview,
-                    reason: "lifecycle_changed"
+                    reason: update.action == .recover ? "publisher_recovered" : "lifecycle_changed"
                 )
             }
             setPublisherHealth(.live)
@@ -2007,12 +1973,20 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             // diagnostics/settings should expose the repair immediately.
             updateStatusMenu()
             refreshSettings()
-        case .stale:
-            lastPublicationRejectionReason = PublisherHealth.stale.rawValue
-            rejectPublisher(.stale)
-        case .futureSkew:
-            lastPublicationRejectionReason = PublisherHealth.futureSkew.rawValue
-            rejectPublisher(.futureSkew)
+        case .unchanged:
+            lastPublicationRejectionReason = nil
+            updateStatusMenu()
+            refreshSettings()
+        case let .rejectOrder(ordering, acceptedFreshness):
+            recordPublicationRejection(ordering.rawValue)
+            if acceptedFreshness != .fresh {
+                rejectPublisher(acceptedFreshness == .futureSkew ? .futureSkew : .stale)
+            }
+            updateStatusMenu()
+            refreshSettings()
+        case let .rejectFreshness(freshness):
+            lastPublicationRejectionReason = freshness.rawValue
+            rejectPublisher(freshness == .futureSkew ? .futureSkew : .stale)
         }
     }
 

@@ -612,6 +612,16 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         XCTAssertEqual(body["text_language"] as? String, "japanese")
         XCTAssertEqual(body["reference_language"] as? String, "japanese")
         XCTAssertTrue(invocation.deniesNetwork)
+        XCTAssertEqual(invocation.timeout, 120)
+    }
+
+    func testProcessRunnerTimeoutClampAllowsBoundedVoxWorkloads() {
+        XCTAssertEqual(Qwen3TTSProcessRunner.boundedTimeout(-1), 0.05)
+        XCTAssertEqual(Qwen3TTSProcessRunner.boundedTimeout(120), 120)
+        XCTAssertEqual(Qwen3TTSProcessRunner.boundedTimeout(300), 300)
+        XCTAssertEqual(Qwen3TTSProcessRunner.boundedTimeout(600), 600)
+        XCTAssertEqual(Qwen3TTSProcessRunner.boundedTimeout(1_200), 600)
+        XCTAssertEqual(Qwen3TTSProcessRunner.maximumInvocationTimeout, 600)
     }
 
     func testNetworkDeniedProcessInvocationUsesOSNetworkSandbox() throws {
@@ -886,6 +896,24 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         }
     }
 
+    func testQwenRuntimeProbeKeepsShortProviderSpecificTimeout() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-runtime-timeout-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try makeQwenFixture(root: root)
+        let captured = LockedQwenInvocation()
+        let client = Qwen3TTSClient(
+            helperExecutableURL: fixture.helper,
+            probeExecutableURL: fixture.helper
+        ) { invocation in
+            captured.set(invocation)
+        }
+
+        try await client.validateProfile(fixture.profile, applicationSupportRoot: root)
+
+        XCTAssertEqual(try XCTUnwrap(captured.value).timeout, 15)
+    }
+
     func testQwenProcessRunnerCompletesContainedSilentProbeAfterStdinHandshake() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("qwen-fast-probe-\(UUID())", isDirectory: true)
@@ -1053,6 +1081,146 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         XCTAssertTrue(waitForProcessExit(publishedParent), "cancelled child remained alive or unreaped")
     }
 
+    func testQwenProcessRunnerAllowsShortLivedDescendantToDrainAfterSuccessfulLeaderExit() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-draining-probe-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let probe = root.appendingPathComponent("probe.py")
+        let output = root.appendingPathComponent("result.bin")
+        let childPID = root.appendingPathComponent("child.pid")
+        try Data(
+            "import os, time\n"
+                .appending("child = os.fork()\n")
+                .appending("if child == 0:\n")
+                .appending(" open('child.pid','w').write(str(os.getpid()))\n")
+                .appending(" time.sleep(0.12)\n")
+                .appending(" os._exit(0)\n")
+                .appending("deadline = time.time() + 2\n")
+                .appending("while not os.path.exists('child.pid') and time.time() < deadline: time.sleep(0.01)\n")
+                .appending("open('result.bin','wb').write(b'valid-output')\n")
+                .utf8
+        ).write(to: probe)
+
+        let python = try authenticatedPythonExecutable()
+        try await Qwen3TTSProcessRunner().run(Qwen3TTSProcessInvocation(
+            executableURL: python,
+            expectedRuntimeIdentity: try Qwen3TTSProfileValidator.validatePythonExecutable(
+                at: python
+            ),
+            helperURL: probe,
+            currentDirectoryURL: root,
+            environment: ["PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"],
+            standardInput: Data(), outputURL: output,
+            timeout: 5
+        ))
+
+        XCTAssertEqual(try Data(contentsOf: output), Data("valid-output".utf8))
+        let publishedChild = try XCTUnwrap(readPublishedPID(childPID))
+        XCTAssertTrue(waitForProcessExit(publishedChild), "short-lived descendant was not reaped")
+    }
+
+    func testQwenProcessRunnerCancellationDuringNaturalDrainStaysCancelledAndReapsDescendant() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-cancelled-drain-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let probe = root.appendingPathComponent("probe.py")
+        let parentPID = root.appendingPathComponent("parent.pid")
+        let childPID = root.appendingPathComponent("child.pid")
+        try Data(
+            "import os, signal, time\n"
+                .appending("open('parent.pid','w').write(str(os.getpid()))\n")
+                .appending("child = os.fork()\n")
+                .appending("if child == 0:\n")
+                .appending(" signal.signal(signal.SIGTERM, signal.SIG_IGN)\n")
+                .appending(" open('child.pid','w').write(str(os.getpid()))\n")
+                .appending(" while True: time.sleep(1)\n")
+                .appending("deadline = time.time() + 2\n")
+                .appending("while not os.path.exists('child.pid') and time.time() < deadline: time.sleep(0.01)\n")
+                .utf8
+        ).write(to: probe)
+
+        let python = try authenticatedPythonExecutable()
+        let invocation = Qwen3TTSProcessInvocation(
+            executableURL: python,
+            expectedRuntimeIdentity: try Qwen3TTSProfileValidator.validatePythonExecutable(
+                at: python
+            ),
+            helperURL: probe,
+            currentDirectoryURL: root,
+            environment: ["PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"],
+            standardInput: Data(), outputURL: root.appendingPathComponent("unused"),
+            timeout: 5, requiresOutputFile: false
+        )
+        let task = Task { try await Qwen3TTSProcessRunner().run(invocation) }
+        let publicationDeadline = Date().addingTimeInterval(2)
+        while (readPublishedPID(parentPID) == nil || readPublishedPID(childPID) == nil),
+              Date() < publicationDeadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let publishedParent = try XCTUnwrap(readPublishedPID(parentPID))
+        let publishedChild = try XCTUnwrap(readPublishedPID(childPID))
+        XCTAssertTrue(waitForProcessExit(publishedParent), "successful leader remained alive")
+        try await Task.sleep(nanoseconds: 100_000_000)
+        task.cancel()
+        do {
+            try await task.value
+            XCTFail("Cancellation during descendant drain completed successfully")
+        } catch let error as DialogueVoiceRuntimeError {
+            XCTAssertEqual(error, .cancelled)
+        }
+        XCTAssertTrue(waitForProcessExit(publishedChild), "cancelled descendant escaped cleanup")
+    }
+
+    func testQwenProcessRunnerDoesNotGraceDescendantAfterFailedLeaderExit() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-failed-leader-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let probe = root.appendingPathComponent("probe.py")
+        let childPID = root.appendingPathComponent("child.pid")
+        let termMarker = root.appendingPathComponent("term.received")
+        try Data(
+            "import os, signal, time\n"
+                .appending("child = os.fork()\n")
+                .appending("if child == 0:\n")
+                .appending(" def handle_term(_signal, _frame):\n")
+                .appending("  open('term.received','w').write('1')\n")
+                .appending("  os._exit(0)\n")
+                .appending(" signal.signal(signal.SIGTERM, handle_term)\n")
+                .appending(" open('child.pid','w').write(str(os.getpid()))\n")
+                .appending(" time.sleep(0.12)\n")
+                .appending(" os._exit(0)\n")
+                .appending("deadline = time.time() + 2\n")
+                .appending("while not os.path.exists('child.pid') and time.time() < deadline: time.sleep(0.01)\n")
+                .appending("raise SystemExit(7)\n")
+                .utf8
+        ).write(to: probe)
+
+        do {
+            let python = try authenticatedPythonExecutable()
+            try await Qwen3TTSProcessRunner().run(Qwen3TTSProcessInvocation(
+                executableURL: python,
+                expectedRuntimeIdentity: try Qwen3TTSProfileValidator.validatePythonExecutable(
+                    at: python
+                ),
+                helperURL: probe,
+                currentDirectoryURL: root,
+                environment: ["PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"],
+                standardInput: Data(), outputURL: root.appendingPathComponent("unused"),
+                timeout: 5, requiresOutputFile: false
+            ))
+            XCTFail("A failed leader completed successfully")
+        } catch let error as DialogueVoiceRuntimeError {
+            XCTAssertEqual(error, .inferenceUnavailable)
+        }
+
+        let publishedChild = try XCTUnwrap(readPublishedPID(childPID))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: termMarker.path))
+        XCTAssertTrue(waitForProcessExit(publishedChild), "failed leader descendant escaped cleanup")
+    }
+
     func testQwenProcessRunnerKillsDescendantAfterSuccessfulLeaderExit() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("qwen-orphan-probe-\(UUID())", isDirectory: true)
@@ -1142,6 +1310,111 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         let venv = try Qwen3TTSProfileValidator.validatePythonExecutable(at: launcher)
         XCTAssertEqual(venv.invocationPath, launcher.path)
         XCTAssertEqual(venv.finalTargetSHA256, regular.finalTargetSHA256)
+    }
+
+    func testQwenPythonRuntimeIdentityAcceptsAuthenticatedIntermediateDirectoryAlias() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let environment = root.appendingPathComponent("environment", isDirectory: true)
+        let bin = environment.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+
+        let executable = try authenticatedPythonExecutable()
+        let base = try authenticatedPythonBaseRoot()
+        let baseAlias = root.appendingPathComponent("python-base-alias", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: baseAlias, withDestinationURL: base)
+        let aliasedExecutable = baseAlias
+            .appendingPathComponent("bin", isDirectory: true)
+            .appendingPathComponent(executable.lastPathComponent)
+        let launcher = bin.appendingPathComponent("python")
+        XCTAssertEqual(symlink(aliasedExecutable.path, launcher.path), 0)
+        try Data(
+            "home = \(base.appendingPathComponent("bin").path)\n"
+                .appending("include-system-site-packages = false\n")
+                .appending("executable = \(executable.path)\n")
+                .utf8
+        ).write(to: environment.appendingPathComponent("pyvenv.cfg"))
+
+        let regular = try Qwen3TTSProfileValidator.validatePythonExecutable(at: executable)
+        let directAlias = try Qwen3TTSProfileValidator.validatePythonExecutable(
+            at: aliasedExecutable
+        )
+        let aliased = try Qwen3TTSProfileValidator.validatePythonExecutable(at: launcher)
+        XCTAssertEqual(directAlias.invocationPath, aliasedExecutable.path)
+        XCTAssertEqual(directAlias.finalTargetSHA256, regular.finalTargetSHA256)
+        XCTAssertEqual(aliased.invocationPath, launcher.path)
+        XCTAssertEqual(aliased.finalTargetSHA256, regular.finalTargetSHA256)
+    }
+
+    func testQwenPythonRuntimeIdentityIgnoresUnrelatedUnsafePyvenvHomeSibling() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-pyvenv-scope-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let environment = root.appendingPathComponent("environment", isDirectory: true)
+        let bin = environment.appendingPathComponent("bin", isDirectory: true)
+        let coarseHome = root.appendingPathComponent("coarse-home", isDirectory: true)
+        let homeBin = coarseHome.appendingPathComponent("bin", isDirectory: true)
+        let unrelated = coarseHome.appendingPathComponent("unrelated-tool", isDirectory: true)
+        for directory in [bin, homeBin, unrelated] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        let executable = try authenticatedPythonExecutable()
+        let launcher = try makeAuthenticatedPythonSymlink(at: bin.appendingPathComponent("python"))
+        try Data(
+            "home = \(homeBin.path)\n"
+                .appending("include-system-site-packages = false\n")
+                .appending("executable = \(executable.path)\n")
+                .utf8
+        ).write(to: environment.appendingPathComponent("pyvenv.cfg"))
+
+        XCTAssertEqual(chmod(unrelated.path, 0o770), 0)
+        XCTAssertNoThrow(try Qwen3TTSProfileValidator.validatePythonExecutable(at: launcher))
+    }
+
+    func testQwenPythonRuntimeIdentityAcceptsCopiedPyvenvExecutable() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-pyvenv-copy-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let environment = root.appendingPathComponent("environment", isDirectory: true)
+        let bin = environment.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        let executable = try authenticatedPythonExecutable()
+        let launcher = try makeAuthenticatedPythonSymlink(at: bin.appendingPathComponent("python"))
+        let copied = root.appendingPathComponent("python-metadata-copy")
+        try FileManager.default.copyItem(at: executable, to: copied)
+        XCTAssertEqual(chmod(copied.path, 0o700), 0)
+        let base = try authenticatedPythonBaseRoot()
+        try Data(
+            "home = \(base.appendingPathComponent("bin").path)\n"
+                .appending("include-system-site-packages = false\n")
+                .appending("executable = \(copied.path)\n")
+                .utf8
+        ).write(to: environment.appendingPathComponent("pyvenv.cfg"))
+
+        let regular = try Qwen3TTSProfileValidator.validatePythonExecutable(at: executable)
+        let copy = try Qwen3TTSProfileValidator.validatePythonExecutable(at: launcher)
+        XCTAssertEqual(copy.invocationPath, launcher.path)
+        XCTAssertEqual(copy.finalTargetSHA256, regular.finalTargetSHA256)
+
+        var changedCopy = try Data(contentsOf: copied)
+        changedCopy.append(Data("changed".utf8))
+        try changedCopy.write(to: copied)
+        assertQwenRuntimeUnavailable(at: launcher)
+    }
+
+    func testConfiguredExternalPythonRuntimeAuthority() throws {
+        guard let path = ProcessInfo.processInfo.environment[
+            "STATELET_TEST_EXTERNAL_PYTHON_RUNTIME"
+        ] else { return }
+        XCTAssertTrue(path.hasPrefix("/"))
+        let executable = URL(fileURLWithPath: path)
+        _ = try Qwen3TTSProfileValidator.validatePythonExecutable(at: executable)
+        _ = try Qwen3TTSProfileValidator.validatedRuntimeSearchPlan(
+            at: executable,
+            environment: ["PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"],
+            control: runtimeValidationControl(timeout: 120)
+        )
     }
 
     func testQwenPythonRuntimeIdentityRejectsCrossPrincipalWritableEnvironment() throws {
@@ -1320,11 +1593,20 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let environment = root.appendingPathComponent("environment", isDirectory: true)
         let bin = environment.appendingPathComponent("bin", isDirectory: true)
-        let library = environment.appendingPathComponent("lib", isDirectory: true)
+        let version = try authenticatedPythonVersion()
+        let sitePackages = environment.appendingPathComponent(
+            "lib/python\(version)/site-packages",
+            isDirectory: true
+        )
         try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: sitePackages, withIntermediateDirectories: true)
         let executable = try makeAuthenticatedPythonSymlink(at: bin.appendingPathComponent("python"))
-        let module = library.appendingPathComponent("runtime_module.py")
+        let base = try authenticatedPythonBaseRoot()
+        try Data(
+            "home = \(base.appendingPathComponent("bin").path)\n"
+                .appending("include-system-site-packages = false\n").utf8
+        ).write(to: environment.appendingPathComponent("pyvenv.cfg"))
+        let module = sitePackages.appendingPathComponent("runtime_module.py")
         try Data("trusted = True\n".utf8).write(to: module)
 
         try addEveryoneWriteACL(to: environment)
@@ -1334,8 +1616,13 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
 
         try addEveryoneWriteACL(to: module)
         assertQwenRuntimeUnavailable(at: executable)
+        assertQwenRuntimeSearchUnavailable(at: executable)
         try removeFirstACL(from: module)
-        XCTAssertNoThrow(try Qwen3TTSProfileValidator.validatePythonExecutable(at: executable))
+        XCTAssertNoThrow(try Qwen3TTSProfileValidator.validatedRuntimeSearchPlan(
+            at: executable,
+            environment: ["PATH": "/usr/bin:/bin"],
+            control: runtimeValidationControl(timeout: 5)
+        ))
     }
 
     func testQwenProcessRunnerRejectsChangedRuntimeBeforeExecutingHelper() async throws {
@@ -1412,7 +1699,11 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let environment = root.appendingPathComponent("environment", isDirectory: true)
         let bin = environment.appendingPathComponent("bin", isDirectory: true)
-        let scanRoot = environment.appendingPathComponent("scan", isDirectory: true)
+        let version = try authenticatedPythonVersion()
+        let scanRoot = environment.appendingPathComponent(
+            "lib/python\(version)/site-packages",
+            isDirectory: true
+        )
         try FileManager.default.createDirectory(at: scanRoot, withIntermediateDirectories: true)
         let python = try makeAuthenticatedPythonSymlink(at: bin.appendingPathComponent("python"))
         let base = try authenticatedPythonBaseRoot()
@@ -1500,19 +1791,77 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         assertQwenRuntimeUnavailable(at: firstLoop)
     }
 
-    func testQwenPythonRuntimeAuthorityRejectsCyclicEnvironmentSymlinks() throws {
+    func testQwenPythonRuntimeAuthorityRejectsCyclicImportRootSymlinks() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("qwen-authority-cycle-\(UUID())", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
+        let version = try authenticatedPythonVersion()
+        let sitePackages = root.appendingPathComponent(
+            "lib/python\(version)/site-packages",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: sitePackages,
+            withIntermediateDirectories: true
+        )
         let executable = try makeAuthenticatedPythonSymlink(
             at: root.appendingPathComponent("bin/python")
         )
-        let firstLoop = root.appendingPathComponent("runtime-loop-a")
-        let secondLoop = root.appendingPathComponent("runtime-loop-b")
+        let base = try authenticatedPythonBaseRoot()
+        try Data(
+            "home = \(base.appendingPathComponent("bin").path)\n"
+                .appending("include-system-site-packages = false\n").utf8
+        ).write(to: root.appendingPathComponent("pyvenv.cfg"))
+        let firstLoop = sitePackages.appendingPathComponent("runtime-loop-a")
+        let secondLoop = sitePackages.appendingPathComponent("runtime-loop-b")
         XCTAssertEqual(symlink(secondLoop.lastPathComponent, firstLoop.path), 0)
         XCTAssertEqual(symlink(firstLoop.lastPathComponent, secondLoop.path), 0)
 
         assertQwenRuntimeUnavailable(at: executable)
+        assertQwenRuntimeSearchUnavailable(at: executable)
+    }
+
+    func testQwenPythonRuntimeAuthorityTraversesChainedImportDirectorySymlinks() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-authority-alias-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let environment = root.appendingPathComponent("environment", isDirectory: true)
+        let version = try authenticatedPythonVersion()
+        let sitePackages = environment.appendingPathComponent(
+            "lib/python\(version)/site-packages",
+            isDirectory: true
+        )
+        let externalPackage = root.appendingPathComponent("external-package", isDirectory: true)
+        for directory in [sitePackages, externalPackage] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        let executable = try makeAuthenticatedPythonSymlink(
+            at: environment.appendingPathComponent("bin/python")
+        )
+        let base = try authenticatedPythonBaseRoot()
+        try Data(
+            "home = \(base.appendingPathComponent("bin").path)\n"
+                .appending("include-system-site-packages = false\n").utf8
+        ).write(to: environment.appendingPathComponent("pyvenv.cfg"))
+        let module = externalPackage.appendingPathComponent("__init__.py")
+        try Data("value = 1\n".utf8).write(to: module)
+        let externalAlias = root.appendingPathComponent("package-alias")
+        let importAlias = sitePackages.appendingPathComponent("linked_package")
+        XCTAssertEqual(symlink(externalPackage.path, externalAlias.path), 0)
+        XCTAssertEqual(symlink(externalAlias.path, importAlias.path), 0)
+
+        XCTAssertNoThrow(try Qwen3TTSProfileValidator.validatePythonExecutable(at: executable))
+        XCTAssertNoThrow(try Qwen3TTSProfileValidator.validatedRuntimeSearchPlan(
+            at: executable,
+            environment: ["PATH": "/usr/bin:/bin"],
+            control: runtimeValidationControl(timeout: 5)
+        ))
+
+        // The final package is importable through both aliases. Its module
+        // authority must be checked even though the first hop is another link.
+        XCTAssertEqual(chmod(module.path, 0o660), 0)
+        assertQwenRuntimeUnavailable(at: executable)
+        assertQwenRuntimeSearchUnavailable(at: executable)
     }
 
     func testQwenPythonRuntimeIdentityRejectsExtremeFat64SliceOffsetsWithoutCrash() throws {
@@ -3466,6 +3815,7 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         let capturedProbe = try XCTUnwrap(probeInvocation.value)
         XCTAssertEqual(capturedProbe.executableURL, fixture.python)
         XCTAssertTrue(capturedProbe.deniesNetwork)
+        XCTAssertEqual(capturedProbe.timeout, 300)
         let probeBody = try XCTUnwrap(
             JSONSerialization.jsonObject(with: capturedProbe.standardInput) as? [String: Any]
         )
@@ -3506,6 +3856,7 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             fixture.snapshot.appendingPathComponent("model", isDirectory: true).path
         )
         XCTAssertTrue(capturedSynthesis.deniesNetwork)
+        XCTAssertEqual(capturedSynthesis.timeout, 600)
     }
 
     func testVoxCPM2ProbeRejectsMalformedSchemaAndSampleRate() async throws {

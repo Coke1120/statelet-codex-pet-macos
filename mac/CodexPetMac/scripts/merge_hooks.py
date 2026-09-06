@@ -55,6 +55,7 @@ LEGACY_TREE_DIGEST_ALGORITHM = "statelet-unframed-v1"
 TREE_DIGEST_ALGORITHMS = {TREE_DIGEST_ALGORITHM, LEGACY_TREE_DIGEST_ALGORITHM}
 _TREE_DIGEST_DOMAIN = b"STATELET-SAFE-TREE-DIGEST\0v2\0"
 _HOOK_ATTESTATION_VERSION = 2
+_STATELET_COMMAND_GUARD = " >/dev/null 2>&1 || :"
 
 
 def _new_tree_digest(algorithm: str = TREE_DIGEST_ALGORITHM) -> Any:
@@ -525,16 +526,37 @@ def safe_copy_tree(source: Path, destination: Path) -> None:
         raise ValueError("migration copy did not validate")
 
 
-def parse_statelet_command(command: object) -> Optional[Tuple[str, Path]]:
+def guarded_statelet_command(python: str, hook: Path) -> str:
+    """Keep a missing or failing display hook from interrupting its agent turn."""
+    return shlex.join([python, str(hook)]) + _STATELET_COMMAND_GUARD
+
+
+def _statelet_command_parts(command: object) -> Optional[Tuple[str, str]]:
     if not isinstance(command, str):
         return None
+    guarded = command.endswith(_STATELET_COMMAND_GUARD)
+    invocation = command[:-len(_STATELET_COMMAND_GUARD)] if guarded else command
     try:
-        parts = shlex.split(command)
+        parts = shlex.split(invocation)
     except ValueError:
         return None
     if len(parts) != 2 or Path(parts[1]).name not in {"statelet_hook.py", "codex_pet_hook.py"}:
         return None
-    return command, Path(parts[1]).expanduser()
+    # Only the exact wrapper emitted here is managed. Do not infer ownership
+    # from a hook pathname embedded in an arbitrary shell command or wrapper.
+    # Historical two-argument commands retain their existing recognition rules.
+    if guarded and command != shlex.join(parts) + _STATELET_COMMAND_GUARD:
+        return None
+    return parts[0], parts[1]
+
+
+def parse_statelet_command(command: object) -> Optional[Tuple[str, Path]]:
+    """Return one guarded identity for historical and canonical hook commands."""
+    parts = _statelet_command_parts(command)
+    if parts is None:
+        return None
+    hook = Path(parts[1]).expanduser()
+    return guarded_statelet_command(parts[0], hook), hook
 
 
 def is_application_support_hook(path: Path) -> bool:
@@ -549,7 +571,9 @@ def is_application_support_hook(path: Path) -> bool:
 
 
 def command_interpreter_exists(command: str) -> bool:
-    parts = shlex.split(command)
+    parts = _statelet_command_parts(command)
+    if parts is None:
+        return False
     interpreter = parts[0]
     if "/" in interpreter:
         return os.access(interpreter, os.X_OK) and Path(interpreter).is_file()
@@ -608,7 +632,7 @@ def choose_command(hooks: dict[str, Any], python: str, installed_hook: Path) -> 
                 command,
             ),
         )
-    return shlex.join([python, str(installed_hook)])
+    return guarded_statelet_command(python, installed_hook)
 
 
 def registrations(provider: str) -> tuple[tuple[str, Optional[str]], ...]:
@@ -775,6 +799,7 @@ def remove_widget_hook(
         if not isinstance(groups, list):
             raise ValueError(f"existing hook event {event!r} must contain a list")
         found_replacement = False
+        seen_replacements: set[str] = set()
         retained_groups = []
         for group in groups:
             if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
@@ -794,6 +819,22 @@ def remove_widget_hook(
                 if parsed is not None and (parsed[1] == widget_hook or recognized_grok_handler):
                     continue
                 if parsed is not None and replacement is not None and parsed[0] == replacement:
+                    # Reuse the selected shared runtime with the same guard as
+                    # fresh installations. Deduplicate equivalent registrations
+                    # without dropping distinct matchers or handler properties.
+                    item = dict(item)
+                    item["command"] = replacement
+                    identity = json.dumps(
+                        {
+                            "group": {key: value for key, value in group.items() if key != "hooks"},
+                            "handler": item,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    if identity in seen_replacements:
+                        continue
+                    seen_replacements.add(identity)
                     found_replacement = True
                 retained_items.append(item)
             group["hooks"] = retained_items

@@ -770,6 +770,9 @@ public struct DialogueLine: Codable, Equatable, Sendable {
     public let generatedSynthesisPolicyVersion: Int?
     public let outputRelativePath: String?
     public let failureCode: String?
+    /// Protects the previous output during an explicit unchanged-line
+    /// regeneration, including retries and recovery after an interrupted job.
+    public let retainsOutputForRegeneration: Bool
 
     public init(
         id: UUID = UUID(),
@@ -781,7 +784,8 @@ public struct DialogueLine: Codable, Equatable, Sendable {
         generatedProfileRevision: Int? = nil,
         generatedSynthesisPolicyVersion: Int? = nil,
         outputRelativePath: String? = nil,
-        failureCode: String? = nil
+        failureCode: String? = nil,
+        retainsOutputForRegeneration: Bool = false
     ) throws {
         guard revision > 0 else { throw DialogueVoiceError.invalidState }
         self.id = id
@@ -798,10 +802,15 @@ public struct DialogueLine: Codable, Equatable, Sendable {
         self.generatedSynthesisPolicyVersion = generatedSynthesisPolicyVersion
         self.outputRelativePath = try outputRelativePath.map(DialogueVoiceValidation.managedPath)
         self.failureCode = try failureCode.map(DialogueVoiceValidation.failureCode)
+        self.retainsOutputForRegeneration = retainsOutputForRegeneration
         try validateState()
     }
 
     private func validateState() throws {
+        if retainsOutputForRegeneration {
+            guard [.queued, .generating, .stale].contains(status),
+                  outputRelativePath != nil else { throw DialogueVoiceError.invalidState }
+        }
         switch status {
         case .draft:
             guard generatedProfileRevision == nil,
@@ -849,6 +858,24 @@ public struct DialogueLine: Codable, Equatable, Sendable {
         case generatedSynthesisPolicyVersion = "generated_synthesis_policy_version"
         case outputRelativePath = "output_relative_path"
         case failureCode = "failure_code"
+        case retainsOutputForRegeneration = "retains_output_for_regeneration"
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(state, forKey: .state)
+        try container.encode(text, forKey: .text)
+        try container.encode(textLanguage, forKey: .textLanguage)
+        try container.encode(revision, forKey: .revision)
+        try container.encode(status, forKey: .status)
+        try container.encodeIfPresent(generatedProfileRevision, forKey: .generatedProfileRevision)
+        try container.encodeIfPresent(generatedSynthesisPolicyVersion, forKey: .generatedSynthesisPolicyVersion)
+        try container.encodeIfPresent(outputRelativePath, forKey: .outputRelativePath)
+        try container.encodeIfPresent(failureCode, forKey: .failureCode)
+        if retainsOutputForRegeneration {
+            try container.encode(true, forKey: .retainsOutputForRegeneration)
+        }
     }
 
     public init(from decoder: Decoder) throws {
@@ -869,7 +896,8 @@ public struct DialogueLine: Codable, Equatable, Sendable {
             generatedProfileRevision: container.decodeIfPresent(Int.self, forKey: .generatedProfileRevision),
             generatedSynthesisPolicyVersion: generatedSynthesisPolicyVersion,
             outputRelativePath: outputRelativePath,
-            failureCode: container.decodeIfPresent(String.self, forKey: .failureCode)
+            failureCode: container.decodeIfPresent(String.self, forKey: .failureCode),
+            retainsOutputForRegeneration: container.decodeIfPresent(Bool.self, forKey: .retainsOutputForRegeneration) ?? false
         )
     }
 }
@@ -1114,14 +1142,18 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
                     state: line.state,
                     text: line.text,
                     textLanguage: line.textLanguage,
-                    revision: line.revision,
+                    revision: line.revision + (line.retainsOutputForRegeneration ? 1 : 0),
                     status: .stale,
                     generatedProfileRevision: line.generatedProfileRevision,
                     generatedSynthesisPolicyVersion: line.generatedSynthesisPolicyVersion,
                     outputRelativePath: line.outputRelativePath
                 )
             case .generating, .queued, .failed:
-                return try pendingLine(from: line, status: .queued)
+                return try pendingLine(
+                    from: line,
+                    status: .queued,
+                    revision: line.revision + (line.retainsOutputForRegeneration ? 1 : 0)
+                )
             case .draft:
                 return try pendingLine(from: line, status: .queued)
             }
@@ -1155,7 +1187,7 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
                     state: line.state,
                     text: line.text,
                     textLanguage: line.textLanguage,
-                    revision: line.revision,
+                    revision: line.revision + (line.retainsOutputForRegeneration ? 1 : 0),
                     status: .stale,
                     generatedProfileRevision: line.generatedProfileRevision,
                     generatedSynthesisPolicyVersion: line.generatedSynthesisPolicyVersion,
@@ -1170,7 +1202,7 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
                     state: line.state,
                     text: line.text,
                     textLanguage: line.textLanguage,
-                    revision: line.revision,
+                    revision: line.revision + (line.retainsOutputForRegeneration ? 1 : 0),
                     status: .stale,
                     generatedProfileRevision: line.generatedProfileRevision,
                     generatedSynthesisPolicyVersion: line.generatedSynthesisPolicyVersion,
@@ -1195,8 +1227,12 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
                 return try pendingLine(from: line, status: .queued)
             case .stale:
                 count += 1
-                if shouldRetainOutputForSynthesisMigration(line) {
-                    return try pendingLineRetainingOutput(from: line, status: .queued)
+                if shouldRetainOutputForReplacement(line) {
+                    return try pendingLineRetainingOutput(
+                        from: line,
+                        status: .queued,
+                        revision: line.revision + (line.retainsOutputForRegeneration ? 1 : 0)
+                    )
                 }
                 return try pendingLine(from: line, status: .queued)
             case .queued, .generating, .ready, .failed:
@@ -1254,6 +1290,33 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
     }
 
     @discardableResult
+    public mutating func regenerateLine(id: UUID) throws -> DialogueLine {
+        guard activeProfileID != nil, profileStatus == .ready else {
+            throw DialogueVoiceError.profileNotConfigured
+        }
+        let index = try lineIndex(id)
+        let old = lines[index]
+        guard old.status != .queued, old.status != .generating else {
+            throw DialogueVoiceError.invalidState
+        }
+        let retainsOutput = old.status == .ready || shouldRetainOutputForReplacement(old)
+        let line = try DialogueLine(
+            id: old.id,
+            state: old.state,
+            text: old.text,
+            textLanguage: old.textLanguage,
+            revision: old.revision + 1,
+            status: .queued,
+            generatedProfileRevision: retainsOutput ? old.generatedProfileRevision : nil,
+            generatedSynthesisPolicyVersion: retainsOutput ? old.generatedSynthesisPolicyVersion : nil,
+            outputRelativePath: retainsOutput ? old.outputRelativePath : nil,
+            retainsOutputForRegeneration: retainsOutput
+        )
+        lines[index] = line
+        return line
+    }
+
+    @discardableResult
     public mutating func retryLine(id: UUID) throws -> DialogueLine {
         guard activeProfileID != nil, profileStatus == .ready else {
             throw DialogueVoiceError.profileNotConfigured
@@ -1263,8 +1326,12 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
             throw DialogueVoiceError.invalidState
         }
         let line = if lines[index].status == .stale,
-                      shouldRetainOutputForSynthesisMigration(lines[index]) {
-            try pendingLineRetainingOutput(from: lines[index], status: .queued)
+                      shouldRetainOutputForReplacement(lines[index]) {
+            try pendingLineRetainingOutput(
+                from: lines[index],
+                status: .queued,
+                revision: lines[index].revision + (lines[index].retainsOutputForRegeneration ? 1 : 0)
+            )
         } else {
             try pendingLine(from: lines[index], status: .queued)
         }
@@ -1337,7 +1404,8 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
                 status: .stale,
                 generatedProfileRevision: old.generatedProfileRevision,
                 generatedSynthesisPolicyVersion: old.generatedSynthesisPolicyVersion,
-                outputRelativePath: old.outputRelativePath
+                outputRelativePath: old.outputRelativePath,
+                retainsOutputForRegeneration: old.retainsOutputForRegeneration
             )
         } else {
             line = try DialogueLine(
@@ -1389,7 +1457,8 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
             if line.outputRelativePath != nil {
                 return try pendingLineRetainingOutput(
                     from: line,
-                    status: activeProfileID != nil && profileStatus == .ready ? .queued : .stale
+                    status: activeProfileID != nil && profileStatus == .ready ? .queued : .stale,
+                    revision: line.revision + (line.retainsOutputForRegeneration ? 1 : 0)
                 )
             }
             return try pendingLine(
@@ -1468,20 +1537,25 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
         return index
     }
 
-    private func pendingLine(from line: DialogueLine, status: DialogueGenerationStatus) throws -> DialogueLine {
+    private func pendingLine(
+        from line: DialogueLine,
+        status: DialogueGenerationStatus,
+        revision: Int? = nil
+    ) throws -> DialogueLine {
         try DialogueLine(
             id: line.id,
             state: line.state,
             text: line.text,
             textLanguage: line.textLanguage,
-            revision: line.revision,
+            revision: revision ?? line.revision,
             status: status
         )
     }
 
     private func pendingLineRetainingOutput(
         from line: DialogueLine,
-        status: DialogueGenerationStatus
+        status: DialogueGenerationStatus,
+        revision: Int? = nil
     ) throws -> DialogueLine {
         guard line.outputRelativePath != nil else {
             return try pendingLine(from: line, status: status)
@@ -1491,19 +1565,21 @@ public struct DialogueVoiceLibrary: Codable, Equatable, Sendable {
             state: line.state,
             text: line.text,
             textLanguage: line.textLanguage,
-            revision: line.revision,
+            revision: revision ?? line.revision,
             status: status,
             generatedProfileRevision: line.generatedProfileRevision,
             generatedSynthesisPolicyVersion: line.generatedSynthesisPolicyVersion,
-            outputRelativePath: line.outputRelativePath
+            outputRelativePath: line.outputRelativePath,
+            retainsOutputForRegeneration: line.retainsOutputForRegeneration
         )
     }
 
-    private func shouldRetainOutputForSynthesisMigration(_ line: DialogueLine) -> Bool {
+    private func shouldRetainOutputForReplacement(_ line: DialogueLine) -> Bool {
         guard let profileRevision = activeProfileRevision else { return false }
         return line.outputRelativePath != nil
             && line.generatedProfileRevision == profileRevision
-            && line.generatedSynthesisPolicyVersion != DialogueSynthesisPolicy.currentVersion
+            && (line.retainsOutputForRegeneration
+                || line.generatedSynthesisPolicyVersion != DialogueSynthesisPolicy.currentVersion)
     }
 
     private static func referencedPaths(

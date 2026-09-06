@@ -53,7 +53,7 @@ class PetPlayerPlaybackSourceTests(unittest.TestCase):
         self.assertIn("trimmingCharacters(in: .whitespacesAndNewlines)", text)
         self.assertIn("dialogueBubble.isHidden = normalized.isEmpty", text)
         self.assertIn("quickControls.frame.minX - overlayGap", text)
-        self.assertIn("occupiedFrames = [stateBadge, fpsBadge, quickControls]", text)
+        self.assertIn("occupiedFrames = [stateBadge, fpsBadge, quickControls, placeholderCard]", text)
 
     def test_quick_controls_are_visible_regular_size_targets(self) -> None:
         text = source()

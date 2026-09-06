@@ -653,6 +653,8 @@ def evaluate_fixture(path: Path) -> Tuple[Dict[str, Any], bool]:
 
 
 def _resolve_media_path(raw: str, base: Path) -> str:
+    if not isinstance(raw, str) or not raw or "\0" in raw or "://" in raw:
+        raise HarnessError("invalid_media_map")
     candidate = Path(raw).expanduser()
     if not candidate.is_absolute():
         candidate = base / candidate
@@ -660,6 +662,52 @@ def _resolve_media_path(raw: str, base: Path) -> str:
     # _local_regular_file must still see and reject a media-file symlink.
     normalized = Path(os.path.abspath(str(candidate)))
     return str(_local_regular_file(str(normalized)))
+
+
+def _normalize_media_entry(
+    entry: Any, base: Path, require_transition_report: bool = False
+) -> None:
+    if not isinstance(entry, dict):
+        raise HarnessError("invalid_media_map")
+    entry["path"] = _resolve_media_path(entry.get("path"), base)
+    if entry.get("poster_path") is not None:
+        entry["poster_path"] = _resolve_media_path(entry["poster_path"], base)
+    if require_transition_report:
+        # The app derives this adjacent sidecar from the movie URL; reports
+        # have no separate path field in the media-map schema. Keep the movie
+        # at its original absolute location so attestation sees the same pair.
+        # Content/hash/alpha verification remains the app's runtime gate.
+        report = Path(entry["path"]).with_suffix(".report.json")
+        _local_regular_file(str(report))
+
+
+def _normalize_media_playlist(
+    configuration: Any, base: Path, require_transition_report: bool = False
+) -> None:
+    if not isinstance(configuration, dict):
+        raise HarnessError("invalid_media_map")
+    if "entries" not in configuration:
+        # Both states and directional routes accept the legacy single-entry
+        # form. Its poster must also retain its source-relative meaning.
+        _normalize_media_entry(configuration, base, require_transition_report)
+        return
+    entries = configuration["entries"]
+    if not isinstance(entries, list) or not entries:
+        raise HarnessError("invalid_media_map")
+    if configuration.get("mode") not in (None, "fixed", "random", "sequential"):
+        raise HarnessError("invalid_media_map")
+    if configuration.get("advance_on") not in (None, "state_entry", "clip_end"):
+        raise HarnessError("invalid_media_map")
+    for entry in entries:
+        _normalize_media_entry(entry, base, require_transition_report)
+    paths = {entry["path"] for entry in entries}
+    if len(paths) != len(entries):
+        raise HarnessError("invalid_media_map")
+    if configuration.get("fixed_path") is not None:
+        fixed_path = _resolve_media_path(configuration["fixed_path"], base)
+        if fixed_path not in paths:
+            raise HarnessError("invalid_media_map")
+        configuration["fixed_path"] = fixed_path
 
 
 def isolated_media_map(source: Path, destination: Path) -> None:
@@ -671,21 +719,30 @@ def isolated_media_map(source: Path, destination: Path) -> None:
         raise HarnessError("invalid_media_map")
     base = source.parent
     for state, configuration in payload["states"].items():
-        if state not in VALID_STATES or not isinstance(configuration, dict):
+        if state not in VALID_STATES:
             raise HarnessError("invalid_media_map")
-        if isinstance(configuration.get("path"), str):
-            configuration["path"] = _resolve_media_path(configuration["path"], base)
-        if isinstance(configuration.get("fixed_path"), str):
-            configuration["fixed_path"] = _resolve_media_path(configuration["fixed_path"], base)
-        entries = configuration.get("entries", [])
-        if entries is not None and not isinstance(entries, list):
+        _normalize_media_playlist(configuration, base)
+    transitions = payload.get("transitions")
+    if transitions is not None:
+        if not isinstance(transitions, dict):
             raise HarnessError("invalid_media_map")
-        for entry in entries or []:
-            if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+        for route, configuration in transitions.items():
+            parts = route.split("_to_")
+            if (
+                len(parts) != 2
+                or any(state not in VALID_STATES for state in parts)
+                or parts[0] == parts[1]
+            ):
                 raise HarnessError("invalid_media_map")
-            entry["path"] = _resolve_media_path(entry["path"], base)
-            if isinstance(entry.get("poster_path"), str):
-                entry["poster_path"] = _resolve_media_path(entry["poster_path"], base)
+            _normalize_media_playlist(configuration, base, require_transition_report=True)
+    in_state_transitions = payload.get("in_state_transitions")
+    if in_state_transitions is not None:
+        if not isinstance(in_state_transitions, dict):
+            raise HarnessError("invalid_media_map")
+        for state, entry in in_state_transitions.items():
+            if state not in VALID_STATES:
+                raise HarnessError("invalid_media_map")
+            _normalize_media_entry(entry, base, require_transition_report=True)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(
         json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n",

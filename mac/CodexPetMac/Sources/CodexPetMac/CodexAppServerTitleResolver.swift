@@ -629,6 +629,10 @@ enum CodexAppServerProcessRunner {
         let stderr = Pipe()
         let drain = CodexAppServerLineDrain(maximumBytes: maximumOutputBytes)
         let readers = DispatchGroup()
+        guard let stdoutReader = ProcessPipeReader(handle: stdout.fileHandleForReading),
+              let stderrReader = ProcessPipeReader(handle: stderr.fileHandleForReading) else {
+            throw CodexAppServerResolutionFailure.unavailable
+        }
 
         process.executableURL = resolvedExecutable
         process.arguments = ["app-server"]
@@ -660,9 +664,11 @@ enum CodexAppServerProcessRunner {
             while process.isRunning, Date() < grace { Thread.sleep(forTimeInterval: 0.01) }
             if process.isRunning { control.terminate(signal: SIGKILL) }
             process.waitUntilExit()
+            stdoutReader.stop()
+            stderrReader.stop()
+            readers.wait()
             try? stdout.fileHandleForReading.close()
             try? stderr.fileHandleForReading.close()
-            _ = readers.wait(timeout: .now() + 0.5)
         }
 
         guard runningProcessValidator(process, trustPolicy) else {
@@ -671,19 +677,13 @@ enum CodexAppServerProcessRunner {
 
         readers.enter()
         DispatchQueue.global(qos: .utility).async {
-            let handle = stdout.fileHandleForReading
-            while true {
-                let data = handle.availableData
-                if data.isEmpty { break }
-                drain.append(data)
-            }
+            stdoutReader.drain { drain.append($0) }
             drain.finish()
             readers.leave()
         }
         readers.enter()
         DispatchQueue.global(qos: .utility).async {
-            let handle = stderr.fileHandleForReading
-            while !handle.availableData.isEmpty {}
+            stderrReader.drain { _ in }
             readers.leave()
         }
 

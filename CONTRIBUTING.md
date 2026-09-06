@@ -1,7 +1,7 @@
 # Contributing to Statelet
 
-Thank you for improving Statelet, the local-first Codex lifecycle companion for
-macOS.
+Thank you for improving Statelet, the local-first Codex and Grok Build lifecycle
+companion for macOS.
 
 ## Project scope
 
@@ -19,22 +19,26 @@ under the repository's MIT license. Record new public visual assets in
 Requirements:
 
 - macOS 13 or newer
-- Xcode Command Line Tools with Swift 5.9 or newer
+- Full Xcode with Swift 5.9 or newer and XCTest for the complete test suite
 - Python 3.9 for the hash-locked alpha-authoring dependencies
-- `ffmpeg` and Apple's `avconvert` for the complete media round-trip tests
+- `ffmpeg`, `ffprobe`, and Apple's `avconvert` for the complete media round-trip tests
+- A logged-in, GUI-capable Mac for native layout and AVPlayer integration tests
 
-Create a local Python environment and run the checks from the repository root:
+Create and activate a local Python environment from the repository root:
 
 ```bash
 python3.9 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install --require-hashes -r mac/requirements-alpha.txt
-.venv/bin/python -m unittest discover -s tests -p 'test_*.py' -v
-swift test --package-path mac/CodexPetMac
-swift run --package-path mac/CodexPetMac -c release codex-pet-core-self-test
-bash mac/CodexPetMac/scripts/build_app.sh
-codesign --verify --deep --strict mac/CodexPetMac/dist/Statelet.app
+. .venv/bin/activate
 ```
+
+Then run the canonical [release verification gate](docs/DEPLOYMENT.md#release-verification)
+in the same shell. It rejects skipped Python tests and runs both the Swift unit
+suite and the explicitly enabled AVPlayer integration suite. A plain
+`swift test` skips AVPlayer integration unless its opt-in environment variable
+is set. Command Line Tools alone can build the app and run the core self-test,
+but may not provide XCTest; see the gate's Xcode selection instructions.
 
 ## Identity and compatibility contract
 

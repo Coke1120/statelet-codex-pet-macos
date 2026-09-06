@@ -33,7 +33,10 @@ optimization. The output is accepted only as a bounded 48 kHz mono PCM16 WAV;
 the previous ready result remains until atomic replacement succeeds.
 
 Apple Silicon MPS follows the upstream float32 stability path and may be slow
-or memory-intensive on a MacBook Air. A `Ready` profile or playable container
+or memory-intensive on a MacBook Air. Saved-profile validation at app launch
+also loads the model; measure validation and generation helpers separately
+from the player, and verify they exit and release their allocations afterward.
+A `Ready` profile or playable container
 does not prove natural or audible speech; use **Preview** and evaluate private
 audio locally.
 
@@ -43,7 +46,7 @@ audio locally.
   matching reference WAV/transcript, and the Python executable from its working
   environment. Statelet executes only its private managed copy; changes to the
   selected source folder after import do not change the active snapshot.
-- If validation is `Local service unavailable`, confirm the runtime can import
+- If validation is `Local runtime unavailable`, confirm the runtime can import
   `voxcpm` offline and that the bounded probe can load the model within its
   timeout. Restore the prepared environment before retrying.
 - If generation times out or is cancelled, Statelet kills the contained child
