@@ -865,9 +865,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             self.showSettings()
             self.settingsController?.showAnimations(for: state)
         }
-        player.view.onPetClick = { [weak self] in
-            self?.advanceCurrentClip(reason: "pet_click")
-        }
         player.view.onResizeEnded = { [weak self] size in
             self?.persistUserResizedWindow(size: size)
         }
@@ -888,6 +885,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             self?.openSessionActivity(id)
         }
         sessionActivityView.onExpand = { [weak self] in
+            self?.expandSessionActivityPanel()
+        }
+        sessionActivityView.onShowAll = { [weak self] in
             self?.expandSessionActivityPanel()
         }
         sessionActivityPanel = SessionActivityPanel(

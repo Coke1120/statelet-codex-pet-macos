@@ -172,7 +172,6 @@ final class PetPlayerView: NSView {
     }
     var contextMenuProvider: (() -> NSMenu?)?
     var onAdvanceClip: (() -> Void)?
-    var onPetClick: (() -> Void)?
     var onResizeEnded: ((NSSize) -> Void)?
     var onTemporaryStateSelection: ((PetState?) -> Void)?
     var onOpenAnimationSettings: ((PetState) -> Void)?
@@ -502,6 +501,7 @@ final class PetPlayerView: NSView {
         button.widthAnchor.constraint(equalToConstant: 40).isActive = true
         button.heightAnchor.constraint(equalToConstant: 40).isActive = true
         button.setAccessibilityLabel(accessibilityLabel)
+        button.toolTip = accessibilityLabel
     }
 
     private func layoutQuickControls() {
@@ -1110,8 +1110,6 @@ final class PetPlayerView: NSView {
             if let size = window?.frame.size {
                 onResizeEnded?(size)
             }
-        } else if !interaction.didDrag, interaction.resizeEdges.isEmpty {
-            onPetClick?()
         }
     }
 

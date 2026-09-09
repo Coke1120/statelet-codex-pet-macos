@@ -964,6 +964,16 @@ final class SettingsWindowControllerTests: XCTestCase {
                 $0.accessibilityLabel() == "Open managed media location in Finder"
             }
         )
+        XCTAssertNotNil(
+            Self.descendants(of: window.contentView).compactMap { $0 as? NSButton }.first {
+                $0.title == "Open Animations"
+            }
+        )
+        XCTAssertNotNil(
+            Self.descendants(of: window.contentView).compactMap { $0 as? NSButton }.first {
+                $0.title == "Open Dialogue & Voice"
+            }
+        )
     }
 
     func testStaticSettingsPanesProvideScrollableOverflow() throws {

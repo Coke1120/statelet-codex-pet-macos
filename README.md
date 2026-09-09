@@ -11,7 +11,7 @@ transparent desktop presence. It runs without a development board, keeps its
 runtime data on the Mac, and uses AppKit and AVFoundation rather than a browser
 runtime.
 
-Statelet 1.8.21 (build 35) requires macOS 13 or newer. Its tagged release attaches
+Statelet 1.8.22 (build 36) requires macOS 13 or newer. Its tagged release attaches
 an ad-hoc-signed package for owner-authorized personal updates; it is not a
 Developer ID-signed or notarized public binary. Existing 1.8.4 or earlier
 installs require one manual bootstrap update to 1.8.5 or later.
@@ -215,8 +215,7 @@ The character selector at the top of **Settings → Animations** chooses which
 character owns the four state libraries shown below it. **New Character…**
 starts with an empty map that copies the current map's window/default-format
 settings; the actions menu can rename, duplicate, export, or delete the active
-character. A directly visible **Delete Profile…** button uses the same confirmed
-deletion flow.
+character.
 Duplicate copies the character's map, while Delete removes only its catalog
 entry and keeps its map and media files. The last character cannot be deleted.
 
@@ -304,7 +303,10 @@ supports local GPT-SoVITS, Qwen3-TTS, and VoxCPM2 profiles. Profiles may remain
 configured, while one selected provider is active. Imported assets, Qwen
 packages, and VoxCPM2 snapshots are copied into private Application Support
 storage and bound by complete-tree fingerprints. None of these private inputs
-is added to the repository or release bundle. Persisted fingerprints bind
+is tracked in Git or added to a release bundle. Optional local source archives
+can be organized under Git-ignored `private-assets/tts/`; see
+[private TTS source storage](docs/USAGE.md#private-tts-source-storage-and-downloads-cleanup).
+Persisted fingerprints bind
 model, reference, language, settings, and runtime inputs and are revalidated at
 launch.
 
@@ -398,8 +400,9 @@ a public report.
 - Ordinary playlist changes are hard cuts. Configured transition clips have
   their own layered fade choreography; there is no general cross-fade or
   weighted playlist mode.
-- The FPS label reports intended playback FPS and the source track's nominal
-  FPS. It does not measure rendered frame rate.
+- The optional FPS / media-rate badge reports intended playback FPS and the
+  source track's nominal FPS. It is off by default and does not measure
+  rendered frame rate.
 - Temporary State, Next Clip cursors, and Play Once are process-local controls;
   they do not rewrite the published agent state.
 - Full Swift XCTest execution requires full Xcode. Command Line Tools can build
@@ -416,8 +419,8 @@ Statelet uses one canonical identity for new builds and installations:
 | Application Support | `~/Library/Application Support/Statelet` |
 | LaunchAgents | `com.coke1120.statelet.state-aggregator`, `com.coke1120.statelet.mac-player` |
 | Managed marker | `statelet-v2` |
-| App version | `1.8.21` |
-| Build number | `35` |
+| App version | `1.8.22` |
+| Build number | `36` |
 
 ## Uninstall
 

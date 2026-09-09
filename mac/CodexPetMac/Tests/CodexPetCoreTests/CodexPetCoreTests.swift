@@ -734,7 +734,7 @@ final class CodexPetCoreTests: XCTestCase {
         XCTAssertEqual(map.window.appearance.stateLabelPosition, .topLeft)
         XCTAssertEqual(map.window.appearance.stateLabelSize, .regular)
         XCTAssertNil(map.window.appearance.stateLabelColor)
-        XCTAssertTrue(map.window.appearance.showFPS)
+        XCTAssertFalse(map.window.appearance.showFPS)
         XCTAssertEqual(map.window.appearance.fpsColor, "#00FF00")
         XCTAssertEqual(map.window.appearance.fpsLabelSize, .small)
         XCTAssertEqual(map.window.appearance.dialogueBackgroundColor, "#20242A")

@@ -281,7 +281,7 @@ private final class SessionActivityAppearancePreviewView: NSView {
         "hidden": NSNull(),
     ]
 
-    private let label = NSTextField(labelWithString: "Running · Tool #1 · just now")
+    private let label = NSTextField(labelWithString: "Active · Tool #1 · just now")
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -953,6 +953,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         animationsMode.selectedSegment = 0
         changeAnimationsMode()
         if let row = Self.sidebarRow(for: .animations) {
+            sidebarTableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        }
+        changePane()
+        show()
+    }
+
+    @objc private func openFirstRunAnimations() {
+        showAnimations(for: .idle)
+    }
+
+    @objc private func openFirstRunVoice() {
+        if let row = Self.sidebarRow(for: .voice) {
             sidebarTableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
         }
         changePane()
@@ -1665,11 +1677,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         fpsSizePopup.target = self
         fpsSizePopup.action = #selector(appearanceChanged)
         fpsSizePopup.setAccessibilityLabel("FPS label size")
-        let fpsHelp = NSTextField(wrappingLabelWithString: "Shows intended playback FPS at the top-right edge. When playback rate changes it also shows the source nominal FPS; this is not measured rendered FPS. Static Reduce Motion posters are labeled Still.")
+        let fpsHelp = NSTextField(wrappingLabelWithString: "Optional media-rate badge at the top-right edge. It shows intended playback FPS and the source nominal FPS, not measured rendered FPS. It is off by default. Static Reduce Motion posters are labeled Still.")
         fpsHelp.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         fpsHelp.textColor = .secondaryLabelColor
         let fpsStack = NSStackView(views: [
-            makeSettingsRow(title: "Playback FPS", subtitle: "Show target and nominal frame rate", control: fpsEnabledCheckbox),
+            makeSettingsRow(title: "Playback FPS", subtitle: "Optional media-rate badge, off by default", control: fpsEnabledCheckbox),
             makeRowSeparator(),
             makeAppearanceRow(title: "Color", control: fpsColorWell),
             makeRowSeparator(),
@@ -1832,8 +1844,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         launchAtLoginLabel.textColor = .secondaryLabelColor
         let startupStack = NSStackView(views: [
             makeSettingsRow(
-                title: "Login Startup",
-                subtitle: "Start Statelet companion automatically upon user login",
+                title: "Open at Login",
+                subtitle: "Start Statelet when you log in to this Mac",
                 control: launchAtLoginCheckbox
             ),
             makeRowSeparator(),
@@ -2050,13 +2062,41 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private func buildHelpPane() {
         let header = makePageHeader(
             title: "Help & Updates",
-            subtitle: "The supported workflow, recovery paths, updates, and privacy boundary in one place."
+            subtitle: "Get visible playback first, then use the reference below for recovery, privacy, and updates."
         )
 
-        let quickStart = makeSection(
-            title: "First launch",
-            content: NSTextField(wrappingLabelWithString: "Open the Statelet menu-bar icon and choose Settings. Start with Animations → Idle. Add an authorized green-screen MP4 to convert, or add a verified transparent MOV. Confirm visible playback, then restart any selected agent that was already running when Statelet was installed. If click-through is enabled, the menu-bar icon remains the recovery path.")
+        let firstLaunchSteps = NSTextField(
+            wrappingLabelWithString: "1. Add an Idle clip in Animations. 2. Confirm the pet plays on the desktop. 3. Optionally add Dialogue & Voice after playback works."
         )
+        firstLaunchSteps.font = .systemFont(ofSize: NSFont.systemFontSize)
+        let openAnimations = NSButton(
+            title: "Open Animations",
+            target: self,
+            action: #selector(openFirstRunAnimations)
+        )
+        openAnimations.bezelStyle = .rounded
+        openAnimations.setAccessibilityLabel("Open Animations for first-run Idle setup")
+        let openVoice = NSButton(
+            title: "Open Dialogue & Voice",
+            target: self,
+            action: #selector(openFirstRunVoice)
+        )
+        openVoice.bezelStyle = .rounded
+        openVoice.setAccessibilityLabel("Open Dialogue and Voice after playback works")
+        let firstLaunchActions = NSStackView(views: [openAnimations, openVoice])
+        firstLaunchActions.orientation = .horizontal
+        firstLaunchActions.alignment = .centerY
+        firstLaunchActions.spacing = 8
+        let firstLaunchHelp = NSTextField(
+            wrappingLabelWithString: "If click-through is on, use the Statelet menu-bar icon to reopen Settings. Restart any selected agent that was already running when Statelet was installed."
+        )
+        firstLaunchHelp.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        firstLaunchHelp.textColor = .secondaryLabelColor
+        let firstLaunchStack = NSStackView(views: [firstLaunchSteps, firstLaunchActions, firstLaunchHelp])
+        firstLaunchStack.orientation = .vertical
+        firstLaunchStack.alignment = .leading
+        firstLaunchStack.spacing = 8
+        let quickStart = makeSection(title: "First launch", content: firstLaunchStack)
         let lifecycle = makeSection(
             title: "Lifecycle states",
             content: NSTextField(wrappingLabelWithString: "Idle means no active turn from the selected Agent Source. Running means a selected agent is working. Waiting means a selected agent needs input or permission. Review means tests, lint, type checks or review work are active. Statelet keeps these records local and does not store prompts or tool output.")
@@ -2070,13 +2110,20 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         )
         managedMediaLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         let managedMediaButton = NSButton(
-            title: "Open Managed Media in Finder",
+            title: "Show in Finder",
             target: self,
             action: #selector(revealMediaFolder)
         )
-        managedMediaButton.bezelStyle = .rounded
+        managedMediaButton.controlSize = .small
         managedMediaButton.setAccessibilityLabel("Open managed media location in Finder")
-        let managedMediaStack = NSStackView(views: [managedMediaLabel, managedMediaButton])
+        let managedMediaStack = NSStackView(views: [
+            managedMediaLabel,
+            makeSettingsRow(
+                title: "Managed Media",
+                subtitle: "Private animation files stay here",
+                control: managedMediaButton
+            ),
+        ])
         managedMediaStack.orientation = .vertical
         managedMediaStack.alignment = .leading
         managedMediaStack.spacing = 8
@@ -2204,40 +2251,38 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         helpPromptTextView.autoresizingMask = [.width]
         helpPromptTextView.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
         helpPromptTextView.textContainer?.widthTracksTextView = true
-        helpPromptTextView.setAccessibilityLabel("Video generation prompt")
+        helpPromptTextView.setAccessibilityLabel("Generated prompt text")
         let scroll = NSScrollView()
         scroll.translatesAutoresizingMaskIntoConstraints = false
         scroll.borderType = .bezelBorder
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
-        scroll.setAccessibilityLabel("Settings pane scroll area")
+        scroll.setAccessibilityLabel("Generated prompt text")
         scroll.documentView = helpPromptTextView
 
         let checklist = NSTextField(wrappingLabelWithString: "Before import, inspect the generated MP4. The first and last frames should be pixel-identical for a seamless loop. Require a completely uniform RGB #00FF00 pure green background; no white background, scene, floor, material texture, shadow, reflection, particles, text, logo, watermark. Also reject cuts, camera movement, gradients, motion blur, green spill on the character, or any foreground touching the frame edge.")
         checklist.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         checklist.textColor = .secondaryLabelColor
 
-        for view in [header, promptControls, checklist] {
-            view.translatesAutoresizingMaskIntoConstraints = false
-            promptsPane.addSubview(view)
-        }
-        promptsPane.addSubview(scroll)
+        let stack = NSStackView(views: [header, promptControls, scroll, checklist])
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = SettingsVisualMetrics.pageSectionSpacing
         let preferredScrollHeight = scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 330)
         preferredScrollHeight.priority = .defaultLow
+        let (_, document) = makeScrollablePane(for: promptsPane)
+        document.addSubview(stack)
         NSLayoutConstraint.activate([
-            header.topAnchor.constraint(equalTo: promptsPane.topAnchor, constant: 4),
-            header.leadingAnchor.constraint(equalTo: promptsPane.leadingAnchor),
-            header.trailingAnchor.constraint(equalTo: promptsPane.trailingAnchor),
-            promptControls.topAnchor.constraint(equalTo: header.bottomAnchor, constant: SettingsVisualMetrics.pageSectionSpacing),
-            promptControls.leadingAnchor.constraint(equalTo: promptsPane.leadingAnchor),
-            scroll.topAnchor.constraint(equalTo: promptControls.bottomAnchor, constant: 10),
-            scroll.leadingAnchor.constraint(equalTo: promptsPane.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: promptsPane.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 4),
+            stack.leadingAnchor.constraint(equalTo: document.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: document.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -4),
+            header.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            promptControls.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor),
+            scroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
             preferredScrollHeight,
-            checklist.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 12),
-            checklist.leadingAnchor.constraint(equalTo: promptsPane.leadingAnchor),
-            checklist.trailingAnchor.constraint(equalTo: promptsPane.trailingAnchor),
-            checklist.bottomAnchor.constraint(lessThanOrEqualTo: promptsPane.bottomAnchor),
+            checklist.widthAnchor.constraint(equalTo: stack.widthAnchor),
         ])
         updateHelpPrompt()
     }
@@ -3515,10 +3560,10 @@ extension PetState {
 
     var explanation: String {
         switch self {
-        case .idle: return "No active selected-agent turn"
-        case .running: return "Selected agent is working"
-        case .waiting: return "Selected agent needs input or permission"
-        case .review: return "Tests, lint, or review"
+        case .idle: return "No active agent turn"
+        case .running: return "The selected agent is working"
+        case .waiting: return "The selected agent needs input or permission"
+        case .review: return "Tests, lint, or review are active"
         }
     }
 

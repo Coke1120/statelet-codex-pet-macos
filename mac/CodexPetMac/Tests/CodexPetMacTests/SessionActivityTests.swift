@@ -230,6 +230,74 @@ final class SessionActivityTests: XCTestCase {
     }
 
     @MainActor
+    func testShowAllOverflowRevealsHiddenActiveRows() throws {
+        let waiting = try item(
+            "0",
+            state: .waiting,
+            event: .permissionRequest,
+            terminal: false,
+            eventAt: 80
+        )
+        let runningA = try item(
+            "1",
+            state: .running,
+            event: .userPromptSubmit,
+            terminal: false,
+            eventAt: 81
+        )
+        let runningB = try item(
+            "2",
+            state: .running,
+            event: .userPromptSubmit,
+            terminal: false,
+            eventAt: 82
+        )
+        let runningC = try item(
+            "3",
+            state: .running,
+            event: .userPromptSubmit,
+            terminal: false,
+            eventAt: 83
+        )
+        let active = [waiting, runningA, runningB, runningC]
+        let view = SessionActivityView(
+            frame: NSRect(x: 0, y: 0, width: 360, height: 220),
+            clock: { Date(timeIntervalSince1970: 100) }
+        )
+        var expanded = false
+        view.onShowAll = { expanded = true }
+        view.update(
+            snapshot: try SessionActivitySnapshot(
+                emittedAt: 100,
+                active: active
+            ),
+            acknowledgedIDs: []
+        )
+        view.layoutSubtreeIfNeeded()
+
+        XCTAssertEqual(view.displayState.active.count, 3)
+        XCTAssertEqual(view.displayState.hiddenActiveCount, 1)
+        let header = try XCTUnwrap(
+            allDescendants(of: view).compactMap { $0 as? NSTextField }.first {
+                $0.stringValue == "Needs attention · 4"
+            }
+        )
+        XCTAssertEqual(header.accessibilityLabel(), "Needs attention: 1 waiting of 4 active sessions")
+        let showAll = try XCTUnwrap(
+            allDescendants(of: view).compactMap { $0 as? NSButton }.first {
+                $0.title == "+1 more"
+            }
+        )
+        showAll.performClick(nil)
+        XCTAssertTrue(expanded)
+        XCTAssertEqual(view.displayState.active.count, 4)
+        XCTAssertEqual(view.displayState.hiddenActiveCount, 0)
+        XCTAssertEqual(
+            view.renderedItemIDs,
+            [waiting.id, runningA.id, runningB.id, runningC.id]
+        )
+    }
+
     func testActivityRowsAreExplicitlyInformationalWhenActivationIsUnavailable() throws {
         let active = try item(
             "a",
@@ -506,7 +574,7 @@ final class SessionActivityTests: XCTestCase {
         XCTAssertFalse(compactText.contains { $0.contains("Repair tool execution") })
         XCTAssertFalse(compactText.contains { $0.contains("Verify release signing") })
         XCTAssertNotNil(allDescendants(of: view).compactMap { $0 as? NSButton }.first {
-            $0.title == "Running · 1"
+            $0.title == "Active · 1"
         })
         XCTAssertNotNil(allDescendants(of: view).compactMap { $0 as? NSButton }.first {
             $0.title == "Completed · 1"

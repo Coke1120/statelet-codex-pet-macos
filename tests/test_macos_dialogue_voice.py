@@ -303,10 +303,16 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         self.assertIn("NSSlider(value: 100, minValue: 0, maxValue: 100", self.voice_view)
         self.assertIn('fieldLabel("Voice volume")', self.voice_view)
         self.assertIn('fieldLabel("Repeat interval")', self.voice_view)
-        self.assertIn(
-            '"Never", "15s", "30s", "60s", "120s", "300s", "600s"',
-            self.voice_view,
-        )
+        for title in (
+            '"Never"',
+            '"Every 15 seconds"',
+            '"Every 30 seconds"',
+            '"Every minute"',
+            '"Every 2 minutes"',
+            '"Every 5 minutes"',
+            '"Every 10 minutes"',
+        ):
+            self.assertIn(title, self.voice_view)
         self.assertIn(
             "private let repeatIntervalValues: [TimeInterval?] = [nil, 15, 30, 60, 120, 300, 600]",
             self.voice_view,

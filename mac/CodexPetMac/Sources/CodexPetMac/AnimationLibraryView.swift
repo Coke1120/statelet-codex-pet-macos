@@ -856,7 +856,11 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
             return LibraryClipRowModel(
                 position: index + 1,
                 entry: entry,
-                name: URL(fileURLWithPath: entry.path).lastPathComponent,
+                name: Self.displayName(
+                    for: entry.path,
+                    state: selectedState,
+                    position: index + 1
+                ),
                 exists: FileManager.default.isReadableFile(atPath: resolvedURL.path),
                 posterSummary: entry.posterPath == nil ? "No poster" : (posterExists ? "Poster ready" : "Poster missing"),
                 posterMissing: entry.posterPath != nil && !posterExists,
@@ -894,7 +898,7 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
         case LibraryColumn.clip:
             let cell = reusableTextCell(identifier: LibraryColumn.clip)
             cell.update(
-                primary: "\(model.position). \(model.name)",
+                primary: model.name,
                 secondary: model.posterSummary,
                 primaryColor: model.exists ? .labelColor : .systemRed,
                 secondaryColor: model.posterMissing ? .systemRed : .secondaryLabelColor,
@@ -948,6 +952,20 @@ final class AnimationLibraryView: NSView, NSTableViewDataSource, NSTableViewDele
         default:
             return nil
         }
+    }
+
+    private static func displayName(
+        for path: String,
+        state: PetState,
+        position: Int
+    ) -> String {
+        let filename = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+        let prefix = "\(state.rawValue)-"
+        if filename.lowercased().hasPrefix(prefix),
+           filename.dropFirst(prefix.count).contains(where: { $0.isNumber || $0 == "-" }) {
+            return "\(state.displayName) \(position)"
+        }
+        return filename.isEmpty ? "\(state.displayName) \(position)" : filename
     }
 
     private func reusableTextCell(identifier: NSUserInterfaceItemIdentifier) -> LibraryTextCell {

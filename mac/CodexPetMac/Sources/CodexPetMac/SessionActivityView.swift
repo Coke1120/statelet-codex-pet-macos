@@ -217,6 +217,7 @@ final class SessionActivityView: NSView {
     private var openabilityPendingIDs: Set<String> = []
     private var titles: [String: String] = [:]
     private var compactOverride: Bool?
+    private var showsAllRows = false
     private var panelAppearance = try! SessionActivityPanelAppearance()
     private var resolvedAppearance = SessionActivityPanelResolvedAppearance(
         backgroundColor: .windowBackgroundColor,
@@ -237,6 +238,7 @@ final class SessionActivityView: NSView {
     var onAcknowledgeAllCompleted: (([String]) -> Void)?
     var onOpen: ((String) -> Void)?
     var onExpand: (() -> Void)?
+    var onShowAll: (() -> Void)?
 
     private static let disabledLayerActions: [String: CAAction] = [
         "bounds": NSNull(),
@@ -319,6 +321,9 @@ final class SessionActivityView: NSView {
 
     func setCompactOverride(_ compact: Bool?) {
         compactOverride = compact
+        if compact == true {
+            showsAllRows = false
+        }
         rebuild()
     }
 
@@ -413,7 +418,8 @@ final class SessionActivityView: NSView {
         displayState = SessionActivityPresentation.displayState(
             snapshot: snapshot,
             acknowledgedIDs: acknowledgedIDs,
-            compact: compact
+            compact: compact,
+            maximumRowsPerGroup: showsAllRows ? Int.max : SessionActivityPresentation.maximumRowsPerGroup
         )
         stack.arrangedSubviews.forEach { view in
             stack.removeArrangedSubview(view)
@@ -432,7 +438,16 @@ final class SessionActivityView: NSView {
 
         if compact {
             if activeCount > 0 {
-                addCompactPill(title: "Running · \(activeCount)", accessibility: "Running sessions: \(activeCount)")
+                addCompactPill(
+                    title: Self.activeGroupTitle(
+                        items: snapshot?.active ?? [],
+                        count: activeCount
+                    ),
+                    accessibility: Self.activeGroupAccessibility(
+                        items: snapshot?.active ?? [],
+                        count: activeCount
+                    )
+                )
             }
             if completedCount > 0 {
                 addCompactPill(title: "Completed · \(completedCount)", accessibility: "Completed unread sessions: \(completedCount)")
@@ -449,8 +464,14 @@ final class SessionActivityView: NSView {
             }
             if !displayState.active.isEmpty {
                 addGroup(
-                    title: "Running · \(activeCount)",
-                    accessibility: "Running sessions: \(activeCount)",
+                    title: Self.activeGroupTitle(
+                        items: snapshot?.active ?? [],
+                        count: activeCount
+                    ),
+                    accessibility: Self.activeGroupAccessibility(
+                        items: snapshot?.active ?? [],
+                        count: activeCount
+                    ),
                     items: displayState.active,
                     completed: false,
                     hiddenCount: displayState.hiddenActiveCount
@@ -467,7 +488,7 @@ final class SessionActivityView: NSView {
             }
         }
         setAccessibilityValue(
-            "\(activeCount) running, \(completedCount) completed unread"
+            "\(activeCount) active, \(completedCount) completed unread"
         )
         invalidateIntrinsicContentSize()
         needsLayout = true
@@ -532,12 +553,15 @@ final class SessionActivityView: NSView {
             }
         }
         if hiddenCount > 0 {
-            let overflow = NSTextField(labelWithString: "+\(hiddenCount) more")
-            overflow.font = .systemFont(ofSize: 11)
-            overflow.textColor = resolvedAppearance.secondaryTextColor
-            overflow.setAccessibilityElement(true)
-            overflow.setAccessibilityRole(.staticText)
-            overflow.setAccessibilityLabel("\(hiddenCount) more sessions")
+            let overflow = NSButton(
+                title: "+\(hiddenCount) more",
+                target: self,
+                action: #selector(showAllActivity(_:))
+            )
+            overflow.bezelStyle = .inline
+            overflow.controlSize = .small
+            overflow.setAccessibilityLabel("Show all \(hiddenCount) additional sessions")
+            overflow.setAccessibilityHelp("Expands this popup so every active and unread completed session can be inspected.")
             stack.addArrangedSubview(overflow)
         }
     }
@@ -712,6 +736,36 @@ final class SessionActivityView: NSView {
         compactOverride = false
         rebuild()
         onExpand?()
+    }
+
+    @objc private func showAllActivity(_ sender: NSButton) {
+        compactOverride = false
+        showsAllRows = true
+        rebuild()
+        onShowAll?()
+    }
+
+    private static func activeGroupTitle(
+        items: [SessionActivityItem],
+        count: Int
+    ) -> String {
+        waitingCount(in: items) > 0
+            ? "Needs attention · \(count)"
+            : "Active · \(count)"
+    }
+
+    private static func activeGroupAccessibility(
+        items: [SessionActivityItem],
+        count: Int
+    ) -> String {
+        let waiting = waitingCount(in: items)
+        return waiting > 0
+            ? "Needs attention: \(waiting) waiting of \(count) active sessions"
+            : "Active sessions: \(count)"
+    }
+
+    private static func waitingCount(in items: [SessionActivityItem]) -> Int {
+        items.filter { $0.state == .waiting }.count
     }
 }
 

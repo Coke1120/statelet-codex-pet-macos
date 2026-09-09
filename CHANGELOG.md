@@ -5,6 +5,8 @@ versioning for the public source release.
 
 ## [Unreleased]
 
+## [1.8.22] - 2026-09-09
+
 ### Fixed
 
 - Background process readers no longer race a Foundation pipe read against
@@ -38,6 +40,18 @@ versioning for the public source release.
 
 ### Changed
 
+- The activity popup now labels groups as Active, or Needs attention when a
+  waiting session is present, instead of calling every active session Running.
+  Overflow counts are a Show all control that reveals the remaining rows.
+- The FPS / media-rate badge is off by default for new and legacy maps that
+  omit `show_fps`. Existing maps that already enable it keep that preference.
+- Clicking the pet no longer skips to the next clip. Next Clip remains on the
+  overlay button and in the menu bar.
+- Animation clip rows hide hashed managed filenames, Voice status no longer
+  shows generated WAV names, and repeat-interval menus use plain-language
+  durations.
+- Help & Updates now starts with a three-step first-launch path and buttons
+  into Animations and Dialogue & Voice.
 - Added behavioral lifecycle and recovery-navigation coverage, aligned local
   verification with CI's explicit playback integration suite, and clarified
   first-run, local-voice and personal-update guidance.
@@ -46,6 +60,17 @@ versioning for the public source release.
 - Successful standby-player promotion emits the presentation timing event used
   by the performance harness, measured from the original playback request.
 - Added a prioritized roadmap and structured bug, feature and PR templates.
+
+### Distribution notes
+
+- Version 1.8.22 supersedes 1.8.21 with activity-status language, quieter
+  overlay defaults, and a shorter first-launch Help path; existing private
+  media, voice, models, credentials, logs, prompts, and runtime data remain
+  local and excluded from releases.
+- The package remains ad-hoc signed for owner-authorized personal updates. It
+  is not Developer ID signed, notarized, or presented as an Apple-authorized
+  public binary.
+
 
 ## [1.8.21] - 2026-09-03
 
@@ -690,6 +715,7 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
+[1.8.22]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.22
 [1.8.21]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.21
 [1.8.20]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.20
 [1.8.19]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.19

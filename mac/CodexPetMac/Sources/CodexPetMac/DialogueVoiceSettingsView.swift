@@ -331,12 +331,14 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
             cell.textField?.stringValue = line.textLanguage
             cell.setAccessibilityLabel("Language \(line.textLanguage)")
         case Column.status:
-            let output = line.outputRelativePath.map { safeBasename($0) }
+            let title = statusTitle(line.status)
             let failure = line.failureCode?.isEmpty == false ? line.failureCode : nil
-            let detail = output ?? failure
-            cell.textField?.stringValue = detail.map { "\(statusTitle(line.status)) · \($0)" } ?? statusTitle(line.status)
+            cell.textField?.stringValue = title
             cell.textField?.textColor = line.status == .failed ? .systemRed : .labelColor
-            cell.setAccessibilityLabel(detail.map { "\(statusTitle(line.status)), \($0)" } ?? statusTitle(line.status))
+            cell.textField?.toolTip = failure
+            cell.setAccessibilityLabel(
+                failure.map { "\(title), \($0)" } ?? title
+            )
         default:
             return nil
         }
@@ -739,7 +741,13 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         dialogueStatePopup.setAccessibilityLabel("Owning lifecycle state")
         dialogueStatePopup.setAccessibilityHelp("Choose which Statelet lifecycle state owns this message and generated voice.")
         repeatIntervalPopup.addItems(withTitles: [
-            "Never", "15s", "30s", "60s", "120s", "300s", "600s",
+            "Never",
+            "Every 15 seconds",
+            "Every 30 seconds",
+            "Every minute",
+            "Every 2 minutes",
+            "Every 5 minutes",
+            "Every 10 minutes",
         ])
         repeatIntervalPopup.setAccessibilityLabel("Automatic voice repeat interval")
         repeatIntervalPopup.setAccessibilityHelp("Choose how often automatic voice may repeat, or Never to disable repeats.")
@@ -1138,9 +1146,17 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
     }
 
     private static func repeatIntervalLabel(_ interval: TimeInterval) -> String {
-        interval.rounded() == interval
-            ? "\(Int(interval))s"
-            : "\(interval.formatted(.number.precision(.fractionLength(1))))s"
+        switch interval {
+        case 15: return "Every 15 seconds"
+        case 30: return "Every 30 seconds"
+        case 60: return "Every minute"
+        case 120: return "Every 2 minutes"
+        case 300: return "Every 5 minutes"
+        case 600: return "Every 10 minutes"
+        default:
+            let seconds = interval.rounded() == interval ? "\(Int(interval))" : interval.formatted(.number.precision(.fractionLength(1)))
+            return "Every \(seconds) seconds"
+        }
     }
 
     private func editorContentChanged(onServer line: DialogueLine) -> Bool {

@@ -900,7 +900,7 @@ private func runSelfTest() throws {
     let defaultAppearance = try PetAppearanceConfiguration()
     try require(mediaMap.window.appearance == defaultAppearance, "legacy media map did not use appearance defaults")
     try require(defaultAppearance.stateLabelColor == nil, "legacy media map did not preserve automatic state label color")
-    try require(defaultAppearance.showFPS, "legacy media map did not enable the FPS label")
+    try require(!defaultAppearance.showFPS, "legacy media map did not keep the FPS label off by default")
     try require(defaultAppearance.fpsColor == "#00FF00", "legacy media map did not use the default FPS color")
     try require(defaultAppearance.fpsLabelSize == .small, "legacy media map did not use the default FPS size")
 

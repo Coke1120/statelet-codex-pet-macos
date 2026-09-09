@@ -212,7 +212,7 @@ character's name and clip count, followed by:
   directory package, then activates the imported character.
 
 Use the adjacent actions button for **Rename…**, **Duplicate…**, **Export…**,
-and **Delete…**, or use the directly visible **Delete Profile…** button. Names
+and **Delete…**. Names
 must be unique. Duplicate copies the selected character's
 entire map and activates the copy; media paths may remain shared. Delete removes
 the character from the selector but deliberately keeps its map, movies, posters,
@@ -642,6 +642,43 @@ reference, and generated-audio copies while retaining dialogue text as drafts.
 If a private managed file cannot be removed safely, Statelet persists a bounded
 cleanup record, reports the deferred cleanup, and retries it at next launch.
 
+### Private TTS source storage and Downloads cleanup
+
+Keep source handovers separate from Statelet's managed runtime data. The local
+Sakamata source archive uses this layout relative to the checkout:
+
+```text
+private-assets/tts/
+├── README.md
+├── cleanup-manifest.json
+├── voxcpm2/Sakamata-ZeroShot-Handover/
+├── qwen3/Sakamata-ZeroShot-Handover/
+└── gpt-sovits/sakamata_clean_natural_v3/
+```
+
+This entire directory is Git-ignored. It is optional local storage, is absent
+from fresh clones, and must never be force-added to Git or included in releases.
+Its local README records the retained sources; the local cleanup manifest
+records their destinations and recoverable demo/experiment folders moved to
+macOS Trash. Keep those machine-specific records private.
+
+Statelet continues to use imported copies under
+`~/Library/Application Support/Statelet/voice/`, including managed models,
+references, profiles, dialogue, and generated speech. Moving the original
+handover or weight files from Downloads into this archive does not relocate
+those managed copies or require changing the saved profile. Python environments
+and the GPT-SoVITS service remain separate dependencies at their configured
+locations; do not move or delete them as part of source-folder cleanup.
+
+Before cleaning Downloads, inspect **Voice Setup** for all configured providers,
+including inactive alternatives. Verify that retained sources match the managed
+imports, and check that configured runtimes and services do not depend on the
+folders being removed. Move confirmed obsolete demos and experiments to Trash
+for recovery. Preserve original recordings and training sources unless their
+removal is explicitly intended. After cleanup, verify profile readiness and
+generated speech, then use **Preview** to check playback. Historical paths in
+handover documentation may still refer to the original Downloads location.
+
 ## Appearance, resizing, and FPS
 
 Settings uses a persistent native left sidebar grouped as App, Pet Content,
@@ -656,7 +693,7 @@ Open **Settings → Appearance** to configure:
 - border color, opacity, width, and enablement;
 - lifecycle label visibility, corner position, size, automatic state color, or
   a custom `#RRGGBB` accent; and
-- FPS label visibility, color, and size;
+- optional FPS / media-rate badge visibility, color, and size (off by default);
 - dialogue-bubble background/text colors, opacity, and automatic/custom
   contrast with a live preview; and
 - Codex activity-popup background, opacity, contrast, and reset controls.
@@ -664,16 +701,19 @@ Open **Settings → Appearance** to configure:
 The custom lifecycle color applies to the state text, state symbol, and badge
 border. Publisher health keeps an independent health color.
 
-The FPS label shows intended playback FPS and the source track's nominal FPS.
-When they differ because of `playback_rate`, the source value is labeled as
-nominal. These are media metadata and playback intent, not a measurement of
-rendered frames. Reduce Motion posters display `Still`.
+The FPS / media-rate badge is off by default. When enabled, it shows intended
+playback FPS and the source track's nominal FPS. When they differ because of
+`playback_rate`, the source value is labeled as nominal. These are media
+metadata and playback intent, not a measurement of rendered frames. Reduce
+Motion posters display `Still`.
 
 ## Help, updates, prompts and source recommendations
 
-**Settings → Help & Updates** is the local first-run and recovery guide. It explains the
-four lifecycle states, animation and voice privacy boundaries, click-through
-recovery, and diagnostics. It also shows the installed version and update
+**Settings → Help & Updates** starts with a short first-launch path: add an
+Idle clip, confirm desktop playback, then optionally open Dialogue & Voice. The
+same pane still explains the four lifecycle states, animation and voice privacy
+boundaries, click-through recovery, and diagnostics. It also shows the installed
+version and update
 status. Statelet checks for releases automatically at launch and at most once
 per day; **Check Now** is available when a manual refresh is useful. Automatic
 installation is opt-in and only applies a verified update at a safe restart
