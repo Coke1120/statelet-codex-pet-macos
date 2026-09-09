@@ -5,6 +5,21 @@ versioning for the public source release.
 
 ## [Unreleased]
 
+## [1.8.23] - 2026-09-10
+
+### Fixed
+
+- Animation import failures now show a scrollable, selectable list of failed
+  filenames and reasons in a local dialog.
+- Transition MP4 batches stop after a failure or cancellation, preserving
+  successful imports and leaving remaining files available to retry.
+
+### Distribution notes
+
+- Personal arm64 update package with a signed manifest; not Developer ID
+  signed or notarized. Minimum macOS 13 and installed-app manual smoke
+  coverage have not been repeated for this patch.
+
 ## [1.8.22] - 2026-09-09
 
 ### Fixed
@@ -715,6 +730,7 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
+[1.8.23]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.23
 [1.8.22]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.22
 [1.8.21]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.21
 [1.8.20]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.20

@@ -312,7 +312,10 @@ Each variant row provides **Preview**, **Replace…**, **Up / Down**, and
 **Remove…**. Use **Add… → Import MP4s…** to convert one or more MP4s, or
 **Add… → Add Verified MOVs…** to install one or more transparent MOV/report
 pairs. Adding appends variants without replacing the route. Replacing affects
-only the selected row. Set the route selection mode directly in its row:
+only the selected row. If a transition conversion fails, a dialog identifies
+the file and reason, and the batch stops. Files already imported remain in the
+library; select the remaining files again to continue. Cancelling also stops
+the batch. Set the route selection mode directly in its row:
 
 | Mode | Transition selection |
 | --- | --- |
@@ -409,7 +412,9 @@ Select **Add Clip… → Import MP4s…**, or drag local `.mp4` files from Finde
 the selected state's drop zone. A drop preserves Finder order and removes exact
 duplicate paths. Missing, unreadable, directory, remote, and non-MP4 items are
 reported individually while the remaining valid MP4s continue through the
-batch.
+batch. When a batch finishes with failures, a scrollable dialog lists every
+failed filename and reason. You can select and copy the details, and use
+**Retry Failed** for eligible failed conversions.
 
 Explicit non-square sample-aspect-ratio media is rejected before decoding.
 Audio tracks are removed because Statelet animations are silent; the completed

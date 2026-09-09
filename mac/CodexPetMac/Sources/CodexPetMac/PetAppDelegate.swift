@@ -4593,8 +4593,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         guard !isTerminating else { return }
         let orderedURLs = replacingPath == nil && !route.isSameState ? sourceURLs : Array(sourceURLs.prefix(1))
         guard let first = orderedURLs.first else { return }
-        importTransitionMP4(first, scope: scope, route: route, replacingPath: replacingPath) { [weak self] _ in
-            guard replacingPath == nil else { return }
+        importTransitionMP4(first, scope: scope, route: route, replacingPath: replacingPath) { [weak self] succeeded in
+            guard succeeded, replacingPath == nil else { return }
             guard let self, !self.isTerminating else { return }
             self.importTransitionMP4s(
                 Array(orderedURLs.dropFirst()),
@@ -4613,28 +4613,37 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         completion: @escaping (Bool) -> Void
     ) {
         let destination = transitionActivityState(for: route)
-        guard !mediaMutationInProgress, !isTerminating else {
-            settingsController?.update(
-                activity: .failed(destination, "Transition import unavailable · wait for the current media operation to finish")
+        let reportFailure: (String) -> Void = { [weak self] reason in
+            guard let self, !self.isTerminating else { return }
+            let name = self.safeMediaDisplayName(sourceURL)
+            self.settingsController?.update(activity: .failed(destination, "\(name): \(reason)"))
+            self.presentConversionFailures(
+                [MP4ImportFailure(name: name, reason: reason, sourceURL: nil)],
+                summary: "Transition import stopped. Remaining selected files were not processed."
             )
+        }
+        guard !mediaMutationInProgress, !isTerminating else {
+            reportFailure("Transition import unavailable · wait for the current media operation to finish")
             completion(false)
             return
         }
         guard case let .ready(toolchain) = toolchainState else {
+            reportFailure("Conversion tools aren’t ready. Use Setup Guide, then Check Again.")
             completion(false)
             return
         }
         switch MP4ImportURLValidator.validate([sourceURL]) {
         case let .rejected(reason):
-            settingsController?.update(activity: .failed(destination, reason))
+            reportFailure(reason)
             completion(false)
         case let .accepted(urls, _):
             guard let validatedSource = urls.first else {
+                reportFailure("No readable MP4 was available for conversion.")
                 completion(false)
                 return
             }
             do { try prepareMediaDirectory() } catch {
-                settingsController?.update(activity: .failed(destination, "Statelet couldn’t prepare the Media folder."))
+                reportFailure("Statelet couldn’t prepare the Media folder.")
                 completion(false)
                 return
             }
@@ -4677,7 +4686,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 activeTransitionConversionDestination = nil
                 transitionConversionCancellationRequested = false
                 mediaMutationInProgress = false
-                settingsController?.update(activity: .failed(destination, "Statelet could not prepare transition conversion."))
+                reportFailure("Statelet could not prepare transition conversion.")
                 completion(false)
                 return
             }
@@ -4810,7 +4819,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                             try? FileManager.default.removeItem(at: outputURL)
                             try? FileManager.default.removeItem(at: reportURL)
                             self.clearConversionJournal()
-                            self.settingsController?.update(activity: .failed(destination, error.localizedDescription))
+                            self.updateConversionFailureDiagnostic(from: error)
+                            reportFailure(error.localizedDescription)
                         }
                         self.activeTransitionConversionID = nil
                         self.activeTransitionConversionDestination = nil
@@ -5597,6 +5607,42 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             )
         }
         refreshSettings()
+        if !failures.isEmpty, !isTerminating {
+            presentConversionFailures(
+                failures,
+                summary: "Imported \(imported) of \(total) clips. \(failures.count) failed."
+            )
+        }
+    }
+
+    // Filenames and reasons stay in the local UI, outside logs and diagnostics.
+    private func presentConversionFailures(_ failures: [MP4ImportFailure], summary: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Animation import failed"
+        alert.informativeText = summary
+        alert.addButton(withTitle: "OK")
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 520, height: 240))
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        let details = NSTextView(frame: scroll.bounds)
+        details.isEditable = false
+        details.isSelectable = true
+        details.font = .systemFont(ofSize: NSFont.systemFontSize)
+        details.textContainerInset = NSSize(width: 8, height: 8)
+        details.isVerticallyResizable = true
+        details.isHorizontallyResizable = false
+        details.autoresizingMask = [.width]
+        details.textContainer?.widthTracksTextView = true
+        details.string = failures.map { "\($0.name)\n\($0.reason)" }.joined(separator: "\n\n")
+        details.setAccessibilityLabel("Failed animation files and reasons")
+        scroll.documentView = details
+        alert.accessoryView = scroll
+        if let settingsWindow = settingsController?.window {
+            alert.beginSheetModal(for: settingsWindow)
+        } else {
+            alert.runModal()
+        }
     }
 
     private func updateConversionFailureDiagnostic(from error: Error) {

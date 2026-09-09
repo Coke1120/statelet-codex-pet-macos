@@ -711,13 +711,13 @@ class MacLifecycleTransitionRuntimeSourceTests(unittest.TestCase):
         self.assertIn("Darwin.fsync(rootDescriptor)", helper_source)
         self.assertGreaterEqual(helper_source.count("errno == ENOENT"), 2)
 
-    def test_transition_mp4_batch_continues_after_individual_failure(self):
+    def test_transition_mp4_batch_stops_after_failure_or_cancellation(self):
         start = self.app.index("private func importTransitionMP4s(")
         end = self.app.index("private func importTransitionMP4(", start)
         source = self.app[start:end]
         self.assertIn("Array(orderedURLs.dropFirst())", source)
-        self.assertIn("guard replacingPath == nil else { return }", source)
-        self.assertNotIn("guard succeeded", source)
+        self.assertIn("guard succeeded, replacingPath == nil else { return }", source)
+        self.assertLess(source.index("guard succeeded"), source.index("Array(orderedURLs.dropFirst())"))
 
 
 if __name__ == "__main__":
