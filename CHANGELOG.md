@@ -5,6 +5,17 @@ versioning for the public source release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Settings sidebar titles stay fully visible when selected, including Source
+  Requirements, Dialogue & Voice, and Help & Updates.
+- Settings pages keep their titles at the top instead of stretching a blank
+  band into the first card.
+- The activity popup uses the full panel width for row labels and only shows
+  the Codex activation notice when every visible row is informational.
+- The Idle animation editor describes Idle as a definition instead of a live
+  "no active turn" status.
+
 ## [1.8.23] - 2026-09-10
 
 ### Fixed

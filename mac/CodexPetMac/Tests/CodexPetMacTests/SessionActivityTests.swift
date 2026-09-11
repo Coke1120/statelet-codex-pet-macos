@@ -413,8 +413,8 @@ final class SessionActivityTests: XCTestCase {
         )
         view.layoutSubtreeIfNeeded()
         descendants = allDescendants(of: view)
-        XCTAssertNotNil(descendants.compactMap { $0 as? NSTextField }.first {
-            $0.stringValue.contains("unavailable for some sessions")
+        XCTAssertFalse(descendants.compactMap { ($0 as? NSTextField)?.stringValue }.contains {
+            $0.contains("unavailable")
         })
         XCTAssertNotNil(descendants.compactMap { $0 as? NSButton }.first {
             $0.title == "Open in Codex"
@@ -433,6 +433,37 @@ final class SessionActivityTests: XCTestCase {
         let text = descendants.compactMap { ($0 as? NSTextField)?.stringValue }
         XCTAssertFalse(text.contains { $0.contains("Open in Codex is available") })
         XCTAssertFalse(text.contains { $0.contains("unavailable") })
+    }
+
+    @MainActor
+    func testActivityRowLabelsUseThePanelWidthInsteadOfAFixedCap() throws {
+        let completed = try item(
+            "c",
+            state: .idle,
+            event: .sessionEnd,
+            terminal: true,
+            eventAt: 80,
+        )
+        let view = SessionActivityView(
+            frame: NSRect(x: 0, y: 0, width: 538, height: 180),
+            clock: { Date(timeIntervalSince1970: 100) }
+        )
+        view.setCompactOverride(false)
+        view.update(
+            snapshot: try SessionActivitySnapshot(emittedAt: 100, completed: [completed]),
+            acknowledgedIDs: [],
+            openableIDs: []
+        )
+        view.layoutSubtreeIfNeeded()
+
+        let label = try XCTUnwrap(
+            allDescendants(of: view).compactMap { $0 as? NSTextField }.first {
+                $0.stringValue.contains("Unread")
+            }
+        )
+        XCTAssertGreaterThan(label.frame.width, 320)
+        XCTAssertTrue(label.stringValue.hasSuffix("Unread"))
+        XCTAssertFalse(label.stringValue.contains("Unre…"))
     }
 
     func testOpenabilityPresentationDistinguishesPendingResolvedAndRemappedTargets() {

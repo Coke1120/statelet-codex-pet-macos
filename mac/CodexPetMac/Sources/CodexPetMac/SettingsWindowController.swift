@@ -1164,7 +1164,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         sidebarScrollView.setAccessibilityLabel("Settings navigation sidebar")
         sidebarTableView.headerView = nil
         sidebarTableView.backgroundColor = .clear
-        sidebarTableView.style = .sourceList
+        // Inset selection avoids the source-list trailing accessory that clips
+        // custom badge+label cells on recent macOS releases.
+        sidebarTableView.style = .inset
+        sidebarTableView.selectionHighlightStyle = .regular
         sidebarTableView.rowHeight = 32
         sidebarTableView.intercellSpacing = NSSize(width: 0, height: 2)
         sidebarTableView.allowsEmptySelection = false
@@ -1818,6 +1821,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = SettingsVisualMetrics.pageSectionSpacing
+        stack.setHuggingPriority(.required, for: .vertical)
         let (_, documentView) = makeScrollablePane(for: appearancePane)
         documentView.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -1833,7 +1837,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             fpsBox.widthAnchor.constraint(equalTo: overlayRow.widthAnchor),
             dialogueBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
             activityBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            stack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor),
+            documentView.bottomAnchor.constraint(greaterThanOrEqualTo: stack.bottomAnchor),
         ])
     }
 
@@ -1977,6 +1981,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = SettingsVisualMetrics.pageSectionSpacing
+        stack.setHuggingPriority(.required, for: .vertical)
         let (_, documentView) = makeScrollablePane(for: generalPane)
         documentView.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -1989,7 +1994,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             petWindowBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
             motionBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
             localBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            stack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor),
+            documentView.bottomAnchor.constraint(greaterThanOrEqualTo: stack.bottomAnchor),
         ])
     }
 
@@ -2207,6 +2212,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         for view in [header, quickStart, lifecycle, media, managedMedia, accessibility, recovery, updateBox] {
             view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
+        stack.setHuggingPriority(.required, for: .vertical)
 
         let (_, document) = makeScrollablePane(for: helpPane)
         document.addSubview(stack)
@@ -2214,7 +2220,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 4),
             stack.leadingAnchor.constraint(equalTo: document.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: document.trailingAnchor),
-            stack.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -4),
+            document.bottomAnchor.constraint(greaterThanOrEqualTo: stack.bottomAnchor, constant: 4),
         ])
     }
 
@@ -2311,6 +2317,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = SettingsVisualMetrics.pageSectionSpacing
+        stack.setHuggingPriority(.required, for: .vertical)
         let (_, documentView) = makeScrollablePane(for: recommendationPane)
         documentView.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -2322,7 +2329,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             backgroundBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
             framingBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
             toolsBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            stack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor),
+            documentView.bottomAnchor.constraint(greaterThanOrEqualTo: stack.bottomAnchor),
         ])
     }
 
@@ -2986,7 +2993,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         if paneChanged, section == .animations {
             refreshRows()
         }
+        if paneChanged {
+            resetPaneScrollPosition(selectedPane)
+        }
         updateLibraryRevisionTimer()
+    }
+
+    private func resetPaneScrollPosition(_ pane: NSView) {
+        for case let scroll as NSScrollView in pane.subviews
+        where scroll.accessibilityLabel() == "Settings pane scroll area" {
+            scroll.contentView.scroll(to: .zero)
+            scroll.reflectScrolledClipView(scroll.contentView)
+        }
     }
 
     private func updateSplitPreferredContentSizes(for size: NSSize) {
@@ -3426,6 +3444,11 @@ extension SettingsWindowController: NSToolbarDelegate {
 }
 
 extension SettingsWindowController: NSTableViewDataSource, NSTableViewDelegate {
+    fileprivate static func sidebarSymbolView(in cell: NSView) -> NSImageView? {
+        cell.subviews.first { $0.identifier?.rawValue == "SettingsSidebarBadge" }?
+            .subviews.compactMap { $0 as? NSImageView }.first
+    }
+
     func numberOfRows(in tableView: NSTableView) -> Int {
         Self.sidebarItems.count
     }
@@ -3464,11 +3487,11 @@ extension SettingsWindowController: NSTableViewDataSource, NSTableViewDelegate {
 
                 let imageView = NSImageView()
                 imageView.translatesAutoresizingMaskIntoConstraints = false
+                imageView.identifier = NSUserInterfaceItemIdentifier("SettingsSidebarSymbol")
                 imageView.imageScaling = .scaleProportionallyDown
                 imageView.contentTintColor = .white
                 imageView.setAccessibilityElement(false)
                 badge.addSubview(imageView)
-                cell.imageView = imageView
                 cell.addSubview(badge)
                 NSLayoutConstraint.activate([
                     badge.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 6),
@@ -3503,7 +3526,7 @@ extension SettingsWindowController: NSTableViewDataSource, NSTableViewDelegate {
                 let badge = cell.subviews.first { $0.identifier?.rawValue == "SettingsSidebarBadge" }
                 badge?.layer?.backgroundColor = section.badgeColor.cgColor
                 let config = NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
-                cell.imageView?.image = NSImage(systemSymbolName: section.symbolName, accessibilityDescription: nil)?
+                Self.sidebarSymbolView(in: cell)?.image = NSImage(systemSymbolName: section.symbolName, accessibilityDescription: nil)?
                     .withSymbolConfiguration(config)
             }
         }
@@ -3560,7 +3583,7 @@ extension PetState {
 
     var explanation: String {
         switch self {
-        case .idle: return "No active agent turn"
+        case .idle: return "Shown when no agent turn is active"
         case .running: return "The selected agent is working"
         case .waiting: return "The selected agent needs input or permission"
         case .review: return "Tests, lint, or review are active"

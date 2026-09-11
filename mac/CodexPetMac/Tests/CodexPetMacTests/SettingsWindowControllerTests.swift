@@ -544,7 +544,7 @@ final class SettingsWindowControllerTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(labelView.frame.width + 0.5, labelView.intrinsicContentSize.width, label)
             XCTAssertFalse(cell.isAccessibilityElement(), "native table rows should own destination selection semantics")
             XCTAssertNotNil(
-                (cell as? NSTableCellView)?.imageView?.image,
+                Self.sidebarSymbolView(in: cell)?.image,
                 "destination \(label) should use a monochrome system symbol"
             )
         }
@@ -591,6 +591,68 @@ final class SettingsWindowControllerTests: XCTestCase {
         }
         let restoredSidebar = try Self.settingsSidebar(in: restoredWindow)
         XCTAssertEqual(restoredSidebar.selectedRow, try Self.sidebarRow(in: restoredSidebar, label: "Prompt Generator"))
+    }
+
+    func testSelectedSidebarTitlesKeepTheirSymbolsInsideTheBadge() throws {
+        let controller = SettingsWindowController()
+        let window = try XCTUnwrap(controller.window)
+        controller.show()
+        Self.pumpMainRunLoop(for: 0.1)
+        defer {
+            window.close()
+            Self.pumpMainRunLoop(for: 0.05)
+        }
+
+        let sidebar = try Self.settingsSidebar(in: window)
+        XCTAssertEqual(sidebar.style, .inset)
+        for label in ["Source Requirements", "Dialogue & Voice", "Help & Updates", "Prompt Generator"] {
+            let row = try Self.selectSidebar(in: sidebar, label: label)
+            let cell = try XCTUnwrap(sidebar.view(atColumn: 0, row: row, makeIfNecessary: true) as? NSTableCellView)
+            let labelView = try XCTUnwrap(Self.sidebarLabelView(in: sidebar, row: row))
+            XCTAssertNil(cell.imageView, "AppKit must not own the symbol or it relocates onto the title")
+            XCTAssertGreaterThanOrEqual(labelView.frame.width + 0.5, labelView.intrinsicContentSize.width, label)
+            XCTAssertEqual(labelView.stringValue, label)
+            XCTAssertNotNil(Self.sidebarSymbolView(in: cell)?.image, label)
+        }
+    }
+
+    func testSourceRequirementsAndGeneralStayTopAlignedInTheScrollDocument() throws {
+        let controller = SettingsWindowController()
+        let window = try XCTUnwrap(controller.window)
+        controller.show()
+        Self.pumpMainRunLoop(for: 0.1)
+        window.setContentSize(NSSize(width: 1_200, height: 650))
+        Self.pumpMainRunLoop(for: 0.05)
+        defer {
+            window.close()
+            Self.pumpMainRunLoop(for: 0.05)
+        }
+
+        let sidebar = try Self.settingsSidebar(in: window)
+        for section in ["Source Requirements", "General"] {
+            try Self.selectSidebar(in: sidebar, label: section)
+            let scrollView = try XCTUnwrap(
+                Self.descendants(of: window.contentView).compactMap { $0 as? NSScrollView }.first {
+                    $0.accessibilityLabel() == "Settings pane scroll area"
+                },
+                section
+            )
+            let document = try XCTUnwrap(scrollView.documentView, section)
+            let title = try XCTUnwrap(
+                Self.descendants(of: document).compactMap { $0 as? NSTextField }.first {
+                    $0.stringValue == section
+                },
+                section
+            )
+            let titleFrame = title.convert(title.bounds, to: document)
+            XCTAssertLessThan(titleFrame.minY, 24, "\(section) title should stay at the top of the pane")
+            XCTAssertEqual(scrollView.contentView.bounds.minY, 0, accuracy: 1, section)
+        }
+    }
+
+    func testIdleExplanationDescribesTheStateInsteadOfLiveStatus() {
+        XCTAssertEqual(PetState.idle.explanation, "Shown when no agent turn is active")
+        XCTAssertFalse(PetState.idle.explanation.localizedCaseInsensitiveContains("no active agent turn"))
     }
 
     func testSettingsSidebarMigratesLegacySelectionWithoutChangingItsDestination() throws {
@@ -1394,6 +1456,11 @@ final class SettingsWindowControllerTests: XCTestCase {
     private static func sidebarLabelView(in sidebar: NSTableView, row: Int) -> NSTextField? {
         guard let cell = sidebar.view(atColumn: 0, row: row, makeIfNecessary: true) else { return nil }
         return descendants(of: cell).compactMap { $0 as? NSTextField }.first
+    }
+
+    private static func sidebarSymbolView(in cell: NSView) -> NSImageView? {
+        cell.subviews.first { $0.identifier?.rawValue == "SettingsSidebarBadge" }?
+            .subviews.compactMap { $0 as? NSImageView }.first
     }
 
     private static func sidebarRow(in sidebar: NSTableView, label: String) throws -> Int {

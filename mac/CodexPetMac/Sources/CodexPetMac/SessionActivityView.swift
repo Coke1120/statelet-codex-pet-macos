@@ -458,9 +458,9 @@ final class SessionActivityView: NSView {
                 .subtracting(openableIDs)
                 .subtracting(openabilityPendingIDs)
             if !unavailableIDs.isEmpty {
-                addActivationUnavailableNotice(
-                    affectsAllVisibleItems: unavailableIDs.count == visibleIDs.count
-                )
+                if unavailableIDs.count == visibleIDs.count {
+                    addActivationUnavailableNotice()
+                }
             }
             if !displayState.active.isEmpty {
                 addGroup(
@@ -494,10 +494,8 @@ final class SessionActivityView: NSView {
         needsLayout = true
     }
 
-    private func addActivationUnavailableNotice(affectsAllVisibleItems: Bool) {
-        let message = affectsAllVisibleItems
-            ? "Codex Desktop activation is unavailable for these sessions. Activity rows are informational only."
-            : "Open in Codex is unavailable for some sessions. Those activity rows are informational only."
+    private func addActivationUnavailableNotice() {
+        let message = "Codex Desktop activation is unavailable for these sessions. Activity rows are informational only."
         let notice = NSTextField(
             wrappingLabelWithString: message
         )
@@ -578,7 +576,6 @@ final class SessionActivityView: NSView {
         label.textColor = resolvedActivityColor(item.state.sessionActivityColor)
         label.lineBreakMode = .byTruncatingTail
         label.maximumNumberOfLines = 1
-        label.widthAnchor.constraint(lessThanOrEqualToConstant: 320).isActive = true
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         label.setAccessibilityElement(true)
         label.setAccessibilityRole(.staticText)
@@ -604,6 +601,7 @@ final class SessionActivityView: NSView {
         row.alignment = .centerY
         row.spacing = 5
         stack.addArrangedSubview(row)
+        pinActivityRow(row, stretching: label)
     }
 
     private func addCompletedRow(_ item: SessionActivityItem, ordinal: Int) {
@@ -619,7 +617,6 @@ final class SessionActivityView: NSView {
         label.textColor = resolvedActivityColor(.systemGreen)
         label.lineBreakMode = .byTruncatingTail
         label.maximumNumberOfLines = 1
-        label.widthAnchor.constraint(lessThanOrEqualToConstant: 320).isActive = true
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         label.setAccessibilityElement(true)
         label.setAccessibilityRole(.staticText)
@@ -656,6 +653,7 @@ final class SessionActivityView: NSView {
         row.setAccessibilityRole(.group)
         row.setAccessibilityLabel("\(item.provider.displayName) completed unread session \(ordinal)")
         stack.addArrangedSubview(row)
+        pinActivityRow(row, stretching: label)
     }
 
     private func activityDot(color: NSColor) -> NSTextField {
@@ -664,6 +662,17 @@ final class SessionActivityView: NSView {
         dot.textColor = color
         dot.setAccessibilityElement(false)
         return dot
+    }
+
+    private func pinActivityRow(_ row: NSStackView, stretching label: NSTextField) {
+        label.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        for view in row.arrangedSubviews where view is NSButton {
+            view.setContentCompressionResistancePriority(.required, for: .horizontal)
+            view.setContentHuggingPriority(.required, for: .horizontal)
+        }
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
     }
 
     private func openButton(for id: String, accessibility: String) -> NSButton {
