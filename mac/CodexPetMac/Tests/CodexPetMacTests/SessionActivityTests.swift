@@ -442,7 +442,7 @@ final class SessionActivityTests: XCTestCase {
             state: .idle,
             event: .sessionEnd,
             terminal: true,
-            eventAt: 80,
+            eventAt: 80
         )
         let view = SessionActivityView(
             frame: NSRect(x: 0, y: 0, width: 538, height: 180),
