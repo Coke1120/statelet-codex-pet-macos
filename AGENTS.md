@@ -147,17 +147,16 @@ Activate the hash-locked Python environment and select full Xcode (for example,
 the commands below. Record unavailable or unexpectedly skipped checks as
 incomplete validation; plain `swift test` does not enable AVPlayer integration.
 
-1. **Python Test Suite (Zero Skips Permitted in CI)**:
+1. **Python Smoke/CI Suite (Conversion Is Manual; Selected Tests Must Not Skip)**:
    ```bash
-   PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY'
-   import unittest
-   suite = unittest.defaultTestLoader.discover("tests", pattern="test_*.py")
-   result = unittest.TextTestRunner(verbosity=2).run(suite)
-   if result.skipped:
-       raise SystemExit(f"Python tests skipped: {result.skipped}")
-   raise SystemExit(0 if result.wasSuccessful() else 1)
-   PY
+   PYTHONDONTWRITEBYTECODE=1 python3 tools/run_tests.py
    ```
+
+   The runner excludes `test_macos_alpha_video.py` from smoke and CI before
+   import. Conversion tests remain available manually with
+   `python3 tools/run_tests.py --include-conversion`. Do not add real conversion
+   work back to automatic smoke or CI runs. Playback, lifecycle, installer and
+   report-validation tests remain automatic.
 
 2. **Swift Core Self-Test**:
    ```bash

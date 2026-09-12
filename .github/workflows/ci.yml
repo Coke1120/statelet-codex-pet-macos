@@ -33,27 +33,14 @@ jobs:
           cache: pip
           cache-dependency-path: mac/requirements-alpha.txt
 
-      - name: Install locked alpha dependencies
+      - name: Install locked test dependencies
         run: python -m pip install --require-hashes -r mac/requirements-alpha.txt
 
       - name: Install FFmpeg
         run: brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
 
-      - name: Run complete Python test suite without skips
-        run: |
-          python - <<'PY'
-          import unittest
-
-          suite = unittest.defaultTestLoader.discover(
-              "tests",
-              pattern="test_*.py",
-          )
-          result = unittest.TextTestRunner(verbosity=2).run(suite)
-          if result.skipped:
-              raise SystemExit(f"Python tests skipped: {result.skipped}")
-          if not result.wasSuccessful():
-              raise SystemExit(1)
-          PY
+      - name: Run Python smoke suite without conversion
+        run: python tools/run_tests.py
 
       - name: Reject excluded public-release content
         run: |

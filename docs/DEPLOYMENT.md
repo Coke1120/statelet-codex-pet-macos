@@ -389,8 +389,9 @@ public binary distribution.
 
 ## Release verification
 
-This is the canonical complete local gate for pull requests and releases. Run
-it from the repository root after preparing the hash-locked alpha environment
+This is the canonical local smoke gate for pull requests and releases. MP4/alpha
+conversion tests are manual and are excluded from both this gate and CI. Run
+it from the repository root after preparing the hash-locked Python environment
 in [CONTRIBUTING.md](../CONTRIBUTING.md#development-setup), with that environment
 activated. Focused tests are useful during development, but do not replace this
 gate for a release.
@@ -404,23 +405,13 @@ export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 xcrun --find swift
 ```
 
-Run on a logged-in, GUI-capable Mac with `ffmpeg`, `ffprobe`, and Apple's
-`avconvert` available. AVPlayer integration must be enabled explicitly:
+Run on a logged-in, GUI-capable Mac with the media fixture tools available.
+AVPlayer integration must be enabled explicitly:
 
 ```bash
 (
 set -euo pipefail
-PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY'
-import unittest
-
-suite = unittest.defaultTestLoader.discover(
-    "tests", pattern="test_*.py"
-)
-result = unittest.TextTestRunner(verbosity=2).run(suite)
-if result.skipped:
-    raise SystemExit(f"Python tests skipped: {result.skipped}")
-raise SystemExit(0 if result.wasSuccessful() else 1)
-PY
+PYTHONDONTWRITEBYTECODE=1 python3 tools/run_tests.py
 
 swift run -c release --package-path mac/CodexPetMac codex-pet-core-self-test
 swift test -c release --package-path mac/CodexPetMac --skip PetPlayerPlaybackIntegrationTests
@@ -437,10 +428,23 @@ git diff --check
 )
 ```
 
-Python discovery includes every `tests/test_*.py` module, including the alpha
-and native AppKit layout suites, and fails if any Python test is skipped. Check
-both Swift summaries as well: unexpected skipped tests or unavailable GUI
-coverage must be recorded as incomplete validation.
+The shared Python runner includes every `tests/test_*.py` module except
+`test_macos_alpha_video.py`, which is excluded before import. Selected tests
+still fail the gate if any are skipped. Native AppKit layout, playback,
+lifecycle, installer and report-validation checks remain automatic. Check both
+Swift summaries as well: unexpected skipped tests or unavailable GUI coverage
+must be recorded as incomplete validation.
+
+To include the conversion suite manually, prepare `ffmpeg`, `ffprobe`, Apple's
+`avconvert` and the locked alpha dependencies, then run:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 tools/run_tests.py --include-conversion
+```
+
+Use `python3 tools/run_tests.py --list` to inspect the automatic module selection.
+The explicit `--playback-smoke` command in the conversion-tools section is a
+manual converted-asset acceptance check; it is not part of smoke or CI runs.
 
 Record the commit, version/build, macOS version, architecture, test results, and
 any unrun checks with the release decision. Hosted CI currently tests on

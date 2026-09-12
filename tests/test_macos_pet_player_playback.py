@@ -66,7 +66,7 @@ class PetPlayerPlaybackSourceTests(unittest.TestCase):
         self.assertIn("button.convert(button.bounds, to: self)", text)
         self.assertIn("if target.contains(point) { return button }", text)
         self.assertLess(
-            text.index("for button in [nextClipButton, temporaryStateButton]"),
+            text.index("for button in [companionButton, nextClipButton, temporaryStateButton]"),
             text.index("if quickControls.frame.contains(point)"),
         )
 

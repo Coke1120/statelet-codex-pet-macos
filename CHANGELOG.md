@@ -7,6 +7,11 @@ versioning for the public source release.
 
 ## [1.9.0] - 2026-09-12
 
+### Changed
+
+- Smoke and CI runs omit the MP4/alpha conversion suite. Run
+  `python tools/run_tests.py --include-conversion` to include it manually.
+
 ### Added
 
 - Native Companion panel with Chat, Activity and Pet tabs, a Mini bar,

@@ -34,7 +34,10 @@ python3.9 -m venv .venv
 ```
 
 Then run the canonical [release verification gate](docs/DEPLOYMENT.md#release-verification)
-in the same shell. It rejects skipped Python tests and runs both the Swift unit
+in the same shell. Smoke and CI use `python3 tools/run_tests.py`, which excludes
+the MP4/alpha conversion suite before import and rejects skipped selected tests.
+Run `python3 tools/run_tests.py --include-conversion` only when you want the
+manual conversion checks as well. The gate also runs both the Swift unit
 suite and the explicitly enabled AVPlayer integration suite. A plain
 `swift test` skips AVPlayer integration unless its opt-in environment variable
 is set. Command Line Tools alone can build the app and run the core self-test,

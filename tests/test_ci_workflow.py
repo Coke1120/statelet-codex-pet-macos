@@ -1,4 +1,6 @@
 from pathlib import Path
+import subprocess
+import sys
 import unittest
 
 
@@ -8,6 +10,21 @@ RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 
 
 class CIWorkflowTests(unittest.TestCase):
+    def test_smoke_and_ci_make_conversion_explicitly_opt_in(self) -> None:
+        runner = ROOT / "tools" / "run_tests.py"
+        def selected(*arguments: str) -> set[str]:
+            result = subprocess.run(
+                [sys.executable, str(runner), "--list", *arguments],
+                cwd=ROOT, capture_output=True, text=True, check=True, timeout=10,
+            )
+            return set(result.stdout.splitlines())
+
+        all_modules = {path.name for path in (ROOT / "tests").glob("test_*.py")}
+        self.assertEqual(selected(), all_modules - {"test_macos_alpha_video.py"})
+        self.assertEqual(selected("--include-conversion"), all_modules)
+        self.assertIn("run: python tools/run_tests.py", CI_WORKFLOW.read_text())
+        self.assertNotIn("--include-conversion", CI_WORKFLOW.read_text())
+
     def test_ci_avoids_duplicate_branch_and_tag_runs(self) -> None:
         ci_triggers = CI_WORKFLOW.read_text(encoding="utf-8").split("permissions:", 1)[0]
         release_triggers = RELEASE_WORKFLOW.read_text(encoding="utf-8").split("permissions:", 1)[0]
