@@ -80,7 +80,7 @@ final class PetPlayerInteractionTests: XCTestCase {
         XCTAssertFalse(controls.frame.intersects(card.frame))
         XCTAssertGreaterThanOrEqual(label.frame.height + 1, label.fittingSize.height)
         let buttons = controls.views.compactMap { $0 as? NSButton }
-        XCTAssertEqual(buttons.count, 2)
+        XCTAssertEqual(buttons.count, 3)
         for button in buttons {
             XCTAssertTrue(button.isEnabled)
             XCTAssertFalse(button.isHidden)
@@ -88,6 +88,13 @@ final class PetPlayerInteractionTests: XCTestCase {
             XCTAssertFalse(frame.intersects(card.frame))
             XCTAssertTrue(view.hitTest(NSPoint(x: frame.midX, y: frame.midY)) === button)
         }
+        var companionCount = 0
+        view.onOpenCompanion = { companionCount += 1 }
+        let companionButton = try XCTUnwrap(buttons.first {
+            $0.accessibilityLabel() == "Open Statelet Companion"
+        })
+        companionButton.performClick(nil)
+        XCTAssertEqual(companionCount, 1)
         var advanceCount = 0
         view.onAdvanceClip = { advanceCount += 1 }
         let nextButton = try XCTUnwrap(buttons.first {

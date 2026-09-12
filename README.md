@@ -11,7 +11,7 @@ transparent desktop presence. It runs without a development board, keeps its
 runtime data on the Mac, and uses AppKit and AVFoundation rather than a browser
 runtime.
 
-Statelet 1.8.22 (build 36) requires macOS 13 or newer. Its tagged release attaches
+Statelet 1.9.0 (build 38) requires macOS 13 or newer. Its tagged release attaches
 an ad-hoc-signed package for owner-authorized personal updates; it is not a
 Developer ID-signed or notarized public binary. Existing 1.8.4 or earlier
 installs require one manual bootstrap update to 1.8.5 or later.
@@ -129,6 +129,24 @@ earlier results.
 - Includes a dedicated Settings → Help & Updates guide and privacy-safe in-app update checks.
 - Runs the lifecycle publisher with the Python standard library; Python media
   packages are needed only for optional MP4 conversion.
+
+## Companion panel
+
+Open **Companion…** from the menu-bar menu or click the pet's chat button.
+The native floating panel combines quick chat, agent activity and pet controls:
+
+- Chat using your installed Codex sign-in, with follow-ups, explicit text
+  attachments, cancellation and retry. Conversation history stays in Statelet's
+  memory; sending uses your Codex connection.
+- Dictate on this Mac and review before sending, or read replies aloud with the
+  macOS voice. Microphone access is requested only when you choose Dictate.
+- Filter tasks needing input, open verified Codex tasks, and clear completed
+  unread activity. Replying to or stopping desktop tasks happens in their app.
+- Switch/create/import character profiles, resize or hide the desktop pet,
+  control pet dialogue, and collapse the companion into a Mini bar.
+
+See [Companion usage and privacy](docs/COMPANION.md) for connection requirements,
+data handling, supported controls and limitations.
 
 ## How it works
 
@@ -344,6 +362,12 @@ recordings you are authorized to use. See
 
 ## Privacy and security
 
+Quick Chat is user-initiated and uses the signed installed Codex CLI. Messages
+and selected text attachments are sent through your Codex connection only when
+you choose Send or Retry. Statelet keeps them in memory, outside lifecycle
+sidecars and diagnostics. On-device dictation has no cloud fallback. See the
+[Companion privacy boundary](docs/COMPANION.md#chat).
+
 Statelet is designed for local operation:
 
 - The application and lifecycle publisher contain no telemetry or automatic
@@ -419,8 +443,8 @@ Statelet uses one canonical identity for new builds and installations:
 | Application Support | `~/Library/Application Support/Statelet` |
 | LaunchAgents | `com.coke1120.statelet.state-aggregator`, `com.coke1120.statelet.mac-player` |
 | Managed marker | `statelet-v2` |
-| App version | `1.8.22` |
-| Build number | `36` |
+| App version | `1.9.0` |
+| Build number | `38` |
 
 ## Uninstall
 

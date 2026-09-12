@@ -5,6 +5,19 @@ versioning for the public source release.
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-09-12
+
+### Added
+
+- Native Companion panel with Chat, Activity and Pet tabs, a Mini bar,
+  keyboard-accessible composer and a pet/menu-bar entry point.
+- Memory-only Codex quick chat with text attachments, follow-ups, safe local
+  routing, bounded replies, cancellation and retry.
+- Explicit on-device dictation and macOS spoken replies, plus quick access to
+  existing character import, animation editing, resizing and pet dialogue.
+- Activity filtering and completion acknowledgement; verified tasks open in
+  their owning app for replies, approvals and task controls.
+
 ### Fixed
 
 - Settings sidebar titles stay fully visible when selected, including Source

@@ -400,6 +400,10 @@ enum CodexAppServerExecutableDiscovery {
         fileManager: FileManager = .default
     ) -> URL? {
         let candidates = [
+            URL(fileURLWithPath: "/Applications/ChatGPT.app/Contents/Resources/codex"),
+            URL(fileURLWithPath: "/Applications/Codex.app/Contents/Resources/codex"),
+            homeDirectory.appendingPathComponent("Applications/ChatGPT.app/Contents/Resources/codex"),
+            homeDirectory.appendingPathComponent("Applications/Codex.app/Contents/Resources/codex"),
             homeDirectory.appendingPathComponent(".local/bin/codex"),
             homeDirectory.appendingPathComponent(".codex/packages/standalone/current/bin/codex"),
             URL(fileURLWithPath: "/opt/homebrew/bin/codex"),
@@ -490,7 +494,7 @@ enum CodexAppServerExecutableTrustPolicy: Sendable {
     case testOnlyAllowUnsignedExecutable
 }
 
-private final class CodexAppServerProcessControl: @unchecked Sendable {
+final class CodexAppServerProcessControl: @unchecked Sendable {
     private let lock = NSLock()
     private var process: Process?
     private var ownsGroup = false
@@ -531,7 +535,7 @@ private final class CodexAppServerProcessControl: @unchecked Sendable {
     }
 }
 
-private final class CodexAppServerLineDrain: @unchecked Sendable {
+final class CodexAppServerLineDrain: @unchecked Sendable {
     private let condition = NSCondition()
     private let maximumBytes: Int
     private var buffer = Data()

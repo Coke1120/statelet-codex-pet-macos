@@ -959,6 +959,15 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         show()
     }
 
+    /// Opens a named destination from the companion using existing navigation.
+    func showCompanionDestination(_ destination: String) {
+        guard let section = SettingsSection(rawValue: destination),
+              let row = Self.sidebarRow(for: section) else { show(); return }
+        sidebarTableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        changePane()
+        show()
+    }
+
     @objc private func openFirstRunAnimations() {
         showAnimations(for: .idle)
     }

@@ -172,6 +172,8 @@ final class PetPlayerView: NSView {
     }
     var contextMenuProvider: (() -> NSMenu?)?
     var onAdvanceClip: (() -> Void)?
+    var onOpenCompanion: (() -> Void)?
+    private let companionButton = NSButton()
     var onResizeEnded: ((NSSize) -> Void)?
     var onTemporaryStateSelection: ((PetState?) -> Void)?
     var onOpenAnimationSettings: ((PetState) -> Void)?
@@ -443,6 +445,12 @@ final class PetPlayerView: NSView {
 
     private func configureQuickControls() {
         configureQuickControlButton(
+            companionButton,
+            symbolName: "bubble.left.and.text.bubble.right",
+            accessibilityLabel: "Open Statelet Companion",
+            action: #selector(openCompanion)
+        )
+        configureQuickControlButton(
             nextClipButton,
             symbolName: "forward.end.fill",
             accessibilityLabel: "Next Clip",
@@ -458,12 +466,14 @@ final class PetPlayerView: NSView {
         quickControls.alignment = .centerX
         quickControls.spacing = 6
         quickControls.translatesAutoresizingMaskIntoConstraints = true
-        quickControls.setViews([nextClipButton, temporaryStateButton], in: .leading)
+        quickControls.setViews([companionButton, nextClipButton, temporaryStateButton], in: .leading)
         quickControls.setAccessibilityElement(true)
         quickControls.setAccessibilityRole(.group)
         quickControls.setAccessibilityLabel("Pet quick controls")
         addSubview(quickControls)
     }
+
+    @objc private func openCompanion() { onOpenCompanion?() }
 
     private func configureDialogueBubble() {
         dialogueBubble.wantsLayer = true
@@ -516,7 +526,18 @@ final class PetPlayerView: NSView {
         if !stateBadge.isHidden {
             let proposedFrame = NSRect(origin: origin, size: size)
             if proposedFrame.intersects(stateBadge.frame.insetBy(dx: -4, dy: -4)) {
-                origin.x = max(margin, stateBadge.frame.minX - size.width - 6)
+                // Keep the control rail on the right when a large badge and
+                // the third companion button meet on a small pet. Moving it
+                // left first can consume the dialogue bubble's entire width.
+                let belowBadge = stateBadge.frame.minY - size.height - 6
+                let aboveBadge = stateBadge.frame.maxY + 6
+                if belowBadge >= margin {
+                    origin.y = belowBadge
+                } else if aboveBadge + size.height <= bounds.maxY - margin {
+                    origin.y = aboveBadge
+                } else {
+                    origin.x = max(margin, stateBadge.frame.minX - size.width - 6)
+                }
             }
         }
         quickControls.frame = NSRect(origin: origin, size: size)
@@ -1056,7 +1077,7 @@ final class PetPlayerView: NSView {
         // NSStackView's fitting frame can be narrower than an arranged
         // button's visible 40-point bezel. Test the button bounds first so the
         // entire physical target remains clickable at every edge.
-        for button in [nextClipButton, temporaryStateButton] where !quickControls.isHidden && !button.isHidden {
+        for button in [companionButton, nextClipButton, temporaryStateButton] where !quickControls.isHidden && !button.isHidden {
             let target = button.convert(button.bounds, to: self)
             if target.contains(point) { return button }
         }

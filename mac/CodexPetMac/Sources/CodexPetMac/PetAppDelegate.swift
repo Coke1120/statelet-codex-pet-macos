@@ -15,6 +15,7 @@ private struct LaunchOptions {
     var clickThroughOverride: Bool?
     var alwaysOnTopOverride: Bool?
     var openSettings: Bool
+    var openCompanion: Bool = false
 
     static func parse(arguments: [String], fileManager: FileManager = .default) -> LaunchOptions {
         let support = fileManager.homeDirectoryForCurrentUser
@@ -64,6 +65,8 @@ private struct LaunchOptions {
                 options.alwaysOnTopOverride = false
             case "--settings":
                 options.openSettings = true
+            case "--companion":
+                options.openCompanion = true
             default:
                 break
             }
@@ -651,6 +654,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var oneShotArbiter = OneShotPlaybackArbiter()
     private var activeOneShotPreview: ActiveOneShotPreview?
     private var settingsController: SettingsWindowController?
+    private var companionController: CompanionPanelController?
+    private var companionPetVisible = true
     private var updateCoordinator: StateletUpdateCoordinator?
     private var updateRecoveryBlocked = false
     private var dialogueVoiceCoordinator: DialogueVoiceCoordinator!
@@ -871,6 +876,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         player.view.onTemporaryStateSelection = { [weak self] state in
             self?.selectTemporaryState(state, reason: "pet_button")
         }
+        player.view.onOpenCompanion = { [weak self] in self?.showCompanion() }
         sessionActivityView = SessionActivityView(
             frame: NSRect(origin: .zero, size: Self.sessionActivityPanelSize)
         )
@@ -968,6 +974,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 self.showSettings()
             }
         }
+        if options.openCompanion {
+            DispatchQueue.main.async { [weak self] in self?.showCompanion() }
+        }
         recoverInterruptedConversionIfPresent()
         DispatchQueue.main.async { [weak self] in
             self?.processPendingCharacterBundleOpenIfPossible()
@@ -992,6 +1001,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        MainActor.assumeIsolated { companionController?.shutdown() }
+        CompanionChatService.shutdownAll()
         enterTerminationState()
         transientStateReadRetry?.cancel()
         transientStateReadRetry = nil
@@ -1599,6 +1610,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             self.sessionActivityOpenTask = nil
             guard !opened, self.sessionActivityTargets[id] == threadID else { return }
             self.sessionActivityOpenableIDs.remove(id)
+            self.companionController?.model.openableIDs.remove(id)
             self.sessionActivityOpenabilityRequest = [:]
             self.refreshSessionActivityPresentation(rescheduleTitleHydration: false)
         }
@@ -1726,6 +1738,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         previousTargets: [String: String]? = nil,
         rescheduleOpenability: Bool = true
     ) {
+        refreshCompanion()
         guard let sessionActivityView, let sessionActivityPanel else { return }
         defer {
             if rescheduleOpenability {
@@ -1871,6 +1884,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func orderSessionActivityPanelVisible() {
+        guard companionPetVisible else { sessionActivityPanel.orderOut(nil); return }
         sessionActivityPanel.apply(
             alwaysOnTop: effectiveAlwaysOnTop,
             fullScreenAuxiliary: mediaMap.window.fullScreenAuxiliary
@@ -3163,6 +3177,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         clickItem.target = self
         clickItem.tag = StatusMenuTag.clickThrough.rawValue
         menu.addItem(clickItem)
+        let companionItem = NSMenuItem(title: "Open Companion…", action: #selector(showCompanion), keyEquivalent: "j")
+        companionItem.target = self
+        menu.addItem(companionItem)
         let settingsItem = NSMenuItem(title: "Settings…", action: #selector(showSettings), keyEquivalent: ",")
         settingsItem.target = self
         menu.addItem(settingsItem)
@@ -3377,6 +3394,81 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         options?.alwaysOnTopOverride ?? mediaMap.window.alwaysOnTop
     }
 
+    @objc private func showCompanion() {
+        MainActor.assumeIsolated { showCompanionOnMain() }
+    }
+
+    @MainActor private func showCompanionOnMain() {
+        guard !isTerminating, let panel else { return }
+        if companionController == nil {
+            let controller = CompanionPanelController()
+            companionController = controller
+            controller.model.onOpenTask = { [weak self] id in self?.openSessionActivity(id) }
+            controller.model.onAcknowledge = { [weak self] id in self?.acknowledgeSessionActivity(id) }
+            controller.model.onClearCompleted = { [weak self] in
+                guard let self else { return }
+                self.acknowledgeSessionActivities(self.sessionActivitySnapshot?.completed.map(\.id) ?? [])
+            }
+            controller.model.onSettings = { [weak self] destination in
+                self?.showSettings()
+                self?.settingsController?.showCompanionDestination(destination)
+            }
+            controller.model.onSelectCharacter = { [weak self] id in self?.selectCharacter(id: id) }
+            controller.model.onCreateCharacter = { [weak self] name in self?.createCharacter(name: name) }
+            controller.model.onImportCharacter = { [weak self] in self?.chooseCharacterBundle() }
+            controller.model.onResizePet = { [weak self] width in
+                guard let self else { return }
+                let ratio = self.mediaMap.window.height / self.mediaMap.window.width
+                self.persistUserResizedWindow(size: NSSize(width: width, height: width * ratio))
+                self.applyConfiguredWindowSize()
+                self.refreshCompanion()
+            }
+            controller.model.onTogglePetVoice = { [weak self] enabled in
+                guard let self else { return }
+                let current = self.dialogueVoiceCoordinator.library.playbackSettings
+                guard let updated = try? DialogueVoicePlaybackSettings(
+                    automaticPlaybackEnabled: enabled, volume: current.volume,
+                    repeatIntervalSeconds: current.repeatIntervalSeconds
+                ) else { return }
+                self.updateDialogueVoicePlaybackSettings(updated)
+                self.refreshCompanion()
+            }
+            controller.model.onTogglePet = { [weak self] visible in
+                guard let self else { return }
+                self.companionPetVisible = visible
+                if visible {
+                    if self.effectiveAlwaysOnTop { self.panel.orderFrontRegardless() }
+                    else { self.panel.orderFront(nil) }
+                    self.refreshSessionActivityPresentation()
+                } else {
+                    self.panel.orderOut(nil)
+                    self.sessionActivityPanel.orderOut(nil)
+                }
+                self.refreshCompanion()
+            }
+        }
+        refreshCompanion()
+        companionController?.show(beside: panel.frame)
+    }
+
+    private func refreshCompanion() {
+        MainActor.assumeIsolated { refreshCompanionOnMain() }
+    }
+
+    @MainActor private func refreshCompanionOnMain() {
+        guard let controller = companionController else { return }
+        controller.model.characters = characterLibrary.characters
+        controller.model.selectedCharacter = characterLibrary.activeCharacterID
+        controller.model.petSize = mediaMap.window.width
+        controller.model.petVisible = companionPetVisible
+        controller.model.petVoiceEnabled = dialogueVoiceCoordinator.library.playbackSettings.automaticPlaybackEnabled
+        controller.updateActivity(
+            snapshot: sessionActivitySnapshot,
+            acknowledged: Set(sessionActivityAcknowledgementHistory),
+            titles: sessionActivityTitles, targets: sessionActivityTargets
+        )
+    }
+
     @objc private func showSettings() {
         guard !isTerminating else { return }
         if settingsController == nil {
@@ -3559,6 +3651,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func refreshSettings() {
+        refreshCompanion()
         guard let settingsController else { return }
         let effectiveMap: MediaMap
         do {

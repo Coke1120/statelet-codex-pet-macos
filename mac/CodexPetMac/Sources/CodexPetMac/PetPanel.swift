@@ -40,7 +40,7 @@ final class PetPanel: NSPanel {
         if collectionBehavior != behavior {
             collectionBehavior = behavior
         }
-        if levelChanged {
+        if levelChanged && isVisible {
             if alwaysOnTop {
                 orderFrontRegardless()
             } else {
