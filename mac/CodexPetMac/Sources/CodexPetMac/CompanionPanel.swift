@@ -1,6 +1,7 @@
 import AppKit
 import CodexPetCore
 import Darwin
+import QuartzCore
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -15,7 +16,7 @@ final class CompanionModel: NSObject, ObservableObject, NSSpeechSynthesizerDeleg
     @Published private(set) var isRunning = false
     @Published private(set) var status = "Ready when you are"
     @Published var error: String?
-    @Published var compact = false
+    @Published private(set) var compact = false
     @Published var speakReplies = false
     @Published var speaking = false
     @Published var attachments: [CompanionAttachment] = []
@@ -41,6 +42,7 @@ final class CompanionModel: NSObject, ObservableObject, NSSpeechSynthesizerDeleg
     var onCreateCharacter: ((String) -> Void)?
     var onImportCharacter: (() -> Void)?
     var onCompactChange: (() -> Void)?
+    var onCompactWillChange: (() -> Void)?
     var onClose: (() -> Void)?
 
     private let runner: Runner
@@ -171,7 +173,14 @@ final class CompanionModel: NSObject, ObservableObject, NSSpeechSynthesizerDeleg
     }
 
     func stopSpeech() { speech.stopSpeaking(); speaking = false }
-    func toggleCompact() { dictation.stop(); compact.toggle(); onCompactChange?() }
+    func toggleCompact() { setCompact(!compact) }
+    func setCompact(_ value: Bool) {
+        guard compact != value else { return }
+        dictation.stop()
+        onCompactWillChange?()
+        compact = value
+        onCompactChange?()
+    }
     func toggleDictation() {
         if dictation.isListening || dictation.isStarting { dictation.stop() }
         else {
@@ -214,6 +223,64 @@ final class CompanionWindow: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+/// Keep the incoming layout at its final height while the window reveals it.
+/// The outgoing image lives only in memory and is discarded after the crossfade.
+@MainActor
+private final class CompanionContentView: NSView {
+    let host: NSHostingView<CompanionView>
+    var presentationHeight: CGFloat?
+    private var snapshot: NSImageView?
+
+    init(model: CompanionModel) {
+        host = NSHostingView(rootView: CompanionView(model: model))
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.masksToBounds = true
+        layer?.cornerRadius = 14
+        addSubview(host)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func layout() {
+        super.layout()
+        let height = presentationHeight ?? bounds.height
+        host.frame = NSRect(x: 0, y: bounds.height - height, width: bounds.width, height: height)
+        if let snapshot {
+            snapshot.setFrameOrigin(NSPoint(x: 0, y: bounds.height - snapshot.frame.height))
+        }
+    }
+
+    func captureOutgoing() {
+        layoutSubtreeIfNeeded()
+        guard let bitmap = bitmapImageRepForCachingDisplay(in: bounds) else { return }
+        cacheDisplay(in: bounds, to: bitmap)
+        let image = NSImage(size: bounds.size)
+        image.addRepresentation(bitmap)
+        snapshot?.removeFromSuperview()
+        let outgoing = NSImageView(frame: bounds)
+        outgoing.image = image
+        outgoing.imageScaling = .scaleNone
+        outgoing.imageAlignment = .alignTopLeft
+        addSubview(outgoing)
+        snapshot = outgoing
+    }
+
+    func crossfade() {
+        host.animator().alphaValue = 1
+        snapshot?.animator().alphaValue = 0
+    }
+
+    func finishTransition() {
+        snapshot?.removeFromSuperview()
+        snapshot = nil
+        host.alphaValue = 1
+        presentationHeight = nil
+        needsLayout = true
+        layoutSubtreeIfNeeded()
+    }
+}
+
 @MainActor
 final class CompanionPanelController: NSWindowController, NSWindowDelegate {
     let model = CompanionModel()
@@ -221,6 +288,10 @@ final class CompanionPanelController: NSWindowController, NSWindowDelegate {
     private var activityGeneration = UUID()
     private var openabilityTask: Task<Void, Never>?
     private var targets: [String: String] = [:]
+    private var expandedSize = NSSize(width: 440, height: 640)
+    private var transitionGeneration = UUID()
+    private var transitionTarget: NSRect?
+    private var content: CompanionContentView?
 
     init() {
         let panel = CompanionWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 640),
@@ -234,12 +305,22 @@ final class CompanionPanelController: NSWindowController, NSWindowDelegate {
         panel.isMovableByWindowBackground = true
         panel.isReleasedWhenClosed = false
         panel.hidesOnDeactivate = false
+        panel.animationBehavior = .utilityWindow
         panel.level = .floating
         panel.collectionBehavior = [.fullScreenAuxiliary, .moveToActiveSpace]
         panel.minSize = NSSize(width: 400, height: 440)
         super.init(window: panel)
         panel.delegate = self
-        panel.contentView = NSHostingView(rootView: CompanionView(model: model))
+        let content = CompanionContentView(model: model)
+        self.content = content
+        panel.contentView = content
+        model.onCompactWillChange = { [weak self] in
+            guard let self, let window = self.window else { return }
+            if !self.model.compact, self.transitionTarget == nil { self.expandedSize = window.frame.size }
+            if window.isVisible, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                self.content?.captureOutgoing()
+            }
+        }
         model.onCompactChange = { [weak self] in self?.resizeForMode() }
         model.onClose = { [weak self] in self?.window?.close() }
     }
@@ -264,20 +345,52 @@ final class CompanionPanelController: NSWindowController, NSWindowDelegate {
     }
 
     private func resizeForMode() {
-        guard let window else { return }
+        guard let window, let content else { return }
+        let generation = UUID()
+        transitionGeneration = generation
         var frame = window.frame
-        let size = NSSize(width: 440, height: model.compact ? 56 : 640)
+        let size = model.compact ? NSSize(width: 440, height: 56) : expandedSize
         frame.origin.y += frame.height - size.height
         frame.size = size
-        // Mini is a single input bar with no title-bar space or resize chrome.
+        if let visible = window.screen?.visibleFrame {
+            frame.size.width = min(frame.width, visible.width)
+            frame.size.height = min(frame.height, visible.height)
+            frame.origin.x = max(visible.minX, min(frame.minX, visible.maxX - frame.width))
+            frame.origin.y = max(visible.minY, min(frame.minY, visible.maxY - frame.height))
+        }
+        transitionTarget = frame
+        // Keep native title-bar chrome out of the morph and lift the expanded
+        // minimum until the shrinking window reaches Mini's height.
+        window.minSize = NSSize(width: 400, height: 56)
+        window.styleMask = [.borderless]
+        content.presentationHeight = frame.height
+        content.needsLayout = true
+        content.layoutSubtreeIfNeeded()
+
+        guard window.isVisible, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+            finishModeTransition(generation)
+            return
+        }
+        content.host.alphaValue = 0
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = model.compact ? 0.28 : 0.36
+            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 1, 0.36, 1)
+            window.animator().setFrame(frame, display: true)
+            content.crossfade()
+        } completionHandler: { [weak self] in
+            MainActor.assumeIsolated { self?.finishModeTransition(generation) }
+        }
+    }
+
+    private func finishModeTransition(_ generation: UUID) {
+        guard generation == transitionGeneration, let window, let frame = transitionTarget else { return }
         window.styleMask = model.compact ? [.borderless] : [.titled, .closable, .resizable, .fullSizeContentView]
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
-        window.minSize = model.compact ? size : NSSize(width: 400, height: 440)
-        if let visible = window.screen?.visibleFrame {
-            frame.origin.y = max(visible.minY, min(frame.minY, visible.maxY - frame.height))
-        }
+        window.minSize = model.compact ? NSSize(width: 440, height: 56) : NSSize(width: 400, height: 440)
         window.setFrame(frame, display: true)
+        transitionTarget = nil
+        content?.finishTransition()
     }
 
     func updateActivity(snapshot: SessionActivitySnapshot?, acknowledged: Set<String>,
@@ -303,12 +416,16 @@ final class CompanionPanelController: NSWindowController, NSWindowDelegate {
         }
     }
 
-    func windowWillClose(_ notification: Notification) { model.dictation.stop(); model.stopSpeech() }
+    func windowWillClose(_ notification: Notification) {
+        finishModeTransition(transitionGeneration)
+        model.dictation.stop(); model.stopSpeech()
+    }
     func shutdown() { openabilityTask?.cancel(); model.shutdown(); window?.close() }
 }
 
 private struct CompanionView: View {
     @ObservedObject var model: CompanionModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var newPetName = ""
     @FocusState private var composerFocused: Bool
     private let accent = Color(red: 0.17, green: 0.49, blue: 0.44)
@@ -320,7 +437,7 @@ private struct CompanionView: View {
                     Image(systemName: "bubble.left.and.text.bubble.right").foregroundStyle(accent)
                     TextField("Ask something…", text: $model.draft)
                         .font(.system(size: 16)).focused($composerFocused)
-                        .textFieldStyle(.plain).onSubmit { model.compact = false; model.tab = .chat; model.onCompactChange?(); model.send() }
+                        .textFieldStyle(.plain).onSubmit { model.setCompact(false); model.tab = .chat; model.send() }
                         .accessibilityLabel("Quick chat message")
                     if model.isRunning { ProgressView().controlSize(.small).accessibilityLabel(model.status) }
                     Button { model.toggleCompact() } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }
@@ -336,15 +453,24 @@ private struct CompanionView: View {
                     }
                 }.pickerStyle(.segmented).labelsHidden().padding(.horizontal, 20).padding(.bottom, 14)
                 Divider()
-                switch model.tab {
-                case .chat: chat
-                case .activity: activity
-                case .pet: pet
+                ZStack {
+                    Group {
+                        switch model.tab {
+                        case .chat: chat
+                        case .activity: activity
+                        case .pet: pet
+                        }
+                    }.id(model.tab).transition(.opacity)
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: model.tab)
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .clipShape(RoundedRectangle(cornerRadius: model.compact ? 14 : 0))
+        // Header padding already reserves the native window controls. Keeping
+        // safe-area handling stable avoids a final jump when chrome returns.
+        .ignoresSafeArea()
         .tint(accent)
         .onChange(of: model.compact) { _ in composerFocused = true }
         .onChange(of: model.speakReplies) { enabled in if !enabled { model.stopSpeech() } }

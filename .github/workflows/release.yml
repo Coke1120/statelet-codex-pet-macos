@@ -11,7 +11,7 @@ on:
         required: true
         type: string
       skip_tests:
-        description: Owner-authorized test waiver for v1.9.1 only
+        description: Owner-authorized test waiver for v1.9.2 only
         required: false
         default: false
         type: boolean
@@ -57,8 +57,8 @@ jobs:
           fi
           [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           if [[ "$SKIP_TESTS" == "true" ]]; then
-            [[ "$EVENT_NAME" == "workflow_dispatch" && "$tag" == "v1.9.1" ]]
-            echo 'Owner-authorized v1.9.1 release: CI and updater tests skipped. Build and signed artifact verification remain required.' >> "$GITHUB_STEP_SUMMARY"
+            [[ "$EVENT_NAME" == "workflow_dispatch" && "$tag" == "v1.9.2" ]]
+            echo 'Owner-authorized v1.9.2 release: CI and updater tests skipped. Build and signed artifact verification remain required.' >> "$GITHUB_STEP_SUMMARY"
           fi
 
           git fetch --force --tags origin

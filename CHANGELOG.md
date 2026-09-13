@@ -5,6 +5,24 @@ versioning for the public source release.
 
 ## [Unreleased]
 
+## [1.9.2] - 2026-09-14
+
+### Changed
+
+- Mini and expanded companion modes resize with a gentle ease-out and an
+  in-memory crossfade. Incoming content keeps its final height during the
+  transition, avoiding compressed controls.
+- Expanded window size is preserved; rapid mode changes discard stale
+  completion callbacks and keep the destination within the visible screen.
+- Chat, Activity, and Pet tabs fade between sections. Mode and tab animations
+  respect macOS Reduce Motion.
+
+### Validation notes
+
+- Tests and exact-commit CI were skipped at the owner's request. The app build
+  passed locally; installed-app motion was not manually verified.
+- Release builds, signed manifests, and hosted artifact checks remain required.
+
 ## [1.9.1] - 2026-09-13
 
 ### Changed

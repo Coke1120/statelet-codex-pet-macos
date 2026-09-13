@@ -342,7 +342,7 @@ push at that exact commit before signing. Wait for that CI result before
 pushing the release tag; a successful check on an earlier commit or a pull
 request merge ref is not a substitute.
 
-For the owner-authorized v1.9.1 release only, manual dispatch accepts
+For the owner-authorized v1.9.2 release only, manual dispatch accepts
 `skip_tests: true` to waive exact-commit CI and focused updater tests. This
 exception is recorded in the workflow summary and release notes; it does not
 waive build, repository/tag binding, signing, or hosted artifact verification.
