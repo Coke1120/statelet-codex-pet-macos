@@ -5,6 +5,21 @@ versioning for the public source release.
 
 ## [Unreleased]
 
+## [1.9.1] - 2026-09-13
+
+### Changed
+
+- Mini chat is a single Spotlight-style bar, reduced from 116 to 56 points
+  tall. The header and title bar are removed; expand and close remain inline.
+- Switching between Mini and expanded chat preserves the draft and focuses
+  the composer.
+
+### Validation notes
+
+- Release test execution and exact-commit CI were skipped at the owner's
+  request. The 12 companion tests passed before release versioning.
+- Build, manifest signing, and hosted artifact verification remain required.
+
 ## [1.9.0] - 2026-09-12
 
 ### Changed

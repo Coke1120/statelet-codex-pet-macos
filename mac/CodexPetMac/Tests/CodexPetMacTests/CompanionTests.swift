@@ -136,10 +136,16 @@ final class CompanionTests: XCTestCase {
         let controller = CompanionPanelController()
         controller.model.draft = "Unsent text"
         controller.model.toggleCompact()
-        XCTAssertEqual(controller.window?.frame.height, 116)
+        XCTAssertEqual(controller.window?.frame.height, 56)
+        XCTAssertEqual(controller.window?.styleMask, .borderless)
+        controller.window?.contentView?.layoutSubtreeIfNeeded()
+        XCTAssertLessThanOrEqual(controller.window?.contentView?.fittingSize.height ?? .infinity, 56)
         XCTAssertEqual(controller.model.draft, "Unsent text")
         controller.model.toggleCompact()
         XCTAssertEqual(controller.window?.frame.height, 640)
+        XCTAssertTrue(controller.window?.styleMask.contains(.titled) == true)
+        XCTAssertTrue(controller.window?.styleMask.contains(.resizable) == true)
+        XCTAssertEqual(controller.model.draft, "Unsent text")
         controller.shutdown()
     }
 

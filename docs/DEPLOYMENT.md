@@ -342,6 +342,12 @@ push at that exact commit before signing. Wait for that CI result before
 pushing the release tag; a successful check on an earlier commit or a pull
 request merge ref is not a substitute.
 
+For the owner-authorized v1.9.1 release only, manual dispatch accepts
+`skip_tests: true` to waive exact-commit CI and focused updater tests. This
+exception is recorded in the workflow summary and release notes; it does not
+waive build, repository/tag binding, signing, or hosted artifact verification.
+Other versions reject this option, and normal releases retain the CI gate.
+
 The repository secret `STATELET_UPDATE_SIGNING_PRIVATE_KEY_B64` contains the
 raw Ed25519 private key. It must never be printed, committed, placed in release
 notes, or copied into the app. The matching public key is embedded in Statelet.

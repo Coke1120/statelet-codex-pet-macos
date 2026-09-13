@@ -229,6 +229,8 @@ final class CompanionPanelController: NSWindowController, NSWindowDelegate {
         panel.title = "Statelet Companion"
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
         panel.isMovableByWindowBackground = true
         panel.isReleasedWhenClosed = false
         panel.hidesOnDeactivate = false
@@ -264,9 +266,13 @@ final class CompanionPanelController: NSWindowController, NSWindowDelegate {
     private func resizeForMode() {
         guard let window else { return }
         var frame = window.frame
-        let size = NSSize(width: 440, height: model.compact ? 116 : 640)
+        let size = NSSize(width: 440, height: model.compact ? 56 : 640)
         frame.origin.y += frame.height - size.height
         frame.size = size
+        // Mini is a single input bar with no title-bar space or resize chrome.
+        window.styleMask = model.compact ? [.borderless] : [.titled, .closable, .resizable, .fullSizeContentView]
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
         window.minSize = model.compact ? size : NSSize(width: 400, height: 440)
         if let visible = window.screen?.visibleFrame {
             frame.origin.y = max(visible.minY, min(frame.minY, visible.maxY - frame.height))
@@ -309,17 +315,21 @@ private struct CompanionView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            header
             if model.compact {
                 HStack(spacing: 10) {
                     Image(systemName: "bubble.left.and.text.bubble.right").foregroundStyle(accent)
                     TextField("Ask something…", text: $model.draft)
+                        .font(.system(size: 16)).focused($composerFocused)
                         .textFieldStyle(.plain).onSubmit { model.compact = false; model.tab = .chat; model.onCompactChange?(); model.send() }
                         .accessibilityLabel("Quick chat message")
+                    if model.isRunning { ProgressView().controlSize(.small).accessibilityLabel(model.status) }
                     Button { model.toggleCompact() } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }
                         .help("Expand companion").accessibilityLabel("Expand companion")
-                }.padding(14)
+                    Button { model.onClose?() } label: { Image(systemName: "xmark") }
+                        .help("Close companion").accessibilityLabel("Close companion")
+                }.buttonStyle(.borderless).padding(.horizontal, 16).frame(height: 56)
             } else {
+                header
                 Picker("Companion section", selection: $model.tab) {
                     ForEach(CompanionModel.Tab.allCases, id: \.self) { tab in
                         Text(tab == .activity && model.attentionCount > 0 ? "Activity · \(model.attentionCount)" : tab.rawValue).tag(tab)
@@ -334,7 +344,9 @@ private struct CompanionView: View {
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: model.compact ? 14 : 0))
         .tint(accent)
+        .onChange(of: model.compact) { _ in composerFocused = true }
         .onChange(of: model.speakReplies) { enabled in if !enabled { model.stopSpeech() } }
         .onChange(of: model.tab) { _ in model.dictation.stop() }
         .onAppear { composerFocused = true }

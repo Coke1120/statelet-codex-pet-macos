@@ -10,6 +10,11 @@ on:
         description: Existing stable version tag to publish
         required: true
         type: string
+      skip_tests:
+        description: Owner-authorized test waiver for v1.9.1 only
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -37,6 +42,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           DISPATCH_TAG: ${{ inputs.tag }}
           PUSH_TAG: ${{ github.ref_name }}
+          SKIP_TESTS: ${{ inputs.skip_tests }}
           ACTUAL_REPOSITORY: ${{ github.repository }}
           ACTUAL_REPOSITORY_ID: ${{ github.repository_id }}
         run: |
@@ -50,6 +56,10 @@ jobs:
             tag="$PUSH_TAG"
           fi
           [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if [[ "$SKIP_TESTS" == "true" ]]; then
+            [[ "$EVENT_NAME" == "workflow_dispatch" && "$tag" == "v1.9.1" ]]
+            echo 'Owner-authorized v1.9.1 release: CI and updater tests skipped. Build and signed artifact verification remain required.' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
           git fetch --force --tags origin
           git fetch --force origin +refs/heads/main:refs/remotes/origin/main
@@ -73,6 +83,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Require successful exact-commit macOS CI
+        if: ${{ !inputs.skip_tests }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
@@ -135,6 +146,7 @@ jobs:
           done
 
       - name: Run focused updater tests
+        if: ${{ !inputs.skip_tests }}
         run: >-
           swift test -c release --package-path mac/CodexPetMac
           --filter StateletUpdaterTests
