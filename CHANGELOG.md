@@ -19,6 +19,8 @@ versioning for the public source release.
 - Selected the native SwiftPM release-build backend so crash symbols retain
   sanitized source paths with newer Xcode toolchains; the bundle and symbol
   privacy checks remain mandatory.
+- Removed a scheduler race from the failed-helper cleanup regression fixture,
+  retaining checks that the descendant receives termination and exits.
 
 ## [1.9.2] - 2026-09-14
 

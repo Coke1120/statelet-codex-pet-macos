@@ -1173,7 +1173,7 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         XCTAssertTrue(waitForProcessExit(publishedChild), "cancelled descendant escaped cleanup")
     }
 
-    func testQwenProcessRunnerDoesNotGraceDescendantAfterFailedLeaderExit() async throws {
+    func testQwenProcessRunnerTerminatesDescendantAfterFailedLeaderExit() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("qwen-failed-leader-\(UUID())", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1190,8 +1190,9 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
                 .appending("  os._exit(0)\n")
                 .appending(" signal.signal(signal.SIGTERM, handle_term)\n")
                 .appending(" open('child.pid','w').write(str(os.getpid()))\n")
-                .appending(" time.sleep(0.12)\n")
-                .appending(" os._exit(0)\n")
+                // Keep the child alive until cleanup; a short self-exit races
+                // process-exit observation on a busy runner.
+                .appending(" while True: time.sleep(1)\n")
                 .appending("deadline = time.time() + 2\n")
                 .appending("while not os.path.exists('child.pid') and time.time() < deadline: time.sleep(0.01)\n")
                 .appending("raise SystemExit(7)\n")
