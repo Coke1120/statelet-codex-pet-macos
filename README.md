@@ -444,7 +444,7 @@ Statelet uses one canonical identity for new builds and installations:
 | LaunchAgents | `com.coke1120.statelet.state-aggregator`, `com.coke1120.statelet.mac-player` |
 | Managed marker | `statelet-v2` |
 | App version | `1.9.3` |
-| Build number | `38` |
+| Build number | `41` |
 
 ## Uninstall
 
