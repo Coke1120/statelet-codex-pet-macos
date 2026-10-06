@@ -5,6 +5,23 @@ versioning for the public source release.
 
 ## [Unreleased]
 
+## [1.9.3] - 2026-10-06
+
+### Fixed
+
+- Retired the v1.9.2 release test waiver. Exact-commit CI and focused updater
+  tests are mandatory for both tag pushes and manual dispatches, with
+  regression checks against conditional or failure-tolerant test steps.
+- Added current 1.9.x release qualification status and documented the 1.9.1
+  and 1.9.2 test waivers while preserving the historical 1.8.21 evidence.
+- Kept the Settings sidebar at its fixed width when switching to Dialogue &
+  Voice on newer macOS releases.
+- Selected the native SwiftPM release-build backend so crash symbols retain
+  sanitized source paths with newer Xcode toolchains; the bundle and symbol
+  privacy checks remain mandatory.
+- Removed a scheduler race from the failed-helper cleanup regression fixture,
+  retaining checks that the descendant receives termination and exits.
+
 ## [1.9.2] - 2026-09-14
 
 ### Changed

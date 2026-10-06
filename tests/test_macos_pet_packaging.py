@@ -503,8 +503,12 @@ esac
             info["NSHumanReadableCopyright"],
             "Copyright © 2026 Statelet contributors. MIT licensed.",
         )
-        self.assertEqual(info["CFBundleShortVersionString"], "1.9.0")
-        self.assertEqual(info["CFBundleVersion"], "38")
+        with (PACKAGE / "Resources" / "Info.plist").open("rb") as handle:
+            source_info = plistlib.load(handle)
+        self.assertRegex(info["CFBundleShortVersionString"], r"^[0-9]+\.[0-9]+\.[0-9]+$")
+        self.assertRegex(info["CFBundleVersion"], r"^[1-9][0-9]*$")
+        for key in ("CFBundleShortVersionString", "CFBundleVersion"):
+            self.assertEqual(info[key], source_info[key])
         self.assertEqual(info["CFBundlePackageType"], "APPL")
         self.assertEqual(info["LSMinimumSystemVersion"], "13.0")
         self.assertTrue(info["LSUIElement"])

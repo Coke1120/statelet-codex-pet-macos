@@ -1245,6 +1245,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         splitViewController.preferredContentSize = requestedContentSize
         let splitRootView = splitViewController.view
         NSLayoutConstraint.activate([
+            // Keep native split wrappers from fitting the child views to a
+            // newly selected pane instead of the available window width.
+            sidebar.widthAnchor.constraint(equalToConstant: Self.sidebarWidth),
+            detailView.widthAnchor.constraint(
+                equalTo: splitViewController.splitView.widthAnchor,
+                constant: -Self.sidebarWidth - splitViewController.splitView.dividerThickness
+            ),
             splitViewController.splitView.leadingAnchor.constraint(equalTo: splitRootView.leadingAnchor),
             splitViewController.splitView.trailingAnchor.constraint(equalTo: splitRootView.trailingAnchor),
             splitViewController.splitView.topAnchor.constraint(equalTo: splitRootView.topAnchor),

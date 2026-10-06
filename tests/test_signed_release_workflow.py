@@ -13,6 +13,30 @@ SIGNER = ROOT / "mac" / "CodexPetMac" / "scripts" / "sign_update_manifest.swift"
 
 
 class SignedReleaseWorkflowTests(unittest.TestCase):
+    def test_workflow_has_no_test_waiver(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertNotIn("skip_tests", workflow.lower())
+
+    def test_release_verification_steps_cannot_be_skipped(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        for name, command in (
+            ("Require successful exact-commit macOS CI", "gh api --method GET"),
+            (
+                "Run focused updater tests",
+                "swift test -c release --package-path mac/CodexPetMac --filter StateletUpdaterTests",
+            ),
+        ):
+            with self.subTest(step=name):
+                marker = f"      - name: {name}\n"
+                self.assertEqual(workflow.count(marker), 1)
+                step = workflow.split(marker, 1)[1].split("\n      - ", 1)[0]
+                self.assertNotRegex(step, r"(?m)^\s*(?:if|continue-on-error)\s*:")
+                self.assertIn(command, " ".join(step.split()))
+                self.assertLess(
+                    workflow.index(marker),
+                    workflow.index("- name: Sign and verify update manifest"),
+                )
+
     def test_workflow_is_bound_to_protected_main_and_repository_identity(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("runs-on: macos-15", workflow)

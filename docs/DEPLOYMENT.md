@@ -1,7 +1,8 @@
 # Deploy Statelet on macOS
 
 This guide covers building, installing, upgrading, starting automatically, and
-uninstalling Statelet 1.9.0 (build 38) on macOS 13 or newer.
+uninstalling Statelet on macOS 13 or newer. The current release evidence is
+recorded in the [1.9.3 qualification record](PRODUCTION_READINESS.md#193-qualification--2026-10-06).
 
 Releases through 1.8.4 were source-only. The 1.8.5 tagged release adds an
 ad-hoc-signed personal-update ZIP, manifest, and signature. The maintained
@@ -342,11 +343,13 @@ push at that exact commit before signing. Wait for that CI result before
 pushing the release tag; a successful check on an earlier commit or a pull
 request merge ref is not a substitute.
 
-For the owner-authorized v1.9.2 release only, manual dispatch accepts
-`skip_tests: true` to waive exact-commit CI and focused updater tests. This
-exception is recorded in the workflow summary and release notes; it does not
-waive build, repository/tag binding, signing, or hosted artifact verification.
-Other versions reject this option, and normal releases retain the CI gate.
+Exact-commit CI and focused updater tests are mandatory for both tag pushes
+and manual dispatches. The maintained workflow has no test-waiver input.
+The historical owner-authorized exceptions for 1.9.1 and 1.9.2, including
+which checks ran and which were skipped, remain in the
+[release-status record](PRODUCTION_READINESS.md#release-status--2026-10-06).
+Removing the waiver does not change historical workflow definitions or
+retroactively qualify those releases.
 
 The repository secret `STATELET_UPDATE_SIGNING_PRIVATE_KEY_B64` contains the
 raw Ed25519 private key. It must never be printed, committed, placed in release
