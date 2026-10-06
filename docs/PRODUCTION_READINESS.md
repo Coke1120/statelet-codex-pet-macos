@@ -1,4 +1,41 @@
-# Stabilization qualification — 2026-09-06
+# Stabilization and release qualification
+
+## Release status — 2026-10-06
+
+The released baseline and `main` at this check are version **1.9.2, build 40**,
+commit `8288361c22d86d76c79f3a1f8699dd626c6b5205`. GitHub Actions records the
+following verification scope for the 1.9.x releases:
+
+| Release | Commit / build | Exact-commit main CI | Focused updater tests in release job | Signed release job |
+| --- | --- | --- | --- | --- |
+| 1.9.0 | `2a40ea2050900ca14ea6dcf00fec9c14515696d5` / 38 | [Passed](https://github.com/Coke1120/statelet-codex-pet-macos/actions/runs/34703094302) | Passed | [Passed](https://github.com/Coke1120/statelet-codex-pet-macos/actions/runs/34704134034) |
+| 1.9.1 | `3c488a5158a84e93fbfeb44bcd1bad08a86ea435` / 39 | Waived; no CI run for this commit | Skipped | [Passed](https://github.com/Coke1120/statelet-codex-pet-macos/actions/runs/34767145268) |
+| 1.9.2 | `8288361c22d86d76c79f3a1f8699dd626c6b5205` / 40 | Waived; no CI run for this commit | Skipped | [Passed](https://github.com/Coke1120/statelet-codex-pet-macos/actions/runs/34768381334) |
+
+The 1.9.0 main CI run passed Python smoke tests, Swift unit tests, explicitly
+enabled AVPlayer integration, the core self-test, app assembly and strict
+code-sign verification. MP4/alpha conversion tests were excluded by the
+documented manual-only policy.
+
+The 1.9.1 and 1.9.2 exceptions were explicitly owner-authorized and are recorded
+in the [changelog](../CHANGELOG.md). Their release jobs still passed app build,
+packaging, manifest signing and hosted-byte verification. A successful signed
+release job therefore does not imply that either waived test gate passed.
+The 12 companion tests reported for 1.9.1 preceded release versioning; they do
+not qualify its final commit. Installed-app motion was not manually verified
+for 1.9.2. These Actions records do not add installed, voice-inference or
+minimum-macOS coverage.
+
+The maintained workflow now requires both test gates for tag pushes and manual
+dispatches, with no test-waiver input. This change does not alter historical
+workflow definitions or retroactively qualify earlier releases. A future
+release needs the [complete release gate](DEPLOYMENT.md#release-verification)
+and installed acceptance for its own candidate.
+
+## Historical stabilization qualification — 2026-09-06
+
+All remaining sections preserve the September 6 evidence and its original
+source and executable bindings. These checks must not be attributed to 1.9.x.
 
 This record follows the [project review](PROJECT_REVIEW.md) and covers the
 working tree based on `50491324f1d01c593b9f6ffc6795fcea4e2b1b05` (1.8.21,

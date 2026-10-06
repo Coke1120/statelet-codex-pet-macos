@@ -4,6 +4,24 @@ Follow-up implementation and runtime evidence are recorded in the
 [stabilization qualification](PRODUCTION_READINESS.md). This review preserves
 the evidence and decisions from the earlier documentation-only phase.
 
+## Release-status follow-up — 2026-10-06
+
+The current released baseline and `main` at this check are 1.9.2 (build 40),
+commit `8288361c22d86d76c79f3a1f8699dd626c6b5205`. The
+[release-status record](PRODUCTION_READINESS.md#release-status--2026-10-06)
+links the passing exact-commit CI for 1.9.0 and the owner-authorized CI/updater
+test waivers used for 1.9.1 and 1.9.2. Build, signing and hosted artifact checks
+passed for those releases; the waivers do not establish automated test
+qualification for their commits.
+
+The maintained release workflow has retired the waiver. Its exact-commit CI
+and focused updater checks are mandatory, with regression checks that reject
+conditional or failure-tolerant test steps. The [roadmap](../ROADMAP.md) now
+uses the current release baseline when describing the next qualification.
+
+The assessment, source counts and validation below remain the September 5
+snapshot. Their original 1.8.21 source binding is retained.
+
 ## Assessment
 
 Statelet has a strong technical foundation for a personal macOS companion:

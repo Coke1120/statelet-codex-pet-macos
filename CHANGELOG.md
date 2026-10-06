@@ -5,6 +5,14 @@ versioning for the public source release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Retired the v1.9.2 release test waiver. Exact-commit CI and focused updater
+  tests are mandatory for both tag pushes and manual dispatches, with
+  regression checks against conditional or failure-tolerant test steps.
+- Added current 1.9.x release qualification status and documented the 1.9.1
+  and 1.9.2 test waivers while preserving the historical 1.8.21 evidence.
+
 ## [1.9.2] - 2026-09-14
 
 ### Changed

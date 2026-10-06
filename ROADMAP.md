@@ -9,20 +9,24 @@ See the [2026-09-05 project review](docs/PROJECT_REVIEW.md) for the evidence beh
 these priorities. Each item needs a named owner when work starts; roles below
 describe the responsibility rather than assigning someone else's time.
 
-The [stabilization qualification](docs/PRODUCTION_READINESS.md) records fixes
-and completed local checks. Publication expiry, missing-media recovery,
-superseded playback, pipe cleanup and canonical hook continuity now have
-behavioral coverage. The qualification record now includes a successful
-installed regeneration after restart, old-audio
-retention and cleanup checks, and measured playback/voice memory. The next
-release still needs hosted CI on its exact committed source and the platform
-checks below.
+The release baseline checked on 2026-10-06 is **1.9.2, build 40**, commit
+`8288361c22d86d76c79f3a1f8699dd626c6b5205`. The
+[release-status record](docs/PRODUCTION_READINESS.md#release-status--2026-10-06)
+distinguishes 1.9.0's passing exact-commit CI from the owner-authorized CI and
+updater-test waivers used for 1.9.1 and 1.9.2. Build, signing and hosted artifact
+checks passed for both waived releases; 1.9.2 installed motion was not checked.
+The maintained workflow now requires both test gates without a waiver.
+
+The September stabilization checks remain historical evidence for their
+recorded source and binaries. The next release needs the complete gate on its
+own committed source, installed acceptance including companion transitions,
+and the platform checks below.
 
 ## Next: qualify a stabilization release
 
 | Priority | Outcome | Completion evidence | Responsible role |
 | --- | --- | --- | --- |
-| 1 | Carry the locally verified voice fixes through release qualification | Retain the installed regeneration, Preview, cancellation/retry/restart regression and private-data preservation evidence; run the complete release gate on the resulting commit and identify provider/platform checks not performed | Voice maintainer + release owner |
+| 1 | Qualify the current release candidate without test waivers | Run the complete release gate on the candidate commit and repeat installed acceptance, including companion transitions; retain the historical voice/private-data preservation evidence and identify provider/platform checks not performed | macOS maintainer + release owner |
 | 1 | Make first-run success observable | In an isolated fresh account/profile, follow the README, configure one authorized Idle clip, confirm visible playback and a real agent turn; record setup time and blockers; provide actionable recovery for absent media or conversion tools | macOS UX maintainer |
 | 1 | Make every release's verification scope explicit | Record exact commit, version/build, automated results, installed smoke results and unrun platform/voice checks; passing CI must refer to the released commit | Release owner |
 | 2 | Verify everyday native behavior after Settings changes | Exercise Command-comma, Command-W, Command-Q, resize, click-through recovery, sleep/wake and agent-source switching; observe all four lifecycle states and preserved settings after relaunch | macOS maintainer |
