@@ -64,7 +64,9 @@ if [[ -z "$executable" ]]; then
   build_scratch="$(mktemp -d "$package_dir/.build/CodexPetMac-release.XXXXXX")"
   trap 'rm -rf "$build_scratch"' EXIT
   module_cache="$build_scratch/ModuleCache"
-  swift build --package-path "$package_dir" -c release --product statelet \
+  # Use the native SwiftPM backend consistently. SwiftBuild can retain raw
+  # Clang module command paths in dSYMs despite the prefix maps below.
+  swift build --build-system native --package-path "$package_dir" -c release --product statelet \
     -Xswiftc -file-prefix-map \
     -Xswiftc "$package_dir=/BUILD/CodexPetMac" \
     -Xswiftc -file-prefix-map \
@@ -76,7 +78,7 @@ if [[ -z "$executable" ]]; then
     -Xcc "-fmodules-cache-path=$module_cache" \
     -Xcc "-ffile-prefix-map=$build_scratch=/BUILD/CodexPetMacTemp" \
     -Xcc "-ffile-prefix-map=$swift_temp_root=/BUILD/SwiftTemp"
-  bin_dir="$(swift build --package-path "$package_dir" -c release --show-bin-path)"
+  bin_dir="$(swift build --build-system native --package-path "$package_dir" -c release --show-bin-path)"
   executable="$bin_dir/statelet"
 fi
 

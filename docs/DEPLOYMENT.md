@@ -2,7 +2,7 @@
 
 This guide covers building, installing, upgrading, starting automatically, and
 uninstalling Statelet on macOS 13 or newer. The current release evidence is
-recorded in the [release-status record](PRODUCTION_READINESS.md#release-status--2026-10-06).
+recorded in the [1.9.3 qualification record](PRODUCTION_READINESS.md#193-qualification--2026-10-06).
 
 Releases through 1.8.4 were source-only. The 1.8.5 tagged release adds an
 ad-hoc-signed personal-update ZIP, manifest, and signature. The maintained

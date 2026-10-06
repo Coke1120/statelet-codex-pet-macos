@@ -1,5 +1,23 @@
 # Stabilization and release qualification
 
+## 1.9.3 qualification — 2026-10-06
+
+The release target is **1.9.3, build 41**, bound to
+[`v1.9.3`](https://github.com/Coke1120/statelet-codex-pet-macos/tree/v1.9.3).
+It restores mandatory exact-commit main CI and focused updater tests. Local
+qualification also exposed two preexisting blockers on macOS 27.0.1: switching
+to Dialogue & Voice resized the Settings sidebar, and SwiftBuild retained local
+compiler paths in crash symbols. Explicit split-pane widths and the native
+SwiftPM release-build backend address these without relaxing layout assertions
+or the artifact privacy scan.
+
+The [release notes](https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.9.3)
+record the final commit, completed local checks, exact-commit CI, and signed
+artifact verification. Publication remains conditional on those gates passing;
+this source record alone is not evidence of a completed release. Minimum-macOS
+13 acceptance, fresh-user onboarding, and real voice inference require separate
+evidence and are not implied by the automated checks or historical records.
+
 ## Release status — 2026-10-06
 
 The released baseline and `main` at this check are version **1.9.2, build 40**,

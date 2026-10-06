@@ -9,6 +9,11 @@ See the [2026-09-05 project review](docs/PROJECT_REVIEW.md) for the evidence beh
 these priorities. Each item needs a named owner when work starts; roles below
 describe the responsibility rather than assigning someone else's time.
 
+The [1.9.3 candidate](docs/PRODUCTION_READINESS.md#193-qualification--2026-10-06)
+restores mandatory release checks and addresses the local Settings-layout and
+crash-symbol privacy blockers found during qualification. Its release notes
+record the final verification scope separately from the earlier baseline below.
+
 The release baseline checked on 2026-10-06 is **1.9.2, build 40**, commit
 `8288361c22d86d76c79f3a1f8699dd626c6b5205`. The
 [release-status record](docs/PRODUCTION_READINESS.md#release-status--2026-10-06)
