@@ -1695,6 +1695,9 @@ final class PetPlayerController {
             cancelLifecycleHandoff(notifyFailure: false)
         }
         reduceMotion = enabled
+        // Keep a retained video frame static when no poster is available.
+        // Compose this with sleep and occlusion so neither can resume motion.
+        setSuspended(enabled, for: .reduceMotion)
     }
 
     func applyAppearance(_ configuration: PetAppearanceConfiguration) {

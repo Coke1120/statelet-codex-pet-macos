@@ -4,6 +4,7 @@ import Foundation
 public enum PlaybackSuspensionReason: String, Hashable, Sendable {
     case screenAsleep = "screen_asleep"
     case windowOccluded = "window_occluded"
+    case reduceMotion = "reduce_motion"
 }
 
 public enum PlaybackControlDirective: Equatable, Sendable {

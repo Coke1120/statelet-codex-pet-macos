@@ -582,16 +582,17 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
     }
 
     @MainActor
-    func testReduceMotionWithoutPosterRetainsExistingPresentation() throws {
+    func testReduceMotionWithoutPosterFreezesRetainedPresentationAndResumesSafely() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("statelet-reduce-retention-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let movieURL = directory.appendingPathComponent("movie.mov")
-        try Self.writeTestMovie(to: movieURL)
+        try Self.writeTestMovie(to: movieURL, frameCount: 90)
         let view = PetPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         let controller = PetPlayerController(view: view)
-        let entry = try MediaEntry(path: movieURL.lastPathComponent)
+        defer { controller.clearTransientPresentation() }
+        let entry = try MediaEntry(path: movieURL.lastPathComponent, playbackRate: 0.75)
         _ = controller.show(
             state: .idle,
             entry: entry,
@@ -601,9 +602,9 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
             startedAt: DispatchTime.now().uptimeNanoseconds
         )
         try Self.waitUntil("initial presentation did not become ready") {
-            controller.currentURL == movieURL
+            controller.currentURL == movieURL && (view.playerLayer.player?.rate ?? 0) > 0
         }
-        let player = view.playerLayer.player
+        let player = try XCTUnwrap(view.playerLayer.player)
         controller.setReduceMotion(true)
         XCTAssertEqual(
             controller.show(
@@ -619,6 +620,33 @@ final class PetPlayerPlaybackIntegrationTests: XCTestCase {
         XCTAssertTrue(view.playerLayer.player === player)
         XCTAssertFalse(view.playerLayer.isHidden)
         XCTAssertEqual(controller.currentState, .idle)
+        XCTAssertEqual(player.rate, 0)
+        let frozenTime = player.currentTime().seconds
+        Self.pumpMainRunLoop(for: 0.2)
+        XCTAssertEqual(player.currentTime().seconds, frozenTime, accuracy: 0.03)
+
+        // Display wake must not resume the retained movie while the user's
+        // Reduce Motion preference remains enabled.
+        controller.setSuspended(true, for: .windowOccluded)
+        controller.setSuspended(true, for: .screenAsleep)
+        controller.setSuspended(false, for: .windowOccluded)
+        controller.setSuspended(false, for: .screenAsleep)
+        XCTAssertEqual(player.rate, 0)
+        Self.pumpMainRunLoop(for: 0.2)
+        XCTAssertEqual(player.currentTime().seconds, frozenTime, accuracy: 0.03)
+
+        // Turning Reduce Motion off also cannot override another active
+        // suspension; the saved playback rate returns once all reasons clear.
+        controller.setSuspended(true, for: .windowOccluded)
+        controller.setReduceMotion(false)
+        XCTAssertEqual(player.rate, 0)
+        Self.pumpMainRunLoop(for: 0.2)
+        XCTAssertEqual(player.currentTime().seconds, frozenTime, accuracy: 0.03)
+        controller.setSuspended(false, for: .windowOccluded)
+        try Self.waitUntil("retained animation did not resume after all suspensions cleared") {
+            player.rate == Float(entry.playbackRate.value)
+                && player.currentTime().seconds > frozenTime + 0.05
+        }
     }
 
     @MainActor
