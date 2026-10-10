@@ -309,6 +309,7 @@ final class CompanionPanelController: NSWindowController, NSWindowDelegate {
     private let visibleFrames: () -> [NSRect]
     private var screenObserver: NSObjectProtocol?
     private var previousApplication: NSRunningApplication?
+    private weak var previousKeyWindow: NSWindow?
 
     init(visibleFrames: @escaping () -> [NSRect] = { NSScreen.screens.map(\.visibleFrame) }) {
         self.visibleFrames = visibleFrames
@@ -363,6 +364,10 @@ final class CompanionPanelController: NSWindowController, NSWindowDelegate {
         if let frontmost = NSWorkspace.shared.frontmostApplication,
            frontmost.processIdentifier != ProcessInfo.processInfo.processIdentifier {
             previousApplication = frontmost
+            previousKeyWindow = nil
+        } else if NSApp.keyWindow !== window {
+            previousApplication = nil
+            previousKeyWindow = NSApp.keyWindow
         }
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
@@ -379,8 +384,12 @@ final class CompanionPanelController: NSWindowController, NSWindowDelegate {
     private func hide() {
         let shouldRestore = window?.isKeyWindow == true && NSApp.isActive
         window?.close()
-        if shouldRestore { previousApplication?.activate(options: []) }
+        if shouldRestore {
+            if let previousKeyWindow, previousKeyWindow.isVisible { previousKeyWindow.makeKeyAndOrderFront(nil) }
+            else { previousApplication?.activate(options: []) }
+        }
         previousApplication = nil
+        previousKeyWindow = nil
     }
 
     private func applyReachableFrame(_ frame: NSRect) {

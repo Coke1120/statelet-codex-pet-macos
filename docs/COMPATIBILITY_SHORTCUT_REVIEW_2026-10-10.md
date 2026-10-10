@@ -85,6 +85,10 @@ The RPC lists definitions without dispatching hooks or starting a model turn.
 - Review caught the existing standalone diagnostics compilation harness's new
   dependency. The pure report/metadata policy was separated from process probes
   and added to that harness, preserving the existing privacy assertions.
+- Follow-up review requires a regular executable interpreter and both installed
+  hook modules before runtime presence can count as ready. It also restores the
+  prior Statelet key window when opening Companion from Settings, avoiding a
+  stale external-app focus target. Regression cases cover both corrections.
 - Cloud Linux: **169 selected portable Python tests passed, zero skips** using
   the command in [the prior review](CLOUD_REVIEW_2026-10-10.md#environment-and-baseline).
   A smaller 16-test hook-registration/CI selection passed first. No unrelated
@@ -92,6 +96,10 @@ The RPC lists definitions without dispatching hooks or starting a model turn.
 - Offline Codex **0.159.2** accepted the exact `CompanionChatPolicy.arguments`
   with `--help`. All **17** disabled feature names were recognized and false in
   a fresh isolated home. No authenticated model request was made.
+- The real **0.159.2** read-only `hooks/list` API was exercised against an
+  isolated synthetic config: all 12 event definitions were enabled/untrusted,
+  with the expected camel-case metadata and no warnings/errors. Only initialize,
+  initialized and hooks/list messages were sent; no hook or model turn ran.
 - New native tests cover synthetic CLI compatibility, hook trust/registration
   variants, warning/malformed metadata, privacy sentinels, active cancellation,
   deadlines/output caps, shortcut persistence/conflict rollback, actual Carbon

@@ -58,6 +58,16 @@ final class CodexCompatibilityTests: XCTestCase {
         entries = fixture.entries()
         entries[0]["trustStatus"] = "private status"
         XCTAssertEqual(fixture.evaluate(fixture.hooks(entries: entries)).status, .unverified)
+        entries = fixture.entries().map { entry in
+            var entry = entry
+            entry["command"] = "'\(fixture.home.path)' '\(fixture.hook.path)' >/dev/null 2>&1 || :"
+            return entry
+        }
+        XCTAssertEqual(fixture.evaluate(fixture.hooks(entries: entries)).status, .runtimeUnavailable)
+        let module = fixture.hook.deletingLastPathComponent().appendingPathComponent("codex_pet_state.py")
+        try FileManager.default.removeItem(at: module)
+        XCTAssertEqual(fixture.evaluate(fixture.hooks()).status, .runtimeUnavailable)
+        try Data("# synthetic state module".utf8).write(to: module)
         try FileManager.default.removeItem(at: fixture.hook)
         XCTAssertEqual(fixture.evaluate(fixture.hooks()).status, .runtimeUnavailable)
     }
@@ -157,6 +167,7 @@ final class CodexCompatibilityTests: XCTestCase {
             home = FileManager.default.temporaryDirectory.appendingPathComponent("statelet-compat-test-\(UUID())")
             try FileManager.default.createDirectory(at: hook.deletingLastPathComponent(), withIntermediateDirectories: true)
             try Data("# synthetic hook".utf8).write(to: hook)
+            try Data("# synthetic state module".utf8).write(to: hook.deletingLastPathComponent().appendingPathComponent("codex_pet_state.py"))
         }
         func remove() { try? FileManager.default.removeItem(at: home) }
         func entries(trust: String = "trusted", enabled: Bool = true) -> [[String: Any]] {

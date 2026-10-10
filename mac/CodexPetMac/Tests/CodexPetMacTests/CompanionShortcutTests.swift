@@ -133,6 +133,26 @@ final class CompanionShortcutTests: XCTestCase {
         XCTAssertTrue(labels.contains(CompanionShortcutFailure.conflict.message))
     }
 
+    func testComposerOpeningFromSettingsRestoresThePreviousStateletWindow() throws {
+        _ = NSApplication.shared
+        let settings = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 500, height: 400),
+                                styleMask: [.titled], backing: .buffered, defer: false)
+        defer { settings.close() }
+        NSApp.activate(ignoringOtherApps: true)
+        settings.makeKeyAndOrderFront(nil)
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+        let controller = CompanionPanelController()
+        defer { controller.shutdown() }
+        controller.show(beside: settings.frame, focusComposer: true)
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+        controller.toggleShortcut(beside: settings.frame, focused: true)
+        XCTAssertFalse(controller.model.isPanelVisible)
+        XCTAssertTrue(settings.isVisible)
+        // The requested window is made key synchronously; physical app/Spaces
+        // focus remains an installed acceptance item.
+        XCTAssertTrue(settings.isKeyWindow)
+    }
+
     private func descendants(_ view: NSView) -> [NSView] {
         [view] + view.subviews.flatMap { descendants($0) }
     }

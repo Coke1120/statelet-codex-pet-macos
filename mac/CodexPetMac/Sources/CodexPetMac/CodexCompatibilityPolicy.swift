@@ -82,11 +82,17 @@ struct CodexHookSummary: Equatable, Sendable {
         else if summary.disabled > 0 { summary.status = .disabled }
         else if events != requiredEvents { summary.status = .incomplete }
         else {
-            var info = stat()
-            let hookReadable = lstat(expectedHook.path, &info) == 0 && info.st_mode & S_IFMT == S_IFREG
-                && FileManager.default.isReadableFile(atPath: expectedHook.path)
+            let hookReadable = [expectedHook, expectedHook.deletingLastPathComponent().appendingPathComponent("codex_pet_state.py")].allSatisfy {
+                var info = stat()
+                return lstat($0.path, &info) == 0 && info.st_mode & S_IFMT == S_IFREG
+                    && FileManager.default.isReadableFile(atPath: $0.path)
+            }
             let interpretersReady = interpreters.allSatisfy {
-                $0.hasPrefix("/") && FileManager.default.isExecutableFile(atPath: $0)
+                guard $0.hasPrefix("/") else { return false }
+                let executable = URL(fileURLWithPath: $0).resolvingSymlinksInPath()
+                var interpreterInfo = stat()
+                return lstat(executable.path, &interpreterInfo) == 0 && interpreterInfo.st_mode & S_IFMT == S_IFREG
+                    && FileManager.default.isExecutableFile(atPath: executable.path)
             }
             summary.status = hookReadable && interpretersReady ? .ready : .runtimeUnavailable
         }
