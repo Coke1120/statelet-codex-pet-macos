@@ -46,6 +46,7 @@ HOOK_EVENTS = (
     "SubagentStart",
     "SubagentStop",
     "Stop",
+    "Interrupt",
 )
 GROK_HOOK_EVENTS = (
     "SessionStart",

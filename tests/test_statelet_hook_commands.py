@@ -168,6 +168,24 @@ class StateletHookCommandTests(unittest.TestCase):
                     ]
                     self.assertEqual(managed, [hooks.managed_handler(guarded, provider)])
 
+    def test_interrupt_registration_is_additive_idempotent_and_codex_only(self) -> None:
+        foreign = self.handler("printf synthetic-user-hook", timeout=1)
+        destination = self.write_config("interrupt.json", {
+            "hooks": {"Interrupt": [{"hooks": [foreign]}]},
+        })
+        first = self.base / "interrupt-first.json"
+        second = self.base / "interrupt-second.json"
+        hooks.merge(destination, first, sys.executable, self.widget, "codex")
+        hooks.merge(first, second, sys.executable, self.widget, "codex")
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+        configuration = json.loads(first.read_text())
+        registered = configuration["hooks"]["Interrupt"]
+        self.assertTrue(all(not group.get("matcher") for group in registered))
+        handlers = list(hooks.iter_items({"Interrupt": registered}))
+        self.assertEqual(handlers, [foreign, hooks.managed_handler(self.guarded(self.widget), "codex")])
+        self.assertLessEqual(handlers[1]["timeout"], 3)
+        self.assertNotIn("Interrupt", dict(hooks.registrations("grok")))
+
     def test_shared_runtime_selection_counts_old_and_guarded_as_one_identity(self) -> None:
         self.write_hook(self.shared)
         other_shared = self.support / "other/statelet_hook.py"

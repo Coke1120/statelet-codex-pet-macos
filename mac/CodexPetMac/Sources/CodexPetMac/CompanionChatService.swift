@@ -46,14 +46,21 @@ enum CompanionChatPolicy {
 
     // No project, user instructions, hooks, plugins or MCP servers are loaded by
     // Quick Chat. Work requiring tools is explicitly handed back to the agent app.
+    // The public CLI has no zero-tool allowlist: disable known optional abilities
+    // and keep the read-only sandbox for remaining model-provided tools.
     static let arguments = [
-        "exec", "--ignore-user-config", "--ephemeral", "--json", "--color", "never",
+        "exec", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--json", "--color", "never",
         "--sandbox", "read-only", "--skip-git-repo-check",
         "--disable", "shell_tool", "--disable", "apps", "--disable", "plugins",
         "--disable", "multi_agent", "--disable", "multi_agent_v2",
         "--disable", "hooks", "--disable", "shell_snapshot",
         "--disable", "skill_search", "--disable", "skill_mcp_dependency_install",
+        "--disable", "view_image", "--disable", "image_generation",
+        "--disable", "browser_use", "--disable", "browser_use_external",
+        "--disable", "browser_use_full_cdp_access", "--disable", "computer_use",
+        "--disable", "sleep_tool", "--disable", "tool_suggest",
         "-c", "web_search=\"disabled\"", "-c", "history.persistence=\"none\"",
+        "-c", "tools.experimental_request_user_input.enabled=false", "-c", "tools.update_plan.enabled=false",
         "-c", "project_doc_max_bytes=0", "-c", "approval_policy=\"never\"", "-",
     ]
 
@@ -109,8 +116,20 @@ enum CompanionCodexRouting {
         let environment = ProcessInfo.processInfo.environment
         let root = environment["CODEX_HOME"].map { URL(fileURLWithPath: $0) }
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
-        guard let handle = try? FileHandle(forReadingFrom: root.appendingPathComponent("config.toml")) else { return [] }
+        return arguments(configURL: root.appendingPathComponent("config.toml"))
+    }
+
+    static func arguments(configURL: URL) -> [String] {
+        // Routing is optional. Validate the opened file without waiting for a
+        // FIFO writer before the chat process watchdog has started. Preserve
+        // symlinked config files used by dotfile managers; fstat checks the target.
+        let descriptor = Darwin.open(configURL.path, O_RDONLY | O_CLOEXEC | O_NONBLOCK)
+        guard descriptor >= 0 else { return [] }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         defer { try? handle.close() }
+        var status = stat()
+        guard fstat(descriptor, &status) == 0, status.st_mode & S_IFMT == S_IFREG,
+              status.st_size >= 0, status.st_size <= 1_048_576 else { return [] }
         guard let data = try? handle.read(upToCount: 1_048_577), data.count <= 1_048_576,
               let text = String(data: data, encoding: .utf8) else { return [] }
         return arguments(config: text)
@@ -120,19 +139,21 @@ enum CompanionCodexRouting {
         var values: [String: String] = [:]
         for rawLine in config.split(separator: "\n") {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty || line.hasPrefix("#") { continue }
             if line.hasPrefix("[") { break }
-            guard let separator = line.firstIndex(of: "=") else { continue }
+            guard let separator = line.firstIndex(of: "=") else { return [] }
             let key = line[..<separator].trimmingCharacters(in: .whitespaces)
-            guard ["model", "model_provider", "openai_base_url"].contains(key) else { continue }
+            guard key.range(of: "^[A-Za-z0-9_-]+$", options: .regularExpression) != nil else { return [] }
             let value = line[line.index(after: separator)...].trimmingCharacters(in: .whitespaces)
             // A bounded subset of TOML's root string assignments. Unsupported
-            // syntax is ignored, never interpreted as flags or executable code.
-            if value.hasPrefix("\""), let data = value.data(using: .utf8),
-               let decoded = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) as? String {
-                values[key] = decoded
-            } else if value.hasPrefix("'"), value.hasSuffix("'"), value.count >= 2 {
-                values[key] = String(value.dropFirst().dropLast())
-            }
+            // syntax is not interpreted as flags or executable code.
+            // Complex root values can span lines containing apparent routing
+            // assignments. Fail closed instead of interpreting that context as
+            // root keys or missing a later model_provider restriction.
+            if ["\"\"\"", "'''", "[", "{"].contains(where: value.hasPrefix) { return [] }
+            guard ["model", "model_provider", "openai_base_url"].contains(key) else { continue }
+            guard let decoded = stringValue(value) else { return [] }
+            values[key] = decoded
         }
         guard values["model_provider"] == nil || values["model_provider"] == "openai" else { return [] }
         var result: [String] = []
@@ -150,6 +171,23 @@ enum CompanionCodexRouting {
             result += ["-c", "openai_base_url=\(value)"]
         }
         return result
+    }
+
+    private static func stringValue(_ value: String) -> String? {
+        guard let quote = value.first, quote == "\"" || quote == "'" else { return nil }
+        var escaped = false
+        for index in value.indices.dropFirst() {
+            let character = value[index]
+            if escaped { escaped = false; continue }
+            if quote == "\"", character == "\\" { escaped = true; continue }
+            guard character == quote else { continue }
+            let remainder = value[value.index(after: index)...].trimmingCharacters(in: .whitespaces)
+            guard remainder.isEmpty || remainder.hasPrefix("#") else { return nil }
+            if quote == "'" { return String(value[value.index(after: value.startIndex)..<index]) }
+            guard let data = String(value[...index]).data(using: .utf8) else { return nil }
+            return try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) as? String
+        }
+        return nil
     }
 }
 

@@ -68,6 +68,11 @@ state publisher, adds two marked LaunchAgents, merges lifecycle commands into
 and any active Grok session once after the first install so they load the hook
 configuration.
 
+In current Codex, open `/hooks` and review/trust Statelet's installed commands
+before expecting lifecycle updates. Review changed definitions again after an
+upgrade. Statelet preserves Codex's hook trust checks; see
+[hook setup and compatibility](docs/DEPLOYMENT.md#hook-trust-and-compatibility).
+
 Statelet is an `LSUIElement` accessory app, so it intentionally has no Dock
 icon. Use the Statelet orbit icon in the menu bar to open Settings, disable
 click-through, reveal files, repair managed startup, or quit.

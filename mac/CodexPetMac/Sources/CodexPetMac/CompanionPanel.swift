@@ -47,6 +47,8 @@ final class CompanionModel: NSObject, ObservableObject, NSSpeechSynthesizerDeleg
 
     private let runner: Runner
     private let speech = NSSpeechSynthesizer()
+    private let speechStarter: ((String) -> Bool)?
+    private var panelVisible = false
     let dictation = CompanionDictation()
     private var dictationPrefix = ""
     private var task: Task<Void, Never>?
@@ -55,10 +57,11 @@ final class CompanionModel: NSObject, ObservableObject, NSSpeechSynthesizerDeleg
     private var retryMessages: [CompanionMessage]?
     private(set) var sentMessages: [CompanionMessage] = []
 
-    init(runner: @escaping Runner = { prompt, receive in
+    init(speechStarter: ((String) -> Bool)? = nil, runner: @escaping Runner = { prompt, receive in
         try await CompanionChatService().run(prompt: prompt, receive: receive)
     }) {
         self.runner = runner
+        self.speechStarter = speechStarter
         super.init()
         speech.delegate = self
         dictation.onText = { [weak self] text in
@@ -147,7 +150,7 @@ final class CompanionModel: NSObject, ObservableObject, NSSpeechSynthesizerDeleg
             guard !reply.isEmpty else { error = CompanionChatError.emptyReply.localizedDescription; return }
             sentMessages.append(CompanionMessage(role: .assistant, text: reply))
             retryMessages = nil; replyIDs = [:]; status = "Ready when you are"
-            if speakReplies { readReply(reply) }
+            if speakReplies && panelVisible { readReply(reply) }
         }
     }
 
@@ -165,7 +168,8 @@ final class CompanionModel: NSObject, ObservableObject, NSSpeechSynthesizerDeleg
     func readReply(_ text: String) {
         dictation.stop()
         stopSpeech()
-        speaking = speech.startSpeaking(String(text.prefix(12_000)))
+        let text = String(text.prefix(12_000))
+        speaking = speechStarter?(text) ?? speech.startSpeaking(text)
     }
 
     func speechSynthesizer(_ sender: NSSpeechSynthesizer, didFinishSpeaking finishedSpeaking: Bool) {
@@ -173,6 +177,10 @@ final class CompanionModel: NSObject, ObservableObject, NSSpeechSynthesizerDeleg
     }
 
     func stopSpeech() { speech.stopSpeaking(); speaking = false }
+    func setPanelVisible(_ visible: Bool) {
+        panelVisible = visible
+        if !visible { dictation.stop(); stopSpeech() }
+    }
     func toggleCompact() { setCompact(!compact) }
     func setCompact(_ value: Bool) {
         guard compact != value else { return }
@@ -200,7 +208,8 @@ struct CompanionAttachment: Identifiable {
     let text: String
 
     static func read(_ url: URL) throws -> CompanionAttachment {
-        let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        // Check the opened descriptor without waiting for a FIFO writer first.
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
         guard descriptor >= 0 else { throw CompanionChatError.tooLarge }
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         defer { try? handle.close() }
@@ -341,6 +350,7 @@ final class CompanionPanelController: NSWindowController, NSWindowDelegate {
         }
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+        model.setPanelVisible(true)
         resolveOpenability()
     }
 
@@ -418,7 +428,7 @@ final class CompanionPanelController: NSWindowController, NSWindowDelegate {
 
     func windowWillClose(_ notification: Notification) {
         finishModeTransition(transitionGeneration)
-        model.dictation.stop(); model.stopSpeech()
+        model.setPanelVisible(false)
     }
     func shutdown() { openabilityTask?.cancel(); model.shutdown(); window?.close() }
 }

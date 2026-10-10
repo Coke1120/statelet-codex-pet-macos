@@ -28,6 +28,7 @@ CODEX_EVENTS = (
     "SubagentStart",
     "SubagentStop",
     "Stop",
+    "Interrupt",
 )
 CODEX_EVENT_MATCHERS = {"SessionStart": "startup|resume|clear|compact"}
 GROK_EVENTS = (

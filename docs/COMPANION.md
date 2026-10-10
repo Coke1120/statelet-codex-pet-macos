@@ -19,17 +19,37 @@ next to the desktop pet. It supports macOS 13 and later.
   no cloud-recognition fallback is used. Review the draft before sending.
 - **Read replies aloud** uses the macOS system voice. Each reply also has a
   Read aloud action; Stop audio stops playback. Closing the panel stops audio
-  and dictation. Pet dialogue still uses the existing local voice library.
+  and dictation, including automatic speech from a reply that finishes while
+  the panel is closed. The text reply remains available when reopened.
+  Pet dialogue still uses the existing local voice library.
 
-Quick Chat uses the signed installed Codex CLI and its existing sign-in. It is
-text-only: tools, hooks, plugins, shell snapshots and project instruction loading
-are disabled, with a read-only sandbox. A clean temporary working directory
+Quick Chat uses the signed installed Codex CLI and its existing sign-in. Its
+interface accepts text only. Shell execution, image reading/generation,
+browser/computer use, web search, apps, plugins, multi-agent work, hooks,
+shell snapshots and project instruction loading are disabled. User/project
+execution rules are ignored, and a read-only sandbox remains mandatory.
+A clean temporary working directory
 avoids accidental project context. No separate API key is collected. Advanced
 work stays in the user's Codex or Grok app.
 
+The public CLI does not expose a zero-tool allowlist. A model can still receive
+some built-in tools, including `apply_patch`; the read-only sandbox and disabled
+approvals constrain them. The text-only prompt is guidance, not a tool security
+boundary. Do not treat Quick Chat as proof that the upstream CLI advertises no
+tools. Statelet discards tool output from its chat interface.
+
 Statelet reuses only the root model setting and an optional credential-free
 loopback `openai_base_url` from the local Codex config. It does not load the rest
-of the config or forward arbitrary endpoint/environment overrides.
+of the config or forward arbitrary endpoint/environment overrides. Its bounded
+parser accepts single-line quoted routing values with optional trailing comments.
+Root assignment keys must use bare ASCII letters, digits, underscores or hyphens.
+If the root section contains unsupported syntax such as multiline strings,
+arrays, inline tables, quoted keys or dotted keys, it omits routing overrides
+rather than mistake their contents for root settings;
+the CLI then uses its default model/endpoint. Table contents are never copied.
+The optional config read accepts only a regular UTF-8 file of at most 1 MiB.
+Symlinks to regular config files remain supported. FIFOs and other special files,
+including symlinks to them, are skipped without blocking.
 
 Statelet sends the conversation and explicitly attached text through that Codex connection only
 when Send or Retry is chosen. This is a new user-initiated cloud-backed feature;
@@ -46,8 +66,13 @@ process identity must pass the existing OpenAI signature policy. The process
 and pipe readers are cancelled and reaped when the run ends.
 
 Implementation references: [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode)
-and the installed CLI's `codex exec --help`. Quick Chat requires the flags above;
-an older incompatible CLI reports a recoverable error rather than relaxing them.
+and the installed CLI's `codex exec --help`. Flags and feature names were checked
+offline against Codex CLI **0.159.2**, with the corresponding
+[official tool registration](https://github.com/openai/codex/blob/ff6aec96948b70d94983af2641a6b67c94faeff5/codex-rs/core/src/tools/spec_plan.rs)
+and [extension-only tool allowlist](https://github.com/openai/codex/blob/ff6aec96948b70d94983af2641a6b67c94faeff5/codex-rs/ext/extension-api/src/tool_policy.rs).
+Quick Chat requires the flags above; an older incompatible CLI reports a
+recoverable error rather than relaxing them. This offline check does not verify
+authentication, a live model response or the signed macOS executable.
 
 ## Activity
 
@@ -81,6 +106,7 @@ that follow the system appearance. No second animation decoder is used.
 
 `CompanionTests` covers bounded text/context handling, event filtering,
 conversation continuity, retry, late-result cancellation, compact sizing,
+late speech suppression, FIFO attachment/config rejection, conservative routing parsing,
 synthetic CLI streaming and process timeout/cancellation. Existing activity,
 settings and pet interaction suites cover integration regressions. On-device
 recognition requires manual verification on a Mac with permission and a

@@ -93,6 +93,7 @@ public enum CurrentStateHookEvent: String, Codable, CaseIterable, Sendable {
     case sessionEnd = "SessionEnd"
     case sessionStart = "SessionStart"
     case stop = "Stop"
+    case interrupt = "Interrupt"
     case subagentStart = "SubagentStart"
     case subagentStop = "SubagentStop"
     case userPromptSubmit = "UserPromptSubmit"
@@ -112,7 +113,7 @@ public enum SessionActivityCategory: String, Codable, Equatable, Sendable {
         case .preToolUse, .postToolUse: return .tool
         case .preCompact, .postCompact: return .review
         case .subagentStart, .subagentStop: return .subagent
-        case .sessionStart, .sessionEnd, .userPromptSubmit, .stop: return .codex
+        case .sessionStart, .sessionEnd, .userPromptSubmit, .stop, .interrupt: return .codex
         case .unknown: return .activity
         }
     }

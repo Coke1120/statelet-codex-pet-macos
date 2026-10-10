@@ -59,7 +59,7 @@ diagnostics and expires with its session record.
 
 | Codex event | State |
 | --- | --- |
-| `SessionStart`, `SessionEnd`, `Stop` | Idle |
+| `SessionStart`, `SessionEnd`, `Stop`, Codex `Interrupt` | Idle |
 | `UserPromptSubmit`, `SubagentStart`, `SubagentStop` | Running |
 | `PermissionRequest` | Waiting |
 | `PreCompact`, `PostCompact` | Review |
@@ -101,8 +101,8 @@ The state priority is:
 waiting > review > running > idle
 ```
 
-`Stop` closes the current turn and maps that session to Idle without creating a
-completed-unread activity item. Its private causal fence still rejects delayed
+`Stop` and Codex `Interrupt` close the current turn and map that session to Idle
+without creating a completed-unread activity item. The private causal fence still rejects delayed
 callbacks from that stopped turn. `SessionEnd` alone terminalizes the session
 and becomes a completed-unread activity item. Each other valid session record
 remains active for 900 seconds after its authoritative event

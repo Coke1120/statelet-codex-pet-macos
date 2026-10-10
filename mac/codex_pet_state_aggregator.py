@@ -34,6 +34,7 @@ try:
         read_session_snapshot,
         SESSION_ACTIVITY_FILENAME,
         SESSION_ACTIVITY_TARGETS_FILENAME,
+        SessionRecordSnapshot,
     )
 except ModuleNotFoundError as error:
     if error.name != "statelet_state":
@@ -53,6 +54,7 @@ except ModuleNotFoundError as error:
         read_session_snapshot,
         SESSION_ACTIVITY_FILENAME,
         SESSION_ACTIVITY_TARGETS_FILENAME,
+        SessionRecordSnapshot,
     )
 
 
@@ -954,7 +956,11 @@ def resolve_state_snapshot_with_expiry(
 
 
 def resolve_diagnostic_snapshot(
-    state_dir: Path, active_ttl: float, wall_time: float
+    state_dir: Path,
+    active_ttl: float,
+    wall_time: float,
+    *,
+    records: Optional[SessionRecordSnapshot] = None,
 ) -> Tuple[
     str,
     Optional[float],
@@ -964,7 +970,9 @@ def resolve_diagnostic_snapshot(
     Optional[float],
     Dict[str, object],
 ]:
-    snapshot = read_session_snapshot(state_dir, now=wall_time, active_ttl=active_ttl)
+    snapshot = read_session_snapshot(
+        state_dir, now=wall_time, active_ttl=active_ttl, records=records
+    )
     active = snapshot["active"]
     lifecycle, source_updated_at = aggregate_state_with_source(active)
     next_expiry = (
@@ -1045,87 +1053,92 @@ def run(
             forced = force_is_active(
                 forced_state, once, force_deadline, monotonic_time
             )
-            if forced:
-                (
+            with SessionRecordSnapshot(state_dir) as records:
+                if forced:
+                    (
+                        state,
+                        source_updated_at,
+                        active_sessions,
+                        source_expiry_at,
+                    ) = resolve_state_snapshot_with_expiry(
+                        state_dir,
+                        active_ttl,
+                        wall_time,
+                        forced_state,
+                        force_started_at,
+                    )
+                    latest_event = None
+                    latest_event_at = None
+                    rejection_diagnostics: Dict[str, object] = {"count": 0, "reasons": {}}
+                else:
+                    (
+                        state,
+                        source_updated_at,
+                        active_sessions,
+                        source_expiry_at,
+                        latest_event,
+                        latest_event_at,
+                        rejection_diagnostics,
+                    ) = resolve_diagnostic_snapshot(
+                        state_dir, active_ttl, wall_time, records=records
+                    )
+                record = publisher.publish_if_due(
                     state,
                     source_updated_at,
-                    active_sessions,
-                    source_expiry_at,
-                ) = resolve_state_snapshot_with_expiry(
-                    state_dir,
-                    active_ttl,
                     wall_time,
-                    forced_state,
-                    force_started_at,
-                )
-                latest_event = None
-                latest_event_at = None
-                rejection_diagnostics: Dict[str, object] = {"count": 0, "reasons": {}}
-            else:
-                (
-                    state,
-                    source_updated_at,
+                    monotonic_time,
                     active_sessions,
-                    source_expiry_at,
+                    forced,
                     latest_event,
                     latest_event_at,
                     rejection_diagnostics,
-                ) = resolve_diagnostic_snapshot(state_dir, active_ttl, wall_time)
-            record = publisher.publish_if_due(
-                state,
-                source_updated_at,
-                wall_time,
-                monotonic_time,
-                active_sessions,
-                forced,
-                latest_event,
-                latest_event_at,
-                rejection_diagnostics,
-            )
-            if record is not None and print_state:
-                print(state, flush=True)
-            # The activity rail is an optional projection. Publish the
-            # authoritative lifecycle state first, then fail soft only for
-            # expected filesystem/serialization errors in the sidecar path.
-            try:
-                activity_snapshot = read_session_activity(
-                    state_dir,
-                    now=wall_time,
-                    active_ttl=active_ttl,
                 )
-                target_snapshot = None
+                if record is not None and print_state:
+                    print(state, flush=True)
+                # The activity rail is an optional projection. Publish the
+                # authoritative lifecycle state first, then fail soft only for
+                # expected filesystem/serialization errors in the sidecar path.
                 try:
-                    target_snapshot = read_session_targets(
+                    activity_snapshot = read_session_activity(
                         state_dir,
-                        activity_snapshot,
                         now=wall_time,
+                        active_ttl=active_ttl,
+                        records=records,
                     )
-                except OSError:
-                    target_health.failure("io_error", monotonic_time)
-                except UnicodeError:
-                    target_health.failure("encoding_error", monotonic_time)
-                except (TypeError, ValueError):
-                    target_health.failure("invalid_projection", monotonic_time)
-                activity_publisher.publish_if_due(
-                    activity_snapshot,
-                    wall_time,
-                    monotonic_time,
-                    target_snapshot,
-                )
-                if activity_publisher.last_target_write_status == "success":
-                    target_health.recovery()
-                elif activity_publisher.last_target_write_status is not None:
-                    target_health.failure(
-                        activity_publisher.last_target_write_status,
+                    target_snapshot = None
+                    try:
+                        target_snapshot = read_session_targets(
+                            state_dir,
+                            activity_snapshot,
+                            now=wall_time,
+                            records=records,
+                        )
+                    except OSError:
+                        target_health.failure("io_error", monotonic_time)
+                    except UnicodeError:
+                        target_health.failure("encoding_error", monotonic_time)
+                    except (TypeError, ValueError):
+                        target_health.failure("invalid_projection", monotonic_time)
+                    activity_publisher.publish_if_due(
+                        activity_snapshot,
+                        wall_time,
                         monotonic_time,
+                        target_snapshot,
                     )
-                activity_health.recovery()
-            except OSError:
-                activity_health.failure("io_error", monotonic_time)
-            except UnicodeError:
-                activity_health.failure("encoding_error", monotonic_time)
-            except (TypeError, ValueError):
-                activity_health.failure("invalid_projection", monotonic_time)
+                    if activity_publisher.last_target_write_status == "success":
+                        target_health.recovery()
+                    elif activity_publisher.last_target_write_status is not None:
+                        target_health.failure(
+                            activity_publisher.last_target_write_status,
+                            monotonic_time,
+                        )
+                    activity_health.recovery()
+                except OSError:
+                    activity_health.failure("io_error", monotonic_time)
+                except UnicodeError:
+                    activity_health.failure("encoding_error", monotonic_time)
+                except (TypeError, ValueError):
+                    activity_health.failure("invalid_projection", monotonic_time)
             if once:
                 break
             timeout = next_wake_timeout(
