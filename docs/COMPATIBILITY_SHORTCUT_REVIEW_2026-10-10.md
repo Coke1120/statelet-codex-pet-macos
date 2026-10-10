@@ -99,6 +99,11 @@ The RPC lists definitions without dispatching hooks or starting a model turn.
   crashed during window cleanup. The regression now supplies its focus context,
   verifies the AppKit return-focus request, and disables close-time auto-release
   on its Swift-owned test window. Actual foreground/Spaces focus stays manual.
+- Native gate #229 passed all 19 new cases, including real Carbon exclusive
+  collision/release, retained Settings drafts and return-focus requests. Its two
+  failures were the existing General-page card count/title expectations; these
+  now include the new Companion Shortcut card. All style/accessibility checks
+  remain in place.
 - Cloud Linux: **169 selected portable Python tests passed, zero skips** using
   the command in [the prior review](CLOUD_REVIEW_2026-10-10.md#environment-and-baseline).
   A smaller 16-test hook-registration/CI selection passed first. No unrelated
