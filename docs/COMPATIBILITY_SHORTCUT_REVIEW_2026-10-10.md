@@ -94,6 +94,11 @@ The RPC lists definitions without dispatching hooks or starting a model turn.
 - The native gate identified Carbon's imported `Int` event-count parameter;
   buffer size and event count now use the native Swift counts without narrowing
   conversions. The gate is rerun automatically on the corrected committed head.
+- The next native gate passed all nine compatibility cases and three geometry
+  cases before the focus fixture failed its physical foreground assumption and
+  crashed during window cleanup. The regression now supplies its focus context,
+  verifies the AppKit return-focus request, and disables close-time auto-release
+  on its Swift-owned test window. Actual foreground/Spaces focus stays manual.
 - Cloud Linux: **169 selected portable Python tests passed, zero skips** using
   the command in [the prior review](CLOUD_REVIEW_2026-10-10.md#environment-and-baseline).
   A smaller 16-test hook-registration/CI selection passed first. No unrelated

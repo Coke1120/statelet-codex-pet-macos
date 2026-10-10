@@ -307,12 +307,18 @@ final class CompanionPanelController: NSWindowController, NSWindowDelegate {
     private var transitionTarget: NSRect?
     private var content: CompanionContentView?
     private let visibleFrames: () -> [NSRect]
+    private let frontmostApplication: () -> NSRunningApplication?
+    private let keyWindow: () -> NSWindow?
     private var screenObserver: NSObjectProtocol?
     private var previousApplication: NSRunningApplication?
     private weak var previousKeyWindow: NSWindow?
 
-    init(visibleFrames: @escaping () -> [NSRect] = { NSScreen.screens.map(\.visibleFrame) }) {
+    init(visibleFrames: @escaping () -> [NSRect] = { NSScreen.screens.map(\.visibleFrame) },
+         frontmostApplication: @escaping () -> NSRunningApplication? = { NSWorkspace.shared.frontmostApplication },
+         keyWindow: @escaping () -> NSWindow? = { NSApp.keyWindow }) {
         self.visibleFrames = visibleFrames
+        self.frontmostApplication = frontmostApplication
+        self.keyWindow = keyWindow
         let panel = CompanionWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 640),
                                     styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
                                     backing: .buffered, defer: false)
@@ -361,13 +367,14 @@ final class CompanionPanelController: NSWindowController, NSWindowDelegate {
             ? CompanionFramePolicy.fitting(window.frame, visibleFrames: screens)
             : CompanionFramePolicy.beside(petFrame, size: window.frame.size, visibleFrames: screens)
         applyReachableFrame(frame)
-        if let frontmost = NSWorkspace.shared.frontmostApplication,
+        let currentKeyWindow = keyWindow()
+        if let frontmost = frontmostApplication(),
            frontmost.processIdentifier != ProcessInfo.processInfo.processIdentifier {
             previousApplication = frontmost
             previousKeyWindow = nil
-        } else if NSApp.keyWindow !== window {
+        } else if currentKeyWindow !== window {
             previousApplication = nil
-            previousKeyWindow = NSApp.keyWindow
+            previousKeyWindow = currentKeyWindow
         }
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
@@ -377,12 +384,12 @@ final class CompanionPanelController: NSWindowController, NSWindowDelegate {
     }
 
     func toggleShortcut(beside petFrame: NSRect, focused: Bool? = nil) {
-        if window?.isVisible == true, focused ?? (window?.isKeyWindow == true && NSApp.isActive) { hide() }
+        if window?.isVisible == true, focused ?? (window?.isKeyWindow == true && NSApp.isActive) { hide(restoreFocus: true) }
         else { show(beside: petFrame, focusComposer: true) }
     }
 
-    private func hide() {
-        let shouldRestore = window?.isKeyWindow == true && NSApp.isActive
+    private func hide(restoreFocus: Bool? = nil) {
+        let shouldRestore = restoreFocus ?? (window?.isKeyWindow == true && NSApp.isActive)
         window?.close()
         if shouldRestore {
             if let previousKeyWindow, previousKeyWindow.isVisible { previousKeyWindow.makeKeyAndOrderFront(nil) }

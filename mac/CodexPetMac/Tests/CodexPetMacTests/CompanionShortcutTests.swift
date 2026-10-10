@@ -133,24 +133,33 @@ final class CompanionShortcutTests: XCTestCase {
         XCTAssertTrue(labels.contains(CompanionShortcutFailure.conflict.message))
     }
 
-    func testComposerOpeningFromSettingsRestoresThePreviousStateletWindow() throws {
+    func testComposerOpeningFromSettingsRequestsReturnFocusOnHide() throws {
         _ = NSApplication.shared
-        let settings = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 500, height: 400),
-                                styleMask: [.titled], backing: .buffered, defer: false)
+        let settings = FocusRequestWindow(contentRect: NSRect(x: 100, y: 100, width: 500, height: 400),
+                                          styleMask: [.titled], backing: .buffered, defer: false)
+        settings.isReleasedWhenClosed = false
         defer { settings.close() }
-        NSApp.activate(ignoringOtherApps: true)
-        settings.makeKeyAndOrderFront(nil)
-        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
-        let controller = CompanionPanelController()
+        settings.orderFront(nil)
+        let controller = CompanionPanelController(frontmostApplication: { nil }, keyWindow: { settings })
         defer { controller.shutdown() }
         controller.show(beside: settings.frame, focusComposer: true)
-        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+        XCTAssertEqual(settings.focusRequests, 0)
         controller.toggleShortcut(beside: settings.frame, focused: true)
         XCTAssertFalse(controller.model.isPanelVisible)
         XCTAssertTrue(settings.isVisible)
-        // The requested window is made key synchronously; physical app/Spaces
-        // focus remains an installed acceptance item.
-        XCTAssertTrue(settings.isKeyWindow)
+        // Assert the actual AppKit request to the previous window. A hosted
+        // test process cannot establish physical foreground/Spaces acceptance.
+        XCTAssertEqual(settings.focusRequests, 1)
+        controller.show(beside: settings.frame, focusComposer: true)
+        settings.orderOut(nil)
+        controller.toggleShortcut(beside: settings.frame, focused: true)
+        XCTAssertFalse(controller.model.isPanelVisible)
+        XCTAssertEqual(settings.focusRequests, 1, "Do not bring back a window hidden while Companion was open")
+    }
+
+    private final class FocusRequestWindow: NSWindow {
+        var focusRequests = 0
+        override func makeKeyAndOrderFront(_ sender: Any?) { focusRequests += 1 }
     }
 
     private func descendants(_ view: NSView) -> [NSView] {
