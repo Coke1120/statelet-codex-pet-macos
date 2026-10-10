@@ -236,7 +236,10 @@ class LifecycleStateTests(unittest.TestCase):
 
     def test_next_snapshot_observes_replacement_membership_and_source_changes(self) -> None:
         with tempfile.TemporaryDirectory() as root:
-            directory = Path(root)
+            # macOS temporary roots may use /var -> /private/var. Provider
+            # selection deliberately rejects symlink ancestors, so exercise
+            # refresh behavior through the canonical fixture path.
+            directory = Path(root).resolve()
             original = record_path(directory, "a")
             write_v2_record(original, "running", "UserPromptSubmit", 99.0)
             with state.SessionRecordSnapshot(directory) as records:
