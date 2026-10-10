@@ -17,6 +17,7 @@ final class CompanionModel: NSObject, ObservableObject, NSSpeechSynthesizerDeleg
     @Published private(set) var status = "Ready when you are"
     @Published var error: String?
     @Published private(set) var compact = false
+    @Published private(set) var composerFocusRequest: UInt64 = 0
     @Published var speakReplies = false
     @Published var speaking = false
     @Published var attachments: [CompanionAttachment] = []
@@ -72,6 +73,8 @@ final class CompanionModel: NSObject, ObservableObject, NSSpeechSynthesizerDeleg
     }
 
     var canSend: Bool { !isRunning && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    var isPanelVisible: Bool { panelVisible }
+    func requestComposerFocus() { tab = .chat; composerFocusRequest &+= 1 }
     var attentionCount: Int { activity.filter { $0.state == .waiting }.count }
     var characterName: String { characters.first { $0.id == selectedCharacter }?.name ?? "Your companion" }
 
@@ -228,8 +231,10 @@ struct CompanionAttachment: Identifiable {
 }
 
 final class CompanionWindow: NSPanel {
+    var onCancel: (() -> Void)?
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+    override func cancelOperation(_ sender: Any?) { onCancel?() }
 }
 
 /// Keep the incoming layout at its final height while the window reveals it.
@@ -301,8 +306,19 @@ final class CompanionPanelController: NSWindowController, NSWindowDelegate {
     private var transitionGeneration = UUID()
     private var transitionTarget: NSRect?
     private var content: CompanionContentView?
+    private let visibleFrames: () -> [NSRect]
+    private let frontmostApplication: () -> NSRunningApplication?
+    private let keyWindow: () -> NSWindow?
+    private var screenObserver: NSObjectProtocol?
+    private var previousApplication: NSRunningApplication?
+    private weak var previousKeyWindow: NSWindow?
 
-    init() {
+    init(visibleFrames: @escaping () -> [NSRect] = { NSScreen.screens.map(\.visibleFrame) },
+         frontmostApplication: @escaping () -> NSRunningApplication? = { NSWorkspace.shared.frontmostApplication },
+         keyWindow: @escaping () -> NSWindow? = { NSApp.keyWindow }) {
+        self.visibleFrames = visibleFrames
+        self.frontmostApplication = frontmostApplication
+        self.keyWindow = keyWindow
         let panel = CompanionWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 640),
                                     styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
                                     backing: .buffered, defer: false)
@@ -331,27 +347,69 @@ final class CompanionPanelController: NSWindowController, NSWindowDelegate {
             }
         }
         model.onCompactChange = { [weak self] in self?.resizeForMode() }
-        model.onClose = { [weak self] in self?.window?.close() }
+        model.onClose = { [weak self] in self?.hide() }
+        panel.onCancel = { [weak self] in self?.hide() }
+        screenObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.fitToCurrentScreens() }
+        }
     }
 
     required init?(coder: NSCoder) { nil }
+    deinit { if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) } }
 
-    func show(beside petFrame: NSRect) {
+    func show(beside petFrame: NSRect, focusComposer: Bool = false) {
         guard let window else { return }
-        if !window.isVisible {
-            let screen = NSScreen.screens.first { $0.visibleFrame.intersects(petFrame) } ?? NSScreen.main
-            let visible = screen?.visibleFrame ?? petFrame
-            var frame = window.frame
-            frame.origin = NSPoint(x: petFrame.maxX + 12, y: petFrame.midY - frame.height / 2)
-            if frame.maxX > visible.maxX { frame.origin.x = petFrame.minX - frame.width - 12 }
-            frame.origin.x = min(max(frame.minX, visible.minX), max(visible.minX, visible.maxX - frame.width))
-            frame.origin.y = min(max(frame.minY, visible.minY), max(visible.minY, visible.maxY - frame.height))
-            window.setFrame(frame, display: false)
+        finishModeTransition(transitionGeneration)
+        let screens = visibleFrames()
+        let frame = window.isVisible
+            ? CompanionFramePolicy.fitting(window.frame, visibleFrames: screens)
+            : CompanionFramePolicy.beside(petFrame, size: window.frame.size, visibleFrames: screens)
+        applyReachableFrame(frame)
+        let currentKeyWindow = keyWindow()
+        if let frontmost = frontmostApplication(),
+           frontmost.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+            previousApplication = frontmost
+            previousKeyWindow = nil
+        } else if currentKeyWindow !== window {
+            previousApplication = nil
+            previousKeyWindow = currentKeyWindow
         }
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         model.setPanelVisible(true)
+        if focusComposer { model.requestComposerFocus() }
         resolveOpenability()
+    }
+
+    func toggleShortcut(beside petFrame: NSRect, focused: Bool? = nil) {
+        if window?.isVisible == true, focused ?? (window?.isKeyWindow == true && NSApp.isActive) { hide(restoreFocus: true) }
+        else { show(beside: petFrame, focusComposer: true) }
+    }
+
+    private func hide(restoreFocus: Bool? = nil) {
+        let shouldRestore = restoreFocus ?? (window?.isKeyWindow == true && NSApp.isActive)
+        window?.close()
+        if shouldRestore {
+            if let previousKeyWindow, previousKeyWindow.isVisible { previousKeyWindow.makeKeyAndOrderFront(nil) }
+            else { previousApplication?.activate(options: []) }
+        }
+        previousApplication = nil
+        previousKeyWindow = nil
+    }
+
+    private func applyReachableFrame(_ frame: NSRect) {
+        guard let window else { return }
+        window.minSize = NSSize(width: min(model.compact ? 440 : 400, frame.width),
+                                height: min(model.compact ? 56 : 440, frame.height))
+        window.setFrame(frame, display: window.isVisible)
+    }
+
+    private func fitToCurrentScreens() {
+        finishModeTransition(transitionGeneration)
+        guard let window else { return }
+        applyReachableFrame(CompanionFramePolicy.fitting(window.frame, visibleFrames: visibleFrames()))
     }
 
     private func resizeForMode() {
@@ -362,16 +420,11 @@ final class CompanionPanelController: NSWindowController, NSWindowDelegate {
         let size = model.compact ? NSSize(width: 440, height: 56) : expandedSize
         frame.origin.y += frame.height - size.height
         frame.size = size
-        if let visible = window.screen?.visibleFrame {
-            frame.size.width = min(frame.width, visible.width)
-            frame.size.height = min(frame.height, visible.height)
-            frame.origin.x = max(visible.minX, min(frame.minX, visible.maxX - frame.width))
-            frame.origin.y = max(visible.minY, min(frame.minY, visible.maxY - frame.height))
-        }
+        frame = CompanionFramePolicy.fitting(frame, visibleFrames: visibleFrames())
         transitionTarget = frame
         // Keep native title-bar chrome out of the morph and lift the expanded
         // minimum until the shrinking window reaches Mini's height.
-        window.minSize = NSSize(width: 400, height: 56)
+        window.minSize = NSSize(width: min(400, frame.width), height: min(56, frame.height))
         window.styleMask = [.borderless]
         content.presentationHeight = frame.height
         content.needsLayout = true
@@ -397,8 +450,7 @@ final class CompanionPanelController: NSWindowController, NSWindowDelegate {
         window.styleMask = model.compact ? [.borderless] : [.titled, .closable, .resizable, .fullSizeContentView]
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
-        window.minSize = model.compact ? NSSize(width: 440, height: 56) : NSSize(width: 400, height: 440)
-        window.setFrame(frame, display: true)
+        applyReachableFrame(CompanionFramePolicy.fitting(frame, visibleFrames: visibleFrames()))
         transitionTarget = nil
         content?.finishTransition()
     }
@@ -482,7 +534,15 @@ private struct CompanionView: View {
         // safe-area handling stable avoids a final jump when chrome returns.
         .ignoresSafeArea()
         .tint(accent)
+        .onExitCommand { model.onClose?() }
         .onChange(of: model.compact) { _ in composerFocused = true }
+        .onChange(of: model.composerFocusRequest) { request in
+            composerFocused = false
+            DispatchQueue.main.async {
+                guard model.isPanelVisible, model.composerFocusRequest == request else { return }
+                composerFocused = true
+            }
+        }
         .onChange(of: model.speakReplies) { enabled in if !enabled { model.stopSpeech() } }
         .onChange(of: model.tab) { _ in model.dictation.stop() }
         .onAppear { composerFocused = true }

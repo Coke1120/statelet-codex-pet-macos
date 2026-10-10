@@ -461,6 +461,7 @@ struct SettingsSnapshot {
     let characterProfiles: [CharacterProfileSummary]
     let activeCharacterID: String
     let agentSourceMode: AgentSourceMode
+    let companionShortcut: CompanionShortcutSnapshot
 
     init(
         mediaMap: MediaMap,
@@ -479,7 +480,8 @@ struct SettingsSnapshot {
             CharacterProfileSummary(id: "default", name: "Default", clipCount: 0)
         ],
         activeCharacterID: String = "default",
-        agentSourceMode: AgentSourceMode = .combined
+        agentSourceMode: AgentSourceMode = .combined,
+        companionShortcut: CompanionShortcutSnapshot = CompanionShortcutSnapshot()
     ) {
         self.mediaMap = mediaMap
         self.mediaMapURL = mediaMapURL
@@ -496,6 +498,7 @@ struct SettingsSnapshot {
         self.characterProfiles = characterProfiles
         self.activeCharacterID = activeCharacterID
         self.agentSourceMode = agentSourceMode
+        self.companionShortcut = companionShortcut
     }
 }
 
@@ -717,6 +720,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     var onRepairInstallation: (() -> Void)?
     var onLaunchAtLoginChange: ((Bool) -> Void)?
     var onAgentSourceChange: ((AgentSourceMode) -> Void)?
+    var onCompanionShortcutChange: ((CompanionShortcut?) -> Bool)?
     var onCleanUnusedMedia: (() -> Void)?
     var onCheckForUpdates: (() -> Void)?
     var onCancelUpdate: (() -> Void)?
@@ -831,6 +835,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let installUpdateButton = NSButton(title: "Install & Relaunch", target: nil, action: nil)
     private let automaticInstallCheckbox = NSButton(checkboxWithTitle: "Automatically install verified updates at the next safe restart", target: nil, action: nil)
     private let diagnosticsTextView = NSTextView()
+    private let companionShortcutView = CompanionShortcutSettingsView()
     private let launchAtLoginCheckbox = NSButton(checkboxWithTitle: "Start Statelet when I log in", target: nil, action: nil)
     private let launchAtLoginLabel = NSTextField(wrappingLabelWithString: "Checking…")
     private let agentSourceControl = NSSegmentedControl(
@@ -1002,6 +1007,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         launchAtLoginCheckbox.state = snapshot.launchAtLoginEnabled ? .on : .off
         launchAtLoginLabel.stringValue = snapshot.launchAtLoginSummary
         agentSourceControl.selectedSegment = AgentSourceMode.allCases.firstIndex(of: snapshot.agentSourceMode) ?? 0
+        companionShortcutView.update(snapshot.companionShortcut)
         repairButton.isEnabled = snapshot.repairAvailable
         updateCharacterSelector()
     }
@@ -1893,6 +1899,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         agentSourceStack.alignment = .leading
         agentSourceStack.spacing = 8
         let agentSourceBox = makeSection(title: "Agent Source", content: agentSourceStack)
+        companionShortcutView.onChange = { [weak self] shortcut in self?.onCompanionShortcutChange?(shortcut) ?? false }
+        let companionBox = makeSection(title: "Companion Shortcut", content: companionShortcutView)
 
         sizeSlider.target = self
         sizeSlider.action = #selector(sizeChanged)
@@ -1992,7 +2000,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             title: "General",
             subtitle: "Control startup, window behavior, accessibility, and Statelet's local files."
         )
-        let stack = NSStackView(views: [header, startupBox, agentSourceBox, petWindowBox, motionBox, localBox])
+        let stack = NSStackView(views: [header, startupBox, agentSourceBox, companionBox, petWindowBox, motionBox, localBox])
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -2006,6 +2014,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             stack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor),
             header.widthAnchor.constraint(equalTo: stack.widthAnchor),
             agentSourceBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            companionBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
             startupBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
             petWindowBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
             motionBox.widthAnchor.constraint(equalTo: stack.widthAnchor),

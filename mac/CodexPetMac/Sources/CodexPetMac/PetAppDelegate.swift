@@ -655,6 +655,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var activeOneShotPreview: ActiveOneShotPreview?
     private var settingsController: SettingsWindowController?
     private var companionController: CompanionPanelController?
+    private var companionShortcutController: CompanionShortcutController?
     private var companionPetVisible = true
     private var updateCoordinator: StateletUpdateCoordinator?
     private var updateRecoveryBlocked = false
@@ -673,6 +674,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         qos: .utility
     )
     private var diagnosticsRefreshGeneration: UInt64 = 0
+    private var compatibilityControl: CodexAppServerProcessControl?
     private let preferencesMigrationStatus: PreferencesMigration.Status
     private var cachedLaunchAtLoginStatus: LaunchAtLoginManager.Status?
     private var cachedDiagnosticsReport = "Open Diagnostics and choose Refresh to inspect this Mac."
@@ -974,6 +976,18 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 self.showSettings()
             }
         }
+        MainActor.assumeIsolated {
+            let shortcut = CompanionShortcutController()
+            shortcut.onTrigger = { [weak self] in
+                guard let self, !self.isTerminating, let panel = self.panel else { return }
+                if let controller = self.companionController { controller.toggleShortcut(beside: panel.frame) }
+                else {
+                    self.showCompanionOnMain()
+                    self.companionController?.model.requestComposerFocus()
+                }
+            }
+            companionShortcutController = shortcut
+        }
         if options.openCompanion {
             DispatchQueue.main.async { [weak self] in self?.showCompanion() }
         }
@@ -1001,7 +1015,9 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        MainActor.assumeIsolated { companionController?.shutdown() }
+        compatibilityControl?.cancel()
+        CodexCompatibilityService.shutdownAll()
+        MainActor.assumeIsolated { companionShortcutController?.shutdown(); companionController?.shutdown() }
         CompanionChatService.shutdownAll()
         enterTerminationState()
         transientStateReadRetry?.cancel()
@@ -3563,6 +3579,14 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         controller.onRepairInstallation = { [weak self] in self?.repairStartupInstallation() }
         controller.onLaunchAtLoginChange = { [weak self] enabled in self?.setLaunchAtLogin(enabled) }
         controller.onAgentSourceChange = { [weak self] mode in self?.setAgentSourceMode(mode) }
+        controller.onCompanionShortcutChange = { [weak self] shortcut in
+            MainActor.assumeIsolated {
+                guard let self, !self.isTerminating, let controller = self.companionShortcutController else { return false }
+                let changed = controller.setShortcut(shortcut)
+                self.refreshSettings()
+                return changed
+            }
+        }
         controller.onCleanUnusedMedia = { [weak self] in self?.cleanUnusedMedia() }
         controller.onCheckForUpdates = { [weak self] in
             guard let self, !self.isTerminating else { return }
@@ -3687,7 +3711,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                     )
                 },
                 activeCharacterID: characterLibrary.activeCharacterID,
-                agentSourceMode: agentSourceMode
+                agentSourceMode: agentSourceMode,
+                companionShortcut: MainActor.assumeIsolated { companionShortcutController?.snapshot ?? CompanionShortcutSnapshot() }
             )
         )
         settingsController.update(toolchainState: toolchainState)
@@ -7351,13 +7376,18 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         )
         diagnosticsRefreshGeneration &+= 1
         let generation = diagnosticsRefreshGeneration
+        compatibilityControl?.cancel()
+        let control = CodexAppServerProcessControl()
+        compatibilityControl = control
         let launchAtLoginManager = launchAtLoginManager
         let diagnostics = diagnostics
         diagnosticsQueue.async { [weak self] in
             let startup = launchAtLoginManager.status()
-            let report = diagnostics.build(input: input, startupStatus: startup)
+            let compatibility = CodexCompatibilityService().check(control: control)
+            let report = diagnostics.build(input: input, startupStatus: startup, compatibility: compatibility)
             DispatchQueue.main.async {
-                guard let self, self.diagnosticsRefreshGeneration == generation else { return }
+                guard let self, !self.isTerminating, self.diagnosticsRefreshGeneration == generation else { return }
+                self.compatibilityControl = nil
                 self.cachedLaunchAtLoginStatus = startup
                 self.cachedDiagnosticsReport = report
                 self.refreshSettings()
