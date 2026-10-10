@@ -149,7 +149,7 @@ final class CarbonCompanionHotKeys: CompanionHotKeyRegistering {
                 guard let event, let userData else { return OSStatus(eventNotHandledErr) }
                 var id = EventHotKeyID()
                 let status = GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
-                    nil, UInt32(MemoryLayout<EventHotKeyID>.size), nil, &id)
+                    nil, MemoryLayout<EventHotKeyID>.size, nil, &id)
                 guard status == noErr, id.signature == CarbonCompanionHotKeys.signature else { return OSStatus(eventNotHandledErr) }
                 return MainActor.assumeIsolated {
                     let owner = Unmanaged<CarbonCompanionHotKeys>.fromOpaque(userData).takeUnretainedValue()
