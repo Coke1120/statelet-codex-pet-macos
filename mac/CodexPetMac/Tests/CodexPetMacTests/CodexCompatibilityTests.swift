@@ -64,6 +64,12 @@ final class CodexCompatibilityTests: XCTestCase {
             return entry
         }
         XCTAssertEqual(fixture.evaluate(fixture.hooks(entries: entries)).status, .runtimeUnavailable)
+        entries = fixture.entries().map { entry in
+            var entry = entry
+            entry["command"] = "\"/usr/bin/python\\3\" '\(fixture.hook.path)' >/dev/null 2>&1 || :"
+            return entry
+        }
+        XCTAssertEqual(fixture.evaluate(fixture.hooks(entries: entries)).status, .runtimeUnavailable)
         let module = fixture.hook.deletingLastPathComponent().appendingPathComponent("codex_pet_state.py")
         try FileManager.default.removeItem(at: module)
         XCTAssertEqual(fixture.evaluate(fixture.hooks()).status, .runtimeUnavailable)

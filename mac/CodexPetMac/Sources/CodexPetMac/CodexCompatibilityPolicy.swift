@@ -112,7 +112,13 @@ struct CodexHookSummary: Equatable, Sendable {
         let invocation = command.hasSuffix(guardSuffix) ? String(command.dropLast(guardSuffix.count)) : command
         var parts: [String] = [], token = "", quote: Character?, escaped = false, started = false
         for character in invocation {
-            if escaped { token.append(character); escaped = false; started = true; continue }
+            if escaped {
+                // POSIX double quotes preserve backslashes before ordinary
+                // characters. Do not turn a nonexistent python\\3 into python3.
+                if quote == "\"", !"$`\"\\\n".contains(character) { token.append("\\") }
+                if character != "\n" { token.append(character) }
+                escaped = false; started = true; continue
+            }
             if quote == "'" {
                 if character == "'" { quote = nil } else { token.append(character) }
                 continue
@@ -199,4 +205,3 @@ struct CodexCompatibilitySnapshot: Equatable, Sendable {
         return lines
     }
 }
-

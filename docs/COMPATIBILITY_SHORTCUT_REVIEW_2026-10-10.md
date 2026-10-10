@@ -89,6 +89,8 @@ The RPC lists definitions without dispatching hooks or starting a model turn.
   hook modules before runtime presence can count as ready. It also restores the
   prior Statelet key window when opening Companion from Settings, avoiding a
   stale external-app focus target. Regression cases cover both corrections.
+- Command recognition preserves POSIX double-quoted non-special backslashes,
+  so a nonexistent interpreter cannot be mistaken for an executable one.
 - Cloud Linux: **169 selected portable Python tests passed, zero skips** using
   the command in [the prior review](CLOUD_REVIEW_2026-10-10.md#environment-and-baseline).
   A smaller 16-test hook-registration/CI selection passed first. No unrelated
