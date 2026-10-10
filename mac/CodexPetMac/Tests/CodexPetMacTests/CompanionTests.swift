@@ -145,9 +145,9 @@ final class CompanionTests: XCTestCase {
 
     @MainActor
     func testSendFollowUpAndClearKeepConversationInMemory() async throws {
-        let model = CompanionModel { _, receive in
+        let model = CompanionModel(runner: { _, receive in
             receive(.reply(id: "1", text: "Hello")); receive(.reply(id: "1", text: "Hello there")); receive(.completed)
-        }
+        })
         model.draft = "First question"; model.send()
         await settle(model)
         XCTAssertEqual(model.messages.count, 2)
@@ -165,11 +165,11 @@ final class CompanionTests: XCTestCase {
     @MainActor
     func testCancellationRejectsLateOutputAndDoesNotStopNewReply() async throws {
         let gate = CompanionTestGate()
-        let model = CompanionModel { _, receive in
+        let model = CompanionModel(runner: { _, receive in
             let call = gate.next()
             try? await Task.sleep(nanoseconds: call == 1 ? 150_000_000 : 10_000_000)
             receive(.reply(id: "1", text: call == 1 ? "stale" : "current")); receive(.completed)
-        }
+        })
         model.draft = "first"; model.send()
         try await Task.sleep(nanoseconds: 20_000_000)
         model.newChat()
@@ -182,12 +182,12 @@ final class CompanionTests: XCTestCase {
     @MainActor
     func testRetryReplacesPartialResponseWithoutDuplicatingUserTurn() async throws {
         let gate = CompanionTestGate()
-        let model = CompanionModel { _, receive in
+        let model = CompanionModel(runner: { _, receive in
             let call = gate.next()
             receive(.reply(id: "a", text: call == 1 ? "partial" : "finished"))
             if call == 1 { throw CompanionChatError.failed }
             receive(.completed)
-        }
+        })
         model.draft = "question"; model.send(); await settle(model)
         XCTAssertNotNil(model.error)
         XCTAssertTrue(model.canRetry)
@@ -246,7 +246,12 @@ final class CompanionTests: XCTestCase {
         XCTAssertEqual(mkfifo(file.path, 0o600), 0)
         let finished = expectation(description: "FIFO rejected without a writer")
         DispatchQueue.global().async {
-            XCTAssertThrowsError(try CompanionAttachment.read(file))
+            do {
+                _ = try CompanionAttachment.read(file)
+                XCTFail("Expected a FIFO attachment to be rejected")
+            } catch {
+                XCTAssertEqual(error as? CompanionChatError, .tooLarge)
+            }
             finished.fulfill()
         }
         wait(for: [finished], timeout: 1)
