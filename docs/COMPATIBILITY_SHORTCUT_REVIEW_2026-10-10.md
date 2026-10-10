@@ -91,6 +91,9 @@ The RPC lists definitions without dispatching hooks or starting a model turn.
   stale external-app focus target. Regression cases cover both corrections.
 - Command recognition preserves POSIX double-quoted non-special backslashes,
   so a nonexistent interpreter cannot be mistaken for an executable one.
+- The native gate identified Carbon's imported `Int` event-count parameter;
+  buffer size and event count now use the native Swift counts without narrowing
+  conversions. The gate is rerun automatically on the corrected committed head.
 - Cloud Linux: **169 selected portable Python tests passed, zero skips** using
   the command in [the prior review](CLOUD_REVIEW_2026-10-10.md#environment-and-baseline).
   A smaller 16-test hook-registration/CI selection passed first. No unrelated

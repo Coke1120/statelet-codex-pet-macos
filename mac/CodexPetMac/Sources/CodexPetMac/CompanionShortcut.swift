@@ -155,7 +155,7 @@ final class CarbonCompanionHotKeys: CompanionHotKeyRegistering {
                     let owner = Unmanaged<CarbonCompanionHotKeys>.fromOpaque(userData).takeUnretainedValue()
                     return owner.handle(id: id.id, pressed: GetEventKind(event) == UInt32(kEventHotKeyPressed))
                 }
-            }, UInt32(types.count), &types, Unmanaged.passUnretained(self).toOpaque(), &handler)
+            }, types.count, &types, Unmanaged.passUnretained(self).toOpaque(), &handler)
             guard result == noErr, handler != nil else { throw CompanionShortcutFailure.unavailable }
         }
         nextID &+= 1
