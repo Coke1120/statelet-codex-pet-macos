@@ -438,6 +438,11 @@ class MacPetStartupTests(unittest.TestCase):
                                     previewStatus: "presented",
                                     toolchainStatus: "ready",
                                     preferencesMigrationStatus: .migrated
+                                ),
+                                compatibility: CodexCompatibilitySnapshot(
+                                    installation: .signed, version: .validatedBaseline,
+                                    flags: .compatible, features: .compatible,
+                                    hooks: CodexHookSummary(status: .needsReview, registered: 12, needsReview: 12)
                                 )
                             )
                             guard !report.contains(home.path),
@@ -449,6 +454,9 @@ class MacPetStartupTests(unittest.TestCase):
                                   report.contains("publisher.observed_revision: 1786000000000008"),
                                   report.contains("publisher.accepted_revision: 1786000000000007"),
                                   report.contains("publisher.rejection_categories: lower_revision=2"),
+                                  report.contains("compatibility.cli.version: 0.159.2"),
+                                  report.contains("compatibility.hooks.status: needs-review"),
+                                  report.contains("compatibility.hooks.needs_review: 12"),
                                   !report.contains("/private/path") else {
                                 throw HarnessFailure.failed("diagnostics privacy")
                             }
@@ -468,6 +476,7 @@ class MacPetStartupTests(unittest.TestCase):
                     str(SOURCES / "SingletonLock.swift"),
                     str(SOURCES / "LaunchAtLoginManager.swift"),
                     str(SOURCES / "PetDiagnostics.swift"),
+                    str(SOURCES / "CodexCompatibilityPolicy.swift"),
                     str(harness),
                     "-o",
                     str(executable),
