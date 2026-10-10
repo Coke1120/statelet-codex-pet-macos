@@ -1,5 +1,6 @@
 import AppKit
 import CodexPetCore
+import Darwin
 import XCTest
 @testable import Statelet
 
@@ -22,6 +23,18 @@ final class CompanionTests: XCTestCase {
             CompanionMessage(role: .user, text: String(repeating: "語", count: 30_000))
         ]))
         XCTAssertThrowsError(try CompanionChatPolicy.prompt(messages: []))
+    }
+
+    func testQuickChatDisablesOptionalImageAndDesktopCapabilities() {
+        let arguments = CompanionChatPolicy.arguments
+        let disabled = Set(arguments.indices.dropLast().compactMap { index in
+            arguments[index] == "--disable" ? arguments[index + 1] : nil
+        })
+        XCTAssertTrue(disabled.isSuperset(of: ["view_image", "image_generation", "browser_use",
+            "browser_use_external", "browser_use_full_cdp_access", "computer_use", "sleep_tool", "tool_suggest"]))
+        XCTAssertTrue(arguments.contains("--ignore-rules"))
+        XCTAssertTrue(arguments.contains("tools.experimental_request_user_input.enabled=false"))
+        XCTAssertTrue(arguments.contains("tools.update_plan.enabled=false"))
     }
 
     func testOnlyAssistantTextAndSafeStatusReachChat() throws {
@@ -54,6 +67,76 @@ final class CompanionTests: XCTestCase {
             XCTAssertTrue(CompanionCodexRouting.arguments(config: "openai_base_url = " + encoded).isEmpty)
         }
         XCTAssertTrue(CompanionCodexRouting.arguments(config: "[other]\nmodel = \"not-a-root-model\"").isEmpty)
+    }
+
+    func testRoutingHandlesCommentsWithoutInterpretingQuotedContent() {
+        let config = """
+        # model_provider = "not-openai"
+        model = "gpt-test" # selected model
+        model_provider = 'openai' # provider
+        openai_base_url = 'http://127.0.0.1:8000/v1' # local route
+        """
+        XCTAssertEqual(CompanionCodexRouting.arguments(config: config), [
+            "-c", "model=\"gpt-test\"", "-c", "openai_base_url=\"http://127.0.0.1:8000/v1\""
+        ])
+        // A hash inside a quoted value is data, not the start of a comment.
+        XCTAssertTrue(CompanionCodexRouting.arguments(config: "model = 'gpt-test#suffix' # note").isEmpty)
+        XCTAssertTrue(CompanionCodexRouting.arguments(config: "openai_base_url = \"http://localhost/v1#fragment\"").isEmpty)
+        XCTAssertTrue(CompanionCodexRouting.arguments(config: "model = \"gpt-test\\\"#suffix\" # note").isEmpty)
+        XCTAssertTrue(CompanionCodexRouting.arguments(config: "model = \"gpt-test\" unexpected").isEmpty)
+        XCTAssertTrue(CompanionCodexRouting.arguments(config: "model = 'gpt-test'\nmodel_provider = 'other' # note").isEmpty)
+    }
+
+    func testRoutingReadsOnlyBoundedRegularConfigFiles() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let config = directory.appendingPathComponent("config.toml")
+        try Data("model = 'gpt-test' # chosen model".utf8).write(to: config)
+        XCTAssertEqual(CompanionCodexRouting.arguments(configURL: config), ["-c", "model=\"gpt-test\""])
+        let link = directory.appendingPathComponent("linked-config.toml")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: config)
+        XCTAssertEqual(CompanionCodexRouting.arguments(configURL: link), ["-c", "model=\"gpt-test\""])
+        XCTAssertTrue(CompanionCodexRouting.arguments(configURL: directory).isEmpty)
+        try Data(repeating: 65, count: 1_048_577).write(to: config)
+        XCTAssertTrue(CompanionCodexRouting.arguments(configURL: config).isEmpty)
+        try Data([0xff]).write(to: config)
+        XCTAssertTrue(CompanionCodexRouting.arguments(configURL: config).isEmpty)
+    }
+
+    func testRoutingRejectsFIFOWithoutWaitingForAWriter() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let config = directory.appendingPathComponent("config.toml")
+        XCTAssertEqual(mkfifo(config.path, 0o600), 0)
+        let link = directory.appendingPathComponent("linked-config.toml")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: config)
+        for candidate in [config, link] {
+            let finished = expectation(description: "Config FIFO rejected without a writer")
+            DispatchQueue.global().async {
+                XCTAssertTrue(CompanionCodexRouting.arguments(configURL: candidate).isEmpty)
+                finished.fulfill()
+            }
+            wait(for: [finished], timeout: 1)
+            // Unblock the old implementation after a failing timeout so the native
+            // suite does not retain a worker waiting indefinitely on this fixture.
+            let writer = Darwin.open(config.path, O_WRONLY | O_NONBLOCK | O_CLOEXEC)
+            if writer >= 0 { Darwin.close(writer) }
+        }
+    }
+
+    func testRoutingRejectsApparentRootKeysInsideComplexValues() {
+        for opener in ["'''", "\"\"\"", "[", "{"] {
+            let config = "model = 'earlier-model'\ndeveloper_instructions = \(opener)\nopenai_base_url = 'http://127.0.0.1:9999/v1'"
+            XCTAssertTrue(CompanionCodexRouting.arguments(config: config).isEmpty, opener)
+        }
+        let validMultiline = "developer_instructions = '''\nopenai_base_url = \"http://127.0.0.1:9999/v1\"\n'''\nmodel = 'actual-model'"
+        XCTAssertTrue(CompanionCodexRouting.arguments(config: validMultiline).isEmpty)
+        let quotedKey = "\"foo=bar\" = '''\nopenai_base_url = 'http://127.0.0.1:9999/v1'\n'''"
+        XCTAssertTrue(CompanionCodexRouting.arguments(config: quotedKey).isEmpty)
+        XCTAssertTrue(CompanionCodexRouting.arguments(config: "model = 'gpt-test'\nunknown.key = 1").isEmpty)
+        XCTAssertTrue(CompanionCodexRouting.arguments(config: "model = 'gpt-test'\nunexpected line").isEmpty)
     }
 
     private func event(_ object: [String: Any]) throws -> CompanionChatEvent? {
@@ -114,6 +197,31 @@ final class CompanionTests: XCTestCase {
         XCTAssertNil(model.error)
     }
 
+    @MainActor
+    func testClosingPanelSuppressesLateAutomaticSpeechAndReopeningRestoresIt() async {
+        var spoken: [String] = []
+        let model = CompanionModel(speechStarter: { text in spoken.append(text); return true }) { _, receive in
+            receive(.reply(id: "a", text: "Finished reply")); receive(.completed)
+        }
+        model.speakReplies = true
+        model.setPanelVisible(true)
+        model.draft = "First question"; model.send()
+        // The runner cannot finish on the main actor until this synchronous close.
+        model.setPanelVisible(false)
+        await settle(model)
+        XCTAssertEqual(model.messages.last?.text, "Finished reply")
+        XCTAssertTrue(spoken.isEmpty)
+        XCTAssertFalse(model.speaking)
+        XCTAssertTrue(model.speakReplies)
+
+        model.setPanelVisible(true)
+        model.draft = "Follow up"; model.send()
+        await settle(model)
+        XCTAssertEqual(spoken, ["Finished reply"])
+        model.setPanelVisible(false)
+        XCTAssertFalse(model.speaking)
+    }
+
     func testAttachmentRejectsOversizeAndBinaryFiles() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
@@ -128,6 +236,24 @@ final class CompanionTests: XCTestCase {
         let link = directory.appendingPathComponent("link.txt")
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: file)
         XCTAssertThrowsError(try CompanionAttachment.read(link))
+    }
+
+    func testAttachmentRejectsFIFOWithoutWaitingForAWriter() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("context.txt")
+        XCTAssertEqual(mkfifo(file.path, 0o600), 0)
+        let finished = expectation(description: "FIFO rejected without a writer")
+        DispatchQueue.global().async {
+            XCTAssertThrowsError(try CompanionAttachment.read(file))
+            finished.fulfill()
+        }
+        wait(for: [finished], timeout: 1)
+        // Release a blocked reader if the regression returns, so failure does
+        // not leave a worker stuck for the rest of the native test suite.
+        let writer = Darwin.open(file.path, O_WRONLY | O_NONBLOCK | O_CLOEXEC)
+        if writer >= 0 { Darwin.close(writer) }
     }
 
     @MainActor
