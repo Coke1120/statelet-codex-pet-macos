@@ -143,6 +143,114 @@ class ScriptedWaiter:
 
 
 class LifecycleStateTests(unittest.TestCase):
+    def test_malformed_records_do_not_hide_healthy_sessions(self) -> None:
+        causal = {
+            "version": 1,
+            "current_turn": None,
+            "prior_turns": [],
+            "tool_phases": {},
+            "active_tool": None,
+            "pending_permissions": [],
+            "latest_event": [],
+        }
+        cases = [
+            {"causal": causal},
+            {"causal": dict(causal, latest_event={})},
+            {"event": []},
+            {"event": {}},
+        ] + [{field: 10 ** 400} for field in (
+            "event_at", "updated_at", "started_at", "completed_at"
+        )]
+        for change in cases:
+            with self.subTest(field=next(iter(change))), tempfile.TemporaryDirectory() as root:
+                directory = Path(root)
+                bad = record_path(directory, "a")
+                write_v2_record(bad, "running", "UserPromptSubmit", 99.0)
+                record = json.loads(bad.read_text())
+                record.update(change)
+                bad.write_text(json.dumps(record))
+                write_v2_record(record_path(directory, "b"), "waiting", "PermissionRequest", 99.0)
+
+                snapshot = state.read_session_snapshot(directory, now=100.0)
+                activity = state.read_session_activity(directory, now=100.0)
+
+                self.assertEqual(snapshot["active"], [("waiting", 99.0)])
+                self.assertEqual(sum(snapshot["rejections"].values()), 1)
+                self.assertEqual([item["id"] for item in activity["active"]], ["b" * 24])
+
+    def test_json_integer_conversion_limit_does_not_abort_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            # Python versions with an integer-string conversion limit raise
+            # ValueError during JSON parsing; older versions reach float
+            # conversion and raise OverflowError. Both must fail per record.
+            record_path(directory, "a").write_text(
+                '{"version":1,"state":"running","event":"UserPromptSubmit",'
+                '"updated_at":' + "9" * 5000 + "}"
+            )
+            write_record(record_path(directory, "b"), "waiting", 99.0)
+            snapshot = state.read_session_snapshot(directory, now=100.0)
+        self.assertEqual(snapshot["active"], [("waiting", 99.0)])
+        self.assertEqual(sum(snapshot["rejections"].values()), 1)
+
+    def test_shared_snapshot_matches_standalone_projections_with_fewer_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            for digit, lifecycle in (("a", "waiting"), ("b", "running")):
+                write_record(record_path(directory, digit), lifecycle, 99.0)
+                write_target_record(directory / (digit * 24 + ".target.json"), digit * 24, "thread-" + digit, 99.0)
+            expected_state = state.read_session_snapshot(directory, now=100.0)
+            expected_activity = state.read_session_activity(directory, now=100.0)
+            expected_targets = state.read_session_targets(directory, expected_activity, now=100.0)
+
+            with mock.patch.object(state, "_read_hook_record", wraps=state._read_hook_record) as reads, mock.patch.object(state.os, "listdir", wraps=state.os.listdir) as lists:
+                with state.SessionRecordSnapshot(directory) as records:
+                    actual_state = state.read_session_snapshot(directory, now=100.0, records=records)
+                    activity = state.read_session_activity(directory, now=100.0, records=records)
+                    targets = state.read_session_targets(directory, activity, now=100.0, records=records)
+                    self.assertEqual(len(records._records), 2)
+                    self.assertTrue(all(name.endswith(".json") and not name.endswith(".target.json") for name in records._records))
+                self.assertEqual(records._records, {})
+            self.assertEqual((actual_state, activity, targets), (expected_state, expected_activity, expected_targets))
+            self.assertEqual(reads.call_count, 4)
+            self.assertEqual(lists.call_count, 1)
+
+    def test_snapshot_reuse_is_bounded_without_dropping_sessions(self) -> None:
+        for budget, limit, expected_reads in (
+            ("MAX_SNAPSHOT_CACHE_BYTES", 0, 4),
+            ("MAX_SNAPSHOT_CACHE_RECORDS", 1, 3),
+        ):
+            with self.subTest(budget=budget), tempfile.TemporaryDirectory() as root:
+                directory = Path(root)
+                write_record(record_path(directory, "a"), "waiting", 99.0)
+                write_record(record_path(directory, "b"), "running", 99.0)
+                with mock.patch.object(state, budget, limit), mock.patch.object(state, "_read_hook_record", wraps=state._read_hook_record) as reads:
+                    with state.SessionRecordSnapshot(directory) as records:
+                        snapshot = state.read_session_snapshot(directory, now=100.0, records=records)
+                        activity = state.read_session_activity(directory, now=100.0, records=records)
+                        self.assertLessEqual(records._cached_bytes, state.MAX_SNAPSHOT_CACHE_BYTES)
+                        self.assertLessEqual(len(records._records), state.MAX_SNAPSHOT_CACHE_RECORDS)
+                self.assertEqual(len(snapshot["active"]), 2)
+                self.assertEqual(len(activity["active"]), 2)
+                self.assertEqual(reads.call_count, expected_reads)
+
+    def test_next_snapshot_observes_replacement_membership_and_source_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            original = record_path(directory, "a")
+            write_v2_record(original, "running", "UserPromptSubmit", 99.0)
+            with state.SessionRecordSnapshot(directory) as records:
+                state.read_session_snapshot(directory, now=100.0, records=records)
+                replacement = directory / "replacement"
+                write_v2_record(replacement, "waiting", "PermissionRequest", 100.0)
+                os.replace(replacement, original)
+                write_v2_record(record_path(directory, "b"), "review", "PreCompact", 100.0, provider="grok")
+                write_agent_source(directory / state.AGENT_SOURCE_FILENAME, "grok")
+                first = state.read_session_activity(directory, now=100.0, records=records)
+            second = state.read_session_activity(directory, now=100.0)
+            self.assertEqual([(item["id"], item["state"]) for item in first["active"]], [("a" * 24, "running")])
+            self.assertEqual([(item["id"], item["state"]) for item in second["active"]], [("b" * 24, "review")])
+
     def test_default_paths_use_statelet_identity_with_legacy_environment_fallback(self) -> None:
         previous_statelet = os.environ.pop("STATELET_STATE_DIR", None)
         previous_legacy = os.environ.pop("CODEX_PET_STATE_DIR", None)
@@ -1053,6 +1161,37 @@ class LifecycleStateTests(unittest.TestCase):
 
 
 class PublisherTests(unittest.TestCase):
+    def test_run_publishes_healthy_session_despite_malformed_records(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root) / "sessions"
+            directory.mkdir(mode=0o700)
+            output = Path(root) / "runtime" / "current_state.json"
+            bad = record_path(directory, "a")
+            write_v2_record(bad, "running", "UserPromptSubmit", 99.0)
+            record = json.loads(bad.read_text())
+            record["started_at"] = 10 ** 400
+            bad.write_text(json.dumps(record))
+            write_v2_record(record_path(directory, "b"), "waiting", "PermissionRequest", 99.0)
+            write_target_record(directory / ("b" * 24 + ".target.json"), "b" * 24, "synthetic-thread", 99.0)
+            write_target_record(directory / ("c" * 24 + ".target.json"), "c" * 24, "malformed-thread", 10 ** 400)
+            with mock.patch.object(state.os, "listdir", wraps=state.os.listdir) as lists:
+                result = aggregator.run(
+                    directory, output, poll=0.25, heartbeat=60.0,
+                    active_ttl=900.0, once=True, print_state=False,
+                    forced_state=None, force_seconds=30.0,
+                    should_stop=lambda: False, wall_clock=lambda: 100.0,
+                )
+            lifecycle = json.loads(output.read_text())
+            activity = json.loads((directory / state.SESSION_ACTIVITY_FILENAME).read_text())
+            targets = json.loads((directory / state.SESSION_ACTIVITY_TARGETS_FILENAME).read_text())
+        self.assertEqual(result, 0)
+        self.assertEqual(lifecycle["state"], "waiting")
+        self.assertEqual(lifecycle["active_sessions"], 1)
+        self.assertEqual(lifecycle["rejection_diagnostics"]["count"], 1)
+        self.assertEqual([item["id"] for item in activity["active"]], ["b" * 24])
+        self.assertEqual(targets["targets"], [{"id": "b" * 24, "thread_id": "synthetic-thread"}])
+        self.assertEqual(lists.call_count, 1)
+
     def test_default_heartbeat_is_low_frequency(self) -> None:
         self.assertGreaterEqual(aggregator.DEFAULT_HEARTBEAT_INTERVAL, 60.0)
 

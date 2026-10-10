@@ -60,6 +60,9 @@ DEFAULT_ACTIVE_TTL = 900.0
 DEFAULT_COMPLETED_TTL = 7 * 24 * 60 * 60.0
 MAX_ACTIVITY_ENTRIES = 64
 MAX_HOOK_RECORD_BYTES = 1_048_576
+# Bound temporary reuse separately from the size limit for one hook record.
+MAX_SNAPSHOT_CACHE_BYTES = 4 * MAX_HOOK_RECORD_BYTES
+MAX_SNAPSHOT_CACHE_RECORDS = 4096
 MAX_AGENT_SOURCE_BYTES = 4_096
 # A completed tool is evidence that the session is no longer actively using a
 # tool.  If Desktop fails to emit its terminal callback after that point, a
@@ -159,7 +162,7 @@ def _read_hook_record(
                 return (HOOK_RECORD_CORRUPT, None, identity)
             record = json.loads(raw.decode("utf-8"))
             return (HOOK_RECORD_OK, record, identity)
-        except (OSError, UnicodeError, json.JSONDecodeError):
+        except (OSError, UnicodeError, ValueError, RecursionError):
             return (HOOK_RECORD_CORRUPT, None, identity)
     except OSError:
         return (HOOK_RECORD_IGNORED, None, None)
@@ -226,26 +229,76 @@ def _prune_if_unchanged(
         pass
 
 
-def _record_names(directory_fd: int) -> List[str]:
-    try:
-        return sorted(
-            name
-            for name in os.listdir(directory_fd)
-            if HOOK_RECORD_NAME.fullmatch(name) is not None
-        )
-    except OSError:
-        return []
+class SessionRecordSnapshot:
+    """Share secure file reads only within one aggregation iteration.
 
+    Directory membership and provider selection are captured once. Bounded
+    record reuse keeps ordinary lifecycle and activity projections consistent
+    without retaining stale records across directory wakes or TTL deadlines.
+    Beyond the reuse budget, readers use the original secure read path.
+    Targets remain lazy so optional target I/O follows lifecycle publication.
+    """
 
-def _target_record_names(directory_fd: int) -> List[str]:
-    try:
-        return sorted(
-            name
-            for name in os.listdir(directory_fd)
-            if TARGET_RECORD_NAME.fullmatch(name) is not None
-        )
-    except OSError:
-        return []
+    def __init__(self, state_dir: Path) -> None:
+        self.state_dir = state_dir
+        self.directory_fd: Optional[int] = None
+        self.source_mode = "combined"
+        self.hook_names: Tuple[str, ...] = ()
+        self.target_names: Tuple[str, ...] = ()
+        self._records: Dict[str, Tuple[str, Optional[Any], Optional[FileIdentity]]] = {}
+        self._omitted = set()
+        self._cached_bytes = 0
+
+    def __enter__(self) -> "SessionRecordSnapshot":
+        self.source_mode = read_agent_source_mode(self.state_dir)
+        self.directory_fd = _open_state_directory(self.state_dir)
+        if self.directory_fd is not None:
+            try:
+                names = sorted(os.listdir(self.directory_fd))
+            except OSError:
+                names = []
+            self.hook_names = tuple(
+                name for name in names if HOOK_RECORD_NAME.fullmatch(name) is not None
+            )
+            self.target_names = tuple(
+                name for name in names if TARGET_RECORD_NAME.fullmatch(name) is not None
+            )
+        return self
+
+    def __exit__(self, _type, _value, _traceback) -> None:
+        if self.directory_fd is not None:
+            os.close(self.directory_fd)
+            self.directory_fd = None
+        self._records.clear()
+        self._omitted.clear()
+        self._cached_bytes = 0
+
+    def read(self, name: str) -> Tuple[str, Optional[Any], Optional[FileIdentity]]:
+        if self.directory_fd is None or name in self._omitted:
+            return (HOOK_RECORD_IGNORED, None, None)
+        if name in self._records:
+            return self._records[name]
+        result = _read_hook_record(self.directory_fd, name)
+        identity = result[2]
+        size = max(0, identity[2]) if identity is not None else 0
+        # Targets have only one consumer; retaining their parsed data buys no
+        # reuse and needlessly increases the peak memory of a large directory.
+        if (
+            HOOK_RECORD_NAME.fullmatch(name) is not None
+            and len(self._records) < MAX_SNAPSHOT_CACHE_RECORDS
+            and self._cached_bytes + size <= MAX_SNAPSHOT_CACHE_BYTES
+        ):
+            self._records[name] = result
+            self._cached_bytes += size
+        return result
+
+    def prune(self, name: str, identity: Optional[FileIdentity]) -> None:
+        # Never project a rejected snapshot record after attempting cleanup.
+        # The existing identity check still preserves replacements that win a
+        # race; they are picked up by a fresh snapshot on the next iteration.
+        self._omitted.add(name)
+        if self.directory_fd is not None:
+            _prune_if_unchanged(self.directory_fd, name, identity)
 
 
 def _open_agent_source_directory(state_dir: Path) -> Optional[int]:
@@ -411,7 +464,10 @@ def _valid_causal_metadata(value: Any) -> bool:
             and 1 <= rank <= 3
             for key, rank in tool_phases.items()
         )
-        and (latest_event is None or latest_event in VALID_EVENTS)
+        and (
+            latest_event is None
+            or (isinstance(latest_event, str) and latest_event in VALID_EVENTS)
+        )
     )
 
 
@@ -464,7 +520,7 @@ def _event_category(event: str) -> str:
 def _finite_or_none(value: Any) -> Optional[float]:
     try:
         parsed = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return parsed if math.isfinite(parsed) else None
 
@@ -473,16 +529,21 @@ def read_session_snapshot(
     state_dir: Path,
     now: Optional[float] = None,
     active_ttl: float = DEFAULT_ACTIVE_TTL,
+    *,
+    records: Optional[SessionRecordSnapshot] = None,
 ) -> Dict[str, Any]:
     """Read active sessions plus bounded, identifier-free event diagnostics."""
+    if records is None:
+        with SessionRecordSnapshot(state_dir) as records:
+            return read_session_snapshot(state_dir, now, active_ttl, records=records)
     current = time.time() if now is None else now
     active: List[Tuple[str, float]] = []
     active_expiries: List[float] = []
     latest_event: Optional[str] = None
     latest_event_at: Optional[float] = None
     rejections: Dict[str, int] = {}
-    source_mode = read_agent_source_mode(state_dir)
-    directory_fd = _open_state_directory(state_dir)
+    source_mode = records.source_mode
+    directory_fd = records.directory_fd
     if directory_fd is None:
         return {
             "active": active,
@@ -491,104 +552,101 @@ def read_session_snapshot(
             "rejections": rejections,
             "next_expiry": None,
         }
-    try:
-        for name in _record_names(directory_fd):
-            read_status, record, identity = _read_hook_record(directory_fd, name)
-            if read_status == HOOK_RECORD_IGNORED:
-                continue
-            if read_status == HOOK_RECORD_CORRUPT:
+    for name in records.hook_names:
+        read_status, record, identity = records.read(name)
+        if read_status == HOOK_RECORD_IGNORED:
+            continue
+        if read_status == HOOK_RECORD_CORRUPT:
+            _add_rejection(rejections, "invalid_record")
+            continue
+        try:
+            if not isinstance(record, dict):
                 _add_rejection(rejections, "invalid_record")
                 continue
-            try:
-                if not isinstance(record, dict):
-                    _add_rejection(rejections, "invalid_record")
-                    continue
-                version = record.get("version")
-                if not _valid_hook_record_keys(record, version):
-                    _add_rejection(rejections, "invalid_record")
-                    continue
-                event = record.get("event")
-                if event not in VALID_EVENTS:
-                    _add_rejection(rejections, "invalid_record")
-                    continue
-                state = record["state"]
-                updated_at = float(record["updated_at"])
-                event_at = float(record.get("event_at", updated_at))
-                terminal = record.get("terminal", event == "SessionEnd")
-                started_at = record.get("started_at", event_at)
-                completed_at = record.get("completed_at", event_at if terminal else None)
-                category = record.get("category", _event_category(event))
-                provider = record.get("provider", "codex")
-                stored_rejections = record.get("rejections", {})
-                causal = record.get("causal")
-                fence = record.get("fence")
-            except (ValueError, TypeError, KeyError):
-                _add_rejection(rejections, "invalid_timestamp")
-                continue
-            if (
-                state not in VALID_STATES
-                or not math.isfinite(updated_at)
-                or not math.isfinite(event_at)
-                or _finite_or_none(started_at) is None
-                or (completed_at is not None and _finite_or_none(completed_at) is None)
-                or not isinstance(terminal, bool)
-                or (event != "Stop" and terminal != (event == "SessionEnd"))
-                or not isinstance(category, str)
-                or category not in ACTIVITY_CATEGORIES
-                or provider not in VALID_PROVIDERS
-                or not isinstance(stored_rejections, dict)
-                or (causal is not None and not _valid_causal_metadata(causal))
-                or (fence is not None and not _valid_fence(fence))
-            ):
+            version = record.get("version")
+            if not _valid_hook_record_keys(record, version):
                 _add_rejection(rejections, "invalid_record")
-                _prune_if_unchanged(directory_fd, name, identity)
                 continue
-            provider_selected = _provider_is_selected(provider, source_mode)
-            event_ttl = active_ttl_for_event(event, active_ttl)
-            age = current - event_at
-            if age < -MAX_FUTURE_SKEW or age > event_ttl:
-                # Terminal records are the source for the optional session
-                # activity rail. Keep them for a bounded retention window even
-                # after they stop contributing to aggregate lifecycle state.
-                if terminal and 0 <= age <= DEFAULT_COMPLETED_TTL:
-                    continue
-                reason = (
-                    "future_event"
-                    if age < 0
-                    else (
-                        "quiescent_expired"
-                        if event in QUIESCENT_EVENTS
-                        else "expired"
-                    )
+            event = record.get("event")
+            if not isinstance(event, str) or event not in VALID_EVENTS:
+                _add_rejection(rejections, "invalid_record")
+                continue
+            state = record["state"]
+            updated_at = float(record["updated_at"])
+            event_at = float(record.get("event_at", updated_at))
+            terminal = record.get("terminal", event == "SessionEnd")
+            started_at = record.get("started_at", event_at)
+            completed_at = record.get("completed_at", event_at if terminal else None)
+            category = record.get("category", _event_category(event))
+            provider = record.get("provider", "codex")
+            stored_rejections = record.get("rejections", {})
+            causal = record.get("causal")
+            fence = record.get("fence")
+        except (ValueError, TypeError, KeyError, OverflowError):
+            _add_rejection(rejections, "invalid_timestamp")
+            continue
+        if (
+            state not in VALID_STATES
+            or not math.isfinite(updated_at)
+            or not math.isfinite(event_at)
+            or _finite_or_none(started_at) is None
+            or (completed_at is not None and _finite_or_none(completed_at) is None)
+            or not isinstance(terminal, bool)
+            or (event != "Stop" and terminal != (event == "SessionEnd"))
+            or not isinstance(category, str)
+            or category not in ACTIVITY_CATEGORIES
+            or provider not in VALID_PROVIDERS
+            or not isinstance(stored_rejections, dict)
+            or (causal is not None and not _valid_causal_metadata(causal))
+            or (fence is not None and not _valid_fence(fence))
+        ):
+            _add_rejection(rejections, "invalid_record")
+            records.prune(name, identity)
+            continue
+        provider_selected = _provider_is_selected(provider, source_mode)
+        event_ttl = active_ttl_for_event(event, active_ttl)
+        age = current - event_at
+        if age < -MAX_FUTURE_SKEW or age > event_ttl:
+            # Terminal records are the source for the optional session
+            # activity rail. Keep them for a bounded retention window even
+            # after they stop contributing to aggregate lifecycle state.
+            if terminal and 0 <= age <= DEFAULT_COMPLETED_TTL:
+                continue
+            reason = (
+                "future_event"
+                if age < 0
+                else (
+                    "quiescent_expired"
+                    if event in QUIESCENT_EVENTS
+                    else "expired"
                 )
-                if provider_selected:
-                    _add_rejection(rejections, reason)
-                _prune_if_unchanged(directory_fd, name, identity)
-                continue
-            if not provider_selected:
-                # Source selection is only a projection. Fresh hidden records
-                # survive for immediate switching, while normal retention above
-                # still bounds disk usage independently of the selected source.
-                continue
-            for reason, count in stored_rejections.items():
-                if (
-                    reason in VALID_REJECTION_REASONS
-                    and isinstance(count, int)
-                    and not isinstance(count, bool)
-                    and 0 < count <= MAX_REJECTION_COUNT
-                ):
-                    _add_rejection(rejections, reason, count)
-            if latest_event_at is None or (event_at, event) > (
-                latest_event_at,
-                latest_event or "",
+            )
+            if provider_selected:
+                _add_rejection(rejections, reason)
+            records.prune(name, identity)
+            continue
+        if not provider_selected:
+            # Source selection is only a projection. Fresh hidden records
+            # survive for immediate switching, while normal retention above
+            # still bounds disk usage independently of the selected source.
+            continue
+        for reason, count in stored_rejections.items():
+            if (
+                reason in VALID_REJECTION_REASONS
+                and isinstance(count, int)
+                and not isinstance(count, bool)
+                and 0 < count <= MAX_REJECTION_COUNT
             ):
-                latest_event = event
-                latest_event_at = event_at
-            if not terminal and _event_projects_as_active(event, state, provider):
-                active.append((state, event_at))
-                active_expiries.append(event_at + event_ttl)
-    finally:
-        os.close(directory_fd)
+                _add_rejection(rejections, reason, count)
+        if latest_event_at is None or (event_at, event) > (
+            latest_event_at,
+            latest_event or "",
+        ):
+            latest_event = event
+            latest_event_at = event_at
+        if not terminal and _event_projects_as_active(event, state, provider):
+            active.append((state, event_at))
+            active_expiries.append(event_at + event_ttl)
     return {
         "active": active,
         "latest_event": latest_event,
@@ -603,6 +661,8 @@ def read_session_activity(
     now: Optional[float] = None,
     active_ttl: float = DEFAULT_ACTIVE_TTL,
     completed_ttl: float = DEFAULT_COMPLETED_TTL,
+    *,
+    records: Optional[SessionRecordSnapshot] = None,
 ) -> Dict[str, Any]:
     """Return bounded, identifier-free active and completed session summaries.
 
@@ -612,14 +672,19 @@ def read_session_activity(
     status; prompt, transcript, repository, and correlation metadata never
     crosses this boundary.
     """
+    if records is None:
+        with SessionRecordSnapshot(state_dir) as records:
+            return read_session_activity(
+                state_dir, now, active_ttl, completed_ttl, records=records
+            )
     current = time.time() if now is None else now
     active: List[Dict[str, Any]] = []
     completed: List[Dict[str, Any]] = []
     completed_retention: Dict[str, List[Tuple[float, str, FileIdentity]]] = {
         provider: [] for provider in VALID_PROVIDERS
     }
-    source_mode = read_agent_source_mode(state_dir)
-    directory_fd = _open_state_directory(state_dir)
+    source_mode = records.source_mode
+    directory_fd = records.directory_fd
     if directory_fd is None:
         return {
             "version": 1,
@@ -627,105 +692,103 @@ def read_session_activity(
             "active": active,
             "completed": completed,
         }
-    try:
-        for name in _record_names(directory_fd):
-            read_status, record, identity = _read_hook_record(directory_fd, name)
-            if read_status != HOOK_RECORD_OK or identity is None:
+    for name in records.hook_names:
+        read_status, record, identity = records.read(name)
+        if read_status != HOOK_RECORD_OK or identity is None:
+            continue
+        try:
+            if not isinstance(record, dict):
                 continue
-            try:
-                if not isinstance(record, dict):
-                    continue
-                version = record.get("version")
-                if not _valid_hook_record_keys(record, version):
-                    continue
-                event = record.get("event")
-                state = record.get("state")
-                updated_at = float(record.get("updated_at"))
-                event_at = float(record.get("event_at", updated_at))
-                terminal = record.get("terminal", event == "SessionEnd")
-                started_at = _finite_or_none(record.get("started_at", event_at))
-                completed_at = _finite_or_none(
-                    record.get("completed_at", event_at if terminal else None)
-                )
-                category = record.get("category", _event_category(event))
-                provider = record.get("provider", "codex")
-            except (TypeError, ValueError, KeyError):
+            version = record.get("version")
+            if not _valid_hook_record_keys(record, version):
                 continue
-            if (
-                event not in VALID_EVENTS
-                or state not in VALID_STATES
-                or not math.isfinite(updated_at)
-                or not math.isfinite(event_at)
-                or started_at is None
-                or (terminal and completed_at is None)
-                or (not terminal and record.get("completed_at") is not None and completed_at is None)
-                or not isinstance(terminal, bool)
-                or (event != "Stop" and terminal != (event == "SessionEnd"))
-                or not isinstance(category, str)
-                or category not in ACTIVITY_CATEGORIES
-                or provider not in VALID_PROVIDERS
-            ):
-                continue
-            age = current - event_at
-            event_ttl = active_ttl_for_event(event, active_ttl)
-            if age < -MAX_FUTURE_SKEW:
-                continue
-            identifier = name[:-5]
-            is_completed = terminal and event == "SessionEnd"
-            if is_completed:
-                if age > completed_ttl:
-                    _prune_if_unchanged(directory_fd, name, identity)
-                    continue
-                completed_retention[provider].append((event_at, identifier, identity))
-            elif age > event_ttl:
-                _prune_if_unchanged(directory_fd, name, identity)
-                continue
-            if not _provider_is_selected(provider, source_mode):
-                # Keep fresh hidden records available for immediate switching;
-                # retention is enforced above before projection filtering.
-                continue
-            if is_completed:
-                completed.append({
-                    "id": identifier,
-                    "state": state,
-                    "event": event,
-                    "event_at": event_at,
-                    "started_at": started_at,
-                    "completed_at": completed_at,
-                    "category": category,
-                    "provider": provider,
-                    "terminal": True,
-                })
-            elif (
-                _event_projects_as_active(event, state, provider)
-                and age <= event_ttl
-                and state != "idle"
-            ):
-                active.append({
-                    "id": identifier,
-                    "state": state,
-                    "event": event,
-                    "event_at": event_at,
-                    "started_at": started_at,
-                    "completed_at": None,
-                    "category": category,
-                    "provider": provider,
-                    "terminal": False,
-                })
-        for retained in completed_retention.values():
-            retained.sort(key=lambda item: (-item[0], item[1]))
-            for _event_at, identifier, identity in retained[MAX_ACTIVITY_ENTRIES:]:
-                _prune_if_unchanged(directory_fd, f"{identifier}.json", identity)
-        active.sort(
-            key=lambda item: (
-                -STATE_PRIORITY[item["state"]],
-                -item["event_at"],
-                item["id"],
+            event = record.get("event")
+            state = record.get("state")
+            updated_at = float(record.get("updated_at"))
+            event_at = float(record.get("event_at", updated_at))
+            terminal = record.get("terminal", event == "SessionEnd")
+            started_at = _finite_or_none(record.get("started_at", event_at))
+            completed_at = _finite_or_none(
+                record.get("completed_at", event_at if terminal else None)
             )
+            category = record.get("category", _event_category(event))
+            provider = record.get("provider", "codex")
+        except (TypeError, ValueError, KeyError, OverflowError):
+            continue
+        if (
+            not isinstance(event, str)
+            or event not in VALID_EVENTS
+            or state not in VALID_STATES
+            or not math.isfinite(updated_at)
+            or not math.isfinite(event_at)
+            or started_at is None
+            or (terminal and completed_at is None)
+            or (not terminal and record.get("completed_at") is not None and completed_at is None)
+            or not isinstance(terminal, bool)
+            or (event != "Stop" and terminal != (event == "SessionEnd"))
+            or not isinstance(category, str)
+            or category not in ACTIVITY_CATEGORIES
+            or provider not in VALID_PROVIDERS
+        ):
+            continue
+        age = current - event_at
+        event_ttl = active_ttl_for_event(event, active_ttl)
+        if age < -MAX_FUTURE_SKEW:
+            continue
+        identifier = name[:-5]
+        is_completed = terminal and event == "SessionEnd"
+        if is_completed:
+            if age > completed_ttl:
+                records.prune(name, identity)
+                continue
+            completed_retention[provider].append((event_at, identifier, identity))
+        elif age > event_ttl:
+            records.prune(name, identity)
+            continue
+        if not _provider_is_selected(provider, source_mode):
+            # Keep fresh hidden records available for immediate switching;
+            # retention is enforced above before projection filtering.
+            continue
+        if is_completed:
+            completed.append({
+                "id": identifier,
+                "state": state,
+                "event": event,
+                "event_at": event_at,
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "category": category,
+                "provider": provider,
+                "terminal": True,
+            })
+        elif (
+            _event_projects_as_active(event, state, provider)
+            and age <= event_ttl
+            and state != "idle"
+        ):
+            active.append({
+                "id": identifier,
+                "state": state,
+                "event": event,
+                "event_at": event_at,
+                "started_at": started_at,
+                "completed_at": None,
+                "category": category,
+                "provider": provider,
+                "terminal": False,
+            })
+    for retained in completed_retention.values():
+        retained.sort(key=lambda item: (-item[0], item[1]))
+        for _event_at, identifier, identity in retained[MAX_ACTIVITY_ENTRIES:]:
+            records.prune(f"{identifier}.json", identity)
+    active.sort(
+        key=lambda item: (
+            -STATE_PRIORITY[item["state"]],
+            -item["event_at"],
+            item["id"],
         )
-        completed.sort(key=lambda item: (-item["event_at"], item["id"]))
-    finally:
-        os.close(directory_fd)
+    )
+    completed.sort(key=lambda item: (-item["event_at"], item["id"]))
     return {
         "version": 1,
         "emitted_at": current,
@@ -739,8 +802,15 @@ def read_session_targets(
     activity: Dict[str, Any],
     now: Optional[float] = None,
     target_ttl: float = DEFAULT_COMPLETED_TTL,
+    *,
+    records: Optional[SessionRecordSnapshot] = None,
 ) -> Dict[str, Any]:
     """Read the private activation mapping for currently projected sessions."""
+    if records is None:
+        with SessionRecordSnapshot(state_dir) as records:
+            return read_session_targets(
+                state_dir, activity, now, target_ttl, records=records
+            )
     current = time.time() if now is None else now
     projected_ids = {
         item.get("id")
@@ -754,48 +824,45 @@ def read_session_targets(
         )
     }
     targets: List[Dict[str, str]] = []
-    directory_fd = _open_state_directory(state_dir)
+    directory_fd = records.directory_fd
     if directory_fd is None:
         return {"version": 1, "emitted_at": current, "targets": targets}
-    try:
-        for name in _target_record_names(directory_fd):
-            read_status, record, identity = _read_hook_record(directory_fd, name)
-            if read_status != HOOK_RECORD_OK or identity is None:
-                continue
-            identifier = name[:-12]
+    for name in records.target_names:
+        read_status, record, identity = records.read(name)
+        if read_status != HOOK_RECORD_OK or identity is None:
+            continue
+        identifier = name[:-12]
+        valid = False
+        try:
+            raw_updated_at = record.get("updated_at") if isinstance(record, dict) else None
+            updated_at = (
+                float(raw_updated_at)
+                if not isinstance(raw_updated_at, bool)
+                else math.nan
+            )
+            thread_id = record.get("thread_id") if isinstance(record, dict) else None
+            valid = (
+                isinstance(record, dict)
+                and set(record) == TARGET_RECORD_KEYS
+                and record.get("version") == 1
+                and not isinstance(record.get("version"), bool)
+                and record.get("id") == identifier
+                and isinstance(thread_id, str)
+                and OPAQUE_TARGET.fullmatch(thread_id) is not None
+                and math.isfinite(updated_at)
+                and -MAX_FUTURE_SKEW <= current - updated_at <= target_ttl
+            )
+        except (TypeError, ValueError, OverflowError):
             valid = False
-            try:
-                raw_updated_at = record.get("updated_at") if isinstance(record, dict) else None
-                updated_at = (
-                    float(raw_updated_at)
-                    if not isinstance(raw_updated_at, bool)
-                    else math.nan
-                )
-                thread_id = record.get("thread_id") if isinstance(record, dict) else None
-                valid = (
-                    isinstance(record, dict)
-                    and set(record) == TARGET_RECORD_KEYS
-                    and record.get("version") == 1
-                    and not isinstance(record.get("version"), bool)
-                    and record.get("id") == identifier
-                    and isinstance(thread_id, str)
-                    and OPAQUE_TARGET.fullmatch(thread_id) is not None
-                    and math.isfinite(updated_at)
-                    and -MAX_FUTURE_SKEW <= current - updated_at <= target_ttl
-                )
-            except (TypeError, ValueError):
-                valid = False
-            if not valid:
-                _prune_if_unchanged(directory_fd, name, identity)
-                continue
-            # A normal turn ends with Stop before the main session may later
-            # emit SessionEnd. Keep the private target for its bounded TTL
-            # during that unprojected interval, but never expose it in the
-            # consolidated sidecar until the session is projected again.
-            if identifier in projected_ids:
-                targets.append({"id": identifier, "thread_id": thread_id})
-    finally:
-        os.close(directory_fd)
+        if not valid:
+            records.prune(name, identity)
+            continue
+        # A normal turn ends with Stop before the main session may later
+        # emit SessionEnd. Keep the private target for its bounded TTL
+        # during that unprojected interval, but never expose it in the
+        # consolidated sidecar until the session is projected again.
+        if identifier in projected_ids:
+            targets.append({"id": identifier, "thread_id": thread_id})
     targets.sort(key=lambda item: item["id"])
     return {"version": 1, "emitted_at": current, "targets": targets}
 
