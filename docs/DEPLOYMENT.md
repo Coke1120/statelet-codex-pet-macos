@@ -143,6 +143,22 @@ open "$HOME/Applications/Statelet.app"
 
 Statelet has no Dock icon. Look for its orbit icon in the menu bar.
 
+### Hook trust and compatibility
+
+Current Codex requires user review of non-managed hook definitions through
+`/hooks`. After installing or upgrading Statelet, review its commands there
+and trust the definitions you recognize. Trust is tied to the exact definition,
+so changes can require review again. The installer does not bypass this gate or
+alter trust for unrelated hooks. Restarting alone does not establish trust.
+
+Statelet registers the documented `Interrupt` hook to clear an interrupted
+main turn's Running or Waiting state without marking the session complete.
+Support was checked against Codex CLI 0.159.2 and the current
+[official hook contract](https://learn.chatgpt.com/docs/hooks#interrupt);
+the earliest supporting version has not been established. If an older Codex
+rejects that event, update Codex and review the hook definitions before relying
+on interrupted-turn status. Grok registrations are unchanged.
+
 ## Control autostart
 
 The normal installer registers the player to start at login. To install the app

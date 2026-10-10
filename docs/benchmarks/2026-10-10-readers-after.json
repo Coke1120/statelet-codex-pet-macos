@@ -1,0 +1,90 @@
+{
+  "mode": "synthetic_reader_only",
+  "platform": "Linux",
+  "python": "3.12.14",
+  "reader_mode": "shared_iteration",
+  "rounds": 5,
+  "iterations_per_round": 20,
+  "results": [
+    {
+      "sessions": 1,
+      "target_files": 1,
+      "median_ms": 0.0405,
+      "rounds_ms": [
+        0.0405,
+        0.0343,
+        0.0444,
+        0.0899,
+        0.0383
+      ],
+      "record_reads_per_iteration": 2,
+      "directory_lists_per_iteration": 1,
+      "active_projection_count": 1,
+      "projection_sha256": "a88d12acb10674e22b3ac634abfec7433a0d45de5d0e50b1bace0c9e3cc4c789"
+    },
+    {
+      "sessions": 16,
+      "target_files": 16,
+      "median_ms": 0.334,
+      "rounds_ms": [
+        0.3445,
+        0.3995,
+        0.3025,
+        0.3041,
+        0.334
+      ],
+      "record_reads_per_iteration": 32,
+      "directory_lists_per_iteration": 1,
+      "active_projection_count": 16,
+      "projection_sha256": "6f2f876eac4e5aa474f11867a6774f7b2c7259c48eccc2d7aa6594bf90cfae0f"
+    },
+    {
+      "sessions": 64,
+      "target_files": 64,
+      "median_ms": 1.1853,
+      "rounds_ms": [
+        1.2085,
+        1.1647,
+        1.1853,
+        1.1841,
+        1.199
+      ],
+      "record_reads_per_iteration": 128,
+      "directory_lists_per_iteration": 1,
+      "active_projection_count": 64,
+      "projection_sha256": "472e0a022b5d5209d9c371034a2604c41dc417011623cb436a0015a430873554"
+    },
+    {
+      "sessions": 256,
+      "target_files": 256,
+      "median_ms": 4.7579,
+      "rounds_ms": [
+        4.6408,
+        4.7579,
+        7.1676,
+        5.087,
+        4.598
+      ],
+      "record_reads_per_iteration": 512,
+      "directory_lists_per_iteration": 1,
+      "active_projection_count": 64,
+      "projection_sha256": "cc9b842423553a645aaacfe7cc35fcdef56f88a155c3aac7477bcb4cbb0642ee"
+    },
+    {
+      "sessions": 1024,
+      "target_files": 1024,
+      "median_ms": 20.0176,
+      "rounds_ms": [
+        20.0176,
+        21.3291,
+        19.7339,
+        19.5958,
+        20.2969
+      ],
+      "record_reads_per_iteration": 2048,
+      "directory_lists_per_iteration": 1,
+      "active_projection_count": 64,
+      "projection_sha256": "0f2435f58c01ae6db7bb7edaa0c4e53638996353b153f5e43640ea57744ea3e4"
+    }
+  ]
+}
