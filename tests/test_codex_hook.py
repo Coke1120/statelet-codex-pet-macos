@@ -22,9 +22,49 @@ SPEC = importlib.util.spec_from_file_location(
 assert SPEC and SPEC.loader
 hook = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(hook)
+STATE_SPEC = importlib.util.spec_from_file_location(
+    "statelet_interrupt_state", ROOT / "mac" / "codex_pet_state.py"
+)
+assert STATE_SPEC and STATE_SPEC.loader
+state = importlib.util.module_from_spec(STATE_SPEC)
+STATE_SPEC.loader.exec_module(state)
 
 
 class HookHardeningTests(unittest.TestCase):
+    def test_new_prompt_recovers_from_malformed_existing_record_values(self) -> None:
+        cases = ["nested_event_list", "nested_event_object", "event_list", "state_list", "deep_json"] + [
+            "event_at", "started_at", "completed_at"
+        ]
+        for field in cases:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary) / "sessions"
+                common = {"session_id": "synthetic", "turn_id": "turn-one"}
+                output = hook.write_event(dict(common, hook_event_name="UserPromptSubmit"), directory)
+                record = json.loads(output.read_text())
+                if field.startswith("nested_event"):
+                    record["causal"]["latest_event"] = [] if field.endswith("list") else {}
+                elif field in ("event_list", "state_list"):
+                    record[field.removesuffix("_list")] = []
+                elif field == "deep_json":
+                    # Decoders may reject this depth before a record can be
+                    # validated; either path must allow the new prompt.
+                    pass
+                else:
+                    record[field] = 10 ** 400
+                output.write_text(
+                    '{"nested":' + "[" * 2000 + "0" + "]" * 2000 + "}"
+                    if field == "deep_json" else json.dumps(record)
+                )
+
+                hook.write_event(dict(common, turn_id="turn-two", hook_event_name="UserPromptSubmit"), directory)
+                recovered = json.loads(output.read_text())
+                snapshot = state.read_session_snapshot(directory)
+
+                self.assertEqual(recovered["event"], "UserPromptSubmit")
+                self.assertEqual(recovered["state"], "running")
+                self.assertEqual(len(snapshot["active"]), 1)
+                self.assertEqual(snapshot["rejections"], {})
+
     def test_default_path_uses_statelet_identity_with_legacy_environment_fallback(self) -> None:
         previous_statelet = os.environ.pop("STATELET_STATE_DIR", None)
         previous_legacy = os.environ.pop("CODEX_PET_STATE_DIR", None)
@@ -1130,6 +1170,112 @@ class HookHardeningTests(unittest.TestCase):
         self.assertNotIn("/Users/", warning)
         self.assertNotIn("private-session-id", warning)
         self.assertNotIn("private-thread:secret", warning)
+
+
+class InterruptLifecycleTests(unittest.TestCase):
+    def test_interrupt_returns_active_states_to_idle_without_completed_activity(self) -> None:
+        for event, expected_state in (
+            ("UserPromptSubmit", "running"),
+            ("PreCompact", "review"),
+            ("PermissionRequest", "waiting"),
+        ):
+            with self.subTest(event=event), tempfile.TemporaryDirectory() as temporary, mock.patch.object(hook.time, "time", return_value=100.0):
+                directory = Path(temporary) / "sessions"
+                common = {"session_id": "synthetic", "turn_id": "turn-one"}
+                output = hook.write_event(dict(common, hook_event_name=event), directory)
+                self.assertEqual(json.loads(output.read_text())["state"], expected_state)
+                hook.write_event(dict(common, hook_event_name="Interrupt"), directory)
+                record = json.loads(output.read_text())
+                snapshot = state.read_session_snapshot(directory, now=100.0)
+                activity = state.read_session_activity(directory, now=100.0)
+
+                self.assertEqual(record["event"], "Interrupt")
+                self.assertEqual(record["state"], "idle")
+                self.assertEqual(record["category"], "codex")
+                self.assertEqual(record["causal"]["pending_permissions"], [])
+                self.assertTrue(record["fence"]["turn_closed"])
+                self.assertFalse(record["fence"]["session_closed"])
+                self.assertFalse(record["terminal"])
+                self.assertIsNone(record["completed_at"])
+                self.assertEqual(snapshot["active"], [])
+                self.assertEqual(snapshot["latest_event"], "Interrupt")
+                self.assertEqual(activity["active"], [])
+                self.assertEqual(activity["completed"], [])
+
+    def test_interrupt_rejects_duplicate_and_late_same_turn_callbacks(self) -> None:
+        for event in (
+            "Interrupt", "Stop", "PreToolUse", "PostToolUse",
+            "PermissionRequest", "PreCompact", "SubagentStart", "UserPromptSubmit",
+        ):
+            with self.subTest(event=event), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary) / "sessions"
+                common = {"session_id": "synthetic", "turn_id": "turn-one"}
+                output = hook.write_event(dict(common, hook_event_name="Interrupt"), directory)
+                interrupted = json.loads(output.read_text())
+                hook.write_event(dict(
+                    common, hook_event_name=event, tool_use_id="synthetic-tool",
+                    tool_name="Bash", tool_input={"command": "synthetic"},
+                ), directory)
+                record = json.loads(output.read_text())
+                self.assertEqual(record["event"], "Interrupt")
+                self.assertEqual(record["state"], "idle")
+                self.assertEqual(record["event_at"], interrupted["event_at"])
+                self.assertEqual(record["rejections"], {"stale_event": 1})
+                self.assertFalse(record["terminal"])
+                self.assertIsNone(record["completed_at"])
+
+    def test_fresh_turn_resumes_and_prior_turn_interrupt_cannot_stop_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "sessions"
+            common = {"session_id": "synthetic", "turn_id": "turn-one"}
+            output = hook.write_event(dict(common, hook_event_name="Interrupt"), directory)
+            hook.write_event(dict(common, turn_id="turn-two", hook_event_name="UserPromptSubmit"), directory)
+            resumed = json.loads(output.read_text())
+            hook.write_event(dict(common, hook_event_name="Interrupt"), directory)
+            after_stale_interrupt = json.loads(output.read_text())
+            hook.write_event(dict(
+                common, turn_id="turn-two", hook_event_name="PreToolUse",
+                tool_use_id="new-tool", tool_name="Bash", tool_input={},
+            ), directory)
+            continued = json.loads(output.read_text())
+        self.assertEqual(resumed["state"], "running")
+        self.assertFalse(resumed["fence"]["turn_closed"])
+        self.assertEqual(after_stale_interrupt["event"], "UserPromptSubmit")
+        self.assertEqual(after_stale_interrupt["state"], "running")
+        self.assertEqual(after_stale_interrupt["event_at"], resumed["event_at"])
+        self.assertEqual(after_stale_interrupt["rejections"], {"stale_event": 1})
+        self.assertEqual(continued["event"], "PreToolUse")
+        self.assertEqual(continued["state"], "running")
+
+    def test_session_end_after_interrupt_remains_a_real_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "sessions"
+            common = {"session_id": "synthetic", "turn_id": "turn-one"}
+            output = hook.write_event(dict(common, hook_event_name="Interrupt"), directory)
+            hook.write_event(dict(common, hook_event_name="SessionEnd"), directory)
+            record = json.loads(output.read_text())
+            activity = state.read_session_activity(directory)
+        self.assertEqual(record["event"], "SessionEnd")
+        self.assertTrue(record["terminal"])
+        self.assertEqual(len(activity["completed"]), 1)
+        self.assertEqual(activity["completed"][0]["event"], "SessionEnd")
+
+    def test_interrupt_hook_process_exits_successfully_with_json_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "sessions"
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "mac" / "codex_pet_hook.py")],
+                input=json.dumps({"session_id": "synthetic", "turn_id": "turn-one", "hook_event_name": "Interrupt"}),
+                text=True, capture_output=True, timeout=5,
+                env=dict(os.environ, STATELET_STATE_DIR=str(directory)),
+            )
+            output = directory / (hook.session_key({"session_id": "synthetic"}) + ".json")
+            record = json.loads(output.read_text())
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout), {})
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(record["event"], "Interrupt")
+        self.assertEqual(record["state"], "idle")
 
 
 if __name__ == "__main__":

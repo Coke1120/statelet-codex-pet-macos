@@ -82,10 +82,11 @@ VALID_EVENTS = frozenset(
         "SubagentStart",
         "SubagentStop",
         "Stop",
+        "Interrupt",
     )
 )
 TERMINAL_EVENTS = frozenset(("SessionEnd",))
-TURN_CLOSING_EVENTS = frozenset(("Stop",))
+TURN_CLOSING_EVENTS = frozenset(("Stop", "Interrupt"))
 REVIVAL_EVENTS = frozenset(("SessionStart", "UserPromptSubmit"))
 GROK_CONTINUATION_EVENTS = frozenset(
     (
@@ -127,7 +128,7 @@ def event_category(event: str) -> str:
         return "review"
     if event in ("SubagentStart", "SubagentStop"):
         return "subagent"
-    if event in ("SessionStart", "SessionEnd", "UserPromptSubmit", "Stop"):
+    if event in ("SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "Interrupt"):
         return "codex"
     return "activity"
 
@@ -135,7 +136,7 @@ def event_category(event: str) -> str:
 def _finite_timestamp(value: Any) -> Optional[float]:
     try:
         parsed = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return parsed if math.isfinite(parsed) else None
 
@@ -232,7 +233,7 @@ def event_state(payload: Dict[str, Any]) -> str:
     provider = payload.get("_statelet_provider", "codex")
     if event == "Stop" and payload.get("_statelet_background_active") is True:
         return "running"
-    if event in ("SessionStart", "SessionEnd", "Stop"):
+    if event in ("SessionStart", "SessionEnd", "Stop", "Interrupt"):
         return "idle"
     if event == "PermissionRequest":
         return "waiting"
@@ -386,7 +387,7 @@ def _read_existing(directory_fd: int, name: str) -> Optional[Dict[str, Any]]:
         ):
             return None
         value = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeError, ValueError):
+    except (OSError, UnicodeError, ValueError, RecursionError):
         return None
     finally:
         if descriptor is not None:
@@ -547,7 +548,7 @@ def _read_fence(value: Any, existing_event: Optional[str]) -> Dict[str, Any]:
         ):
             return dict(value)
     fence = _empty_fence()
-    if existing_event == "Stop":
+    if existing_event in ("Stop", "Interrupt"):
         fence["turn_closed"] = True
     elif existing_event == "SessionEnd":
         fence["session_closed"] = True
@@ -594,7 +595,10 @@ def _read_causal_state(value: Any) -> Dict[str, Any]:
         for item in pending_permissions
     ):
         return _empty_causal_state()
-    if latest_event is not None and latest_event not in VALID_EVENTS.union(("unknown",)):
+    if latest_event is not None and (
+        not isinstance(latest_event, str)
+        or latest_event not in VALID_EVENTS.union(("unknown",))
+    ):
         return _empty_causal_state()
     return {
         "version": 1,
@@ -696,10 +700,11 @@ def _causally_accept(
         fingerprint = _tool_fingerprint(payload)
         pending_permissions = causal.get("pending_permissions", [])
         causal["pending_permissions"] = (pending_permissions + [fingerprint])[-MAX_TOOL_IDS:]
-    elif event == "Stop":
+    elif event in TURN_CLOSING_EVENTS:
         # Stop closes the current turn for every provider. A permission that
         # was never followed by a tool callback cannot keep the session in the
-        # waiting projection after that boundary.
+        # waiting projection after that boundary. Codex Interrupt closes the
+        # interrupted turn in the same way without ending the session.
         causal["pending_permissions"] = []
     elif event == "PreCompact":
         if causal.get("latest_event") == "PostCompact":
@@ -726,7 +731,7 @@ def _fence_accepts(payload: Dict[str, Any], event: str, fence: Dict[str, Any]) -
         # can therefore resume; the causal tool phases below still reject
         # delayed callbacks that were already observed before the Stop.
         return True
-    if event == "Stop":
+    if event in TURN_CLOSING_EVENTS:
         incoming_turn = _private_key_hash(payload, "turn_id")
         closed_turn = fence["closed_turn"]
         return incoming_turn is not None and incoming_turn != closed_turn
@@ -772,7 +777,7 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
         )
         if (
             existing is not None
-            and existing.get("event") == "Stop"
+            and existing.get("event") in ("Stop", "Interrupt")
             and fence["closed_turn"] is None
         ):
             fence["closed_turn"] = causal.get("current_turn")
@@ -785,15 +790,16 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
         existing_valid = (
             existing is not None
             and existing.get("version") in (1, 2)
+            and isinstance(existing.get("state"), str)
             and existing.get("state") in VALID_STATES
+            and isinstance(existing.get("event"), str)
             and existing.get("event") in VALID_EVENTS.union(("unknown",))
         )
         if existing_valid:
             existing_terminal = existing.get("event") in TERMINAL_EVENTS
-            try:
-                existing_at = float(existing.get("event_at", existing.get("updated_at")))
-            except (TypeError, ValueError):
-                existing_at = None
+            existing_at = _finite_timestamp(
+                existing.get("event_at", existing.get("updated_at"))
+            )
             existing_started_at = _finite_timestamp(
                 existing.get("started_at", existing_at)
             )

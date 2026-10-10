@@ -27,6 +27,7 @@ VALID_EVENTS = frozenset(
         "SubagentStart",
         "SubagentStop",
         "Stop",
+        "Interrupt",
         "unknown",
     )
 )
@@ -420,6 +421,8 @@ def active_ttl_for_event(event: str, active_ttl: float) -> float:
 
 def _event_projects_as_active(event: str, state: str, provider: str) -> bool:
     """Allow only Grok background work to remain active after Stop."""
+    if event == "Interrupt":
+        return False
     if event != "Stop":
         return True
     return provider == "grok" and state == "running"
@@ -512,7 +515,7 @@ def _event_category(event: str) -> str:
         return "review"
     if event in ("SubagentStart", "SubagentStop"):
         return "subagent"
-    if event in ("SessionStart", "SessionEnd", "UserPromptSubmit", "Stop"):
+    if event in ("SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "Interrupt"):
         return "codex"
     return "activity"
 
