@@ -49,6 +49,91 @@ final class SessionOutcomeUnreadTests: XCTestCase {
         XCTAssertEqual(targets.validated(for: snapshot), [outcome.id: "synthetic-thread"])
     }
 
+    func testRepeatedReadsInOneSessionPreserveHiddenProvidersReadMarker() throws {
+        let hidden = try item("b", receipt: "f", blocked: true)
+        var state = SessionActivityAcknowledgementState().recording([hidden])
+        var previous: SessionActivitySnapshot?
+        var latest: SessionActivityItem?
+        for turn in 0..<140 {
+            let current = try SessionActivityItem(
+                id: String(repeating: "a", count: 24), state: .idle, event: .stop,
+                eventAt: 90, terminal: true, outcome: .unverified,
+                outcomeID: String(format: "%024x", turn + 1000)
+            )
+            // The source-filtered snapshot contains no Grok item. Applying it
+            // must not discard that provider's acknowledgement association.
+            let snapshot = try SessionActivitySnapshot(emittedAt: 100 + Double(turn), outcomes: [current])
+            let application = SessionActivityApplicationPolicy.apply(
+                snapshot, lastAccepted: previous, currentlyDisplayed: previous,
+                acknowledgementHistory: state.history, now: snapshot.emittedAt
+            )
+            state = state.retaining(application.acknowledgementHistory).recording([current])
+            previous = application.lastAcceptedSnapshot
+            latest = current
+        }
+        XCTAssertEqual(state.entries.count, 2)
+        XCTAssertTrue(state.history.contains(hidden.acknowledgementID))
+        let combined = try SessionActivitySnapshot(emittedAt: 250, outcomes: [hidden, XCTUnwrap(latest)])
+        XCTAssertTrue(SessionActivityPresentation.unacknowledgedCompletedItems(snapshot: combined, acknowledgedIDs: Set(state.history)).isEmpty)
+
+        let suite = "statelet-unread-regression-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        SessionActivityAcknowledgementStore.persistState(state, to: defaults)
+        XCTAssertEqual(SessionActivityAcknowledgementStore.restoredState(from: defaults), state)
+    }
+
+    func testLegacyAcknowledgementMigratesAndNewReceiptReplacesItsSessionSlot() throws {
+        let suite = "statelet-unread-migration-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let legacyID = String(repeating: "a", count: 24)
+        defaults.set([legacyID], forKey: SessionActivityAcknowledgementStore.defaultsKey)
+        let migrated = SessionActivityAcknowledgementStore.restoredState(from: defaults)
+        XCTAssertEqual(migrated.entries, [.init(sessionID: legacyID, receiptID: legacyID)])
+        let newer = try item()
+        let updated = migrated.recording([newer])
+        XCTAssertEqual(updated.entries.count, 1)
+        XCTAssertEqual(updated.history, [newer.acknowledgementID])
+        let active = try SessionActivityItem(id: legacyID, state: .running, event: .userPromptSubmit, eventAt: 100, terminal: false)
+        let application = SessionActivityApplicationPolicy.apply(
+            try SessionActivitySnapshot(emittedAt: 100, active: [active]),
+            lastAccepted: nil, currentlyDisplayed: nil, acknowledgementHistory: migrated.history, now: 100
+        )
+        XCTAssertTrue(migrated.retaining(application.acknowledgementHistory).entries.isEmpty)
+    }
+
+    func testMappedAcknowledgementsBoundDistinctSessionsAndBatchReplacement() throws {
+        let items = try (0..<140).map { index in
+            try SessionActivityItem(id: String(format: "%024x", index), state: .idle, event: .stop,
+                                    eventAt: 90, terminal: true, outcome: .unverified,
+                                    outcomeID: String(format: "%024x", index + 1000))
+        }
+        let bounded = SessionActivityAcknowledgementState().recording(items)
+        XCTAssertEqual(bounded.entries.count, 128)
+        XCTAssertEqual(bounded.entries.first?.sessionID, items[12].id)
+        let last = try XCTUnwrap(items.last)
+        let newer = try SessionActivityItem(id: last.id, state: .idle, event: .interrupt,
+                                           eventAt: 91, terminal: true, outcome: .interrupted,
+                                           outcomeID: String(repeating: "f", count: 24))
+        let updated = bounded.recording([newer, newer])
+        XCTAssertEqual(updated.entries.count, 128)
+        XCTAssertEqual(updated.entries.last?.receiptID, newer.acknowledgementID)
+        XCTAssertFalse(updated.history.contains(last.acknowledgementID))
+    }
+
+    func testInvalidMappedPreferencesFallBackToLegacyWithoutRawData() throws {
+        let suite = "statelet-unread-invalid-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let legacyID = String(repeating: "a", count: 24)
+        defaults.set([legacyID], forKey: SessionActivityAcknowledgementStore.defaultsKey)
+        defaults.set(Data("not JSON /private/path".utf8), forKey: SessionActivityAcknowledgementStore.mappedDefaultsKey)
+        XCTAssertEqual(SessionActivityAcknowledgementStore.restoredState(from: defaults).history, [legacyID])
+        let invalid = SessionActivityAcknowledgementState(entries: [.init(sessionID: "/private/path", receiptID: legacyID)])
+        XCTAssertTrue(invalid.entries.isEmpty)
+    }
+
     @MainActor
     func testReadClearAndOpenActionsUseTheirOwnIdentifiers() throws {
         let interrupted = try item()

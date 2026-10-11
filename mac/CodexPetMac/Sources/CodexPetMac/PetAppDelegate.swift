@@ -621,7 +621,8 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var sessionActivityTitleHydrationGeneration: UInt64 = 0
     private var sessionActivityTitleHydrationTask: Task<Void, Never>?
     private var lastAcceptedSessionActivitySnapshot: SessionActivitySnapshot?
-    private var sessionActivityAcknowledgementHistory: [String] = []
+    private var sessionActivityAcknowledgements = SessionActivityAcknowledgementState()
+    private var sessionActivityAcknowledgementHistory: [String] { sessionActivityAcknowledgements.history }
     private var sessionActivityExpandedByUser = false
     private var sessionActivityLayoutAvailable = true
     private var sessionActivityAppearance = try! SessionActivityPanelAppearance()
@@ -1562,7 +1563,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
                 renderedItemIDs: Array(sessionActivityTargets.keys)
             )
             if application.acknowledgementHistory != sessionActivityAcknowledgementHistory {
-                sessionActivityAcknowledgementHistory = application.acknowledgementHistory
+                sessionActivityAcknowledgements = sessionActivityAcknowledgements.retaining(application.acknowledgementHistory)
                 persistSessionActivityAcknowledgements()
             }
             refreshSessionActivityPresentation(previousTargets: previousTargets)
@@ -1588,11 +1589,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     }
 
     private func loadSessionActivityAcknowledgements() {
-        sessionActivityAcknowledgementHistory = SessionActivityAcknowledgementStore.restored()
+        sessionActivityAcknowledgements = SessionActivityAcknowledgementStore.restoredState()
     }
 
     private func persistSessionActivityAcknowledgements() {
-        SessionActivityAcknowledgementStore.persist(sessionActivityAcknowledgementHistory)
+        SessionActivityAcknowledgementStore.persistState(sessionActivityAcknowledgements)
     }
 
     private func acknowledgeSessionActivity(_ id: String) {
@@ -1601,15 +1602,12 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
 
     private func acknowledgeSessionActivities(_ ids: [String]) {
         guard let sessionActivitySnapshot else { return }
-        let eligibleIDs = Set(sessionActivitySnapshot.recentItems.map(\.acknowledgementID))
-        let requestedIDs = ids.filter(eligibleIDs.contains)
-        guard !requestedIDs.isEmpty else { return }
-        let updatedHistory = SessionActivityApplicationPolicy.recordingAcknowledgements(
-            requestedIDs,
-            in: sessionActivityAcknowledgementHistory
-        )
-        guard updatedHistory != sessionActivityAcknowledgementHistory else { return }
-        sessionActivityAcknowledgementHistory = updatedHistory
+        let requestedIDs = Set(ids)
+        let requestedItems = sessionActivitySnapshot.recentItems.filter { requestedIDs.contains($0.acknowledgementID) }
+        guard !requestedItems.isEmpty else { return }
+        let updated = sessionActivityAcknowledgements.recording(requestedItems)
+        guard updated != sessionActivityAcknowledgements else { return }
+        sessionActivityAcknowledgements = updated
         persistSessionActivityAcknowledgements()
         refreshSessionActivityPresentation(previousTargets: sessionActivityTargets)
     }

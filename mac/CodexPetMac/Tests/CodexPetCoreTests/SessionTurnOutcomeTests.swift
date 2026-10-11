@@ -63,6 +63,8 @@ final class SessionTurnOutcomeTests: XCTestCase {
         XCTAssertThrowsError(try SessionActivitySnapshot(emittedAt: 100, active: [active], outcomes: [outcome]))
         let duplicateReceipt = try SessionActivityItem(id: String(repeating: "b", count: 24), state: .idle, event: .stop, eventAt: 99, terminal: true, outcome: .unverified, outcomeID: outcome.outcomeID)
         XCTAssertThrowsError(try SessionActivitySnapshot(emittedAt: 100, outcomes: [outcome, duplicateReceipt]))
+        let closed = try SessionActivityItem(id: try XCTUnwrap(outcome.outcomeID), state: .idle, event: .sessionEnd, eventAt: 99, terminal: true)
+        XCTAssertThrowsError(try SessionActivitySnapshot(emittedAt: 100, completed: [closed], outcomes: [outcome]))
     }
 
     func testSharedRecentBoundIncludesLegacyClosures() throws {

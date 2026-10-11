@@ -67,6 +67,10 @@ continuation; `idle_prompt` alone remains an unverified stop signal.
 - Read/clear uses result receipts; task opening uses session IDs. A new result
   cannot inherit an earlier result's read state when a running snapshot was missed.
   Legacy closure acknowledgements remain compatible. Reading is explicit and local.
+- Persist the session-to-last-read-receipt association, bounded to 128 distinct
+  sessions. Repeated reads within one session replace that session's marker;
+  obsolete receipts cannot displace a retained result from a hidden provider.
+  Legacy session markers migrate without changing their acknowledgement value.
 - Share the existing 64-item recent bound and seven-day retention. Each provider's
   private retention remains bounded during source filtering. Blocked results sort
   first within recent outcomes; active lifecycle ordering remains unchanged.

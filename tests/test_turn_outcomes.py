@@ -29,7 +29,10 @@ class TurnOutcomeTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.directory = Path(self.temporary.name)
+        # macOS exposes temporary directories through /var -> /private/var.
+        # Provider selection deliberately rejects symlinked path components;
+        # give the fixture its canonical path, as a managed state root would.
+        self.directory = Path(self.temporary.name).resolve()
 
     def write(self, event, at, turn="turn-a", session="synthetic-session", provider="codex", **extra):
         payload = dict(hook_event_name=event, session_id=session, turn_id=turn, **extra)

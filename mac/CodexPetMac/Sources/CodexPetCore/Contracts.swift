@@ -570,7 +570,7 @@ public struct SessionActivitySnapshot: Codable, Equatable, Sendable {
         guard activeIDs.count == active.count,
               completedIDs.count == completed.count,
               outcomeIDs.count == outcomes.count,
-              Set(outcomes.map(\.acknowledgementID)).count == outcomes.count,
+              Set((completed + outcomes).map(\.acknowledgementID)).count == completed.count + outcomes.count,
               activeIDs.isDisjoint(with: completedIDs),
               activeIDs.isDisjoint(with: outcomeIDs),
               completedIDs.isDisjoint(with: outcomeIDs) else {

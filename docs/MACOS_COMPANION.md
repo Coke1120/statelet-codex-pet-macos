@@ -127,6 +127,10 @@ for activation. Duplicate/stale callbacks and subsequent session closure retain
 the receipt. New results get new receipts even if the reader missed the running
 snapshot. Old schemas without receipts remain readable. Ready is deliberately
 unavailable through passive hooks; see the [protocol audit](TURN_OUTCOMES_2026-10-11.md).
+Acknowledgements retain a bounded association between each session and its last
+read receipt, rather than consuming a new history slot on every turn. Up to 128
+distinct sessions are retained across providers; source filtering does not clear
+hidden markers. Legacy session-ID markers remain compatible.
 
 The aggregator normally uses macOS `kqueue` directory events, so changed
 session records wake it immediately. It also wakes at session TTL,
