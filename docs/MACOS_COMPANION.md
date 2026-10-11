@@ -101,10 +101,15 @@ The state priority is:
 waiting > review > running > idle
 ```
 
-`Stop` and Codex `Interrupt` close the current turn and map that session to Idle
-without creating a completed-unread activity item. The private causal fence still rejects delayed
-callbacks from that stopped turn. `SessionEnd` alone terminalizes the session
-and becomes a completed-unread activity item. Each other valid session record
+`Stop` and Codex `Interrupt` map that session to Idle without creating a
+successful-completion item. Optional outcome receipts distinguish an unverified
+Stop, interruption (including Grok `StopCancelled`), and Grok `StopFailure`
+(Blocked). `SessionEnd` closes the session; it preserves a known outcome, or
+appears as **Session closed**. Neither Stop nor session closure proves Ready.
+The private causal fence rejects stale callbacks after interruption/failure.
+After provisional Stop, a new correlated Codex PreToolUse (or the existing Grok
+continuation events) can resume work; an unobserved Codex PostToolUse alone cannot.
+Each other valid session record
 remains active for 900 seconds after its authoritative event
 time, except a `PostToolUse` record, which has a 30-second quiescent grace
 period when Desktop fails to provide a terminal callback. A later hook event
@@ -112,6 +117,20 @@ refreshes the normal 900-second lease. Records that are malformed, non-finite,
 expired, or more than 60 seconds in the future are rejected or pruned. A
 delayed callback cannot replace a newer event for the same session.
 Equal-priority records use the newest timestamp.
+
+The optional `outcomes` group in `activity-v1.json` shares the 64-item recent
+bound and seven-day retention with legacy `completed` session closures. Each
+session retains its latest result until accepted new work replaces it; this is
+not an archive of every turn. Each accepted result has a random 24-hex
+`outcome_id` used only for acknowledgement, separate from the session hash used
+for activation. Duplicate/stale callbacks and subsequent session closure retain
+the receipt. New results get new receipts even if the reader missed the running
+snapshot. Old schemas without receipts remain readable. Ready is deliberately
+unavailable through passive hooks; see the [protocol audit](TURN_OUTCOMES_2026-10-11.md).
+Acknowledgements retain a bounded association between each session and its last
+read receipt, rather than consuming a new history slot on every turn. Up to 128
+distinct sessions are retained across providers; source filtering does not clear
+hidden markers. Legacy session-ID markers remain compatible.
 
 The aggregator normally uses macOS `kqueue` directory events, so changed
 session records wake it immediately. It also wakes at session TTL,

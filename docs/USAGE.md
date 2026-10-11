@@ -84,12 +84,14 @@ The badge reports:
 ### Session activity beside the pet
 
 When selected agent activity exists, Statelet shows a compact rail beside the pet with
-two groups: active sessions (Running, Waiting, or Review) and completed
-sessions whose result is still unread. The rail uses deterministic lifecycle
+two groups: active sessions (Running, Waiting, or Review) and unread recent
+outcomes. Outcomes distinguish **Blocked**, **Interrupted**, **Stopped · outcome
+unverified**, and **Session closed**. Stop and session closure do not prove
+successful completion, so passive activity does not claim Ready. The rail uses deterministic lifecycle
 priority/newest ordering, collapses to bounded count pills at compact sizes,
 and stays hidden when both groups are empty.
 
-Completed entries are not marked read merely by being displayed. Use **Mark as
+Recent entries are not marked read merely by being displayed. Use **Mark as
 read** to acknowledge one; acknowledgements persist locally and are pruned with
 the bounded activity history. **Open in Codex** opens a mapped local chat only
 when the owner-only activation sidecar and the verified ChatGPT desktop URL
@@ -108,6 +110,11 @@ activity sidecar is
 owner-only at
 `~/Library/Application Support/Statelet/sessions/activity-v1.json` and does not
 change the aggregate lifecycle state or animation priority.
+Each session shows its latest outcome, replaced when accepted new work begins.
+Read markers for new outcomes identify the result rather than the session, so
+reading one result does not hide a later result in the same session. Blocked
+outcomes appear first within the recent group; other outcomes use newest-first
+order. No transcript or error text is needed to identify these outcomes.
 The optional raw technical thread mapping stays local in the separate owner-only
 `activity-targets-v1.json` sidecar and never enters `activity-v1.json`.
 

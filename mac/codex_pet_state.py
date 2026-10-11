@@ -27,6 +27,7 @@ VALID_EVENTS = frozenset(
         "SubagentStart",
         "SubagentStop",
         "Stop",
+        "StopFailure",
         "Interrupt",
         "unknown",
     )
@@ -42,7 +43,7 @@ HOOK_RECORD_V2_KEYS = frozenset(
     ("version", "state", "event", "event_at", "updated_at", "terminal", "rejections", "causal")
 )
 HOOK_RECORD_V2_OPTIONAL_KEYS = frozenset(
-    ("started_at", "completed_at", "category", "fence", "provider")
+    ("started_at", "completed_at", "category", "fence", "provider", "outcome")
 )
 ACTIVITY_CATEGORIES = frozenset(("codex", "approval", "tool", "review", "subagent", "activity"))
 VALID_REJECTION_REASONS = frozenset(
@@ -421,7 +422,7 @@ def active_ttl_for_event(event: str, active_ttl: float) -> float:
 
 def _event_projects_as_active(event: str, state: str, provider: str) -> bool:
     """Allow only Grok background work to remain active after Stop."""
-    if event == "Interrupt":
+    if event in ("Interrupt", "StopFailure"):
         return False
     if event != "Stop":
         return True
@@ -506,6 +507,32 @@ def _valid_hook_record_keys(record: Dict[str, Any], version: Any) -> bool:
     return required <= keys <= HOOK_RECORD_V2_KEYS | HOOK_RECORD_V2_OPTIONAL_KEYS
 
 
+def _valid_turn_outcome(record: Dict[str, Any]) -> bool:
+    """Validate an optional private, text-free result receipt before projection."""
+    if "outcome" not in record:
+        return True
+    outcome = record["outcome"]
+    if not isinstance(outcome, dict) or set(outcome) != {"id", "kind", "event_at"}:
+        return False
+    kind = outcome.get("kind")
+    if not isinstance(kind, str):
+        return False
+    expected = {"unverified": "Stop", "blocked": "StopFailure", "interrupted": "Interrupt"}.get(kind)
+    identifier = outcome.get("id")
+    at = _finite_or_none(outcome.get("event_at"))
+    record_at = _finite_or_none(record.get("event_at"))
+    return (
+        expected is not None
+        and record.get("event") in (expected, "SessionEnd")
+        and record.get("state") == "idle"
+        and (kind != "blocked" or record.get("provider") == "grok")
+        and isinstance(identifier, str)
+        and CAUSAL_HASH.fullmatch(identifier) is not None
+        and not isinstance(outcome.get("event_at"), bool)
+        and at is not None and record_at is not None and at <= record_at
+    )
+
+
 def _event_category(event: str) -> str:
     if event == "PermissionRequest":
         return "approval"
@@ -515,7 +542,7 @@ def _event_category(event: str) -> str:
         return "review"
     if event in ("SubagentStart", "SubagentStop"):
         return "subagent"
-    if event in ("SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "Interrupt"):
+    if event in ("SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "StopFailure", "Interrupt"):
         return "codex"
     return "activity"
 
@@ -599,6 +626,8 @@ def read_session_snapshot(
             or not isinstance(category, str)
             or category not in ACTIVITY_CATEGORIES
             or provider not in VALID_PROVIDERS
+            or (event == "StopFailure" and provider != "grok")
+            or not _valid_turn_outcome(record)
             or not isinstance(stored_rejections, dict)
             or (causal is not None and not _valid_causal_metadata(causal))
             or (fence is not None and not _valid_fence(fence))
@@ -613,7 +642,7 @@ def read_session_snapshot(
             # Terminal records are the source for the optional session
             # activity rail. Keep them for a bounded retention window even
             # after they stop contributing to aggregate lifecycle state.
-            if terminal and 0 <= age <= DEFAULT_COMPLETED_TTL:
+            if (terminal or "outcome" in record) and 0 <= age <= DEFAULT_COMPLETED_TTL:
                 continue
             reason = (
                 "future_event"
@@ -683,6 +712,7 @@ def read_session_activity(
     current = time.time() if now is None else now
     active: List[Dict[str, Any]] = []
     completed: List[Dict[str, Any]] = []
+    outcomes: List[Dict[str, Any]] = []
     completed_retention: Dict[str, List[Tuple[float, str, FileIdentity]]] = {
         provider: [] for provider in VALID_PROVIDERS
     }
@@ -732,6 +762,8 @@ def read_session_activity(
             or not isinstance(category, str)
             or category not in ACTIVITY_CATEGORIES
             or provider not in VALID_PROVIDERS
+            or (event == "StopFailure" and provider != "grok")
+            or not _valid_turn_outcome(record)
         ):
             continue
         age = current - event_at
@@ -739,12 +771,16 @@ def read_session_activity(
         if age < -MAX_FUTURE_SKEW:
             continue
         identifier = name[:-5]
-        is_completed = terminal and event == "SessionEnd"
-        if is_completed:
-            if age > completed_ttl:
+        outcome = record.get("outcome")
+        is_completed = terminal and event == "SessionEnd" and outcome is None
+        result_at = float(outcome["event_at"]) if outcome is not None else event_at
+        if outcome is not None and started_at > result_at:
+            continue
+        if is_completed or outcome is not None:
+            if current - result_at > completed_ttl:
                 records.prune(name, identity)
                 continue
-            completed_retention[provider].append((event_at, identifier, identity))
+            completed_retention[provider].append((result_at, identifier, identity))
         elif age > event_ttl:
             records.prune(name, identity)
             continue
@@ -752,7 +788,23 @@ def read_session_activity(
             # Keep fresh hidden records available for immediate switching;
             # retention is enforced above before projection filtering.
             continue
-        if is_completed:
+        if outcome is not None:
+            # A turn result is independent of SessionEnd. In particular,
+            # interruption/failure must never enter the legacy completion list.
+            outcomes.append({
+                "id": identifier,
+                "state": "idle",
+                "event": {"unverified": "Stop", "blocked": "StopFailure", "interrupted": "Interrupt"}[outcome["kind"]],
+                "event_at": result_at,
+                "started_at": started_at,
+                "completed_at": result_at,
+                "category": "codex",
+                "provider": provider,
+                "terminal": True,
+                "outcome": outcome["kind"],
+                "outcome_id": outcome["id"],
+            })
+        elif is_completed:
             completed.append({
                 "id": identifier,
                 "state": state,
@@ -791,13 +843,17 @@ def read_session_activity(
             item["id"],
         )
     )
-    completed.sort(key=lambda item: (-item["event_at"], item["id"]))
-    return {
+    recent = sorted(completed + outcomes, key=lambda item: (-item["event_at"], item["id"]))[:MAX_ACTIVITY_ENTRIES]
+    result = {
         "version": 1,
         "emitted_at": current,
         "active": active[:MAX_ACTIVITY_ENTRIES],
-        "completed": completed[:MAX_ACTIVITY_ENTRIES],
+        "completed": [item for item in recent if "outcome" not in item],
     }
+    recent_outcomes = [item for item in recent if "outcome" in item]
+    if recent_outcomes:
+        result["outcomes"] = recent_outcomes
+    return result
 
 
 def read_session_targets(
@@ -817,7 +873,7 @@ def read_session_targets(
     current = time.time() if now is None else now
     projected_ids = {
         item.get("id")
-        for group in (activity.get("active", []), activity.get("completed", []))
+        for group in (activity.get("active", []), activity.get("completed", []), activity.get("outcomes", []))
         if isinstance(group, list)
         for item in group
         if (

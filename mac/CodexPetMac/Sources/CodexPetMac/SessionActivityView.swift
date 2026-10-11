@@ -172,8 +172,8 @@ enum SessionActivityPresentation {
         snapshot: SessionActivitySnapshot?,
         acknowledgedIDs: Set<String>
     ) -> [SessionActivityItem] {
-        (snapshot?.completed ?? []).filter {
-            $0.event == .sessionEnd && !acknowledgedIDs.contains($0.id)
+        (snapshot?.recentItems ?? []).filter {
+            !acknowledgedIDs.contains($0.acknowledgementID)
         }
     }
 
@@ -450,7 +450,7 @@ final class SessionActivityView: NSView {
                 )
             }
             if completedCount > 0 {
-                addCompactPill(title: "Completed · \(completedCount)", accessibility: "Completed unread sessions: \(completedCount)")
+                addCompactPill(title: "Recent · \(completedCount)", accessibility: "Unread outcomes: \(completedCount)")
             }
         } else {
             let visibleIDs = Set((displayState.active + displayState.completed).map(\.id))
@@ -479,8 +479,8 @@ final class SessionActivityView: NSView {
             }
             if !displayState.completed.isEmpty {
                 addGroup(
-                    title: "Completed · \(completedCount)",
-                    accessibility: "Completed unread sessions: \(completedCount)",
+                    title: "Recent outcomes · \(completedCount)",
+                    accessibility: "Unread outcomes: \(completedCount)",
                     items: displayState.completed,
                     completed: true,
                     hiddenCount: displayState.hiddenCompletedCount
@@ -488,7 +488,7 @@ final class SessionActivityView: NSView {
             }
         }
         setAccessibilityValue(
-            "\(activeCount) active, \(completedCount) completed unread"
+            "\(activeCount) active, \(completedCount) unread outcomes"
         )
         invalidateIntrinsicContentSize()
         needsLayout = true
@@ -505,7 +505,7 @@ final class SessionActivityView: NSView {
         notice.setAccessibilityRole(.staticText)
         notice.setAccessibilityLabel(message)
         notice.setAccessibilityHelp(
-            "Only sessions with a verified Codex Desktop target can be opened. Opening never marks a completed session as read."
+            "Only sessions with a verified Codex Desktop target can be opened. Opening never marks an outcome as read."
         )
         stack.addArrangedSubview(notice)
     }
@@ -531,8 +531,8 @@ final class SessionActivityView: NSView {
             )
             clearAll.bezelStyle = .inline
             clearAll.controlSize = .small
-            clearAll.setAccessibilityLabel("Clear all completed sessions")
-            clearAll.setAccessibilityHelp("Marks every completed session as read")
+            clearAll.setAccessibilityLabel("Clear all unread outcomes")
+            clearAll.setAccessibilityHelp("Marks every recent outcome as read")
             let headerRow = NSStackView(views: [header, clearAll])
             headerRow.orientation = .horizontal
             headerRow.alignment = .centerY
@@ -559,7 +559,7 @@ final class SessionActivityView: NSView {
             overflow.bezelStyle = .inline
             overflow.controlSize = .small
             overflow.setAccessibilityLabel("Show all \(hiddenCount) additional sessions")
-            overflow.setAccessibilityHelp("Expands this popup so every active and unread completed session can be inspected.")
+            overflow.setAccessibilityHelp("Expands this popup so every active session and unread outcome can be inspected.")
             stack.addArrangedSubview(overflow)
         }
     }
@@ -607,24 +607,24 @@ final class SessionActivityView: NSView {
     private func addCompletedRow(_ item: SessionActivityItem, ordinal: Int) {
         let completionTime = item.completedAt ?? item.eventAt
         let title = item.provider == .codex ? titles[item.id] : nil
-        let genericText = "\(item.provider.displayName) · Completed · \(item.category.displayName) #\(ordinal) · \(relativeAge(completionTime)) · Unread"
+        let genericText = "\(item.provider.displayName) · \(item.outcomeTitle) · \(item.category.displayName) #\(ordinal) · \(relativeAge(completionTime)) · Unread"
         let label = NSTextField(
             labelWithString: title.map {
-                "\(item.provider.displayName) · \($0) · Completed · \(item.category.displayName) · \(relativeAge(completionTime)) · Unread"
+                "\(item.provider.displayName) · \($0) · \(item.outcomeTitle) · \(item.category.displayName) · \(relativeAge(completionTime)) · Unread"
             } ?? genericText
         )
         label.font = .systemFont(ofSize: 13, weight: .medium)
-        label.textColor = resolvedActivityColor(.systemGreen)
+        label.textColor = resolvedActivityColor(item.outcome == .blocked ? .systemRed : .secondaryLabelColor)
         label.lineBreakMode = .byTruncatingTail
         label.maximumNumberOfLines = 1
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         label.setAccessibilityElement(true)
         label.setAccessibilityRole(.staticText)
         label.setAccessibilityLabel(
-            title.map { "\(item.provider.displayName), \($0), completed unread session \(ordinal)" }
-                ?? "\(item.provider.displayName), completed unread session \(ordinal)"
+            title.map { "\(item.provider.displayName), \($0), \(item.outcomeTitle), unread outcome \(ordinal)" }
+                ?? "\(item.provider.displayName), \(item.outcomeTitle), unread outcome \(ordinal)"
         )
-        label.setAccessibilityValue("\(item.category.displayName), completed \(relativeAge(completionTime))")
+        label.setAccessibilityValue("\(item.category.displayName), \(item.outcomeTitle), \(relativeAge(completionTime))")
         label.setAccessibilityHelp(
             item.provider == .codex && openableIDs.contains(item.id)
                 ? "Use Open in Codex to show this session, or Mark as read to acknowledge it."
@@ -636,13 +636,13 @@ final class SessionActivityView: NSView {
         let acknowledge = NSButton(title: "Mark as read", target: self, action: #selector(markAsRead(_:)))
         acknowledge.bezelStyle = .inline
         acknowledge.controlSize = .small
-        acknowledge.setAccessibilityLabel("Mark completed session as read")
-        acknowledge.identifier = NSUserInterfaceItemIdentifier(item.id)
+        acknowledge.setAccessibilityLabel("Mark outcome as read")
+        acknowledge.identifier = NSUserInterfaceItemIdentifier(item.acknowledgementID)
 
-        let dotColor = resolvedActivityColor(.systemGreen)
+        let dotColor = resolvedActivityColor(item.outcome == .blocked ? .systemRed : .secondaryLabelColor)
         var views: [NSView] = [activityDot(color: dotColor), label]
         if item.provider == .codex && openableIDs.contains(item.id) {
-            views.append(openButton(for: item.id, accessibility: "Open completed session in Codex"))
+            views.append(openButton(for: item.id, accessibility: "Open session in Codex"))
         }
         views.append(acknowledge)
         let row = NSStackView(views: views)
@@ -651,7 +651,7 @@ final class SessionActivityView: NSView {
         row.spacing = 6
         row.setAccessibilityElement(true)
         row.setAccessibilityRole(.group)
-        row.setAccessibilityLabel("\(item.provider.displayName) completed unread session \(ordinal)")
+        row.setAccessibilityLabel("\(item.provider.displayName), \(item.outcomeTitle), unread outcome \(ordinal)")
         stack.addArrangedSubview(row)
         pinActivityRow(row, stretching: label)
     }
@@ -731,7 +731,7 @@ final class SessionActivityView: NSView {
         let ids = SessionActivityPresentation.unacknowledgedCompletedItems(
             snapshot: snapshot,
             acknowledgedIDs: acknowledgedIDs
-        ).map(\.id)
+        ).map(\.acknowledgementID)
         guard !ids.isEmpty else { return }
         onAcknowledgeAllCompleted?(ids)
     }

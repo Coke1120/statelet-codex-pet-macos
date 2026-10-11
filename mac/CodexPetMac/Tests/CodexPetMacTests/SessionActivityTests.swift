@@ -138,7 +138,7 @@ final class SessionActivityTests: XCTestCase {
             ).isEmpty
         )
         let pill = allDescendants(of: view).compactMap { $0 as? NSButton }.first {
-            $0.title == "Completed · 1"
+            $0.title == "Recent · 1"
         }
         XCTAssertNotNil(pill)
         pill?.performClick(nil)
@@ -221,9 +221,9 @@ final class SessionActivityTests: XCTestCase {
                 $0.title == "Clear all"
             }
         )
-        XCTAssertEqual(clearAll.accessibilityLabel(), "Clear all completed sessions")
+        XCTAssertEqual(clearAll.accessibilityLabel(), "Clear all unread outcomes")
         clearAll.performClick(nil)
-        XCTAssertEqual(clearedIDs, unread.map(\.id))
+        XCTAssertEqual(clearedIDs, unread.reversed().map(\.id))
         XCTAssertFalse(clearedIDs?.contains(active.id) == true)
         XCTAssertFalse(clearedIDs?.contains(stopped.id) == true)
         XCTAssertFalse(clearedIDs?.contains(alreadyRead.id) == true)
@@ -583,11 +583,11 @@ final class SessionActivityTests: XCTestCase {
         XCTAssertEqual(activeLabel.lineBreakMode, .byTruncatingTail)
 
         let completedLabel = try XCTUnwrap(labels.first {
-            $0.stringValue.hasPrefix("Codex · Verify release signing · Completed")
+            $0.stringValue.hasPrefix("Codex · Verify release signing · Session closed")
         })
         XCTAssertEqual(
             completedLabel.accessibilityLabel(),
-            "Codex, Verify release signing, completed unread session 1"
+            "Codex, Verify release signing, Session closed, unread outcome 1"
         )
         XCTAssertTrue(completedLabel.stringValue.contains("Unread"))
 
@@ -608,7 +608,7 @@ final class SessionActivityTests: XCTestCase {
             $0.title == "Active · 1"
         })
         XCTAssertNotNil(allDescendants(of: view).compactMap { $0 as? NSButton }.first {
-            $0.title == "Completed · 1"
+            $0.title == "Recent · 1"
         })
     }
 

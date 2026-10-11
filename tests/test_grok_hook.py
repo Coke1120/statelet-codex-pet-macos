@@ -64,8 +64,8 @@ class GrokHookTests(unittest.TestCase):
             "subagent_stop": "SubagentStop",
             "subagent_end": "SubagentStop",
             "stop": "Stop",
-            "stop_failure": "Stop",
-            "stop_cancelled": "Stop",
+            "stop_failure": "StopFailure",
+            "stop_cancelled": "Interrupt",
         }
         for wire_name, expected in cases.items():
             with self.subTest(wire_name=wire_name):
@@ -359,7 +359,8 @@ class GrokHookTests(unittest.TestCase):
                     Path(temporary),
                     {"hookEventName": event, "sessionId": event, "promptId": "prompt"},
                 )
-            self.assertEqual((record["event"], record["state"]), ("Stop", "idle"))
+            expected = "StopFailure" if event == "stop_failure" else "Interrupt"
+            self.assertEqual((record["event"], record["state"]), (expected, "idle"))
 
         with tempfile.TemporaryDirectory() as temporary:
             state_dir = Path(temporary)
