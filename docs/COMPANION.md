@@ -141,16 +141,23 @@ authentication, a live model response or the signed macOS executable.
 
 ## Activity
 
-The Activity tab shows active, waiting and completed-unread sessions from the
-existing privacy-safe lifecycle sidecar. Filter to **Needs you** or **Completed**,
-open a verified Codex task, acknowledge one completion, or clear completed-unread
-items. Titles remain ephemeral and follow the existing title-hydration policy.
+The Activity tab shows active sessions and unread recent outcomes from the
+privacy-safe lifecycle sidecar. Filter to **Needs you** or **Recent**, open a
+verified Codex task, acknowledge one outcome, or clear unread outcomes. Grok
+failures appear as Blocked, cancellations as Interrupted, ordinary Stops as
+unverified, and legacy closures as Session closed. Passive hooks cannot prove
+Ready. Each session shows its latest result; accepted new work replaces it.
+Each new result has its own read receipt. Titles remain ephemeral and follow
+the existing title-hydration policy.
 Unavailable targets stay visible with a manual-open explanation.
 
 Open tasks in the owning agent app to reply, approve a request or stop their
 work. Statelet does not pretend a separate CLI process can control a running
-desktop-owned turn. ChatGPT's internal realtime voice-session controls and its
-private pet installation format are not third-party Statelet integrations.
+desktop-owned turn. The public Realtime API offers a separate voice-session
+integration; it does not establish control of ChatGPT's desktop voice session.
+The documented `codex://pets/install` link opens the official pet install flow;
+Statelet does not yet export that sprite format. These are separate follow-up
+designs, assessed in [the public capability audit](TURN_OUTCOMES_2026-10-11.md).
 
 ## Pet and Mini
 

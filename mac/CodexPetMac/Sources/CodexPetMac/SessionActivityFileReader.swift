@@ -41,7 +41,7 @@ struct SessionActivityTargets: Codable, Equatable, Sendable {
               emittedAt == activity.emittedAt,
               targets.count <= Self.maximumTargets else { return [:] }
         let activityItems = Dictionary(
-            uniqueKeysWithValues: (activity.active + activity.completed).map { ($0.id, $0) }
+            uniqueKeysWithValues: (activity.active + activity.completed + activity.outcomes).map { ($0.id, $0) }
         )
         var result: [String: String] = [:]
         for target in targets {

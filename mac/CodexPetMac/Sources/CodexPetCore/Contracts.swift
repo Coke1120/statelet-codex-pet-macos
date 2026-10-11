@@ -93,6 +93,7 @@ public enum CurrentStateHookEvent: String, Codable, CaseIterable, Sendable {
     case sessionEnd = "SessionEnd"
     case sessionStart = "SessionStart"
     case stop = "Stop"
+    case stopFailure = "StopFailure"
     case interrupt = "Interrupt"
     case subagentStart = "SubagentStart"
     case subagentStop = "SubagentStop"
@@ -113,7 +114,7 @@ public enum SessionActivityCategory: String, Codable, Equatable, Sendable {
         case .preToolUse, .postToolUse: return .tool
         case .preCompact, .postCompact: return .review
         case .subagentStart, .subagentStop: return .subagent
-        case .sessionStart, .sessionEnd, .userPromptSubmit, .stop, .interrupt: return .codex
+        case .sessionStart, .sessionEnd, .userPromptSubmit, .stop, .stopFailure, .interrupt: return .codex
         case .unknown: return .activity
         }
     }
@@ -360,6 +361,20 @@ public struct CurrentState: Codable, Equatable, Sendable {
     }
 }
 
+/// Passive hooks can report an attempt to stop, failure, or interruption.
+/// None proves successful completion; SessionEnd only reports session closure.
+public enum SessionTurnOutcome: String, Codable, Equatable, Sendable {
+    case unverified, blocked, interrupted
+
+    public var displayName: String {
+        switch self {
+        case .unverified: return "Stopped · outcome unverified"
+        case .blocked: return "Blocked"
+        case .interrupted: return "Interrupted"
+        }
+    }
+}
+
 /// A bounded, privacy-safe view of the individual Codex sessions used by the
 /// optional activity rail. The identifier is the 24-hex truncated hash already
 /// used for owner-only hook record filenames; prompts and transcript metadata
@@ -376,6 +391,11 @@ public struct SessionActivityItem: Codable, Equatable, Sendable {
     public let category: SessionActivityCategory
     public let provider: AgentProvider
     public let terminal: Bool
+    public let outcome: SessionTurnOutcome?
+    public let outcomeID: String?
+
+    public var acknowledgementID: String { outcomeID ?? id }
+    public var outcomeTitle: String { outcome?.displayName ?? "Session closed" }
 
     public init(
         id: String,
@@ -386,7 +406,9 @@ public struct SessionActivityItem: Codable, Equatable, Sendable {
         startedAt: Double? = nil,
         completedAt: Double? = nil,
         category: SessionActivityCategory? = nil,
-        provider: AgentProvider = .codex
+        provider: AgentProvider = .codex,
+        outcome: SessionTurnOutcome? = nil,
+        outcomeID: String? = nil
     ) throws {
         guard id.count == Self.maximumIdentifierLength,
               id.unicodeScalars.allSatisfy(
@@ -412,7 +434,23 @@ public struct SessionActivityItem: Codable, Equatable, Sendable {
         } else if terminal {
             throw PetContractError.invalidValue("terminal session activity is missing completed_at")
         }
-        let terminalEvent = event == .sessionEnd || event == .stop
+        guard (outcome == nil) == (outcomeID == nil) else {
+            throw PetContractError.invalidValue("turn outcome receipt is incomplete")
+        }
+        guard event != .stopFailure || outcome == .blocked else {
+            throw PetContractError.invalidValue("failure activity requires a blocked outcome")
+        }
+        if let outcome, let outcomeID {
+            guard outcomeID.count == Self.maximumIdentifierLength,
+                  outcomeID.unicodeScalars.allSatisfy(String("0123456789abcdef").unicodeScalars.contains),
+                  terminal,
+                  (outcome == .unverified && event == .stop)
+                    || (outcome == .blocked && event == .stopFailure && provider == .grok)
+                    || (outcome == .interrupted && event == .interrupt) else {
+                throw PetContractError.invalidValue("turn outcome is inconsistent")
+            }
+        }
+        let terminalEvent = event == .sessionEnd || event == .stop || outcome != nil
         let activeGrokBackgroundStop = provider == .grok
             && event == .stop
             && state == .running
@@ -445,6 +483,8 @@ public struct SessionActivityItem: Codable, Equatable, Sendable {
         self.category = resolvedCategory
         self.provider = provider
         self.terminal = terminal
+        self.outcome = outcome
+        self.outcomeID = outcomeID
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -457,6 +497,8 @@ public struct SessionActivityItem: Codable, Equatable, Sendable {
         case category
         case provider
         case terminal
+        case outcome
+        case outcomeID = "outcome_id"
     }
 
     public init(from decoder: Decoder) throws {
@@ -473,7 +515,9 @@ public struct SessionActivityItem: Codable, Equatable, Sendable {
             startedAt: container.decodeIfPresent(Double.self, forKey: .startedAt) ?? eventAt,
             completedAt: container.decodeIfPresent(Double.self, forKey: .completedAt),
             category: container.decodeIfPresent(SessionActivityCategory.self, forKey: .category),
-            provider: container.decodeIfPresent(AgentProvider.self, forKey: .provider) ?? .codex
+            provider: container.decodeIfPresent(AgentProvider.self, forKey: .provider) ?? .codex,
+            outcome: container.decodeIfPresent(SessionTurnOutcome.self, forKey: .outcome),
+            outcomeID: container.decodeIfPresent(String.self, forKey: .outcomeID)
         )
     }
 }
@@ -487,13 +531,23 @@ public struct SessionActivitySnapshot: Codable, Equatable, Sendable {
     public let emittedAt: Double
     public let active: [SessionActivityItem]
     public let completed: [SessionActivityItem]
+    public let outcomes: [SessionActivityItem]
+
+    public var recentItems: [SessionActivityItem] {
+        (outcomes + completed.filter { $0.event == .sessionEnd }).sorted {
+            if ($0.outcome == .blocked) != ($1.outcome == .blocked) { return $0.outcome == .blocked }
+            if $0.eventAt != $1.eventAt { return $0.eventAt > $1.eventAt }
+            return $0.id < $1.id
+        }
+    }
 
     public init(
         version: Int = Self.version,
         schemaVersion: Int = Self.version,
         emittedAt: Double,
         active: [SessionActivityItem] = [],
-        completed: [SessionActivityItem] = []
+        completed: [SessionActivityItem] = [],
+        outcomes: [SessionActivityItem] = []
     ) throws {
         guard version == Self.version, schemaVersion == Self.version else {
             throw PetContractError.unsupportedVersion(max(version, schemaVersion))
@@ -502,18 +556,24 @@ public struct SessionActivitySnapshot: Codable, Equatable, Sendable {
             throw PetContractError.invalidNumber("session activity emitted_at")
         }
         guard active.count <= Self.maximumItemsPerGroup,
-              completed.count <= Self.maximumItemsPerGroup else {
+              completed.count + outcomes.count <= Self.maximumItemsPerGroup else {
             throw PetContractError.invalidValue("session activity contains too many items")
         }
         guard active.allSatisfy({ !$0.terminal }),
-              completed.allSatisfy(\.terminal) else {
+              completed.allSatisfy({ $0.terminal && $0.outcome == nil }),
+              outcomes.allSatisfy({ $0.terminal && $0.outcome != nil }) else {
             throw PetContractError.invalidValue("session activity item group is invalid")
         }
         let activeIDs = Set(active.map(\.id))
         let completedIDs = Set(completed.map(\.id))
+        let outcomeIDs = Set(outcomes.map(\.id))
         guard activeIDs.count == active.count,
               completedIDs.count == completed.count,
-              activeIDs.isDisjoint(with: completedIDs) else {
+              outcomeIDs.count == outcomes.count,
+              Set(outcomes.map(\.acknowledgementID)).count == outcomes.count,
+              activeIDs.isDisjoint(with: completedIDs),
+              activeIDs.isDisjoint(with: outcomeIDs),
+              completedIDs.isDisjoint(with: outcomeIDs) else {
             throw PetContractError.invalidValue("session activity contains duplicate items")
         }
         self.version = version
@@ -521,6 +581,7 @@ public struct SessionActivitySnapshot: Codable, Equatable, Sendable {
         self.emittedAt = emittedAt
         self.active = active
         self.completed = completed
+        self.outcomes = outcomes
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -529,6 +590,7 @@ public struct SessionActivitySnapshot: Codable, Equatable, Sendable {
         case emittedAt = "emitted_at"
         case active
         case completed
+        case outcomes
     }
 
     public init(from decoder: Decoder) throws {
@@ -538,7 +600,8 @@ public struct SessionActivitySnapshot: Codable, Equatable, Sendable {
             schemaVersion: container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? Self.version,
             emittedAt: container.decode(Double.self, forKey: .emittedAt),
             active: container.decodeIfPresent([SessionActivityItem].self, forKey: .active) ?? [],
-            completed: container.decodeIfPresent([SessionActivityItem].self, forKey: .completed) ?? []
+            completed: container.decodeIfPresent([SessionActivityItem].self, forKey: .completed) ?? [],
+            outcomes: container.decodeIfPresent([SessionActivityItem].self, forKey: .outcomes) ?? []
         )
     }
 }

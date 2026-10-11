@@ -1247,7 +1247,7 @@ class InterruptLifecycleTests(unittest.TestCase):
         self.assertEqual(continued["event"], "PreToolUse")
         self.assertEqual(continued["state"], "running")
 
-    def test_session_end_after_interrupt_remains_a_real_completion(self) -> None:
+    def test_session_end_after_interrupt_preserves_interrupted_outcome(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary) / "sessions"
             common = {"session_id": "synthetic", "turn_id": "turn-one"}
@@ -1257,8 +1257,9 @@ class InterruptLifecycleTests(unittest.TestCase):
             activity = state.read_session_activity(directory)
         self.assertEqual(record["event"], "SessionEnd")
         self.assertTrue(record["terminal"])
-        self.assertEqual(len(activity["completed"]), 1)
-        self.assertEqual(activity["completed"][0]["event"], "SessionEnd")
+        self.assertEqual(activity["completed"], [])
+        self.assertEqual(len(activity["outcomes"]), 1)
+        self.assertEqual(activity["outcomes"][0]["outcome"], "interrupted")
 
     def test_interrupt_hook_process_exits_successfully_with_json_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

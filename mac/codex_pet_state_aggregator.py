@@ -239,7 +239,8 @@ def atomic_write_session_activity(
         raise ValueError("activity emitted_at must be finite")
     active = snapshot.get("active", [])
     completed = snapshot.get("completed", [])
-    if not isinstance(active, list) or not isinstance(completed, list):
+    outcomes = snapshot.get("outcomes", [])
+    if not isinstance(active, list) or not isinstance(completed, list) or not isinstance(outcomes, list):
         raise ValueError("activity groups must be lists")
     record: Dict[str, object] = {
         "version": 1,
@@ -248,6 +249,8 @@ def atomic_write_session_activity(
         "active": active,
         "completed": completed,
     }
+    if outcomes:
+        record["outcomes"] = outcomes
     output_path.parent.mkdir(parents=True, exist_ok=True)
     directory_fd = _open_owner_activity_directory(output_path.parent)
     fd = -1
@@ -405,6 +408,7 @@ class SessionActivityPublisher:
             {
                 "active": snapshot.get("active", []),
                 "completed": snapshot.get("completed", []),
+                "outcomes": snapshot.get("outcomes", []),
                 "targets": (
                     targets.get("targets", []) if targets is not None else None
                 ),

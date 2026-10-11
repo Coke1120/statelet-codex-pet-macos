@@ -1601,9 +1601,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
 
     private func acknowledgeSessionActivities(_ ids: [String]) {
         guard let sessionActivitySnapshot else { return }
-        let eligibleIDs = Set(sessionActivitySnapshot.completed.lazy.filter {
-            $0.event == .sessionEnd
-        }.map(\.id))
+        let eligibleIDs = Set(sessionActivitySnapshot.recentItems.map(\.acknowledgementID))
         let requestedIDs = ids.filter(eligibleIDs.contains)
         guard !requestedIDs.isEmpty else { return }
         let updatedHistory = SessionActivityApplicationPolicy.recordingAcknowledgements(
@@ -3423,7 +3421,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             controller.model.onAcknowledge = { [weak self] id in self?.acknowledgeSessionActivity(id) }
             controller.model.onClearCompleted = { [weak self] in
                 guard let self else { return }
-                self.acknowledgeSessionActivities(self.sessionActivitySnapshot?.completed.map(\.id) ?? [])
+                self.acknowledgeSessionActivities(self.sessionActivitySnapshot?.recentItems.map(\.acknowledgementID) ?? [])
             }
             controller.model.onSettings = { [weak self] destination in
                 self?.showSettings()
