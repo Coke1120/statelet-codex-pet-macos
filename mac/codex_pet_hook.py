@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import secrets
 import stat
 import sys
 import time
@@ -82,13 +83,14 @@ VALID_EVENTS = frozenset(
         "SubagentStart",
         "SubagentStop",
         "Stop",
+        "StopFailure",
         "Interrupt",
     )
 )
 TERMINAL_EVENTS = frozenset(("SessionEnd",))
-TURN_CLOSING_EVENTS = frozenset(("Stop", "Interrupt"))
+TURN_CLOSING_EVENTS = frozenset(("Stop", "StopFailure", "Interrupt"))
 REVIVAL_EVENTS = frozenset(("SessionStart", "UserPromptSubmit"))
-GROK_CONTINUATION_EVENTS = frozenset(
+STOP_CONTINUATION_EVENTS = frozenset(
     (
         "PreToolUse",
         "PostToolUse",
@@ -128,7 +130,7 @@ def event_category(event: str) -> str:
         return "review"
     if event in ("SubagentStart", "SubagentStop"):
         return "subagent"
-    if event in ("SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "Interrupt"):
+    if event in ("SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "StopFailure", "Interrupt"):
         return "codex"
     return "activity"
 
@@ -175,6 +177,9 @@ def normalize_payload(
     normalized = {key: payload[key] for key in retained_keys if key in payload}
     normalized["_statelet_provider"] = selected
     if selected != "grok":
+        if normalized.get("hook_event_name") == "StopFailure":
+            # Codex's public hook schema does not define this event.
+            normalized["hook_event_name"] = "unknown"
         return normalized
 
     aliases = {
@@ -200,8 +205,8 @@ def normalize_payload(
             normalized["hook_event_name"] = "PermissionRequest"
         elif notification_type == "idle_prompt":
             normalized["hook_event_name"] = "Stop"
-    elif event in ("StopFailure", "StopCancelled"):
-        normalized["hook_event_name"] = "Stop"
+    elif event == "StopCancelled":
+        normalized["hook_event_name"] = "Interrupt"
     elif event in ("PostToolUseFailure", "PermissionDenied"):
         normalized["hook_event_name"] = "PostToolUse"
 
@@ -233,7 +238,7 @@ def event_state(payload: Dict[str, Any]) -> str:
     provider = payload.get("_statelet_provider", "codex")
     if event == "Stop" and payload.get("_statelet_background_active") is True:
         return "running"
-    if event in ("SessionStart", "SessionEnd", "Stop", "Interrupt"):
+    if event in ("SessionStart", "SessionEnd", "Stop", "StopFailure", "Interrupt"):
         return "idle"
     if event == "PermissionRequest":
         return "waiting"
@@ -548,7 +553,7 @@ def _read_fence(value: Any, existing_event: Optional[str]) -> Dict[str, Any]:
         ):
             return dict(value)
     fence = _empty_fence()
-    if existing_event in ("Stop", "Interrupt"):
+    if isinstance(existing_event, str) and existing_event in TURN_CLOSING_EVENTS:
         fence["turn_closed"] = True
     elif existing_event == "SessionEnd":
         fence["session_closed"] = True
@@ -714,7 +719,9 @@ def _causally_accept(
     return True
 
 
-def _fence_accepts(payload: Dict[str, Any], event: str, fence: Dict[str, Any]) -> bool:
+def _fence_accepts(
+    payload: Dict[str, Any], event: str, fence: Dict[str, Any], previous_event: Optional[str] = None
+) -> bool:
     if event == "SessionStart":
         return True
     if event in TERMINAL_EVENTS:
@@ -723,14 +730,23 @@ def _fence_accepts(payload: Dict[str, Any], event: str, fence: Dict[str, Any]) -
         return event in REVIVAL_EVENTS
     if not fence["turn_closed"]:
         return True
-    if (
-        payload.get("_statelet_provider") == "grok"
-        and event in GROK_CONTINUATION_EVENTS
-    ):
+    if previous_event == "Stop" and event in ("Interrupt", "StopFailure"):
+        # A provisional Stop cannot hide a later authoritative cancellation or
+        # failure. Causal validation below still rejects an older turn.
+        return True
+    if previous_event == "Stop" and event in STOP_CONTINUATION_EVENTS:
         # A Grok Stop hook may itself be blocked. Correlated same-prompt work
         # can therefore resume; the causal tool phases below still reject
         # delayed callbacks that were already observed before the Stop.
-        return True
+        # Codex also permits Stop hooks to continue the same turn. Require its
+        # turn correlation and a new tool start, not an unobserved late tool
+        # finish; preserve the existing Grok compatibility boundary.
+        return payload.get("_statelet_provider") == "grok" or (
+            event == "PreToolUse"
+            and _private_key_hash(payload, "tool_use_id") is not None
+            and _private_key_hash(payload, "turn_id") is not None
+            and _private_key_hash(payload, "turn_id") == fence["closed_turn"]
+        )
     if event in TURN_CLOSING_EVENTS:
         incoming_turn = _private_key_hash(payload, "turn_id")
         closed_turn = fence["closed_turn"]
@@ -743,6 +759,33 @@ def _fence_accepts(payload: Dict[str, Any], event: str, fence: Dict[str, Any]) -
     # treated as a new prompt because UserPromptSubmit is the only safe revival
     # boundary available for those clients.
     return incoming_turn is None or closed_turn is None or incoming_turn != closed_turn
+
+
+def _read_turn_outcome(record: Any) -> Optional[Dict[str, Any]]:
+    """Keep only a bounded result receipt, never raw failure details or text."""
+    if not isinstance(record, dict) or record.get("state") != "idle":
+        return None
+    value = record.get("outcome")
+    if not isinstance(value, dict) or set(value) != {"id", "kind", "event_at"}:
+        return None
+    kind = value.get("kind")
+    if not isinstance(kind, str):
+        return None
+    expected = {"unverified": "Stop", "blocked": "StopFailure", "interrupted": "Interrupt"}.get(kind)
+    identifier = value.get("id")
+    at = _finite_timestamp(value.get("event_at"))
+    record_at = _finite_timestamp(record.get("event_at"))
+    if (
+        expected is None
+        or record.get("event") not in (expected, "SessionEnd")
+        or (kind == "blocked" and record.get("provider") != "grok")
+        or not isinstance(identifier, str)
+        or HASH_PATTERN.fullmatch(identifier) is None
+        or isinstance(value.get("event_at"), bool)
+        or at is None or record_at is None or at > record_at
+    ):
+        return None
+    return {"id": identifier, "kind": kind, "event_at": at}
 
 
 def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
@@ -777,7 +820,8 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
         )
         if (
             existing is not None
-            and existing.get("event") in ("Stop", "Interrupt")
+            and isinstance(existing.get("event"), str)
+            and existing.get("event") in TURN_CLOSING_EVENTS
             and fence["closed_turn"] is None
         ):
             fence["closed_turn"] = causal.get("current_turn")
@@ -831,7 +875,10 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
             "pending_permissions": list(causal["pending_permissions"]),
             "latest_event": causal["latest_event"],
         }
-        fence_accepted = _fence_accepts(payload, accepted_event, fence)
+        previous_outcome = _read_turn_outcome(existing)
+        fence_accepted = _fence_accepts(
+            payload, accepted_event, fence, existing.get("event") if existing else None
+        )
         causally_accepted = fence_accepted and _causally_accept(
             payload, accepted_event, proposed_causal
         )
@@ -874,6 +921,8 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
                     "causal": preserved_causal,
                     "fence": fence,
                 }
+                if previous_outcome is not None:
+                    preserved["outcome"] = previous_outcome
                 _atomic_write_record(directory_fd, destination_name, preserved)
             else:
                 record = {
@@ -900,8 +949,9 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
             fence["closed_turn"] = None
             fence["session_closed"] = False
         elif (
-            payload.get("_statelet_provider") == "grok"
-            and accepted_event in GROK_CONTINUATION_EVENTS
+            existing is not None
+            and existing.get("event") == "Stop"
+            and accepted_event in STOP_CONTINUATION_EVENTS
         ):
             fence["turn_closed"] = False
             fence["closed_turn"] = None
@@ -944,6 +994,16 @@ def write_event(payload: Dict[str, Any], state_dir: Path) -> Path:
             "causal": proposed_causal,
             "fence": fence,
         }
+        if accepted_event in TURN_CLOSING_EVENTS and record_state == "idle":
+            record["outcome"] = {
+                "id": secrets.token_hex(12),
+                "kind": {"Stop": "unverified", "StopFailure": "blocked", "Interrupt": "interrupted"}[accepted_event],
+                "event_at": received_at,
+            }
+        elif accepted_event == "SessionEnd" and previous_outcome is not None:
+            # Session closure is not another successful turn, nor a reason to
+            # erase the last known failure/interruption or its read receipt.
+            record["outcome"] = previous_outcome
         _atomic_write_record(directory_fd, destination_name, record)
         _publish_activation_target_best_effort(
             directory_fd, payload, identifier, received_at

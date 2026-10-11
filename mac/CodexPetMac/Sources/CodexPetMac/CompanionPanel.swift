@@ -743,19 +743,19 @@ private struct CompanionView: View {
                 HStack(spacing: 10) {
                     metric("Active", count: model.activity.count, color: accent)
                     metric("Needs you", count: model.attentionCount, color: .orange)
-                    metric("Completed", count: model.completed.count, color: .secondary)
+                    metric("Recent", count: model.completed.count, color: .secondary)
                 }
                 Picker("Filter activity", selection: $model.activeFilter) {
-                    Text("All").tag("All"); Text("Needs you").tag("Needs you"); Text("Completed").tag("Completed")
+                    Text("All").tag("All"); Text("Needs you").tag("Needs you"); Text("Recent").tag("Recent")
                 }.pickerStyle(.segmented).labelsHidden()
-                let items = model.activeFilter == "Completed" ? [] : model.activity.filter { model.activeFilter != "Needs you" || $0.state == .waiting }
+                let items = model.activeFilter == "Recent" ? [] : model.activity.filter { model.activeFilter != "Needs you" || $0.state == .waiting }
                 if !items.isEmpty {
                     Text("IN PROGRESS").font(.system(size: 10, weight: .semibold)).tracking(1).foregroundStyle(.secondary)
                     ForEach(items, id: \.id) { item in taskRow(item, completed: false) }
                 }
                 if model.activeFilter != "Needs you", !model.completed.isEmpty {
                     HStack {
-                        Text("FINISHED").font(.system(size: 10, weight: .semibold)).tracking(1).foregroundStyle(.secondary)
+                        Text("RECENT OUTCOMES — UNREAD").font(.system(size: 10, weight: .semibold)).tracking(1).foregroundStyle(.secondary)
                         Spacer(); Button("Clear unread") { model.onClearCompleted?() }.font(.system(size: 11)).buttonStyle(.borderless)
                     }
                     ForEach(model.completed, id: \.id) { item in taskRow(item, completed: true) }
@@ -783,11 +783,11 @@ private struct CompanionView: View {
 
     private func taskRow(_ item: SessionActivityItem, completed: Bool) -> some View {
         HStack(alignment: .top, spacing: 10) {
-            Image(systemName: completed ? "checkmark.circle.fill" : item.state == .waiting ? "hand.raised.fill" : "circle.dotted")
-                .foregroundStyle(item.state == .waiting && !completed ? Color.orange : accent).padding(.top, 2)
+            Image(systemName: completed ? outcomeSymbol(item.outcome) : item.state == .waiting ? "hand.raised.fill" : "circle.dotted")
+                .foregroundStyle(completed ? (item.outcome == .blocked ? Color.red : Color.secondary) : item.state == .waiting ? Color.orange : accent).padding(.top, 2)
             VStack(alignment: .leading, spacing: 5) {
                 Text(model.titles[item.id] ?? "\(item.provider.displayName) · \(item.category.displayName)").font(.system(size: 13, weight: .medium)).lineLimit(2)
-                Text(completed ? "Completed" : item.state == .waiting ? "Needs your input" : item.state.rawValue.capitalized)
+                Text(completed ? item.outcomeTitle : item.state == .waiting ? "Needs your input" : item.state.rawValue.capitalized)
                     .font(.system(size: 11)).foregroundStyle(.secondary)
                 if !model.openableIDs.contains(item.id) {
                     Text("Open in \(item.provider.displayName) manually").font(.system(size: 10)).foregroundStyle(.secondary)
@@ -798,10 +798,19 @@ private struct CompanionView: View {
                 Button("Open") { model.onOpenTask?(item.id) }.controlSize(.small)
             }
             if completed {
-                Button { model.onAcknowledge?(item.id) } label: { Image(systemName: "checkmark") }
+                Button { model.onAcknowledge?(item.acknowledgementID) } label: { Image(systemName: "checkmark") }
                     .buttonStyle(.borderless).help("Mark as read").accessibilityLabel("Mark task as read")
             }
         }.padding(12).background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func outcomeSymbol(_ outcome: SessionTurnOutcome?) -> String {
+        switch outcome {
+        case .blocked: return "exclamationmark.circle.fill"
+        case .interrupted: return "pause.circle"
+        case .unverified: return "questionmark.circle"
+        case nil: return "archivebox"
+        }
     }
 
     private var pet: some View {

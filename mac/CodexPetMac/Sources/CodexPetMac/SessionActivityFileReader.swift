@@ -41,7 +41,7 @@ struct SessionActivityTargets: Codable, Equatable, Sendable {
               emittedAt == activity.emittedAt,
               targets.count <= Self.maximumTargets else { return [:] }
         let activityItems = Dictionary(
-            uniqueKeysWithValues: (activity.active + activity.completed).map { ($0.id, $0) }
+            uniqueKeysWithValues: (activity.active + activity.completed + activity.outcomes).map { ($0.id, $0) }
         )
         var result: [String: String] = [:]
         for target in targets {
@@ -150,8 +150,67 @@ enum SessionActivityApplicationPolicy {
     }
 }
 
+/// One read marker per session, including providers hidden by source filtering.
+/// A new result replaces the session's previous marker instead of consuming
+/// another history slot. The receipt remains distinct from the activation ID.
+struct SessionActivityAcknowledgementState: Equatable {
+    struct Entry: Codable, Equatable {
+        let sessionID: String
+        let receiptID: String
+    }
+
+    let entries: [Entry]
+    var history: [String] { entries.map(\.receiptID) }
+
+    init(entries: [Entry] = []) {
+        var normalized: [Entry] = []
+        for entry in entries {
+            guard Self.validIdentifier(entry.sessionID), Self.validIdentifier(entry.receiptID) else { continue }
+            normalized.removeAll { $0.sessionID == entry.sessionID || $0.receiptID == entry.receiptID }
+            normalized.append(entry)
+        }
+        self.entries = Array(normalized.suffix(SessionActivityApplicationPolicy.maximumAcknowledgements))
+    }
+
+    func recording(_ items: [SessionActivityItem]) -> Self {
+        Self(entries: entries + items.map { Entry(sessionID: $0.id, receiptID: $0.acknowledgementID) })
+    }
+
+    func retaining(_ identifiers: [String]) -> Self {
+        let retained = Set(identifiers)
+        return Self(entries: entries.filter { retained.contains($0.receiptID) })
+    }
+
+    private static func validIdentifier(_ identifier: String) -> Bool {
+        identifier.count == SessionActivityItem.maximumIdentifierLength
+            && identifier.unicodeScalars.allSatisfy(String("0123456789abcdef").unicodeScalars.contains)
+    }
+}
+
 enum SessionActivityAcknowledgementStore {
     static let defaultsKey = "Statelet.sessionActivityAcknowledgements.v1"
+    static let mappedDefaultsKey = "Statelet.sessionActivityAcknowledgements.v2"
+
+    static func restoredState(from defaults: UserDefaults = .standard) -> SessionActivityAcknowledgementState {
+        if let data = defaults.data(forKey: mappedDefaultsKey), data.count <= 64 * 1024,
+           let entries = try? JSONDecoder().decode([SessionActivityAcknowledgementState.Entry].self, from: data) {
+            return SessionActivityAcknowledgementState(entries: entries)
+        }
+        // Legacy markers identified the session itself, so both identifiers
+        // start equal. The first new outcome acknowledgement replaces that slot.
+        return SessionActivityAcknowledgementState(entries: restored(from: defaults).map {
+            .init(sessionID: $0, receiptID: $0)
+        })
+    }
+
+    static func persistState(
+        _ state: SessionActivityAcknowledgementState,
+        to defaults: UserDefaults = .standard
+    ) {
+        guard let data = try? JSONEncoder().encode(state.entries) else { return }
+        defaults.set(data, forKey: mappedDefaultsKey)
+        persist(state.history, to: defaults)
+    }
 
     static func restored(from defaults: UserDefaults = .standard) -> [String] {
         let values = defaults.array(forKey: defaultsKey) as? [String] ?? []

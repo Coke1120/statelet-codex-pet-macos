@@ -47,11 +47,12 @@ AVFoundation Desktop Playback & Menu Bar Controls
 1. **Hook Handlers (`mac/codex_pet_hook.py`)**:
    - Intercepts lifecycle events on stdin from Codex and Grok Build.
    - Maps events to canonical states:
-     - `SessionStart`, `SessionEnd`, `Stop`, Codex `Interrupt`, `idle_prompt` → `Idle`
+     - `SessionStart`, `SessionEnd`, `Stop`, `Interrupt` (Codex interrupt / Grok cancellation), Grok `StopFailure`, `idle_prompt` → `Idle`
      - `UserPromptSubmit`, ordinary tool activity → `Running`
      - `PermissionRequest`, `permission_prompt`, `ask_user_question` → `Waiting`
      - `PreCompact`, `PostCompact`, test/lint/review tool usage → `Review`
    - Strips prompt text, tool output, transcript paths, and working directories. Writes only bounded timestamps, provider, mapped state, and session hashes to per-session JSON.
+   - Optional text-free outcome receipts distinguish unverified Stop, blocked Grok failure, and interruption. Session closure is not successful completion; passive hooks do not establish Ready. See `docs/TURN_OUTCOMES_2026-10-11.md`.
 2. **State Aggregator (`mac/codex_pet_state_aggregator.py`)**:
    - Watches `sessions/` directory using macOS `kqueue` kernel events with 250 ms polling fallback.
    - Enforces state priority: `waiting > review > running > idle`.
