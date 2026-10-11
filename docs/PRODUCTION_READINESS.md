@@ -1,5 +1,26 @@
 # Stabilization and release qualification
 
+## 1.10.0 Cloud release candidate — 2026-10-11
+
+The owner authorized merging PR44/PR45 and publishing **1.10.0, build 42** as a
+personal update. The latest published baseline is 1.9.3/build 41; the minor
+version follows the repository's semantic versioning policy for the added
+backward-compatible Companion features. PR45 is validated again on main after
+PR44, including this release metadata. Publication remains conditional on
+successful main-push CI at the exact tagged commit and every maintained release
+workflow gate, including focused updater tests, signing and hosted-byte checks.
+The [release notes](https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.10.0)
+record the final commit, CI and artifact results; this candidate record is not
+proof of publication.
+
+This Cloud work does not repeat installed acceptance or minimum-macOS smoke
+testing. Real shortcuts/focus, VoiceOver, displays/Spaces, provider hook delivery,
+signed-in chat, microphone/speaker behavior and the official app's URL/Voice/
+Computer Use behavior remain unverified. No local Mac or credentials/permissions
+settings are accessed. Existing historical local evidence below does not qualify
+this candidate. Distribution retains the ad-hoc app and pinned Ed25519 personal
+update path, with no Developer ID/notarization claim.
+
 ## 1.9.3 qualification — 2026-10-06
 
 The release target is **1.9.3, build 41**, bound to

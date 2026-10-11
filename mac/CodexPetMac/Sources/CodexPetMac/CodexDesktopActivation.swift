@@ -7,6 +7,8 @@ enum CodexDesktopActivationPolicy {
     static let trustedBundleIdentifier = "com.openai.codex"
     static let trustedTeamIdentifier = "2DC432GLL2"
     static let maximumThreadIDBytes = 512
+    // Public blank-task entry point; never add prompt, path or other context.
+    static let newThreadDeepLink = URL(string: "codex://threads/new")!
 
     static func isValidThreadID(_ threadID: String) -> Bool {
         let bytes = threadID.utf8.count
@@ -129,11 +131,13 @@ final class CodexDesktopActivator {
     typealias ApplicationTrustResolver = @Sendable (URL) -> Bool
     typealias ApplicationIdentityResolver = (URL) -> CodexDesktopApplicationIdentity?
     typealias Opener = (URL, URL) -> Void
+    typealias NewThreadOpener = @MainActor (URL, URL) async -> Bool
 
     private let applicationResolver: ApplicationResolver
     private let applicationIdentityResolver: ApplicationIdentityResolver
     private let applicationTrustCache: CodexDesktopApplicationTrustCache
     private let opener: Opener
+    private let newThreadOpener: NewThreadOpener
 
     init(
         applicationResolver: @escaping ApplicationResolver = { NSWorkspace.shared.urlForApplication(toOpen: $0) },
@@ -151,6 +155,20 @@ final class CodexDesktopActivator {
                 withApplicationAt: applicationURL,
                 configuration: configuration
             )
+        },
+        newThreadOpener: @escaping NewThreadOpener = { deepLink, applicationURL in
+            await withCheckedContinuation { continuation in
+                let configuration = NSWorkspace.OpenConfiguration()
+                configuration.activates = true
+                NSWorkspace.shared.open(
+                    [deepLink],
+                    withApplicationAt: applicationURL,
+                    configuration: configuration
+                ) { application, error in
+                    // Only the launch result crosses back into Companion.
+                    continuation.resume(returning: application != nil && error == nil)
+                }
+            }
         }
     ) {
         self.applicationResolver = applicationResolver
@@ -159,6 +177,7 @@ final class CodexDesktopActivator {
             trustResolver: applicationTrustResolver
         )
         self.opener = opener
+        self.newThreadOpener = newThreadOpener
     }
 
     @MainActor
@@ -189,6 +208,23 @@ final class CodexDesktopActivator {
     @MainActor
     func open(threadID: String) async -> Bool {
         guard let deepLink = CodexDesktopActivationPolicy.deepLink(for: threadID),
+              let applicationURL = await verifiedApplication(for: deepLink) else {
+            return false
+        }
+        opener(deepLink, applicationURL)
+        return true
+    }
+
+    @MainActor
+    func openNewThread() async -> Bool {
+        let deepLink = CodexDesktopActivationPolicy.newThreadDeepLink
+        guard let applicationURL = await verifiedApplication(for: deepLink) else { return false }
+        return await newThreadOpener(deepLink, applicationURL)
+    }
+
+    @MainActor
+    private func verifiedApplication(for deepLink: URL) async -> URL? {
+        guard !Task.isCancelled,
               let applicationURL = applicationResolver(deepLink),
               let identity = applicationIdentityResolver(applicationURL),
               await applicationTrustCache.validate(
@@ -198,9 +234,8 @@ final class CodexDesktopActivator {
               ),
               !Task.isCancelled,
               applicationIdentityResolver(applicationURL) == identity else {
-            return false
+            return nil
         }
-        opener(deepLink, applicationURL)
-        return true
+        return applicationURL
     }
 }

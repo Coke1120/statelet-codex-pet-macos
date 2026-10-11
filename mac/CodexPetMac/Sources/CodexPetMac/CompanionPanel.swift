@@ -10,6 +10,18 @@ final class CompanionModel: NSObject, ObservableObject, NSSpeechSynthesizerDeleg
     enum Tab: String, CaseIterable { case chat = "Chat", activity = "Activity", pet = "Pet" }
     typealias Runner = @Sendable (String, @escaping CompanionChatService.Receiver) async throws -> Void
 
+    enum DesktopHandoff: Equatable {
+        case idle, opening, opened, unavailable
+        var message: String? {
+            switch self {
+            case .idle: return nil
+            case .opening: return "Opening Codex…"
+            case .opened: return "Codex opened. Continue there; no Statelet content was sent."
+            case .unavailable: return "Could not open Codex. Open the official app directly or install/update it, then retry."
+            }
+        }
+    }
+
     @Published var tab: Tab = .chat
     @Published var draft = ""
     @Published private(set) var messages: [CompanionMessage] = []
@@ -22,6 +34,7 @@ final class CompanionModel: NSObject, ObservableObject, NSSpeechSynthesizerDeleg
     @Published var speaking = false
     @Published var attachments: [CompanionAttachment] = []
     @Published private(set) var contextPreview: CompanionContextPreview?
+    @Published private(set) var desktopHandoff: DesktopHandoff = .idle
     @Published var activity: [SessionActivityItem] = []
     @Published var completed: [SessionActivityItem] = []
     @Published var titles: [String: String] = [:]
@@ -34,6 +47,7 @@ final class CompanionModel: NSObject, ObservableObject, NSSpeechSynthesizerDeleg
     @Published var activeFilter = "All"
 
     var onOpenTask: ((String) -> Void)?
+    var onOpenNewTask: (@MainActor () async -> Bool)?
     var onAcknowledge: ((String) -> Void)?
     var onClearCompleted: (() -> Void)?
     var onSelectCharacter: ((String) -> Void)?
@@ -58,12 +72,17 @@ final class CompanionModel: NSObject, ObservableObject, NSSpeechSynthesizerDeleg
     private var replyIDs: [String: UUID] = [:]
     private var retryMessages: [CompanionMessage]?
     private(set) var sentMessages: [CompanionMessage] = []
+    private let handoffClock: () -> TimeInterval
+    private var lastHandoffOpenedAt: TimeInterval?
 
-    init(speechStarter: ((String) -> Bool)? = nil, runner: @escaping Runner = { prompt, receive in
+    init(speechStarter: ((String) -> Bool)? = nil,
+         handoffClock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         runner: @escaping Runner = { prompt, receive in
         try await CompanionChatService().run(prompt: prompt, receive: receive)
     }) {
         self.runner = runner
         self.speechStarter = speechStarter
+        self.handoffClock = handoffClock
         super.init()
         speech.delegate = self
         dictation.onText = { [weak self] text in
@@ -78,6 +97,19 @@ final class CompanionModel: NSObject, ObservableObject, NSSpeechSynthesizerDeleg
     func requestComposerFocus() { tab = .chat; composerFocusRequest &+= 1 }
     var attentionCount: Int { activity.filter { $0.state == .waiting }.count }
     var characterName: String { characters.first { $0.id == selectedCharacter }?.name ?? "Your companion" }
+
+    func openNewCodexTask() async {
+        guard desktopHandoff != .opening else { return }
+        // Coalesce a click burst even when the system completes the first open
+        // immediately. Failure can be retried immediately; deliberate later
+        // requests may open another blank task.
+        if let lastHandoffOpenedAt, handoffClock() - lastHandoffOpenedAt < 1 { return }
+        dictation.stop()
+        desktopHandoff = .opening
+        let opened = await onOpenNewTask?() ?? false
+        if opened { lastHandoffOpenedAt = handoffClock() }
+        desktopHandoff = opened ? .opened : .unavailable
+    }
 
     func send() {
         guard canSend else { return }
@@ -338,7 +370,7 @@ private final class CompanionContentView: NSView {
 @MainActor
 final class CompanionPanelController: NSWindowController, NSWindowDelegate {
     let model = CompanionModel()
-    private let activator = CodexDesktopActivator()
+    private let activator: CodexDesktopActivator
     private var activityGeneration = UUID()
     private var openabilityTask: Task<Void, Never>?
     private var targets: [String: String] = [:]
@@ -355,10 +387,12 @@ final class CompanionPanelController: NSWindowController, NSWindowDelegate {
 
     init(visibleFrames: @escaping () -> [NSRect] = { NSScreen.screens.map(\.visibleFrame) },
          frontmostApplication: @escaping () -> NSRunningApplication? = { NSWorkspace.shared.frontmostApplication },
-         keyWindow: @escaping () -> NSWindow? = { NSApp.keyWindow }) {
+         keyWindow: @escaping () -> NSWindow? = { NSApp.keyWindow },
+         desktopActivator: CodexDesktopActivator = CodexDesktopActivator()) {
         self.visibleFrames = visibleFrames
         self.frontmostApplication = frontmostApplication
         self.keyWindow = keyWindow
+        self.activator = desktopActivator
         let panel = CompanionWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 640),
                                     styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
                                     backing: .buffered, defer: false)
@@ -388,6 +422,10 @@ final class CompanionPanelController: NSWindowController, NSWindowDelegate {
         }
         model.onCompactChange = { [weak self] in self?.resizeForMode() }
         model.onClose = { [weak self] in self?.hide() }
+        model.onOpenNewTask = { [weak self] in
+            guard let self else { return false }
+            return await self.activator.openNewThread()
+        }
         panel.onCancel = { [weak self] in self?.model.cancelOrClose() }
         screenObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
@@ -696,6 +734,16 @@ private struct CompanionView: View {
             Button { model.showContextPreview() } label: { Label("Review context", systemImage: "doc.text.magnifyingglass") }
                 .font(.system(size: 11)).buttonStyle(.borderless).disabled(!model.canSend)
                 .help("Review the message, earlier conversation and full attached text before sending")
+            VStack(alignment: .leading, spacing: 4) {
+                Button { Task { await model.openNewCodexTask() } } label: {
+                    Label("Open new task in Codex", systemImage: "arrow.up.forward.app")
+                }
+                .font(.system(size: 11)).buttonStyle(.borderless)
+                .disabled(model.desktopHandoff == .opening)
+                .help("Open a blank task in the official app. Your draft and attachments stay in Statelet.")
+                Text(model.desktopHandoff.message ?? "Manual handoff; use Voice or Computer Use there if available.")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+            }
             HStack(spacing: 14) {
                 Button { attachText() } label: { Image(systemName: "paperclip") }
                     .disabled(model.attachments.count >= 2 || model.isRunning).help("Attach UTF-8 text (up to 16 KB each)").accessibilityLabel("Attach text")

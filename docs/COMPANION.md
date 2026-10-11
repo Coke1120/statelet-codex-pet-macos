@@ -130,6 +130,35 @@ protocol errors, reasoning and tool output are discarded. Binary and running
 process identity must pass the existing OpenAI signature policy. The process
 and pipe readers are cancelled and reaped when the run ends.
 
+### Open a new task in the official app
+
+In expanded **Chat**, choose **Open new task in Codex** for a manual handoff.
+Statelet opens only the documented blank-task URL, `codex://threads/new`, in
+the installed handler after a fresh check of the existing OpenAI bundle,
+signature, team and application identity policy. It sends no draft, attachment,
+conversation or path in the URL, uses no clipboard and never submits a task.
+The current draft, selected text attachments, conversation, reviewed context
+and completed-unread items remain in Statelet; a running Quick Chat reply
+continues. Dictation stops when handing off.
+
+Continue manually in the official app, including Voice or Computer Use if that
+app, account and platform offer them. This button does not embed or control
+those features in Statelet. Quick Chat remains text-only with its existing
+safety settings. No API credentials, images or Realtime integration are added.
+
+The button waits for the system launch result, suppresses overlapping requests
+and successful click bursts within one second, and permits immediate retry after
+failure. Missing, untrusted or changed apps fail closed. Only fixed status text
+is shown; launch errors and application paths are discarded. If opening fails,
+open the official app directly or install/update it, then retry. Statelet never
+changes app trust, security settings or URL-handler registration.
+
+The reported success means macOS accepted the app launch, not that the app
+created a task or that Voice/Computer Use is available. Hosted tests use an
+injected launcher; actual signed-app URL handling, foreground focus, Spaces,
+multiple displays and accessibility still require installed Mac verification.
+The URL is documented in the official [Codex commands reference](https://learn.chatgpt.com/docs/reference/commands#chats).
+
 Implementation references: [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode)
 and the installed CLI's `codex exec --help`. Flags and feature names were checked
 offline against Codex CLI **0.159.2**, with the corresponding
@@ -183,3 +212,7 @@ synthetic CLI streaming and process timeout/cancellation. Existing activity,
 settings and pet interaction suites cover integration regressions. On-device
 recognition requires manual verification on a Mac with permission and a
 supported microphone/language; automated tests never request those permissions.
+`CompanionDesktopHandoffTests` covers missing/untrusted/replaced apps, fresh
+trust validation, exact blank URL, launch failure, cancellation, repeated clicks,
+draft/context/unread preservation, a running reply and native controller wiring.
+These injected checks do not certify the installed official app's behavior.

@@ -5,6 +5,54 @@ versioning for the public source release.
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-10-11
+
+### Added
+
+- Offline compatibility health for the signed Codex CLI, Quick Chat flags,
+  versions and Statelet hook readiness, with fixed actionable guidance and no
+  automatic changes to hook trust or security settings.
+- Configurable Companion global shortcut, conflict recovery, draft retention,
+  focus requests and visible-screen boundary handling.
+- In-memory review of the exact next Quick Chat submission, including earlier
+  conversation and attached text, before choosing Send.
+- **Open new task in Codex** for manual handoff to the verified official app
+  using only `codex://threads/new`. Drafts, attachments, conversation, reviewed
+  context and unread items remain in Statelet; no context is transferred and no
+  task is submitted automatically.
+
+### Changed
+
+- Distinguish blocked Grok failure, interruption and unverified Stop outcomes.
+  Session closure is labelled independently from successful completion.
+- Per-result unread receipts retain a result even when its running snapshot
+  was missed. Reading repeatedly in one session preserves retained read markers
+  for hidden providers. Opening a task does not acknowledge it.
+
+### Fixed
+
+- Harden malformed lifecycle records and share bounded reads within each
+  aggregation iteration. Codex Interrupt now closes its active turn fence.
+- Reject FIFO and special-file context/config reads without blocking, preserve
+  supported root routing comments and fail closed on unsupported TOML syntax.
+- Suppress late spoken replies after Companion closes and correctly pause
+  retained video for Reduce Motion without a configured poster.
+
+### Distribution and validation scope
+
+- Owner-authorized personal update: ad-hoc app signature and pinned Ed25519
+  update manifest; no Developer ID signature or notarization is added.
+- Final exact-commit main CI, focused updater tests, package signing and hosted
+  asset/signature/hash checks remain mandatory. The tagged release notes record
+  their final commit and results; earlier separate PR CI is not combined-release
+  evidence.
+- Installed-app acceptance, physical shortcuts/focus, VoiceOver, displays/Spaces,
+  macOS 13, real provider hook delivery, signed-in chat and official-app handoff
+  remain unperformed in Cloud. No local Mac or credentials/permissions settings
+  were used. Voice/Computer Use remain manual official-app features where
+  available; Statelet does not embed them. Passive Ready and Codex failure
+  inference remain unsupported.
+
 ## [1.9.3] - 2026-10-06
 
 ### Fixed
@@ -809,6 +857,7 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
+[1.10.0]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.10.0
 [1.8.23]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.23
 [1.8.22]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.22
 [1.8.21]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.21
