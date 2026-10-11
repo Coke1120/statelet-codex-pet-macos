@@ -65,6 +65,17 @@ configuration is written.
   messages; **New chat** clears the in-memory conversation and attachments.
 - Attach up to two UTF-8 text files, each at most 16 KiB. The attachment chip
   makes the selected context visible and removable before sending.
+- **Review context** opens an in-memory preview of your next message, the full
+  earlier conversation that will be sent, and attachment contents. Earlier
+  attachments remain part of follow-up context after their chips disappear;
+  use **New chat** to leave earlier context out. **Back to draft** preserves
+  your input; **Send** in the preview sends exactly the reviewed submission.
+  If the input changes while the preview is open, review it again before
+  sending. Closing the panel or switching to Mini discards the preview and
+  preserves the draft and selected attachments. Previewing does not contact
+  Codex or reread files. The preview uses the same 64 KiB serialized prompt
+  limit as sending, including Statelet's standard instructions, and never
+  silently truncates context.
 - **Stop** cancels only Statelet's current reply. A failed or interrupted reply
   can be retried without duplicating the user message. Late results from a
   cancelled request cannot replace a newer conversation.

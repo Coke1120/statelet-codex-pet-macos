@@ -21,6 +21,7 @@ final class CompanionModel: NSObject, ObservableObject, NSSpeechSynthesizerDeleg
     @Published var speakReplies = false
     @Published var speaking = false
     @Published var attachments: [CompanionAttachment] = []
+    @Published private(set) var contextPreview: CompanionContextPreview?
     @Published var activity: [SessionActivityItem] = []
     @Published var completed: [SessionActivityItem] = []
     @Published var titles: [String: String] = [:]
@@ -81,17 +82,53 @@ final class CompanionModel: NSObject, ObservableObject, NSSpeechSynthesizerDeleg
     func send() {
         guard canSend else { return }
         dictation.stop()
-        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        let context = attachments.map { "\n\nAttached text (\($0.name)):\n\($0.text)" }.joined()
-        let proposed = sentMessages + [CompanionMessage(role: .user, text: text + context)]
+        do { send(try prepareContext()) }
+        catch { self.error = (error as? CompanionChatError)?.localizedDescription ?? CompanionChatError.failed.localizedDescription }
+    }
+
+    func showContextPreview() {
+        guard canSend else { return }
+        dictation.stop()
+        contextPreview = nil
+        do { contextPreview = try prepareContext() }
+        catch { self.error = (error as? CompanionChatError)?.localizedDescription ?? CompanionChatError.failed.localizedDescription }
+    }
+
+    func dismissContextPreview() { contextPreview = nil }
+
+    func cancelOrClose() {
+        if contextPreview != nil { dismissContextPreview() }
+        else { onClose?() }
+    }
+
+    func sendContextPreview(id: UUID) {
+        guard let preview = contextPreview, preview.id == id else { return }
+        dictation.stop()
         do {
-            let prompt = try CompanionChatPolicy.prompt(messages: proposed)
-            messages.append(CompanionMessage(role: .user, text: text + (attachments.isEmpty ? "" : "\n\n📎 " + attachments.map(\.name).joined(separator: ", "))))
-            sentMessages = proposed
-            retryMessages = proposed
-            draft = ""; attachments = []
-            start(prompt)
-        } catch { self.error = (error as? CompanionChatError)?.localizedDescription ?? CompanionChatError.failed.localizedDescription }
+            // A queued UI/dictation callback must not send unreviewed changes or
+            // silently discard them. Only the exact reviewed submission can run.
+            guard canSend, try prepareContext().prompt == preview.prompt else {
+                contextPreview = nil
+                error = "The message changed. Review the context again before sending."
+                return
+            }
+            send(preview)
+        } catch {
+            contextPreview = nil
+            self.error = (error as? CompanionChatError)?.localizedDescription ?? CompanionChatError.failed.localizedDescription
+        }
+    }
+
+    private func prepareContext() throws -> CompanionContextPreview {
+        try CompanionContextPreview(history: sentMessages, draft: draft, attachments: attachments)
+    }
+
+    private func send(_ submission: CompanionContextPreview) {
+        messages.append(submission.displayMessage)
+        sentMessages = submission.messages
+        retryMessages = submission.messages
+        draft = ""; attachments = []
+        start(submission.prompt)
     }
 
     func retry() {
@@ -101,6 +138,7 @@ final class CompanionModel: NSObject, ObservableObject, NSSpeechSynthesizerDeleg
     }
 
     private func start(_ prompt: String) {
+        contextPreview = nil
         stopSpeech()
         let token = UUID()
         generation = token
@@ -158,6 +196,7 @@ final class CompanionModel: NSObject, ObservableObject, NSSpeechSynthesizerDeleg
     }
 
     func stop() {
+        contextPreview = nil
         generation = nil; task?.cancel(); task = nil; isRunning = false
         status = "Reply stopped"; error = retryMessages == nil ? nil : "Reply stopped. You can retry when ready."; stopSpeech()
     }
@@ -182,11 +221,12 @@ final class CompanionModel: NSObject, ObservableObject, NSSpeechSynthesizerDeleg
     func stopSpeech() { speech.stopSpeaking(); speaking = false }
     func setPanelVisible(_ visible: Bool) {
         panelVisible = visible
-        if !visible { dictation.stop(); stopSpeech() }
+        if !visible { contextPreview = nil; dictation.stop(); stopSpeech() }
     }
     func toggleCompact() { setCompact(!compact) }
     func setCompact(_ value: Bool) {
         guard compact != value else { return }
+        contextPreview = nil
         dictation.stop()
         onCompactWillChange?()
         compact = value
@@ -348,7 +388,7 @@ final class CompanionPanelController: NSWindowController, NSWindowDelegate {
         }
         model.onCompactChange = { [weak self] in self?.resizeForMode() }
         model.onClose = { [weak self] in self?.hide() }
-        panel.onCancel = { [weak self] in self?.hide() }
+        panel.onCancel = { [weak self] in self?.model.cancelOrClose() }
         screenObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
         ) { [weak self] _ in
@@ -494,7 +534,12 @@ private struct CompanionView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if model.compact {
+            if let preview = model.contextPreview {
+                CompanionContextPreviewView(preview: preview,
+                                            onBack: { model.dismissContextPreview() },
+                                            onSend: { model.sendContextPreview(id: preview.id) })
+                    .padding(.top, 18)
+            } else if model.compact {
                 HStack(spacing: 10) {
                     Image(systemName: "bubble.left.and.text.bubble.right").foregroundStyle(accent)
                     TextField("Ask something…", text: $model.draft)
@@ -534,7 +579,10 @@ private struct CompanionView: View {
         // safe-area handling stable avoids a final jump when chrome returns.
         .ignoresSafeArea()
         .tint(accent)
-        .onExitCommand { model.onClose?() }
+        .onExitCommand { model.cancelOrClose() }
+        .onChange(of: model.contextPreview?.id) { id in
+            if id == nil { model.requestComposerFocus() }
+        }
         .onChange(of: model.compact) { _ in composerFocused = true }
         .onChange(of: model.composerFocusRequest) { request in
             composerFocused = false
@@ -645,6 +693,9 @@ private struct CompanionView: View {
             TextField("Message Statelet…", text: $model.draft, axis: .vertical)
                 .lineLimit(2...5).textFieldStyle(.plain).font(.system(size: 13)).focused($composerFocused)
                 .accessibilityLabel("Message Statelet")
+            Button { model.showContextPreview() } label: { Label("Review context", systemImage: "doc.text.magnifyingglass") }
+                .font(.system(size: 11)).buttonStyle(.borderless).disabled(!model.canSend)
+                .help("Review the message, earlier conversation and full attached text before sending")
             HStack(spacing: 14) {
                 Button { attachText() } label: { Image(systemName: "paperclip") }
                     .disabled(model.attachments.count >= 2 || model.isRunning).help("Attach UTF-8 text (up to 16 KB each)").accessibilityLabel("Attach text")
