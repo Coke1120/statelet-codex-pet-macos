@@ -734,14 +734,14 @@ final class SettingsWindowControllerTests: XCTestCase {
         let cards = Self.descendants(of: window.contentView)
             .compactMap { $0 as? NSVisualEffectView }
             .filter { $0.identifier?.rawValue == "SettingsSectionCard" }
-        XCTAssertEqual(cards.count, 5)
+        XCTAssertEqual(cards.count, 6)
         XCTAssertTrue(cards.allSatisfy { $0.material == .contentBackground })
         XCTAssertTrue(cards.allSatisfy { $0.blendingMode == .withinWindow })
         XCTAssertTrue(cards.allSatisfy { ($0.layer?.cornerRadius ?? 0) >= 12 })
         XCTAssertTrue(cards.allSatisfy { $0.accessibilityRole() == .group })
         XCTAssertEqual(
             Set(cards.compactMap { $0.accessibilityLabel() }),
-            Set(["Startup", "Agent Source", "Pet Window", "Motion and Accessibility", "App and Local Data"])
+            Set(["Startup", "Agent Source", "Pet Window", "Companion Shortcut", "Motion and Accessibility", "App and Local Data"])
         )
         let startupCard = try XCTUnwrap(cards.first { $0.accessibilityLabel() == "Startup" })
         let agentSourceCard = try XCTUnwrap(cards.first { $0.accessibilityLabel() == "Agent Source" })

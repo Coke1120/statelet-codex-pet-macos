@@ -64,6 +64,15 @@ enum CompanionChatPolicy {
         "-c", "project_doc_max_bytes=0", "-c", "approval_policy=\"never\"", "-",
     ]
 
+    // Diagnostics derives its feature probe from the actual chat policy, so a
+    // future safety flag cannot silently disappear from compatibility checks.
+    static var disabledFeatures: [String] {
+        arguments.indices.compactMap { index in
+            arguments[index] == "--disable" && index + 1 < arguments.count ? arguments[index + 1] : nil
+        }
+    }
+    static var disabledFeatureArguments: [String] { disabledFeatures.flatMap { ["--disable", $0] } }
+
     static func prompt(messages: [CompanionMessage]) throws -> String {
         let turns = messages.map { ["role": $0.role.rawValue, "content": $0.text] }
         let data = try JSONSerialization.data(withJSONObject: turns, options: [.sortedKeys])

@@ -106,7 +106,8 @@ struct PetDiagnostics {
     /// Absolute home paths and free-form caller text are never emitted.
     func build(
         input: PetDiagnosticsInput,
-        startupStatus: LaunchAtLoginManager.Status? = nil
+        startupStatus: LaunchAtLoginManager.Status? = nil,
+        compatibility: CodexCompatibilitySnapshot = CodexCompatibilitySnapshot()
     ) -> String {
         let startup = startupStatus ?? launchAtLoginManager.status()
         let support = homeURL.appendingPathComponent(
@@ -159,6 +160,7 @@ struct PetDiagnostics {
             "storage.media_directory: \(directoryStatus(support.appendingPathComponent("media", isDirectory: true)))",
             "storage.logs_directory: \(directoryStatus(support.appendingPathComponent("logs", isDirectory: true)))",
         ]
+        lines += compatibility.diagnosticLines
         lines.append("note: report excludes paths, prompt/session content, logs, tool output, and account data")
         return lines.joined(separator: "\n")
     }

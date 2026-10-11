@@ -5,6 +5,60 @@ click the pet's chat button, or launch Statelet with `--companion`.
 The floating native panel puts quick chat, agent activity and character controls
 next to the desktop pet. It supports macOS 13 and later.
 
+## Global shortcut
+
+Press **Control–Option–Command–J** to open Companion and focus its chat composer.
+If it is already open behind another app, the shortcut brings it forward and
+focuses the composer. Press again while Companion is focused to hide it;
+**Escape** also closes it. Drafts, attachments and Mini mode remain in memory.
+Closing Companion stops dictation and speech, while an in-flight text reply can
+still finish for the next time you open it.
+
+Change the combination in **Settings → General → Companion Shortcut**. Choose
+a letter or Space and at least two of Control, Option and Command, then click
+**Apply Shortcut**. **Reset Shortcut** restores the default; **Disable Shortcut**
+removes its global registration. A detected collision with a system or another
+registered shortcut keeps the previous combination and preference. The current
+status indicates whether a shortcut is active or unavailable. The default avoids
+the official app's Option–Space shortcut and common system Space combinations.
+
+Companion uses current visible screen boundaries when opening or resizing and
+after displays change. A pet spanning displays uses the display with the most
+overlap; a removed display falls back to the nearest remaining one. The panel
+shrinks to fit small displays. No global input monitor or clipboard capture is
+used. Letter choices refer to US keyboard positions; other layouts can display
+different letters. Apps using other keyboard interception mechanisms may have
+conflicts that registration cannot detect. Real keyboard delivery, layout,
+Spaces/fullscreen focus and multiple monitors still require installed testing.
+
+## Compatibility health
+
+Open **Settings → Diagnostics & Repair** and choose **Refresh**, then optionally
+**Copy Diagnostics**. The report adds CLI installation/signature, parsed numeric
+version, exact Quick Chat flag parsing and recognized disabled features. These
+are offline checks without a model request. `0.159.2` is the validated baseline;
+an older or unfamiliar version gets an update/refresh recommendation without
+claiming an established earliest compatible release or weakening safety flags.
+
+The report checks the effective Codex hooks feature and the installed Statelet
+user hooks through the read-only `hooks/list` catalog. It distinguishes absent
+or incomplete registration, missing runtime, disabled hooks, definitions needing
+trust review, modified definitions and enabled/trusted readiness. Missing hooks
+suggest rerunning the Statelet installer; trust-related states direct you to
+Codex **`/hooks`** to review the exact definitions yourself. Inconclusive checks
+stay unverified. Statelet never enables a feature, trusts a hook or bypasses hook
+trust for you. A configured/trusted result does not verify live event delivery,
+project overrides, sign-in or authenticated Quick Chat.
+
+Only fixed categories, recommendations, a strictly parsed numeric version and
+bounded counts leave the check. Prompts, credentials, commands, hook keys/hashes,
+source paths, warnings and raw errors are discarded. Probes have bounded output
+and an eight-second total deadline; refreshing again or quitting cancels them.
+CLI syntax/features use a private scratch home. User-hook checks use the active
+Codex home in a scratch working directory and disable apps/plugins and telemetry
+only for that diagnostic invocation. No thread is started and no security/trust
+configuration is written.
+
 ## Chat
 
 - Send with **Command-Return**. Follow-ups include this conversation's previous

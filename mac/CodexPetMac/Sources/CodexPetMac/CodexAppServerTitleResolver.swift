@@ -399,7 +399,13 @@ enum CodexAppServerExecutableDiscovery {
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
         fileManager: FileManager = .default
     ) -> URL? {
-        let candidates = [
+        candidates(homeDirectory: homeDirectory).first {
+            isTrustedExecutable($0, policy: .openAISigned, fileManager: fileManager)
+        }
+    }
+
+    static func candidates(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) -> [URL] {
+        [
             URL(fileURLWithPath: "/Applications/ChatGPT.app/Contents/Resources/codex"),
             URL(fileURLWithPath: "/Applications/Codex.app/Contents/Resources/codex"),
             homeDirectory.appendingPathComponent("Applications/ChatGPT.app/Contents/Resources/codex"),
@@ -409,9 +415,6 @@ enum CodexAppServerExecutableDiscovery {
             URL(fileURLWithPath: "/opt/homebrew/bin/codex"),
             URL(fileURLWithPath: "/usr/local/bin/codex"),
         ]
-        return candidates.first {
-            isTrustedExecutable($0, policy: .openAISigned, fileManager: fileManager)
-        }
     }
 
     static func isTrustedExecutable(
