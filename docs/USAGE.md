@@ -6,6 +6,12 @@ appearance, diagnostics, troubleshooting, and local-data behavior.
 
 Install Statelet first by following [Deployment](DEPLOYMENT.md).
 
+For chat and agent activity, open **Companion…** from the menu bar; see the
+[Companion guide](COMPANION.md). In expanded Chat, **Open new task in Codex**
+opens a blank task for you to continue manually in the verified official app.
+It keeps your Statelet draft, attachments and unread items and sends no context.
+Voice or Computer Use, where available, are used in the official app.
+
 ## First run
 
 Statelet is a menu-bar accessory app and has no Dock icon. Open the Statelet
