@@ -14,6 +14,7 @@ final class AgentSourceModeStoreTests: XCTestCase {
         )
         XCTAssertEqual(store.load(), .combined)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        XCTAssertEqual(chmod(root.path, 0o700), 0)
         try Data(#"{"version":1,"mode":"invalid"}"#.utf8).write(to: store.url)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: store.url.path)
         XCTAssertEqual(store.load(), .combined)
@@ -26,6 +27,9 @@ final class AgentSourceModeStoreTests: XCTestCase {
         try Data(#"{"version":1.5,"mode":"grok"}"#.utf8).write(to: store.url)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: store.url.path)
         XCTAssertEqual(store.load(), .combined)
+        try Data(#"{"version":1,"mode":"grokbot"}"#.utf8).write(to: store.url)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: store.url.path)
+        XCTAssertEqual(store.load(), .grokbot)
     }
 
     func testSaveRoundTripsAndUsesPrivatePermissions() throws {
@@ -41,6 +45,12 @@ final class AgentSourceModeStoreTests: XCTestCase {
             return XCTFail("save failed with \(String(reflecting: error))")
         }
         XCTAssertEqual(store.load(), .grok)
+        do {
+            try store.save(.grokbot)
+        } catch {
+            return XCTFail("save failed with \(String(reflecting: error))")
+        }
+        XCTAssertEqual(store.load(), .grokbot)
         var fileStatus = stat()
         XCTAssertEqual(lstat(store.url.path, &fileStatus), 0)
         XCTAssertEqual(fileStatus.st_mode & 0o777, 0o600)

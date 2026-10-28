@@ -35,7 +35,7 @@ No animation media is bundled. Add at least one Idle clip:
 Restart Codex or Grok Build once if Statelet was installed while it was already running.
 
 In **Settings → General → Agent Source**, choose Combined (the default), Codex,
-or Grok. The choice changes the aggregate lifecycle and activity rail
+Grok, or Grok Bot. The choice changes the aggregate lifecycle and activity rail
 immediately without deleting the other provider's local records.
 
 Start a normal agent turn and confirm the state and activity rail respond. Add
@@ -51,8 +51,8 @@ voice setup and transitions are optional additions after this basic check.
 | Waiting | The selected agent needs input or permission |
 | Review | Tests, lint, type checks, compaction, or review work are active |
 
-Several selected Codex and Grok sessions can be active at once. Statelet selects
-the highest priority state:
+Several selected Codex or Grok sessions, plus coarse Grok Bot presence, can be
+active at once. Statelet selects the highest priority state:
 
 ```text
 waiting > review > running > idle
@@ -96,14 +96,22 @@ Grok Bot contributes only two states:
 There is no **Review** signal, and an unread bot is not treated as a successful
 completion. A long tool call that does not update the roster can briefly settle
 to Idle. A malformed newer roster can briefly fall back to an older snapshot, but
-never for more than 30 seconds. Grok Bot presence appears only while **Agent
-Source** is Combined; it does not add rows to the activity rail in this version.
+never for more than 30 seconds.
 
-The reader discards bot names, titles, descriptions, message previews,
-transcripts, avatars, repository paths, and raw bot IDs. It reads only a small
-text-free whitelist: the bot ID needed to compute an opaque hash, waiting and
-activity timestamps, and hidden/unread metadata. It never writes to the Grok Bot
-directory. To disable it, advanced users can remove `--grokbot` and its
+Grok Bot is included in **Combined** and can be selected alone with the
+**Grok Bot** source mode. Selecting **Codex** or **Grok** hides it. The same
+filter applies to the activity rail, where a bot can appear as a generic
+**Grok Bot · Waiting** or **Grok Bot · Running · Activity** row. No bot name,
+title, description, message preview, transcript, avatar, repository path, or raw
+bot ID is added to the rail. Unread and hidden rows do not become completed
+outcomes, and the rail never claims that a bot succeeded or failed. Grok Bot
+rows are informational and are never sent to Codex Desktop.
+
+The reader discards all of that private text. It reads only a small text-free
+whitelist: the bot ID needed to compute an opaque hash, waiting and activity
+timestamps, and hidden/unread metadata. It never writes to the Grok Bot
+directory. To disable it, select Codex or Grok as the Agent Source. Advanced
+users can instead remove `--grokbot` and its
 `--grokbot-persistence-dir` / `--grokbot-status-path` arguments from the
 aggregator LaunchAgent, then reload that job. See
 [Grok Bot presence](GROKBOT_PRESENCE.md) for the full contract.
@@ -123,20 +131,22 @@ read** to acknowledge one; acknowledgements persist locally and are pruned with
 the bounded activity history. **Open in Codex** opens a mapped local chat only
 when the owner-only activation sidecar and the verified ChatGPT desktop URL
 handler agree on a supported target. Opening a chat does not mark it as read.
-Legacy, missing, malformed, unverified, and Grok targets remain informational.
-Each row identifies its provider. **Open in Codex** and title hydration are
-available only to independently verified Codex targets; Grok IDs are never sent
-to the Codex Desktop activator or App Server. Labels are derived from safe
-lifecycle event categories and bounded start/completion times. When available,
-a bounded, sanitized Codex task title prefixes that generic label. Statelet does
-not read or display prompt, tool-output, preview,
+Legacy, missing, malformed, unverified, Grok, and Grok Bot rows remain
+informational. Each row identifies its provider. **Open in Codex** and title
+hydration are available only to independently verified Codex targets; Grok and
+Grok Bot IDs are never sent to the Codex Desktop activator or App Server.
+Labels are derived from safe lifecycle event categories and bounded
+start/completion times. Grok Bot rows use only the generic provider/state label.
+When available, a bounded, sanitized Codex task title prefixes that generic
+label. Statelet does not read or display prompt, tool-output, preview,
 turn, item, transcript-path, or repository-path response fields. A user-facing
 `thread.name` can contain wording selected or generated in Codex; Statelet bounds
 and normalizes it but does not infer or redact sensitive substrings. The
-activity sidecar is
-owner-only at
+activity sidecar is owner-only at
 `~/Library/Application Support/Statelet/sessions/activity-v1.json` and does not
-change the aggregate lifecycle state or animation priority.
+drive the aggregate lifecycle state or animation priority. It may contain
+generic active `grokbot` rows in Combined or Grok Bot mode; it never contains a
+bot name, title, preview, raw ID, or a synthetic completed/unread outcome.
 Each session shows its latest outcome, replaced when accepted new work begins.
 Read markers for new outcomes identify the result rather than the session, so
 reading one result does not hide a later result in the same session. Blocked

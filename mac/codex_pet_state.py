@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 VALID_STATES = ("idle", "running", "waiting", "review")
 VALID_PROVIDERS = ("codex", "grok")
-VALID_AGENT_SOURCE_MODES = ("combined", "codex", "grok")
+VALID_AGENT_SOURCE_MODES = ("combined", "codex", "grok", "grokbot")
 VALID_EVENTS = frozenset(
     (
         "SessionStart",

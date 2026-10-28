@@ -812,7 +812,7 @@ private struct CompanionView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Image(systemName: "checkmark.circle").font(.system(size: 28)).foregroundStyle(accent)
                         Text(model.activeFilter == "Needs you" ? "Nothing needs your attention" : "A quiet moment").font(.headline)
-                        Text("Codex and Grok activity appears here when Statelet receives their lifecycle events.").font(.system(size: 12)).foregroundStyle(.secondary)
+                        Text("Codex and Grok lifecycle activity and coarse Grok Bot presence appear here when the selected source reports them.").font(.system(size: 12)).foregroundStyle(.secondary)
                     }.padding(.vertical, 20)
                 }
                 Text("Open a task in its agent app to reply, review permissions, or stop its work.")

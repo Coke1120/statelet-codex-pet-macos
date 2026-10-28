@@ -127,11 +127,13 @@ public enum SessionActivityCategory: String, Codable, Equatable, Sendable {
 public enum AgentProvider: String, Codable, CaseIterable, Equatable, Sendable {
     case codex
     case grok
+    case grokbot
 
     public var displayName: String {
         switch self {
         case .codex: return "Codex"
         case .grok: return "Grok"
+        case .grokbot: return "Grok Bot"
         }
     }
 }
@@ -140,12 +142,14 @@ public enum AgentSourceMode: String, Codable, CaseIterable, Equatable, Sendable 
     case combined
     case codex
     case grok
+    case grokbot
 
     public var displayName: String {
         switch self {
         case .combined: return "Combined"
         case .codex: return "Codex"
         case .grok: return "Grok"
+        case .grokbot: return "Grok Bot"
         }
     }
 }
@@ -375,10 +379,11 @@ public enum SessionTurnOutcome: String, Codable, Equatable, Sendable {
     }
 }
 
-/// A bounded, privacy-safe view of the individual Codex sessions used by the
-/// optional activity rail. The identifier is the 24-hex truncated hash already
-/// used for owner-only hook record filenames; prompts and transcript metadata
-/// never cross this contract boundary.
+/// A bounded, privacy-safe view of the individual agent sessions and coarse
+/// Grok Bot presence used by the optional activity rail. The identifier is the
+/// 24-hex truncated hash already used for owner-only hook record filenames, or
+/// an opaque Grok Bot hash; prompts, titles, and transcript metadata never cross
+/// this contract boundary.
 public struct SessionActivityItem: Codable, Equatable, Sendable {
     public static let maximumIdentifierLength = 24
 

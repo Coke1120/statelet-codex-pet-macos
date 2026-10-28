@@ -1887,10 +1887,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         agentSourceControl.selectedSegment = 0
         agentSourceControl.setAccessibilityLabel("Agent Source")
         agentSourceControl.setAccessibilityHelp(
-            "Choose whether Statelet reflects Codex, Grok, or both local agent activity sources."
+            "Choose whether Statelet reflects Codex, Grok, Grok Bot, or all local agent activity sources."
         )
         let agentSourceHelp = NSTextField(
-            wrappingLabelWithString: "Combined reflects local Codex and Grok lifecycle events. Codex and Grok limit the pet and activity popup to that source. Statelet stores only privacy-safe state, timing, event category, and hashed session identifiers."
+            wrappingLabelWithString: "Combined reflects local Codex and Grok lifecycle events plus coarse Grok Bot presence. Each single-source choice limits the pet and activity popup to that source. Statelet stores only privacy-safe state, timing, event category, and opaque hashed identifiers."
         )
         agentSourceHelp.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         agentSourceHelp.textColor = .secondaryLabelColor

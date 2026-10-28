@@ -418,12 +418,21 @@ final class CodexPetCoreTests: XCTestCase {
         XCTAssertTrue(decoded.completed[0].terminal)
     }
 
-    func testSessionActivityDecodesExplicitGrokProviderAndAgentSourceModes() throws {
+    func testSessionActivityDecodesExplicitGrokAndGrokBotProvidersAndAgentSourceModes() throws {
         let json = #"{"version":1,"schema_version":1,"emitted_at":20,"active":[{"id":"aaaaaaaaaaaaaaaaaaaaaaaa","state":"running","event":"UserPromptSubmit","event_at":10,"provider":"grok","terminal":false}],"completed":[]}"#.data(using: .utf8)!
         let decoded = try JSONDecoder.codexPet.decode(SessionActivitySnapshot.self, from: json)
         XCTAssertEqual(decoded.active.first?.provider, .grok)
         XCTAssertEqual(AgentProvider.grok.displayName, "Grok")
-        XCTAssertEqual(AgentSourceMode.allCases, [.combined, .codex, .grok])
+        XCTAssertEqual(AgentSourceMode.allCases, [.combined, .codex, .grok, .grokbot])
+
+        let grokBotJSON = #"{"version":1,"schema_version":1,"emitted_at":20,"active":[{"id":"bbbbbbbbbbbbbbbbbbbbbbbb","state":"waiting","event":"unknown","event_at":11,"started_at":11,"category":"activity","provider":"grokbot","terminal":false}],"completed":[]}"#.data(using: .utf8)!
+        let grokBot = try JSONDecoder.codexPet.decode(SessionActivitySnapshot.self, from: grokBotJSON)
+        XCTAssertEqual(grokBot.active.first?.provider, .grokbot)
+        XCTAssertEqual(grokBot.active.first?.state, .waiting)
+        XCTAssertEqual(grokBot.active.first?.event, .unknown)
+        XCTAssertEqual(grokBot.active.first?.category, .activity)
+        XCTAssertEqual(AgentProvider.grokbot.displayName, "Grok Bot")
+        XCTAssertEqual(AgentSourceMode.grokbot.displayName, "Grok Bot")
     }
 
     func testSessionActivityDecodesRunningNonterminalGrokStopForBackgroundTasksOnly() throws {

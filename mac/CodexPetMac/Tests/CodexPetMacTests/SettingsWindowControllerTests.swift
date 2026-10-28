@@ -944,12 +944,14 @@ final class SettingsWindowControllerTests: XCTestCase {
             }
         )
         XCTAssertEqual(control.selectedSegment, 2)
+        XCTAssertEqual(control.segmentCount, 4)
         XCTAssertEqual(control.label(forSegment: 0), "Combined")
         XCTAssertEqual(control.label(forSegment: 1), "Codex")
         XCTAssertEqual(control.label(forSegment: 2), "Grok")
-        control.selectedSegment = 1
+        XCTAssertEqual(control.label(forSegment: 3), "Grok Bot")
+        control.selectedSegment = 3
         NSApp.sendAction(try XCTUnwrap(control.action), to: control.target, from: control)
-        XCTAssertEqual(selected, .codex)
+        XCTAssertEqual(selected, .grokbot)
     }
 
     @MainActor

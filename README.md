@@ -84,7 +84,7 @@ public-distribution boundary, read [Deployment](docs/DEPLOYMENT.md).
 ## First run
 
 1. Open the Statelet menu-bar icon and choose **Settings…** (`Command-,`).
-2. In **General**, keep **Agent Source** on Combined or choose Codex or Grok.
+2. In **General**, keep **Agent Source** on Combined or choose Codex, Grok, or Grok Bot.
 3. Open **Animations** and select **Idle**.
 4. Choose the import path for your authorized media:
    - For an MP4, drag it onto the Idle drop zone or choose
@@ -113,9 +113,11 @@ earlier results.
 - Aggregates simultaneous Codex and Grok Build sessions with
   `waiting > review > running > idle` priority.
 - Provides **Settings → General → Agent Source** modes for Combined (default),
-  Codex-only, or Grok-only activity without deleting hidden-provider records.
-- Shows active sessions and completed-unread sessions in a compact rail beside
-  the pet with provider labels, without reading prompt, turn, or transcript fields.
+  Codex-only, Grok-only, or Grok Bot-only activity without deleting
+  hidden-provider records.
+- Shows active sessions, coarse Grok Bot presence, and completed-unread
+  sessions in a compact rail beside the pet with provider labels, without
+  reading prompt, turn, transcript, or bot-name fields.
 - Provides a movable, border-and-corner-resizable transparent AppKit panel.
 - Keeps recovery controls in the menu bar when the panel is click-through.
 - Keeps several named characters in one local library and switches each
@@ -175,19 +177,24 @@ not store prompts, tool output, transcript paths, or working directories in
 those records.
 
 The optional `sessions/activity-v1.json` sidecar contains only bounded active
-and completed-session summaries keyed by those opaque hashes. Each entry carries
-safe provider/lifecycle/category labels plus bounded start, last-event, and
-completion timestamps. Statelet uses it to show the activity rail beside the pet;
-completed entries remain unread until the user explicitly marks them as read,
-and acknowledgement state stays local and owner-only.
+and completed-session summaries keyed by those opaque hashes, plus generic
+active Grok Bot presence rows. Each entry carries safe
+provider/lifecycle/category labels plus bounded start, last-event, and
+completion timestamps. Grok Bot rows never enter the completed group and never
+carry a bot name, title, preview, or unread completion. Statelet uses the
+sidecar to show the activity rail beside the pet; completed entries remain
+unread until the user explicitly marks them as read, and acknowledgement state
+stays local and owner-only.
 
 When Codex supplies a supported technical thread identifier, Statelet keeps the
 hash-to-thread mapping in the separate owner-only
 `sessions/activity-targets-v1.json` sidecar. The public activity projection
-remains identifier-free. A verified ChatGPT desktop handler can then open the
-matching local chat through the documented `codex://threads/<thread-id>` link;
-legacy, unmapped, and Grok rows remain informational. Grok activity is never
-passed to the Codex Desktop activator or local Codex App Server.
+remains free of raw identifiers. A verified ChatGPT desktop handler can then
+open the matching local chat through the documented
+`codex://threads/<thread-id>` link;
+legacy, unmapped, Grok, and Grok Bot rows remain informational. Grok and Grok
+Bot activity is never passed to the Codex Desktop activator or local Codex App
+Server.
 
 For a mapped active or completed row, the signed app can invoke the local Codex
 App Server and issue `thread/read` with `includeTurns: false`. Statelet accepts

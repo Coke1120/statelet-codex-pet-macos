@@ -244,6 +244,121 @@ class GrokBotRosterReaderTests(unittest.TestCase):
         )
         self.assertEqual(source.poll(200.0, 0.0), [])
 
+    def test_activity_items_are_generic_stable_and_text_free(self):
+        now = 1_700_000_100.0
+        waiting_hash = grokbot.session_identifier("bot-private-1")
+        running_hash = grokbot.session_identifier("recent")
+        write_roster(
+            self.persistence,
+            [
+                bot_row("bot-private-1", awaiting={"prompt": "private prompt"}),
+                bot_row(
+                    "recent",
+                    last_activity=int((now - 30.0) * 1000),
+                ),
+                bot_row("hidden", awaiting={}, hidden=True),
+                bot_row("unread", unread=True, unread_count=1),
+                bot_row(
+                    "old",
+                    local_activity=int((now - 300.0) * 1000),
+                ),
+            ],
+        )
+        write_status(self.status, os.getpid())
+        source = grokbot.GrokBotRosterSource(
+            self.persistence,
+            self.status,
+            poll_interval=1.0,
+            process_alive=lambda _pid: True,
+        )
+
+        source.poll(now, 0.0)
+        self.assertEqual(
+            source.activity_items(),
+            [
+                {
+                    "id": waiting_hash,
+                    "state": "waiting",
+                    "started_at": now,
+                    "event_at": now,
+                },
+                {
+                    "id": running_hash,
+                    "state": "running",
+                    "started_at": now - 30.0,
+                    "event_at": now - 30.0,
+                },
+            ],
+        )
+        serialized = json.dumps(source.activity_items())
+        for private in (
+            "bot-private-1",
+            "Private Bot Name",
+            "Private Bot Title",
+            "Private Bot Description",
+            "/private/repository",
+            "private-avatar-photo",
+            "private prompt",
+        ):
+            self.assertNotIn(private, serialized)
+
+        write_roster(
+            self.persistence,
+            [
+                bot_row("bot-private-1", awaiting={}),
+                bot_row(
+                    "recent",
+                    last_activity=int((now - 5.0) * 1000),
+                ),
+            ],
+        )
+        source.poll(now + 1.0, 1.0)
+        self.assertEqual(
+            source.activity_items(),
+            [
+                {
+                    "id": waiting_hash,
+                    "state": "waiting",
+                    "started_at": now,
+                    "event_at": now,
+                },
+                {
+                    "id": running_hash,
+                    "state": "running",
+                    "started_at": now - 30.0,
+                    "event_at": now - 5.0,
+                },
+            ],
+        )
+
+        write_roster(
+            self.persistence,
+            [bot_row("bot-private-1", awaiting={}, hidden=True)],
+        )
+        source.poll(now + 2.0, 2.0)
+        self.assertEqual(source.activity_items(), [])
+
+    def test_activity_items_require_an_including_source_mode(self):
+        write_roster(self.persistence, [bot_row(awaiting={})])
+        write_status(self.status, os.getpid())
+        source = grokbot.GrokBotRosterSource(
+            self.persistence,
+            self.status,
+            poll_interval=1.0,
+            process_alive=lambda _pid: True,
+        )
+
+        self.assertEqual(source.poll(200.0, 0.0, "combined"), [("waiting", 200.0)])
+        self.assertEqual(len(source.activity_items()), 1)
+        self.assertEqual(source.poll(201.0, 1.0, "codex"), [])
+        self.assertEqual(source.activity_items(), [])
+        self.assertEqual(source.poll(202.0, 2.0, "grokbot"), [("waiting", 200.0)])
+        self.assertEqual(len(source.activity_items()), 1)
+        self.assertEqual(source.poll(203.0, 3.0, "grok"), [])
+        self.assertEqual(source.activity_items(), [])
+        self.assertEqual(source.poll(204.0, 4.0, "combined"), [("waiting", 200.0)])
+        self.assertEqual(len(source.activity_items()), 1)
+
     def test_source_mode_switch_repolls_immediately(self):
         write_roster(self.persistence, [bot_row(awaiting={})])
         write_status(self.status, os.getpid())
@@ -257,6 +372,9 @@ class GrokBotRosterReaderTests(unittest.TestCase):
         self.assertEqual(source.poll(200.0, 0.0, "combined"), [("waiting", 200.0)])
         self.assertEqual(source.poll(201.0, 1.0, "codex"), [])
         self.assertEqual(source.poll(202.0, 2.0, "combined"), [("waiting", 200.0)])
+        self.assertEqual(source.poll(204.0, 4.0, "grokbot"), [("waiting", 200.0)])
+        self.assertEqual(source.poll(205.0, 5.0, "grok"), [])
+        self.assertEqual(source.poll(206.0, 6.0, "grokbot"), [("waiting", 200.0)])
 
     def test_unsupported_schema_fails_closed_and_recovers(self):
         write_roster(self.persistence, [bot_row(awaiting={})], schema=5)
@@ -428,6 +546,152 @@ class GrokBotRosterReaderTests(unittest.TestCase):
         self.assertEqual(diagnostics, [])
 
 
+class GrokBotActivityMergeTests(unittest.TestCase):
+    def setUp(self):
+        self.hook_id = "1" * 24
+        self.roster_id = "2" * 24
+        self.snapshot = {
+            "version": 1,
+            "emitted_at": 100.0,
+            "active": [
+                {
+                    "id": self.hook_id,
+                    "state": "running",
+                    "event": "UserPromptSubmit",
+                    "event_at": 95.0,
+                    "started_at": 90.0,
+                    "completed_at": None,
+                    "category": "codex",
+                    "provider": "codex",
+                    "terminal": False,
+                }
+            ],
+            "completed": [],
+        }
+        self.items = [
+            {
+                "id": self.roster_id,
+                "state": "waiting",
+                "started_at": 99.0,
+                "event_at": 99.0,
+            }
+        ]
+
+    def test_merge_only_adds_rows_for_including_source_modes(self):
+        self.assertEqual(
+            aggregator.merge_grokbot_activity(
+                self.snapshot, self.items, "codex"
+            ),
+            self.snapshot,
+        )
+        self.assertEqual(
+            aggregator.merge_grokbot_activity(
+                self.snapshot, self.items, "grok"
+            ),
+            self.snapshot,
+        )
+        for mode in ("combined", "grokbot"):
+            merged = aggregator.merge_grokbot_activity(
+                self.snapshot, self.items, mode
+            )
+            self.assertEqual(
+                [item["state"] for item in merged["active"]],
+                ["waiting", "running"],
+            )
+            self.assertEqual(
+                merged["active"][0],
+                {
+                    "id": self.roster_id,
+                    "state": "waiting",
+                    "event": "unknown",
+                    "event_at": 99.0,
+                    "started_at": 99.0,
+                    "completed_at": None,
+                    "category": "activity",
+                    "provider": "grokbot",
+                    "terminal": False,
+                },
+            )
+
+    def test_merge_rejects_collisions_invalid_items_and_preserves_hook_rows(self):
+        self.snapshot["completed"] = [
+            {
+                "id": "3" * 24,
+                "state": "idle",
+                "event": "SessionEnd",
+                "event_at": 90.0,
+                "terminal": True,
+            }
+        ]
+        collision = dict(self.items[0], id=self.hook_id)
+        completed_collision = dict(self.items[0], id="3" * 24)
+        invalid = [
+            dict(self.items[0], id="BAD"),
+            dict(self.items[0], state="idle"),
+            dict(self.items[0], started_at=100.0, event_at=99.0),
+            dict(self.items[0], event_at=float("nan")),
+            dict(self.items[0], started_at=True),
+            "not-a-dict",
+        ]
+        merged = aggregator.merge_grokbot_activity(
+            self.snapshot,
+            [collision, completed_collision] + invalid,
+            "combined",
+        )
+        self.assertEqual(
+            [item["id"] for item in merged["active"]],
+            [self.hook_id],
+        )
+
+    def test_merge_bounds_rows_after_existing_hook_entries(self):
+        self.snapshot["active"] = [
+            {
+                "id": f"{index:024x}",
+                "state": "running",
+                "event": "UserPromptSubmit",
+                "event_at": 90.0,
+                "terminal": False,
+            }
+            for index in range(aggregator.MAX_ACTIVITY_ENTRIES - 1)
+        ]
+        merged = aggregator.merge_grokbot_activity(
+            self.snapshot,
+            self.items + [dict(self.items[0], id="4" * 24)],
+            "combined",
+        )
+        self.assertEqual(len(merged["active"]), aggregator.MAX_ACTIVITY_ENTRIES)
+        self.assertEqual(merged["active"][0]["id"], self.roster_id)
+        self.assertNotIn(
+            "4" * 24,
+            {item["id"] for item in merged["active"]},
+        )
+
+    def test_merge_serializes_only_the_generic_presence_projection(self):
+        items = [
+            dict(
+                self.items[0],
+                name="Private Bot Name",
+                title="Private Bot Title",
+                lastEntry="private prompt",
+                path="/private/repository",
+            )
+        ]
+        merged = aggregator.merge_grokbot_activity(
+            self.snapshot,
+            items,
+            "combined",
+        )
+        serialized = json.dumps(merged)
+        for private in (
+            "Private Bot Name",
+            "Private Bot Title",
+            "private prompt",
+            "/private/repository",
+        ):
+            self.assertNotIn(private, serialized)
+        self.assertNotIn("grokbot:", serialized)
+
+
 class GrokBotAggregatorIntegrationTests(unittest.TestCase):
     def test_grokbot_diagnostic_printer_is_path_free_and_allowlisted(self):
         stderr = io.StringIO()
@@ -534,7 +798,9 @@ class GrokBotAggregatorIntegrationTests(unittest.TestCase):
             2.0,
         )
 
-    def test_run_publishes_roster_state_without_activity_sidecar_entry(self):
+    def test_run_publishes_roster_state_and_generic_activity_entry(self):
+        identifier = "a" * 24
+
         class FakeSource:
             def __init__(self):
                 self.calls = []
@@ -542,6 +808,16 @@ class GrokBotAggregatorIntegrationTests(unittest.TestCase):
             def poll(self, now, monotonic_now, source_mode):
                 self.calls.append((now, monotonic_now, source_mode))
                 return [("waiting", 99.0)]
+
+            def activity_items(self):
+                return [
+                    {
+                        "id": identifier,
+                        "state": "waiting",
+                        "started_at": 99.0,
+                        "event_at": 99.0,
+                    }
+                ]
 
             def next_deadline(self, monotonic_now):
                 return monotonic_now + 2.0
@@ -576,7 +852,22 @@ class GrokBotAggregatorIntegrationTests(unittest.TestCase):
         self.assertEqual(lifecycle["state"], "waiting")
         self.assertEqual(lifecycle["active_sessions"], 1)
         self.assertEqual(lifecycle["source_updated_at"], 99.0)
-        self.assertEqual(activity["active"], [])
+        self.assertEqual(
+            activity["active"],
+            [
+                {
+                    "id": identifier,
+                    "state": "waiting",
+                    "event": "unknown",
+                    "event_at": 99.0,
+                    "started_at": 99.0,
+                    "completed_at": None,
+                    "category": "activity",
+                    "provider": "grokbot",
+                    "terminal": False,
+                }
+            ],
+        )
         self.assertEqual(source.calls, [(100.0, 50.0, "combined")])
 
 

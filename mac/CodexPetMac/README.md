@@ -475,12 +475,12 @@ sidebar. Settings → Appearance owns the dialogue-bubble contrast controls and
 the activity-popup background/opacity controls; Settings → General and Help & Updates
 show the same managed-media location with an **Open in Finder** action. The
 General pane also provides an **Agent Source** selector for Combined (default),
-Codex, or Grok aggregation without deleting hidden-provider records. The
-activity popup is draggable when click-through is disabled and remembers its
+Codex, Grok, or Grok Bot aggregation without deleting records from hidden hook providers.
+The activity popup is draggable when click-through is disabled and remembers its
 position. Rows with a fresh owner-only target expose **Open in Codex** through
 OpenAI's documented `codex://threads/<thread-id>` link; legacy or unverified
-targets and all Grok rows remain informational, and opening never marks a
-completed row as read.
+targets, Grok rows, and generic Grok Bot presence rows remain informational, and
+opening never marks a completed row as read.
 Rows can also show a bounded, sanitized user-facing task title resolved in
 memory through the experimental local Codex App Server. Missing titles keep the
 generic lifecycle label and do not affect **Open in Codex**.
@@ -535,7 +535,10 @@ The activity rail reads the bounded, owner-only companion sidecar:
 ~/Library/Application Support/Statelet/sessions/activity-v1.json
 ```
 
-The optional activation bridge is stored separately so the activity projection
+The sidecar can contain Codex/Grok hook rows and generic active `grokbot` rows
+with only an opaque hash, coarse Waiting/Running state, and bounded timestamps.
+It never contains a Grok Bot name, title, preview, or raw identifier. The
+optional activation bridge is stored separately so the activity projection
 continues to contain no raw session identifiers:
 
 ```text
@@ -546,6 +549,7 @@ The complete serial-free state path is:
 
 ```text
 Codex lifecycle hooks + Grok Build global hooks
+  + optional read-only Grok Bot roster presence
   -> per-session JSON in Application Support
   -> board-independent priority aggregator
   -> runtime/current_state.json
@@ -564,11 +568,12 @@ turn/tool correlation IDs with closed event phases. It excludes
 prompts, tool output, transcript paths, and working directories.
 Correlation metadata stays inside the owner-only session record and is never
 forwarded into `current_state.json` or diagnostics.
-The activity sidecar exposes only bounded active/completed summaries keyed by
-the same opaque filename hash, with safe event categories and start/event/
-completion timestamps. Completed items remain unread until the user explicitly
-acknowledges them in the rail; no prompt, transcript, repository, media, voice,
-or credential data is included.
+The activity sidecar exposes only bounded active/completed hook-session
+summaries keyed by the same opaque filename hash, plus generic active Grok Bot
+presence rows keyed by opaque bot hashes, with safe event categories and
+start/event/completion timestamps. Completed items remain unread until the user
+explicitly acknowledges them in the rail; no prompt, transcript, repository,
+media, voice, or credential data is included.
 The separate owner-only activation sidecar contains only the opaque hash and a
 bounded technical thread identifier needed for the supported desktop deep link.
 It is optional, freshness-matched to the public sidecar, and never changes
@@ -603,8 +608,10 @@ current stable hook baseline relies on `idle_prompt` after cancellation. Active
 `backgroundTasks` keep Running. A blocked Stop may be
 revived by newer correlated work and later settled again; stale callbacks and
 child envelopes carrying `subagentType` cannot replace the host projection.
-`sessions/agent-source-v1.json` selects `combined`, `codex`, or `grok` without
-deleting records from the hidden provider.
+`sessions/agent-source-v1.json` selects `combined`, `codex`, `grok`, or
+`grokbot` without deleting records from the hidden hook provider. Combined also
+includes generic active Grok Bot rail rows; the Grok Bot mode excludes hook
+sessions.
 
 Nonterminal session records remain active for 900 seconds, except a
 `PostToolUse` record, which has a 30-second quiescent grace period when Desktop

@@ -10,6 +10,11 @@ subset needed for Statelet's existing lifecycle states:
     recent lastActivityAt/localActivityAt -> running
     otherwise                             -> no contribution
 
+The same projected presence can be surfaced as generic activity-rail rows.  The
+rail receives only the opaque bot hash, the coarse state, and the stable start /
+latest-activity timestamps.  It never receives a bot name, title, preview, or
+raw identifier.
+
 Bot names, titles, descriptions, message previews, avatars, repository paths,
 and raw bot identifiers never cross this parser boundary.  The source is
 read-only, local-only, and best-effort: an error must never prevent the
@@ -453,6 +458,7 @@ class GrokBotRosterSource:
         self._next_poll_at = 0.0
         self._last_source_mode: Optional[str] = None
         self._last_active: List[Tuple[str, float]] = []
+        self._activity_items: List[Dict[str, object]] = []
         self._rows: List[Dict[str, object]] = []
         self._rows_signature: Optional[RosterSignature] = None
         self._rows_loaded_monotonic = 0.0
@@ -460,6 +466,7 @@ class GrokBotRosterSource:
         self._rows_fallback = False
         self._fallback_since: Optional[float] = None
         self._waiting_since: Dict[str, float] = {}
+        self._running_since: Dict[str, float] = {}
         self._degraded = False
         self._last_reason: Optional[str] = None
         self._next_diagnostic_at = 0.0
@@ -482,14 +489,31 @@ class GrokBotRosterSource:
             # A presence source must never take down hook aggregation.  Retry
             # after a bounded cooldown rather than reproducing the same failure
             # every 250 ms.
-            self._last_active = []
-            self._waiting_since.clear()
+            self._clear_presence()
             self._next_poll_at = monotonic_now + DISABLED_RECHECK_INTERVAL
             self._mark_degraded("internal_error", monotonic_now)
             return []
 
     def next_deadline(self, monotonic_now: float) -> float:
         return max(monotonic_now, self._next_poll_at)
+
+    def activity_items(self) -> List[Dict[str, object]]:
+        """Return the current generic activity-rail rows.
+
+        The rows contain only an opaque 24-hex bot hash, the coarse Waiting or
+        Running state, and bounded timestamps.  They intentionally contain no
+        bot name, title, preview, repository path, or raw identifier.
+        """
+        return [dict(item) for item in self._activity_items]
+
+    def _clear_projection(self) -> None:
+        self._last_active = []
+        self._activity_items = []
+
+    def _clear_presence(self) -> None:
+        self._clear_projection()
+        self._waiting_since.clear()
+        self._running_since.clear()
 
     def _drop_cached_rows(self) -> None:
         # Keep _fallback_since as an expired marker so a persistent malformed
@@ -498,8 +522,7 @@ class GrokBotRosterSource:
         self._rows_signature = None
         self._rows_valid = False
         self._rows_fallback = False
-        self._last_active = []
-        self._waiting_since.clear()
+        self._clear_presence()
 
     def _poll(
         self,
@@ -507,19 +530,19 @@ class GrokBotRosterSource:
         monotonic_now: float,
         source_mode: str,
     ) -> List[Tuple[str, float]]:
-        if source_mode != "combined":
-            self._last_active = []
+        if source_mode not in ("combined", "grokbot"):
+            # Keep the stable waiting/running start timestamps for an immediate
+            # switch back, but remove this source's visible contribution now.
+            self._clear_projection()
             self._next_poll_at = monotonic_now + DISABLED_RECHECK_INTERVAL
             return []
         if not self.persistence_dir.is_dir():
-            self._last_active = []
-            self._waiting_since.clear()
+            self._clear_presence()
             self._next_poll_at = monotonic_now + DISABLED_RECHECK_INTERVAL
             return []
         pid = _read_status_pid(self.status_path)
         if pid is None or not self._process_alive(pid):
-            self._last_active = []
-            self._waiting_since.clear()
+            self._clear_presence()
             self._next_poll_at = monotonic_now + NOT_RUNNING_RECHECK_INTERVAL
             return []
         try:
@@ -595,39 +618,78 @@ class GrokBotRosterSource:
         now: float,
     ) -> List[Tuple[str, float]]:
         active: List[Tuple[str, float]] = []
+        self._activity_items = []
         seen = set()
+        running_active = set()
         for row in rows:
             identifier = row.get("id_hash")
-            if not isinstance(identifier, str):
+            if not isinstance(identifier, str) or identifier in seen:
                 continue
             seen.add(identifier)
             if row.get("hidden") is True:
                 self._waiting_since.pop(identifier, None)
+                self._running_since.pop(identifier, None)
                 continue
             if row.get("awaiting") is True:
+                self._running_since.pop(identifier, None)
                 since = self._waiting_since.get(identifier)
                 if since is None:
                     since = now
                     self._waiting_since[identifier] = since
                 active.append(("waiting", since))
+                self._activity_items.append(
+                    {
+                        "id": identifier,
+                        "state": "waiting",
+                        "started_at": since,
+                        "event_at": since,
+                    }
+                )
                 continue
             self._waiting_since.pop(identifier, None)
             activity_at = row.get("activity_at")
             if isinstance(activity_at, bool) or not isinstance(
                 activity_at, (int, float)
             ):
+                self._running_since.pop(identifier, None)
                 continue
             timestamp = float(activity_at)
-            if (
+            if not (
                 math.isfinite(timestamp)
                 and 0 <= now - timestamp <= self.active_window
             ):
-                active.append(("running", timestamp))
+                self._running_since.pop(identifier, None)
+                continue
+            running_since = self._running_since.get(identifier)
+            if running_since is None:
+                running_since = timestamp
+            else:
+                # Keep the rail row stable across poll ticks while preserving
+                # the activity item contract's started_at <= event_at rule even
+                # if the system clock moves backwards.
+                running_since = min(running_since, timestamp)
+            self._running_since[identifier] = running_since
+            running_active.add(identifier)
+            active.append(("running", timestamp))
+            self._activity_items.append(
+                {
+                    "id": identifier,
+                    "state": "running",
+                    "started_at": running_since,
+                    "event_at": timestamp,
+                }
+            )
         if self._waiting_since:
             self._waiting_since = {
                 identifier: timestamp
                 for identifier, timestamp in self._waiting_since.items()
                 if identifier in seen
+            }
+        if self._running_since:
+            self._running_since = {
+                identifier: timestamp
+                for identifier, timestamp in self._running_since.items()
+                if identifier in running_active
             }
         return active
 

@@ -23,6 +23,7 @@ if str(MAC_DIR) not in sys.path:
 try:
     from statelet_state import (  # type: ignore[import-not-found]  # noqa: E402
         DEFAULT_ACTIVE_TTL,
+        MAX_ACTIVITY_ENTRIES,
         STATE_PRIORITY,
         VALID_EVENTS,
         VALID_REJECTION_REASONS,
@@ -43,6 +44,7 @@ except ModuleNotFoundError as error:
     # canonical module name above.
     from codex_pet_state import (  # noqa: E402
         DEFAULT_ACTIVE_TTL,
+        MAX_ACTIVITY_ENTRIES,
         STATE_PRIORITY,
         VALID_EVENTS,
         VALID_REJECTION_REASONS,
@@ -316,6 +318,116 @@ def atomic_write_session_activity(
                 pass
         os.close(directory_fd)
     return record
+
+
+GROKBOT_ACTIVITY_PROVIDER = "grokbot"
+GROKBOT_ACTIVITY_ID_PATTERN = re.compile(r"^[0-9a-f]{24}$")
+
+
+def _activity_sort_key(item: object) -> Tuple[int, float, str]:
+    if not isinstance(item, dict):
+        return (0, 0.0, "")
+    state = item.get("state")
+    priority = STATE_PRIORITY.get(state, 0) if isinstance(state, str) else 0
+    raw_event_at = item.get("event_at")
+    timestamp = 0.0
+    if isinstance(raw_event_at, (int, float)) and not isinstance(
+        raw_event_at, bool
+    ):
+        try:
+            parsed = float(raw_event_at)
+        except (TypeError, ValueError, OverflowError):
+            parsed = 0.0
+        if math.isfinite(parsed):
+            timestamp = parsed
+    identifier = item.get("id")
+    return (
+        -priority,
+        -timestamp,
+        identifier if isinstance(identifier, str) else "",
+    )
+
+
+def merge_grokbot_activity(
+    snapshot: Dict[str, object],
+    presence_items: Iterable[Dict[str, object]],
+    source_mode: str,
+) -> Dict[str, object]:
+    """Merge coarse Grok Bot presence into the existing activity projection.
+
+    Only generic active rows are emitted.  There is deliberately no completed or
+    unread outcome, so a roster unread flag cannot masquerade as a successful
+    turn.  Hook rows win identifier collisions and the bounded 64-row cap; a
+    malformed presence item is dropped rather than making the whole sidecar
+    unreadable.
+    """
+    if source_mode not in ("combined", GROKBOT_ACTIVITY_PROVIDER):
+        return snapshot
+    active = snapshot.get("active")
+    if not isinstance(active, list):
+        return snapshot
+    existing_ids = set()
+    for group_name in ("active", "completed", "outcomes"):
+        group = snapshot.get(group_name, [])
+        if not isinstance(group, list):
+            continue
+        for item in group:
+            if isinstance(item, dict) and isinstance(item.get("id"), str):
+                existing_ids.add(item["id"])
+    merged = list(active)
+    remaining = max(0, MAX_ACTIVITY_ENTRIES - len(merged))
+    for item in presence_items:
+        if remaining <= 0:
+            break
+        if not isinstance(item, dict):
+            continue
+        identifier = item.get("id")
+        state = item.get("state")
+        started_at = item.get("started_at")
+        event_at = item.get("event_at")
+        if (
+            not isinstance(identifier, str)
+            or GROKBOT_ACTIVITY_ID_PATTERN.fullmatch(identifier) is None
+            or identifier in existing_ids
+            or state not in ("waiting", "running")
+            or isinstance(started_at, bool)
+            or not isinstance(started_at, (int, float))
+            or isinstance(event_at, bool)
+            or not isinstance(event_at, (int, float))
+        ):
+            continue
+        try:
+            started = float(started_at)
+            event = float(event_at)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if (
+            not math.isfinite(started)
+            or not math.isfinite(event)
+            or started <= 0
+            or event <= 0
+            or started > event
+        ):
+            continue
+        merged.append(
+            {
+                "id": identifier,
+                "state": state,
+                "event": "unknown",
+                "event_at": event,
+                "started_at": started,
+                "completed_at": None,
+                "category": "activity",
+                "provider": GROKBOT_ACTIVITY_PROVIDER,
+                "terminal": False,
+            }
+        )
+        existing_ids.add(identifier)
+        remaining -= 1
+    merged.sort(key=_activity_sort_key)
+    result = dict(snapshot)
+    result["active"] = merged
+    return result
 
 
 def atomic_write_activity_targets(
@@ -1111,6 +1223,7 @@ def run(
             )
             with SessionRecordSnapshot(state_dir) as records:
                 roster_active: Tuple[Tuple[str, float], ...] = ()
+                roster_activity_items: Tuple[Dict[str, object], ...] = ()
                 if forced:
                     (
                         state,
@@ -1135,6 +1248,9 @@ def run(
                                 monotonic_time,
                                 records.source_mode,
                             )
+                        )
+                        roster_activity_items = tuple(
+                            grokbot_source.activity_items()
                         )
                     (
                         state,
@@ -1174,6 +1290,12 @@ def run(
                         active_ttl=active_ttl,
                         records=records,
                     )
+                    if roster_activity_items:
+                        activity_snapshot = merge_grokbot_activity(
+                            activity_snapshot,
+                            roster_activity_items,
+                            records.source_mode,
+                        )
                     target_snapshot = None
                     try:
                         target_snapshot = read_session_targets(

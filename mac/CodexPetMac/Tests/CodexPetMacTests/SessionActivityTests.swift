@@ -370,6 +370,46 @@ final class SessionActivityTests: XCTestCase {
     }
 
     @MainActor
+    func testGrokBotRowsUseGenericPresenceAndNeverExposeCodexActivation() throws {
+        let grokBot = try SessionActivityItem(
+            id: String(repeating: "b", count: 24),
+            state: .waiting,
+            event: .unknown,
+            eventAt: 90,
+            terminal: false,
+            provider: .grokbot
+        )
+        let view = SessionActivityView(
+            frame: NSRect(x: 0, y: 0, width: 320, height: 150),
+            clock: { Date(timeIntervalSince1970: 100) }
+        )
+        view.update(
+            snapshot: try SessionActivitySnapshot(emittedAt: 100, active: [grokBot]),
+            acknowledgedIDs: [],
+            openableIDs: [grokBot.id],
+            openabilityPendingIDs: [grokBot.id],
+            titles: [grokBot.id: "Must not hydrate"]
+        )
+
+        XCTAssertFalse(allDescendants(of: view).compactMap { $0 as? NSButton }.contains {
+            $0.title == "Open in Codex"
+        })
+        XCTAssertTrue(allDescendants(of: view).compactMap { $0 as? NSTextField }.contains {
+            $0.stringValue.contains("Grok Bot") && $0.stringValue.contains("Waiting")
+        })
+        XCTAssertFalse(allDescendants(of: view).compactMap { $0 as? NSTextField }.contains {
+            $0.stringValue.contains("Must not hydrate")
+        })
+        let rowLabel = try XCTUnwrap(
+            allDescendants(of: view).compactMap { $0 as? NSTextField }.first {
+                $0.accessibilityLabel()?.contains("Grok Bot, active waiting") == true
+            }
+        )
+        XCTAssertFalse(rowLabel.accessibilityHelp()?.contains("Checking whether") == true)
+        XCTAssertTrue(rowLabel.accessibilityHelp()?.contains("Informational only") == true)
+    }
+
+    @MainActor
     func testAvailabilityNoticeOnlyAppearsForUnavailableOpenInCodexRows() throws {
         let first = try item(
             "a",

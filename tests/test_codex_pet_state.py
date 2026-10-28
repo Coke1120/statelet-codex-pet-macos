@@ -314,6 +314,8 @@ class LifecycleStateTests(unittest.TestCase):
             codex_only = state.read_session_snapshot(directory, now=100.0)
             write_agent_source(source_path, "grok")
             grok_only = state.read_session_snapshot(directory, now=100.0)
+            write_agent_source(source_path, "grokbot")
+            grokbot_only = state.read_session_snapshot(directory, now=100.0)
             write_agent_source(source_path, "invalid")
             invalid_falls_back = state.read_session_snapshot(directory, now=100.0)
 
@@ -322,6 +324,7 @@ class LifecycleStateTests(unittest.TestCase):
             )
             self.assertEqual(codex_only["active"], [("running", 99.0)])
             self.assertEqual(grok_only["active"], [("waiting", 99.5)])
+            self.assertEqual(grokbot_only["active"], [])
             self.assertCountEqual(invalid_falls_back["active"], combined["active"])
             self.assertTrue(codex_record.exists())
             self.assertTrue(grok_record.exists())
@@ -400,6 +403,8 @@ class LifecycleStateTests(unittest.TestCase):
             write_agent_source(source_path, "grok", permissions=0o600)
 
             self.assertEqual(state.read_agent_source_mode(directory), "grok")
+            write_agent_source(source_path, "grokbot", permissions=0o600)
+            self.assertEqual(state.read_agent_source_mode(directory), "grokbot")
 
     def test_agent_source_mode_rejects_symlinked_ancestor_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -858,6 +863,8 @@ class LifecycleStateTests(unittest.TestCase):
             grok_paths = sorted(directory.glob("2" + ("[0-9a-f]" * 23) + ".json"))
             write_agent_source(directory / state.AGENT_SOURCE_FILENAME, "grok")
             grok_only = state.read_session_activity(directory, now=201.0)
+            write_agent_source(directory / state.AGENT_SOURCE_FILENAME, "grokbot")
+            grokbot_only = state.read_session_activity(directory, now=201.0)
 
             self.assertEqual(len(combined["completed"]), state.MAX_ACTIVITY_ENTRIES)
             self.assertEqual(
@@ -868,6 +875,8 @@ class LifecycleStateTests(unittest.TestCase):
             self.assertEqual(
                 {item["provider"] for item in grok_only["completed"]}, {"grok"}
             )
+            self.assertEqual(grokbot_only["active"], [])
+            self.assertEqual(grokbot_only["completed"], [])
 
     def test_session_activity_excludes_fresh_idle_start_without_pruning_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

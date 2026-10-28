@@ -1,7 +1,7 @@
 # Statelet lifecycle and media reference
 
-This reference documents the internal contracts behind Statelet 1.9.0 (build
-38), the native Codex and Grok Build lifecycle companion for macOS. Start with
+This reference documents the internal contracts behind Statelet 1.10.0 (build
+42), the native Codex and Grok Build lifecycle companion for macOS. Start with
 [Deployment](DEPLOYMENT.md) for installation or [Using Statelet](USAGE.md) for
 daily operation.
 
@@ -39,6 +39,8 @@ Grok Bot local roster + desktop status (optional, read-only)
   -> mac/codex_pet_grokbot.py
   -> mac/codex_pet_state_aggregator.py (roster presence merge)
   -> ~/Library/Application Support/Statelet/runtime/current_state.json
+  -> ~/Library/Application Support/Statelet/sessions/activity-v1.json
+     (generic active grokbot rows when selected)
 ```
 
 The hook stores one versioned record per provider session. It contains only:
@@ -86,10 +88,12 @@ rejected. Child-session payloads carrying `subagentType` are ignored for the
 top-level projection.
 
 `sessions/agent-source-v1.json` stores only `{version, mode}` where mode is
-`combined`, `codex`, or `grok`. Missing or invalid data defaults to Combined.
-Filtering is a projection: fresh records from the hidden provider remain
-available and can reappear immediately when the selection changes, while normal
-TTL and completed-history retention still bound both providers.
+`combined`, `codex`, `grok`, or `grokbot`. Missing or invalid data defaults to
+Combined. Filtering is a projection: fresh records from the hidden provider
+remain available and can reappear immediately when the selection changes, while
+normal TTL and completed-history retention still bound both hook providers.
+Grok Bot presence has no hook records; selecting Grok Bot alone projects only
+the roster source, and Combined projects hook records plus the roster.
 
 The Grok adapter is based on the public [Grok Build hooks contract](https://docs.x.ai/build/features/hooks),
 not on private session-file tailing. ACP and streaming JSON remain separate
@@ -146,12 +150,21 @@ as successful completion. A long tool call that does not refresh the roster can
 briefly fall back to Idle. An optional Accessibility-enhanced classifier is a
 future possibility, not part of this source.
 
-Roster presence is included only while **Agent Source** is Combined. Selecting
-Codex or Grok hides it, matching the existing projection behavior. The
-aggregator counts roster presence in `active_sessions`, merges it with hook
-sessions using the normal priority, and wakes at the roster poll deadline. The
-roster does not create activity-rail entries in this version; `latest_event` and
-`latest_event_at` remain hook-only.
+Roster presence is included in **Combined** and in the dedicated **Grok Bot**
+source mode. Selecting Codex or Grok hides it, matching the existing projection
+behavior. The aggregator counts roster presence in `active_sessions`, merges it
+with hook sessions using the normal priority, and wakes at the roster poll
+deadline. `latest_event` and `latest_event_at` remain hook-only.
+
+The activity rail receives generic active rows with provider `grokbot`, the
+coarse Waiting or Running state, and bounded start/latest timestamps. The row
+identifier is the same opaque 24-hex bot hash used by the lifecycle source. The
+rail never receives a bot name, title, description, preview, transcript, avatar,
+repository path, raw identifier, unread completion, or failure claim. Hidden
+bots are omitted. Grok Bot rows are informational, never activate Codex Desktop,
+and never enter the completed or unread groups. In Grok Bot-only mode the hook
+providers are filtered out; in Combined mode the hook rows and generic roster
+rows share the same bounded activity snapshot.
 
 The source polls at most once every two seconds, rechecks a stopped client every
 five seconds, and rechecks a missing roster directory every 30 seconds. Its

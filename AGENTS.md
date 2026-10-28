@@ -35,7 +35,8 @@ mac/codex_pet_state_aggregator.py (kqueue directory watcher with 250 ms poll fal
   │  Multi-session aggregation: waiting > review > running > idle
   ▼
 ~/Library/Application Support/Statelet/runtime/current_state.json
-  │  Sidecars: sessions/activity-v1.json + sessions/activity-targets-v1.json
+  │  Sidecars: sessions/activity-v1.json (hook rows + generic grokbot active rows)
+  │            sessions/activity-targets-v1.json (Codex-only activation mapping)
   ▼
 Statelet AppKit Panel (PetAppDelegate / PetPlayer)
   │  AVQueuePlayer + AVPlayerLooper (single active decoder, layered transitions)
@@ -50,6 +51,7 @@ Grok Bot local roster + desktop-status.json (--grokbot, read-only)
   │  mac/codex_pet_grokbot.py: base32/schema-v4, PID liveness, privacy projection
   ▼
 mac/codex_pet_state_aggregator.py -> current_state.json
+                                  + sessions/activity-v1.json (generic active rows)
 ```
 
 ### Core Components
@@ -88,7 +90,8 @@ mac/codex_pet_state_aggregator.py -> current_state.json
 6. **Grok Bot Roster Source (`mac/codex_pet_grokbot.py`)**:
    - Optional `--grokbot` reader for Grok Bot's local roster and desktop-status PID; no hook, credential, Keychain, or network access.
    - Requires schema version 4, bounds the roster to 8 MiB and 1,024 rows, and projects only opaque 24-hex bot hashes, `awaitingUserResponse` presence, normalized activity timestamps, and hidden/unread flags.
-   - Maps awaiting to Waiting and recent activity to a short Running pulse; no Review, completion, or failure claim. It does not add activity-rail entries.
+   - Maps awaiting to Waiting and recent activity to a short Running pulse; no Review, completion, or failure claim.
+   - In Combined or Grok Bot mode, projects generic active `grokbot` rows into `sessions/activity-v1.json` with only the opaque hash, Waiting/Running state, and bounded start/event timestamps. It never emits bot names/titles, unread completions, activation targets, or failure claims.
 
 ---
 
@@ -228,7 +231,7 @@ Agents modifying Statelet must strictly adhere to the following non-negotiable i
 - Statelet contains **no telemetry, no analytics, and no remote crash reporting**.
 - **Companion Quick Chat is an explicit user-initiated exception:** the signed installed Codex CLI sends typed messages and selected text context through the user's Codex connection. Preserve ephemeral stdin-only conversation handling, disabled shell/image/browser/computer-use features, hooks and plugins, the read-only sandbox, bounded output and cancellation, and the model/credential-free-loopback-only config allowlist. The public CLI does not expose a zero-tool allowlist; do not mistake prompt instructions or hidden tool output for enforcement, or claim that remaining built-in tools are absent. Do not put chat text or dictated audio into diagnostics, shared state or persistent history. On-device dictation must not fall back to cloud recognition. See `docs/COMPANION.md`.
 - **Keep lifecycle aggregation and private media processing local.** The existing app updater makes bounded HTTPS requests for GitHub release metadata and artifacts, including automatic checks; it must retain pinned Ed25519 manifest verification, repository/commit/version binding, artifact verification, and safe installation. These requests must not include private runtime data. The aggregator must not make network calls. Local GPT-SoVITS generation uses loopback HTTPS (`https://127.0.0.1:<port>`) with pinned leaf TLS certificates; Qwen and VoxCPM2 helpers remain offline. These are specific existing capabilities, not permission to add arbitrary network integrations.
-- **Grok Bot roster reads stay local and text-free.** The optional `--grokbot` source is read-only and must never persist or log bot names, titles, descriptions, message previews, transcript text, avatars, repository paths, or raw bot IDs. Project only opaque hashed IDs, boolean presence, hidden/unread flags, and bounded timestamps. Fail closed on unsupported schema versions, and never add network or Keychain access to this path.
+- **Grok Bot roster reads stay local and text-free.** The optional `--grokbot` source is read-only and must never persist or log bot names, titles, descriptions, message previews, transcript text, avatars, repository paths, or raw bot IDs. Project only opaque hashed IDs, boolean presence, hidden/unread flags, and bounded timestamps. Generic active rail rows may carry the opaque hash, Waiting/Running state, and bounded timestamps, but never a name/title, unread completion, activation target, or failure claim. Fail closed on unsupported schema versions, and never add network or Keychain access to this path.
 - **Never log, persist, or expose sensitive user data**: Prompt text, tool input/output, file paths, repository URLs, transcript contents, account credentials, and voice dialogue lines must never be written to logs, diagnostics, or shared state files.
 - The `Copy Diagnostics` action in Settings must output strictly sanitized counts and categories, never raw paths or session IDs.
 
