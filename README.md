@@ -9,7 +9,8 @@ Statelet is a native, local-first macOS companion for Codex and Grok Build. It
 turns agent lifecycle events—Idle, Running, Waiting, and Review—into an animated,
 transparent desktop presence. It runs without a development board, keeps its
 runtime data on the Mac, and uses AppKit and AVFoundation rather than a browser
-runtime.
+runtime. An optional read-only source can also reflect coarse Grok Bot presence
+from its local roster; see [Grok Bot presence](docs/GROKBOT_PRESENCE.md).
 
 Statelet 1.10.0 (build 42) requires macOS 13 or newer. Its tagged release attaches
 an ad-hoc-signed package for owner-authorized personal updates; it is not a

@@ -2371,11 +2371,12 @@ validate_staged_app_bundle "$stage_app" || {
 }
 mkdir -p "$stage_component/python"
 install -m 0644 "$repo_root/mac/codex_pet_state.py" "$stage_component/python/statelet_state.py"
+install -m 0644 "$repo_root/mac/codex_pet_grokbot.py" "$stage_component/python/statelet_grokbot.py"
 install -m 0755 "$repo_root/mac/codex_pet_state_aggregator.py" "$stage_component/python/statelet_state_aggregator.py"
 install -m 0755 "$repo_root/mac/codex_pet_hook.py" "$stage_component/python/statelet_hook.py"
 printf '%s\n' "$managed_marker" > "$stage_component/MANAGED_BY_STATELET"
 chmod 0644 "$stage_component/MANAGED_BY_STATELET"
-PYTHONDONTWRITEBYTECODE=1 "$python_bin" -m py_compile "$stage_component/python/statelet_state.py" "$stage_component/python/statelet_state_aggregator.py" "$stage_component/python/statelet_hook.py"
+PYTHONDONTWRITEBYTECODE=1 "$python_bin" -m py_compile "$stage_component/python/statelet_state.py" "$stage_component/python/statelet_grokbot.py" "$stage_component/python/statelet_state_aggregator.py" "$stage_component/python/statelet_hook.py"
 rm -rf "$stage_component/python/__pycache__"
 
 stage_hooks="$stage_root/hooks.json"
@@ -2407,15 +2408,16 @@ if [[ -n "${STATELET_INSTALL_TEST_GROK_STAGE_GATE:-}" ]]; then
   [[ -e "$gate.release" ]] || { printf 'Grok stage test gate timed out.\n' >&2; exit 76; }
 fi
 
-"$python_bin" - "$stage_aggregator_plist" "$stage_player_plist" "$python_bin" "$python_dir" "$support_dir" "$app_dest" "$aggregator_label" "$player_label" "$managed_marker" "$player_run_at_load" <<'PY'
+"$python_bin" - "$stage_aggregator_plist" "$stage_player_plist" "$python_bin" "$python_dir" "$support_dir" "$home_dir" "$app_dest" "$aggregator_label" "$player_label" "$managed_marker" "$player_run_at_load" <<'PY'
 import plistlib, sys
 from pathlib import Path
-(aggregator_path, player_path, python_bin, python_dir, support_dir, app_dest,
+(aggregator_path, player_path, python_bin, python_dir, support_dir, home_dir, app_dest,
  aggregator_label, player_label, marker, player_run_at_load) = sys.argv[1:]
 support = Path(support_dir)
+grokbot = Path(home_dir) / "Library" / "Application Support" / "Grok Bot"
 common = {"StateletManaged": marker, "ProcessType": "Background", "RunAtLoad": True, "ThrottleInterval": 10}
 aggregator = {**common, "Label": aggregator_label, "KeepAlive": True,
- "ProgramArguments": [python_bin, "-B", str(Path(python_dir) / "statelet_state_aggregator.py"), "--state-dir", str(support / "sessions"), "--output", str(support / "runtime/current_state.json")],
+ "ProgramArguments": [python_bin, "-B", str(Path(python_dir) / "statelet_state_aggregator.py"), "--state-dir", str(support / "sessions"), "--output", str(support / "runtime/current_state.json"), "--grokbot", "--grokbot-persistence-dir", str(grokbot / "sand-client-persistence"), "--grokbot-status-path", str(grokbot / "desktop-status.json")],
  "WorkingDirectory": python_dir, "StandardOutPath": str(support / "logs/state-aggregator.out.log"), "StandardErrorPath": str(support / "logs/state-aggregator.err.log")}
 player = {**common, "RunAtLoad": player_run_at_load == "1", "Label": player_label, "KeepAlive": False,
  "LimitLoadToSessionType": "Aqua", "ProcessType": "Interactive",

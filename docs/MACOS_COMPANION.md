@@ -10,7 +10,8 @@ daily operation.
 Statelet is a macOS 13+ AppKit accessory application. It requires no external
 display or development board. AVFoundation owns the active media decoder, and a
 Python standard-library publisher converts local Codex and Grok Build hook
-events into a small state file.
+events, plus an optional read-only Grok Bot roster snapshot, into a small state
+file.
 
 No animation media is bundled. MP4, MOV, poster, and report files remain
 user-supplied local content.
@@ -33,6 +34,11 @@ Codex or Grok Build hook event on stdin
   -> ~/Library/Application Support/Statelet/runtime/current_state.json
   -> Swift state watcher
   -> lifecycle badge and animation library
+
+Grok Bot local roster + desktop status (optional, read-only)
+  -> mac/codex_pet_grokbot.py
+  -> mac/codex_pet_state_aggregator.py (roster presence merge)
+  -> ~/Library/Application Support/Statelet/runtime/current_state.json
 ```
 
 The hook stores one versioned record per provider session. It contains only:
@@ -90,6 +96,75 @@ not on private session-file tailing. ACP and streaming JSON remain separate
 options for clients that own the Grok process; Statelet's passive desktop mode
 does not require that ownership.
 
+## Grok Bot presence source
+
+Grok Bot is a separate cloud-agent client. It does not expose the Codex/Grok
+Build lifecycle hook contract, so Statelet uses an optional read-only projection
+of its local roster instead. The installed aggregator enables this source with
+`--grokbot`; a manual aggregator run must opt in explicitly.
+
+The source reads:
+
+```text
+~/Library/Application Support/Grok Bot/sand-client-persistence/<base32>.blob
+  newest decoded key ending in .roster.last-roster, schemaVersion 4
+
+~/Library/Application Support/Grok Bot/desktop-status.json
+  pid and signedIn
+```
+
+It requires the reported PID to be alive and treats a signed-out client as
+unavailable. The newest roster blob is bounded to 8 MiB and 1,024 rows. If the
+newest blob is being replaced or is malformed, a small number of older
+candidates may be tried. An older-candidate fallback is degraded and is used for
+at most 30 seconds; if all candidates fail, the last valid rows are reused for at
+most 30 seconds, then the source fails closed. An unsupported schema version
+fails closed immediately.
+
+Only this text-free subset crosses the parser boundary:
+
+- an opaque 24-hex hash of the bot ID;
+- whether `awaitingUserResponse` is non-null/non-false;
+- normalized `lastActivityAt` / `localActivityAt` timestamps;
+- `isHiddenFromSidebar`; and
+- bounded `hasUnread` / `unreadCount` metadata reserved for future use.
+
+Bot names, titles, descriptions, message previews, transcript text, avatars,
+repository paths, and raw bot IDs are discarded during projection and never
+enter state, diagnostics, or logs.
+
+The state mapping is deliberately coarse:
+
+| Roster condition | State |
+| --- | --- |
+| `awaitingUserResponse` present | Waiting |
+| activity timestamp within the 120-second active window | Running |
+| otherwise, hidden, or unavailable | No contribution (Idle when nothing else is active) |
+
+There is no Review or failure signal in this source, and unread is not treated
+as successful completion. A long tool call that does not refresh the roster can
+briefly fall back to Idle. An optional Accessibility-enhanced classifier is a
+future possibility, not part of this source.
+
+Roster presence is included only while **Agent Source** is Combined. Selecting
+Codex or Grok hides it, matching the existing projection behavior. The
+aggregator counts roster presence in `active_sessions`, merges it with hook
+sessions using the normal priority, and wakes at the roster poll deadline. The
+roster does not create activity-rail entries in this version; `latest_event` and
+`latest_event_at` remain hook-only.
+
+The source polls at most once every two seconds, rechecks a stopped client every
+five seconds, and rechecks a missing roster directory every 30 seconds. Its
+diagnostics are path-free and rate-limited:
+
+```text
+Statelet Grok Bot roster status=degraded reason=<category>
+Statelet Grok Bot roster status=recovered
+```
+
+The parser never writes to the Grok Bot directory and makes no network request.
+See [Grok Bot presence](GROKBOT_PRESENCE.md) for the full design and limits.
+
 The display hook always exits successfully after emitting valid empty JSON on
 stdout. A display-state write failure must not block or alter the Codex turn.
 
@@ -134,7 +209,8 @@ hidden markers. Legacy session-ID markers remain compatible.
 
 The aggregator normally uses macOS `kqueue` directory events, so changed
 session records wake it immediately. It also wakes at session TTL,
-temporary-force, and once-per-minute liveness-heartbeat deadlines. If event
+temporary-force, once-per-minute liveness-heartbeat, and (when enabled) Grok Bot
+roster-poll deadlines. If event
 watching is unsupported or fails, bounded 250 ms polling preserves the same
 behavior. Its path-free log diagnostic reports `mode=event_driven` or
 `mode=poll_fallback` with a sanitized reason category. The aggregate contains

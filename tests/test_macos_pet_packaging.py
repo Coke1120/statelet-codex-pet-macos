@@ -1643,6 +1643,15 @@ struct WatchdogHarness {
         self.assertEqual(aggregator["ProcessType"], "Background")
         aggregator_arguments = "\n".join(aggregator["ProgramArguments"])
         self.assertIn("statelet_state_aggregator.py", aggregator_arguments)
+        self.assertIn("--grokbot", aggregator["ProgramArguments"])
+        self.assertIn(
+            str(self.home / "Library/Application Support/Grok Bot/sand-client-persistence"),
+            aggregator["ProgramArguments"],
+        )
+        self.assertIn(
+            str(self.home / "Library/Application Support/Grok Bot/desktop-status.json"),
+            aggregator["ProgramArguments"],
+        )
         self.assertEqual(aggregator["ProgramArguments"][1], "-B")
         self.assertNotIn("codex_pet_daemon.py", aggregator_arguments)
         self.assertNotIn("serial", aggregator_arguments.lower())
@@ -1658,6 +1667,7 @@ struct WatchdogHarness {
             installed_names,
             {
                 "MANAGED_BY_STATELET",
+                "statelet_grokbot.py",
                 "statelet_hook.py",
                 "statelet_state.py",
                 "statelet_state_aggregator.py",

@@ -14,7 +14,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Callable, Dict, Optional, TextIO, Tuple
+from typing import Callable, Dict, Iterable, Optional, TextIO, Tuple
 
 MAC_DIR = Path(__file__).resolve().parent
 if str(MAC_DIR) not in sys.path:
@@ -56,6 +56,21 @@ except ModuleNotFoundError as error:
         SESSION_ACTIVITY_TARGETS_FILENAME,
         SessionRecordSnapshot,
     )
+
+try:
+    import statelet_grokbot as grokbot_source_module  # type: ignore[import-not-found]
+except ModuleNotFoundError as error:
+    if error.name != "statelet_grokbot":
+        raise
+    # Repository/source compatibility. Installed Statelet components use the
+    # canonical module name above.
+    import codex_pet_grokbot as grokbot_source_module  # noqa: E402
+
+GrokBotRosterSource = grokbot_source_module.GrokBotRosterSource
+DEFAULT_GROKBOT_POLL_INTERVAL = grokbot_source_module.DEFAULT_POLL_INTERVAL
+DEFAULT_GROKBOT_ACTIVE_WINDOW = grokbot_source_module.DEFAULT_ACTIVE_WINDOW
+default_grokbot_persistence_dir = grokbot_source_module.default_grokbot_persistence_dir
+default_grokbot_status_path = grokbot_source_module.default_grokbot_status_path
 
 
 DEFAULT_OUTPUT_PATH = (
@@ -846,6 +861,22 @@ def print_activity_diagnostic(message: str) -> None:
     print(message, file=sys.stderr)
 
 
+def print_grokbot_diagnostic(message: str) -> None:
+    prefix = "Statelet Grok Bot roster status=degraded reason="
+    if message == "Statelet Grok Bot roster status=recovered":
+        print(message, file=sys.stderr)
+        return
+    if message.startswith(prefix):
+        reason = message[len(prefix):]
+        if (
+            reason in grokbot_source_module.VALID_DIAGNOSTIC_REASONS
+            and reason != "no_roster"
+        ):
+            print(message, file=sys.stderr)
+            return
+    raise ValueError("invalid Grok Bot roster diagnostic")
+
+
 class OptionalActivityDiagnostic:
     def __init__(
         self,
@@ -965,6 +996,7 @@ def resolve_diagnostic_snapshot(
     wall_time: float,
     *,
     records: Optional[SessionRecordSnapshot] = None,
+    extra_active: Iterable[Tuple[str, float]] = (),
 ) -> Tuple[
     str,
     Optional[float],
@@ -978,6 +1010,22 @@ def resolve_diagnostic_snapshot(
         state_dir, now=wall_time, active_ttl=active_ttl, records=records
     )
     active = snapshot["active"]
+    projected_extra = []
+    for state, timestamp in extra_active:
+        if (
+            state not in VALID_STATES
+            or isinstance(timestamp, bool)
+            or not isinstance(timestamp, (int, float))
+        ):
+            continue
+        try:
+            value = float(timestamp)
+        except (OverflowError, ValueError):
+            continue
+        if math.isfinite(value):
+            projected_extra.append((state, value))
+    if projected_extra:
+        active = active + projected_extra
     lifecycle, source_updated_at = aggregate_state_with_source(active)
     next_expiry = (
         snapshot["next_expiry"] + TTL_DEADLINE_EPSILON
@@ -1006,12 +1054,15 @@ def next_wake_timeout(
     monotonic_time: float,
     force_deadline: Optional[float],
     source_expiry_at: Optional[float],
+    grokbot_deadline: Optional[float] = None,
 ) -> float:
     deadlines = [max(0.0, publisher.next_heartbeat_at - monotonic_time)]
     if force_deadline is not None and force_deadline > monotonic_time:
         deadlines.append(force_deadline - monotonic_time)
     if source_expiry_at is not None:
         deadlines.append(max(0.0, source_expiry_at - wall_time))
+    if grokbot_deadline is not None:
+        deadlines.append(max(0.0, grokbot_deadline - monotonic_time))
     return min(deadlines)
 
 
@@ -1030,6 +1081,7 @@ def run(
     wall_clock: Callable[[], float] = time.time,
     monotonic_clock: Callable[[], float] = time.monotonic,
     activity_diagnostic: Callable[[str], None] = print_activity_diagnostic,
+    grokbot_source: Optional[GrokBotRosterSource] = None,
 ) -> int:
     publisher = StatePublisher(output_path, heartbeat)
     activity_publisher = SessionActivityPublisher(
@@ -1058,6 +1110,7 @@ def run(
                 forced_state, once, force_deadline, monotonic_time
             )
             with SessionRecordSnapshot(state_dir) as records:
+                roster_active: Tuple[Tuple[str, float], ...] = ()
                 if forced:
                     (
                         state,
@@ -1075,6 +1128,14 @@ def run(
                     latest_event_at = None
                     rejection_diagnostics: Dict[str, object] = {"count": 0, "reasons": {}}
                 else:
+                    if grokbot_source is not None:
+                        roster_active = tuple(
+                            grokbot_source.poll(
+                                wall_time,
+                                monotonic_time,
+                                records.source_mode,
+                            )
+                        )
                     (
                         state,
                         source_updated_at,
@@ -1084,7 +1145,11 @@ def run(
                         latest_event_at,
                         rejection_diagnostics,
                     ) = resolve_diagnostic_snapshot(
-                        state_dir, active_ttl, wall_time, records=records
+                        state_dir,
+                        active_ttl,
+                        wall_time,
+                        records=records,
+                        extra_active=roster_active,
                     )
                 record = publisher.publish_if_due(
                     state,
@@ -1145,12 +1210,18 @@ def run(
                     activity_health.failure("invalid_projection", monotonic_time)
             if once:
                 break
+            grokbot_deadline = (
+                grokbot_source.next_deadline(monotonic_time)
+                if grokbot_source is not None and not forced
+                else None
+            )
             timeout = next_wake_timeout(
                 publisher,
                 wall_time,
                 monotonic_time,
                 force_deadline if forced else None,
                 source_expiry_at,
+                grokbot_deadline,
             )
             active_waiter.wait(timeout)
     finally:
@@ -1170,6 +1241,34 @@ def main() -> int:
         "--heartbeat", type=positive_float, default=DEFAULT_HEARTBEAT_INTERVAL
     )
     parser.add_argument("--active-ttl", type=positive_float, default=DEFAULT_ACTIVE_TTL)
+    parser.add_argument(
+        "--grokbot",
+        action="store_true",
+        help=(
+            "read the local Grok Bot roster as a coarse presence source; "
+            "disabled unless explicitly requested"
+        ),
+    )
+    parser.add_argument(
+        "--grokbot-persistence-dir",
+        type=Path,
+        default=default_grokbot_persistence_dir(),
+    )
+    parser.add_argument(
+        "--grokbot-status-path",
+        type=Path,
+        default=default_grokbot_status_path(),
+    )
+    parser.add_argument(
+        "--grokbot-poll",
+        type=positive_float,
+        default=DEFAULT_GROKBOT_POLL_INTERVAL,
+    )
+    parser.add_argument(
+        "--grokbot-active-window",
+        type=positive_float,
+        default=DEFAULT_GROKBOT_ACTIVE_WINDOW,
+    )
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--print-state", action="store_true")
     parser.add_argument("--force-state", choices=VALID_STATES)
@@ -1183,6 +1282,16 @@ def main() -> int:
         ).format(int(MAX_FORCE_DURATION)),
     )
     args = parser.parse_args()
+
+    grokbot_source = None
+    if args.grokbot:
+        grokbot_source = GrokBotRosterSource(
+            args.grokbot_persistence_dir,
+            args.grokbot_status_path,
+            poll_interval=args.grokbot_poll,
+            active_window=args.grokbot_active_window,
+            diagnostic=print_grokbot_diagnostic,
+        )
 
     stopped = False
     waiter = DirectoryEventWaiter(
@@ -1214,6 +1323,7 @@ def main() -> int:
                 args.force_seconds,
                 lambda: stopped,
                 waiter=waiter,
+                grokbot_source=grokbot_source,
             )
     except (OSError, RuntimeError) as exc:
         print("Statelet state aggregator error: {}".format(exc), file=sys.stderr)

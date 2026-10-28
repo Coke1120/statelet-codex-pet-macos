@@ -1,6 +1,7 @@
 # Use Statelet on macOS
 
-Statelet presents Codex and Grok Build lifecycle activity as a transparent animated companion.
+Statelet presents Codex and Grok Build lifecycle activity, plus optional coarse
+Grok Bot presence, as a transparent animated companion.
 This guide covers first run, animation libraries, conversion, controls,
 appearance, diagnostics, troubleshooting, and local-data behavior.
 
@@ -80,6 +81,32 @@ The badge reports:
 - **Offline** when state data is missing, malformed, stale, or too far in the
   future, with safe Idle fallback; and
 - **Preview** for developer-forced state presentation.
+
+### Grok Bot presence (optional)
+
+If Grok Bot is installed and running, Statelet can also use its local roster as a
+coarse presence source. The installed aggregator enables this reader; it requires
+no Grok Bot hook, account token, Keychain access, or network request.
+
+Grok Bot contributes only two states:
+
+- **Waiting** when a bot's roster row says it is awaiting your response.
+- **Running** briefly after recent roster activity (120 seconds by default).
+
+There is no **Review** signal, and an unread bot is not treated as a successful
+completion. A long tool call that does not update the roster can briefly settle
+to Idle. A malformed newer roster can briefly fall back to an older snapshot, but
+never for more than 30 seconds. Grok Bot presence appears only while **Agent
+Source** is Combined; it does not add rows to the activity rail in this version.
+
+The reader discards bot names, titles, descriptions, message previews,
+transcripts, avatars, repository paths, and raw bot IDs. It reads only a small
+text-free whitelist: the bot ID needed to compute an opaque hash, waiting and
+activity timestamps, and hidden/unread metadata. It never writes to the Grok Bot
+directory. To disable it, advanced users can remove `--grokbot` and its
+`--grokbot-persistence-dir` / `--grokbot-status-path` arguments from the
+aggregator LaunchAgent, then reload that job. See
+[Grok Bot presence](GROKBOT_PRESENCE.md) for the full contract.
 
 ### Session activity beside the pet
 
