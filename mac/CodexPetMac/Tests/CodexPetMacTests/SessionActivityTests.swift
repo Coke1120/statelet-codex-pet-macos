@@ -367,6 +367,7 @@ final class SessionActivityTests: XCTestCase {
         )
         XCTAssertFalse(rowLabel.accessibilityHelp()?.contains("Checking whether") == true)
         XCTAssertTrue(rowLabel.accessibilityHelp()?.contains("Informational only") == true)
+        XCTAssertFalse(rowLabel.accessibilityHelp()?.contains("Codex Desktop") == true)
     }
 
     @MainActor
@@ -407,6 +408,24 @@ final class SessionActivityTests: XCTestCase {
         )
         XCTAssertFalse(rowLabel.accessibilityHelp()?.contains("Checking whether") == true)
         XCTAssertTrue(rowLabel.accessibilityHelp()?.contains("Informational only") == true)
+        XCTAssertFalse(rowLabel.accessibilityHelp()?.contains("Codex Desktop") == true)
+
+        view.update(
+            snapshot: try SessionActivitySnapshot(emittedAt: 100, active: [grokBot]),
+            acknowledgedIDs: []
+        )
+        XCTAssertFalse(allDescendants(of: view).compactMap { $0 as? NSTextField }.contains {
+            $0.stringValue.contains("Codex Desktop activation")
+        })
+
+        let codex = try item("c", state: .running, event: .userPromptSubmit, terminal: false, eventAt: 91)
+        view.update(
+            snapshot: try SessionActivitySnapshot(emittedAt: 100, active: [codex, grokBot]),
+            acknowledgedIDs: []
+        )
+        XCTAssertFalse(allDescendants(of: view).compactMap { $0 as? NSTextField }.contains {
+            $0.stringValue.contains("Codex Desktop activation")
+        })
     }
 
     @MainActor
@@ -1182,6 +1201,15 @@ final class SessionActivityTests: XCTestCase {
         XCTAssertEqual(SessionActivityPanelPositionStore.restored(from: defaults), origin)
         defaults.set(["x": "bad", "y": 10], forKey: SessionActivityPanelPositionStore.defaultsKey)
         XCTAssertNil(SessionActivityPanelPositionStore.restored(from: defaults))
+
+        let size = NSSize(width: 400, height: 240)
+        SessionActivityPanelSizeStore.persist(size, to: defaults)
+        XCTAssertEqual(SessionActivityPanelSizeStore.restored(from: defaults), size)
+        defaults.set(["width": 20, "height": 240], forKey: SessionActivityPanelSizeStore.defaultsKey)
+        XCTAssertNil(SessionActivityPanelSizeStore.restored(from: defaults))
+        let panel = SessionActivityPanel(contentRect: NSRect(origin: .zero, size: size), alwaysOnTop: false, fullScreenAuxiliary: false)
+        XCTAssertTrue(panel.styleMask.contains(.resizable))
+        XCTAssertEqual(panel.minSize, SessionActivityPanelSizeStore.minimumSize)
 
         let clamped = SessionActivityPanelPositionStore.clamped(
             origin: NSPoint(x: -500, y: 1_000),

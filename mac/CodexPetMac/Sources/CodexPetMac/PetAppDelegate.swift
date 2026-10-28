@@ -628,6 +628,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     private var sessionActivityAppearance = try! SessionActivityPanelAppearance()
     private var sessionActivityUserOrigin: NSPoint?
     private var isPositioningSessionActivityPanel = false
+    private var sessionActivityUserSize: NSSize?
     private var lastLifecycleStateForSelection: PetState?
     private var lastPresentedState: PetState?
     private var lastCommittedLifecycleState: PetState?
@@ -773,6 +774,7 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
         loadSessionActivityAcknowledgements()
         sessionActivityAppearance = SessionActivityPanelAppearanceStore.restored()
         sessionActivityUserOrigin = SessionActivityPanelPositionStore.restored()
+        sessionActivityUserSize = SessionActivityPanelSizeStore.restored()
         do {
             try StateletUpdateInstaller.reconcilePendingTransaction()
         } catch {
@@ -1110,7 +1112,6 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             guard !isPositioningSessionActivityPanel else { return }
             sessionActivityUserOrigin = movedWindow.frame.origin
             SessionActivityPanelPositionStore.persist(movedWindow.frame.origin)
-            positionSessionActivityPanel()
             return
         }
         schedulePositionSave()
@@ -1119,7 +1120,11 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
     func windowDidResize(_ notification: Notification) {
         if let resizedWindow = notification.object as? NSWindow,
            resizedWindow === sessionActivityPanel {
-            positionSessionActivityPanel()
+            guard !isPositioningSessionActivityPanel else { return }
+            sessionActivityUserSize = resizedWindow.frame.size
+            SessionActivityPanelSizeStore.persist(resizedWindow.frame.size)
+            sessionActivityView.setCompactOverride(false)
+            sessionActivityScrollContainer.setScrollable(true)
             return
         }
         schedulePositionSave()
@@ -1860,23 +1865,28 @@ final class PetAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @
             }
             return
         }
-        sessionActivityView.setCompactOverride(layout.compact)
-        sessionActivityScrollContainer.setScrollable(layout.scrollable)
+        sessionActivityView.setCompactOverride(sessionActivityUserSize == nil ? layout.compact : false)
+        sessionActivityScrollContainer.setScrollable(sessionActivityUserSize != nil || layout.scrollable)
+        let chosenSize = sessionActivityUserSize.map {
+            NSSize(width: min($0.width, visibleFrame.width), height: min($0.height, visibleFrame.height))
+        } ?? layout.frame.size
         let targetFrame: NSRect
         if let origin = sessionActivityUserOrigin {
             let availableFrames = NSScreen.screens.map(\.visibleFrame)
             let clampedOrigin = SessionActivityPanelPositionStore.clamped(
                 origin: origin,
-                size: layout.frame.size,
+                size: chosenSize,
                 to: availableFrames.isEmpty ? [visibleFrame] : availableFrames
             )
             if clampedOrigin != origin {
                 sessionActivityUserOrigin = clampedOrigin
                 SessionActivityPanelPositionStore.persist(clampedOrigin)
             }
-            targetFrame = NSRect(origin: clampedOrigin, size: layout.frame.size)
+            targetFrame = NSRect(origin: clampedOrigin, size: chosenSize)
         } else {
-            targetFrame = layout.frame
+            targetFrame = sessionActivityUserSize == nil ? layout.frame : SessionActivityPanel.anchoredFrame(
+                beside: panel.frame, contentSize: chosenSize, visibleFrame: visibleFrame
+            )
         }
         isPositioningSessionActivityPanel = true
         sessionActivityPanel.setFrame(targetFrame, display: display)

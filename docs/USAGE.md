@@ -166,8 +166,9 @@ This integration is experimental and fail-soft: a missing or unavailable title
 leaves the generic label in place, while **Open in Codex** continues to depend
 only on its validated activation target.
 
-The popup can be moved by dragging its background whenever click-through is
-disabled. Statelet remembers that position, clamps it back onto a visible
+The popup can be moved by dragging its background and resized by dragging its
+edges whenever click-through is disabled. Statelet remembers its size and
+position, clamps it back onto a visible
 display after monitor changes, and provides **Reset Activity Popup Position** in
 Settings. Its background and opacity are local presentation preferences; the
 default uses dynamic system colors and accessibility contrast/transparency

@@ -133,6 +133,28 @@ enum SessionActivityPanelPositionStore {
     }
 }
 
+enum SessionActivityPanelSizeStore {
+    static let defaultsKey = "Statelet.sessionActivityPanelSize.v1"
+    static let minimumSize = NSSize(width: 190, height: 110)
+
+    static func restored(from defaults: UserDefaults = .standard) -> NSSize? {
+        guard let values = defaults.dictionary(forKey: defaultsKey),
+              let width = (values["width"] as? NSNumber)?.doubleValue,
+              let height = (values["height"] as? NSNumber)?.doubleValue,
+              width.isFinite, height.isFinite,
+              (Double(minimumSize.width)...10_000).contains(width),
+              (Double(minimumSize.height)...10_000).contains(height) else { return nil }
+        return NSSize(width: width, height: height)
+    }
+
+    static func persist(_ size: NSSize, to defaults: UserDefaults = .standard) {
+        guard size.width.isFinite, size.height.isFinite,
+              (minimumSize.width...10_000).contains(size.width),
+              (minimumSize.height...10_000).contains(size.height) else { return }
+        defaults.set(["width": Double(size.width), "height": Double(size.height)], forKey: defaultsKey)
+    }
+}
+
 struct SessionActivityDisplayState: Equatable {
     let active: [SessionActivityItem]
     let completed: [SessionActivityItem]
@@ -453,14 +475,15 @@ final class SessionActivityView: NSView {
                 addCompactPill(title: "Recent · \(completedCount)", accessibility: "Unread outcomes: \(completedCount)")
             }
         } else {
-            let visibleIDs = Set((displayState.active + displayState.completed).map(\.id))
+            let visibleItems = displayState.active + displayState.completed
+            let visibleIDs = Set(visibleItems.map(\.id))
             let unavailableIDs = visibleIDs
                 .subtracting(openableIDs)
                 .subtracting(openabilityPendingIDs)
-            if !unavailableIDs.isEmpty {
-                if unavailableIDs.count == visibleIDs.count {
-                    addActivationUnavailableNotice()
-                }
+            if !unavailableIDs.isEmpty,
+               unavailableIDs.count == visibleIDs.count,
+               visibleItems.allSatisfy({ $0.provider == .codex }) {
+                addActivationUnavailableNotice()
             }
             if !displayState.active.isEmpty {
                 addGroup(
@@ -589,7 +612,9 @@ final class SessionActivityView: NSView {
                 ? "Use Open in Codex to show this session in Codex Desktop."
                 : item.provider == .codex && openabilityPendingIDs.contains(item.id)
                     ? "Checking whether this session can be opened in Codex Desktop."
-                    : "Informational only. No verified Codex Desktop target is available for this \(item.provider.displayName) session."
+                    : item.provider == .codex
+                        ? "Informational only. No verified Codex Desktop target is available for this Codex session."
+                        : "Informational only. This \(item.provider.displayName) session cannot be opened from Statelet."
         )
         let dotColor = resolvedActivityColor(item.state.sessionActivityColor)
         var views: [NSView] = [activityDot(color: dotColor), label]
@@ -836,7 +861,7 @@ final class SessionActivityPanel: NSPanel {
     init(contentRect: NSRect, alwaysOnTop: Bool, fullScreenAuxiliary: Bool) {
         super.init(
             contentRect: contentRect,
-            styleMask: [.borderless, .nonactivatingPanel],
+            styleMask: [.borderless, .nonactivatingPanel, .resizable],
             backing: .buffered,
             defer: false
         )
@@ -853,6 +878,7 @@ final class SessionActivityPanel: NSPanel {
         titleVisibility = .hidden
         titlebarAppearsTransparent = true
         isReleasedWhenClosed = false
+        minSize = SessionActivityPanelSizeStore.minimumSize
     }
 
     func apply(alwaysOnTop: Bool, fullScreenAuxiliary: Bool) {
