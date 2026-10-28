@@ -12,7 +12,7 @@ runtime data on the Mac, and uses AppKit and AVFoundation rather than a browser
 runtime. An optional read-only source can also reflect coarse Grok Bot presence
 from its local roster; see [Grok Bot presence](docs/GROKBOT_PRESENCE.md).
 
-Statelet 1.10.0 (build 42) requires macOS 13 or newer. Its tagged release attaches
+Statelet 1.11.0 (build 43) requires macOS 13 or newer. Its tagged release attaches
 an ad-hoc-signed package for owner-authorized personal updates; it is not a
 Developer ID-signed or notarized public binary. Existing 1.8.4 or earlier
 installs require one manual bootstrap update to 1.8.5 or later.
@@ -456,8 +456,8 @@ Statelet uses one canonical identity for new builds and installations:
 | Application Support | `~/Library/Application Support/Statelet` |
 | LaunchAgents | `com.coke1120.statelet.state-aggregator`, `com.coke1120.statelet.mac-player` |
 | Managed marker | `statelet-v2` |
-| App version | `1.10.0` |
-| Build number | `42` |
+| App version | `1.11.0` |
+| Build number | `43` |
 
 ## Uninstall
 

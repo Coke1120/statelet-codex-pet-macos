@@ -38,9 +38,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.10.0</string>
+	<string>1.11.0</string>
 	<key>CFBundleVersion</key>
-	<string>42</string>
+	<string>43</string>
 	<key>StateletManaged</key>
 	<string>statelet-v2</string>
 	<key>StateletUpdateSigningTeamIdentifier</key>

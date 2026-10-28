@@ -1,5 +1,27 @@
 # Stabilization and release qualification
 
+## 1.11.0 Cloud release candidate — 2026-10-28
+
+The owner authorized publishing **1.11.0, build 43** as a personal update. The
+latest published baseline is 1.10.0/build 42; the minor version follows the
+repository's semantic versioning policy for the added backward-compatible Grok
+Bot presence and activity-rail rows. Publication remains conditional on
+successful main-push CI at the exact tagged commit and every maintained release
+workflow gate, including focused updater tests, signing and hosted-byte checks.
+The [release notes](https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.11.0)
+record the final commit, CI and artifact results; this candidate record is not
+proof of publication.
+
+Local candidate validation passed the full Python suite (530), Swift core
+(204), Statelet (379 with 17 AVPlayer integration cases skipped), explicit
+AVPlayer integration (17), the Swift self-test, app build and strict code-sign
+verification. Installed-build checks cover app version/build, signature,
+installed Python module hashes, live aggregation, source-mode projection, and
+synthetic generic Grok Bot rows without private roster text. Manual UI/VoiceOver,
+provider-hook, installed-upgrade, minimum-macOS 13, Intel and voice acceptance
+remain outside this evidence; distribution retains the ad-hoc app and pinned
+Ed25519 personal update path, with no Developer ID/notarization claim.
+
 ## 1.10.0 Cloud release candidate — 2026-10-11
 
 The owner authorized merging PR44/PR45 and publishing **1.10.0, build 42** as a

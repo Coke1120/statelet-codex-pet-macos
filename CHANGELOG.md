@@ -5,6 +5,44 @@ versioning for the public source release.
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-10-28
+
+### Added
+
+- Optional local-only Grok Bot roster presence (`--grokbot`) for coarse
+  Idle, Running, and Waiting animation, with no credentials, Keychain access,
+  network request, hook protocol, or private roster text.
+- Generic active Grok Bot rows in the existing activity rail. The rows use an
+  opaque 24-hex bot hash, Waiting/Running state, and bounded stable timestamps;
+  they never expose a bot name, title, preview, path, raw identifier, completed
+  or unread outcome, or failure claim.
+- **Agent Source** now offers Combined, Codex, Grok, and Grok Bot. The same
+  selector filters both aggregate lifecycle state and the activity rail;
+  switching preserves stable Grok Bot wait/run timestamps for immediate return.
+
+### Changed
+
+- Hook rows retain identifier-collision and 64-row activity-cap precedence over
+  generic Grok Bot rows. Malformed presence rows are dropped without making the
+  activity sidecar unreadable.
+- Grok Bot rows never hydrate Codex task titles, create activation targets, or
+  activate Codex Desktop. Codex and Grok source modes exclude Grok Bot presence;
+  Combined includes it.
+- Updated Settings help, Companion empty-state guidance, contracts, activity
+  rail labels, tests, and documentation.
+
+### Distribution and validation scope
+
+- Owner-authorized personal update: ad-hoc app signature and pinned Ed25519
+  update manifest; no Developer ID signature or notarization is added.
+- Local candidate validation passed the full Python suite, Swift core and
+  Statelet tests, explicit AVPlayer integration, the core self-test, app build,
+  strict code-sign verification, installed module/hash and synthetic privacy
+  checks, and a live local roster projection check.
+- Manual UI/VoiceOver, provider-hook delivery, installed-upgrade, minimum-macOS
+  13, Intel and voice acceptance remain unperformed for this candidate. Passive
+  completion inference and Accessibility classification remain future work.
+
 ## [1.10.0] - 2026-10-11
 
 ### Added
@@ -857,6 +895,7 @@ for macOS.
 - Version 1.6.0 retained the pre-Statelet technical identity. Version 1.7.0
   migrates those values to the canonical Statelet identity.
 
+[1.11.0]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.11.0
 [1.10.0]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.10.0
 [1.8.23]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.23
 [1.8.22]: https://github.com/Coke1120/statelet-codex-pet-macos/releases/tag/v1.8.22
