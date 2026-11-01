@@ -351,22 +351,27 @@ locally with offline model-loading flags, accepts Japanese lines of 500
 characters or fewer, and publishes only validated 24 kHz mono PCM16 WAV output.
 VoxCPM2 accepts the complete source handover folder (not only
 `model.safetensors`), one WAV reference and its exact transcript, plus a
-trusted Python runtime. Its bounded offline probe loads the snapshot, reports
+trusted Python runtime. An explicit bounded offline diagnostic probe loads the snapshot, reports
 only a sanitized `mps`, `cuda`, or `cpu` device category, and requires a 48 kHz
 model output rate. Generation runs asynchronously through an OS
 network-denied helper and publishes only validated 48 kHz mono PCM16 WAV
 output. Apple Silicon MPS uses the upstream float32-stability path and can be
-slow or memory-intensive.
+slow or memory-intensive. Restoring a GPT-SoVITS or VoxCPM2 profile verifies local
+inputs without loading the model; saved audio plays independently of inference.
 
 Adding or editing a line persists it immediately and queues background
 synthesis. Successful WAV output is validated and published atomically before
 it becomes available to **Preview**. Playback never starts synchronous
 inference, and failed or stale lines remain editable and retryable. Switching
 providers revalidates the selected profile and refreshes incompatible output;
-the old WAV is retained until its replacement succeeds.
+the old WAV is retained until its replacement succeeds. Restored GPT-SoVITS and
+VoxCPM2 queues wait for **Generate** on the selected line.
 
-Statelet does not train providers or install their external runtimes. Start
-GPT-SoVITS API v2 behind its pinned-TLS loopback gateway, provide an already
+Statelet does not train providers or install their external runtimes. Configure
+GPT-SoVITS API v2 behind its pinned-TLS loopback gateway; the source installer
+can migrate a recognized existing model service to on-demand startup, and
+Statelet releases a service it started after its requests finish. Pre-existing
+services and custom gateway executables remain externally managed. Provide an already
 working local Qwen Python and MLX
 Audio environment, or prepare the complete VoxCPM2 handover and its Python
 environment. Import only model files you trust, and use voices and reference

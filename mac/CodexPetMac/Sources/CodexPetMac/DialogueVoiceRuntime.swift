@@ -4199,6 +4199,8 @@ actor GPTSoVITSAPIClient {
     private struct ActivatedProfile {
         let baseURL: URL
         let tlsLeafCertificateSHA256: String
+        let gptWeightURL: URL
+        let sovitsWeightURL: URL
         let referenceAudioURL: URL
     }
 
@@ -4247,16 +4249,17 @@ actor GPTSoVITSAPIClient {
 
     private let configuration: URLSessionConfiguration
     private let requestPerformer: GPTSoVITSRequestPerformer
+    nonisolated let demandService: GPTSoVITSDemandService
 
     init(
         configuration: URLSessionConfiguration = .ephemeral,
-        requestPerformer: @escaping GPTSoVITSRequestPerformer = { request, maximumBytes, pin, configuration in
-            try await DialogueVoiceBoundedRequest(
-                maximumBytes: maximumBytes,
-                expectedLeafCertificateSHA256: pin
-            ).perform(request, configuration: configuration)
-        }
+        demandService: GPTSoVITSDemandService? = nil,
+        requestPerformer: GPTSoVITSRequestPerformer? = nil
     ) {
+        // Existing transport fixtures must never touch the user's launchd jobs.
+        let protocols = configuration.protocolClasses?.map(ObjectIdentifier.init) ?? []
+        let defaults = URLSessionConfiguration.ephemeral.protocolClasses?.map(ObjectIdentifier.init) ?? []
+        self.demandService = demandService ?? (requestPerformer != nil || protocols != defaults ? .noop : .shared)
         configuration.waitsForConnectivity = false
         configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         configuration.urlCache = nil
@@ -4265,7 +4268,12 @@ actor GPTSoVITSAPIClient {
         configuration.timeoutIntervalForRequest = 120
         configuration.timeoutIntervalForResource = 180
         self.configuration = configuration
-        self.requestPerformer = requestPerformer
+        self.requestPerformer = requestPerformer ?? { request, maximumBytes, pin, configuration in
+            try await DialogueVoiceBoundedRequest(
+                maximumBytes: maximumBytes,
+                expectedLeafCertificateSHA256: pin
+            ).perform(request, configuration: configuration)
+        }
     }
 
     static func encodedTTSRequestBody(
@@ -4290,10 +4298,26 @@ actor GPTSoVITSAPIClient {
         applicationSupportRoot: URL
     ) async throws -> Data {
         try Task.checkCancellation()
-        let activatedProfile = try await activateProfile(
-            profile,
-            applicationSupportRoot: applicationSupportRoot
-        )
+        let activatedProfile = try resolveProfile(profile, applicationSupportRoot: applicationSupportRoot)
+        let lease = try await acquireDemand(activatedProfile, applicationSupportRoot: applicationSupportRoot)
+        do {
+            try await activateProfile(activatedProfile)
+            let data = try await synthesize(profile: profile, line: line, activatedProfile: activatedProfile)
+            await demandService.release(lease)
+            try Task.checkCancellation()
+            return data
+        } catch {
+            await demandService.release(lease)
+            if Task.isCancelled || error is CancellationError { throw DialogueVoiceRuntimeError.cancelled }
+            throw error
+        }
+    }
+
+    private func synthesize(
+        profile: GPTSoVITSVoiceProfile,
+        line: DialogueLine,
+        activatedProfile: ActivatedProfile
+    ) async throws -> Data {
         let endpoint = activatedProfile.baseURL.appendingPathComponent("tts")
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
@@ -4330,15 +4354,30 @@ actor GPTSoVITSAPIClient {
         _ profile: GPTSoVITSVoiceProfile,
         applicationSupportRoot: URL
     ) async throws {
-        _ = try await activateProfile(profile, applicationSupportRoot: applicationSupportRoot)
+        try Task.checkCancellation()
+        let resolved = try resolveProfile(profile, applicationSupportRoot: applicationSupportRoot)
+        let lease = try await acquireDemand(resolved, applicationSupportRoot: applicationSupportRoot)
+        do {
+            try await activateProfile(resolved)
+            await demandService.release(lease)
+            try Task.checkCancellation()
+        } catch {
+            await demandService.release(lease)
+            if Task.isCancelled || error is CancellationError { throw DialogueVoiceRuntimeError.cancelled }
+            throw error
+        }
     }
 
-    private func activateProfile(
+    private func resolveProfile(
         _ profile: GPTSoVITSVoiceProfile,
         applicationSupportRoot: URL
-    ) async throws -> ActivatedProfile {
+    ) throws -> ActivatedProfile {
         let baseURL = try Self.validatedBaseURL(profile.apiBaseURL)
-        guard let tlsLeafCertificateSHA256 = profile.tlsLeafCertificateSHA256 else {
+        guard let tlsLeafCertificateSHA256 = profile.tlsLeafCertificateSHA256,
+              tlsLeafCertificateSHA256.utf8.count == 64,
+              tlsLeafCertificateSHA256.utf8.allSatisfy({
+                  (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0)
+              }) else {
             throw DialogueVoiceRuntimeError.inferenceUnavailable
         }
         let gptWeightURL = try DialogueVoiceAssetInstaller.resolveManagedFile(
@@ -4356,29 +4395,74 @@ actor GPTSoVITSAPIClient {
             root: applicationSupportRoot,
             maximumBytes: DialogueVoiceAssetKind.referenceAudio.maximumBytes
         )
+        return ActivatedProfile(
+            baseURL: baseURL,
+            tlsLeafCertificateSHA256: tlsLeafCertificateSHA256,
+            gptWeightURL: gptWeightURL,
+            sovitsWeightURL: sovitsWeightURL,
+            referenceAudioURL: referenceAudioURL
+        )
+    }
 
+    private func activateProfile(_ profile: ActivatedProfile) async throws {
         // GPT-SoVITS keeps active weights as process-global state. Re-activate for every
         // request so a service restart or another local client cannot silently select a
         // different model behind Statelet's profile revision.
         try await setWeight(
-            baseURL: baseURL,
+            baseURL: profile.baseURL,
             endpoint: "set_gpt_weights",
             queryName: "weights_path",
-            value: gptWeightURL.path,
-            tlsLeafCertificateSHA256: tlsLeafCertificateSHA256
+            value: profile.gptWeightURL.path,
+            tlsLeafCertificateSHA256: profile.tlsLeafCertificateSHA256
         )
         try await setWeight(
-            baseURL: baseURL,
+            baseURL: profile.baseURL,
             endpoint: "set_sovits_weights",
             queryName: "weights_path",
-            value: sovitsWeightURL.path,
-            tlsLeafCertificateSHA256: tlsLeafCertificateSHA256
+            value: profile.sovitsWeightURL.path,
+            tlsLeafCertificateSHA256: profile.tlsLeafCertificateSHA256
         )
-        return ActivatedProfile(
-            baseURL: baseURL,
-            tlsLeafCertificateSHA256: tlsLeafCertificateSHA256,
-            referenceAudioURL: referenceAudioURL
+    }
+
+    private func acquireDemand(
+        _ profile: ActivatedProfile,
+        applicationSupportRoot: URL
+    ) async throws -> GPTSoVITSDemandService.Lease {
+        do {
+            return try await demandService.acquire(
+                baseURL: profile.baseURL,
+                applicationSupportRoot: applicationSupportRoot
+            ) { timeout in
+                try await self.checkHealth(profile, timeout: timeout)
+            }
+        } catch is CancellationError {
+            throw DialogueVoiceRuntimeError.cancelled
+        } catch DialogueVoiceRuntimeError.cancelled {
+            throw DialogueVoiceRuntimeError.cancelled
+        } catch {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
+    }
+
+    private func checkHealth(_ profile: ActivatedProfile, timeout: TimeInterval) async throws {
+        var request = URLRequest(url: profile.baseURL)
+        request.httpMethod = "GET"
+        request.timeoutInterval = max(0.001, timeout)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let healthConfiguration = configuration.copy() as! URLSessionConfiguration
+        healthConfiguration.timeoutIntervalForRequest = request.timeoutInterval
+        healthConfiguration.timeoutIntervalForResource = request.timeoutInterval
+        let (_, response) = try await perform(
+            request,
+            maximumBytes: Self.maximumControlResponseBytes,
+            tlsLeafCertificateSHA256: profile.tlsLeafCertificateSHA256,
+            configuration: healthConfiguration
         )
+        // The API-v2 root is commonly unused; a pinned 404 proves readiness too.
+        guard let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode) || http.statusCode == 404 else {
+            throw DialogueVoiceRuntimeError.inferenceUnavailable
+        }
     }
 
     private func setWeight(
@@ -4415,22 +4499,24 @@ actor GPTSoVITSAPIClient {
     private func perform(
         _ request: URLRequest,
         maximumBytes: Int,
-        tlsLeafCertificateSHA256: String
+        tlsLeafCertificateSHA256: String,
+        configuration requestConfiguration: URLSessionConfiguration? = nil
     ) async throws -> (Data, URLResponse) {
         do {
             try Task.checkCancellation()
-            return try await requestPerformer(
+            let result = try await requestPerformer(
                 request,
                 maximumBytes,
                 tlsLeafCertificateSHA256,
-                configuration
+                requestConfiguration ?? configuration
             )
-        } catch let error as DialogueVoiceRuntimeError {
-            throw error
-        } catch is CancellationError {
-            throw DialogueVoiceRuntimeError.cancelled
+            try Task.checkCancellation()
+            return result
         } catch {
-            throw DialogueVoiceRuntimeError.inferenceUnavailable
+            if Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled {
+                throw DialogueVoiceRuntimeError.cancelled
+            }
+            throw error as? DialogueVoiceRuntimeError ?? .inferenceUnavailable
         }
     }
 

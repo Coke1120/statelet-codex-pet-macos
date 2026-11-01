@@ -2502,19 +2502,22 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             client: GPTSoVITSAPIClient(configuration: configuration)
         )
         defer { coordinator.shutdown() }
-        let unavailable = expectation(description: "saved profile becomes unavailable")
+        let restored = expectation(description: "saved inputs are verified without waking service")
         coordinator.onChange = { snapshot in
-            guard snapshot.library.profileStatus == .unavailable,
-                  snapshot.library.lines.count == 2,
-                  snapshot.library.lines.allSatisfy({ $0.status == .stale }) else {
-                return
-            }
-            unavailable.fulfill()
+            guard snapshot.library.profileStatus == .ready else { return }
+            restored.fulfill()
         }
         coordinator.start()
+        await fulfillment(of: [restored], timeout: 5)
+
+        let unavailable = expectation(description: "requested service is unavailable")
+        coordinator.onChange = { snapshot in
+            if snapshot.library.profileStatus == .unavailable { unavailable.fulfill() }
+        }
+        try coordinator.retryLine(id: lineID)
         await fulfillment(of: [unavailable], timeout: 5)
 
-        let generated = expectation(description: "stale retry is processed")
+        let generated = expectation(description: "explicitly requested retries are processed")
         coordinator.onChange = { snapshot in
             guard snapshot.library.lines.count == 2,
                   snapshot.library.lines.allSatisfy({ $0.status == .ready }) else {
@@ -2523,6 +2526,7 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
             generated.fulfill()
         }
         try coordinator.retryLine(id: lineID)
+        try coordinator.retryLine(id: secondLineID)
         await fulfillment(of: [generated], timeout: 10)
 
         let readyLine = try XCTUnwrap(
@@ -2768,6 +2772,9 @@ final class DialogueVoiceRuntimeTests: XCTestCase {
         }
 
         coordinator.start()
+        for line in coordinator.library.lines where line.status == .queued {
+            try coordinator.retryLine(id: line.id)
+        }
         await fulfillment(of: [generated], timeout: 10)
 
         let readyLine = try XCTUnwrap(

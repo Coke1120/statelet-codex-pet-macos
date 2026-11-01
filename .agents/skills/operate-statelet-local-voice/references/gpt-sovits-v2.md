@@ -16,6 +16,28 @@
   user paths, or service configuration in source, diagnostics, app bundles, or
   releases.
 
+## On-demand service lifecycle
+
+Opening Statelet, restoring a profile, choosing a provider, and playing a ready
+WAV do not activate GPT weights or start the service. Restored queued lines wait
+for **Generate**; adding/editing dialogue, **Retry**, and **Regenerate** request
+inference explicitly.
+
+The source installer migrates a recognized existing
+`com.coke1120.statelet.gpt-sovits` LaunchAgent to `RunAtLoad=false` and
+`KeepAlive=false`, preserving its local configuration and private assets. It
+loads the job without starting the engine; absent or unrelated jobs are left
+alone. This migration requires running the installer: replacing only the app
+binary does not reconfigure an existing login service.
+
+The API client can start that recognized managed API-v2 job for a request, waits
+for the saved pinned HTTPS endpoint within a bounded cold-start deadline, and
+releases a process it started after the final owned request, including failure
+and cancellation. Pre-existing services remain externally managed. A separate
+gateway port requires an explicit `StateletVoiceEndpoint` binding in the
+Statelet-managed job; the saved profile's HTTPS leaf pin remains mandatory.
+Custom gateway executables are not launched as model servers.
+
 ## API v2 activation and synthesis
 
 GPT-SoVITS commonly exposes plain HTTP. Statelet does not connect to that

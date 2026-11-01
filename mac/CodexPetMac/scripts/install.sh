@@ -5,6 +5,7 @@ managed_marker="statelet-v2"
 legacy_marker="mac-widget-v1"
 aggregator_label="com.coke1120.statelet.state-aggregator"
 player_label="com.coke1120.statelet.mac-player"
+gpt_sovits_label="com.coke1120.statelet.gpt-sovits"
 legacy_aggregator_label="com.coke1120.codex-pet.state-aggregator"
 legacy_player_label="com.coke1120.codex-pet.mac-player"
 script_dir="$(cd "$(dirname "$0")" && pwd -P)"
@@ -91,6 +92,7 @@ migration_manifest="$support_dir/.legacy-migration-v1.json"
 launch_agents_dir="$home_dir/Library/LaunchAgents"
 aggregator_plist="$launch_agents_dir/$aggregator_label.plist"
 player_plist="$launch_agents_dir/$player_label.plist"
+gpt_sovits_plist="$launch_agents_dir/$gpt_sovits_label.plist"
 legacy_aggregator_plist="$launch_agents_dir/$legacy_aggregator_label.plist"
 legacy_player_plist="$launch_agents_dir/$legacy_player_label.plist"
 hooks_file="$home_dir/.codex/hooks.json"
@@ -369,7 +371,7 @@ migration_attests() {
 
 journal_command() {
   "$python_bin" - "$transaction_root" "$home_dir" "$@" <<'PY'
-import ctypes, hashlib, json, os, shutil, signal, stat, subprocess, sys, time
+import ctypes, hashlib, json, os, plistlib, re, runpy, shutil, signal, stat, subprocess, sys, time
 from pathlib import Path
 
 root = Path(sys.argv[1])
@@ -377,6 +379,8 @@ home = Path(sys.argv[2])
 command = sys.argv[3]
 args = sys.argv[4:]
 journal = root / "journal.json"
+gpt_label = "com.coke1120.statelet.gpt-sovits"
+gpt_plist = home / "Library/LaunchAgents" / (gpt_label + ".plist")
 
 TREE_DIGEST_ALGORITHM = "statelet-safe-tree-v2"
 LEGACY_TREE_DIGEST_ALGORITHM = "statelet-unframed-v1"
@@ -1132,6 +1136,11 @@ def seal_payload(data):
     }
     if data.get("version") == 3:
         payload["digest_algorithm"] = data.get("digest_algorithm")
+    if "gpt_sovits" in data:
+        voice = data["gpt_sovits"]
+        launch = voice.get("launch")
+        payload["gpt_sovits"] = {**voice, "launch": None if launch is None else {
+            "loaded": launch.get("loaded"), "running": launch.get("running")}}
     return payload
 
 def seal_digest(payload):
@@ -1186,6 +1195,8 @@ def validate_required_publication(data, installer_args, support):
     ]
     if len(media_operations) != 1:
         raise ValueError("transaction publication contract is invalid")
+    if "gpt_sovits" in data:
+        validate_gpt_publication(data)
     player_active = player_plist in active_targets
     launch = data.get("launch")
     if launch == {"skipped": True}:
@@ -1369,6 +1380,156 @@ def validate_restored_launch_plist(data, label, plist):
     finally:
         os.close(parent)
 
+def read_gpt_plist():
+    parent, name = open_parent(gpt_plist, home)
+    try:
+        before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                or before.st_nlink != 1 or before.st_mode & 0o022 or before.st_size > 1024 * 1024):
+            raise ValueError("unsafe voice launch plist")
+        digest, identity = entry_digest_and_identity(parent, name)
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+        with os.fdopen(descriptor, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if any(getattr(before, field) != getattr(opened, field) for field in fields):
+                raise ValueError("voice launch plist changed before reading")
+            content = handle.read(1024 * 1024 + 1)
+            final = os.fstat(handle.fileno())
+            if any(getattr(opened, field) != getattr(final, field) for field in fields):
+                raise ValueError("voice launch plist changed while reading")
+        if len(content) > 1024 * 1024 or entry_digest_and_identity(parent, name) != (digest, identity):
+            raise ValueError("voice launch plist changed")
+        return plistlib.loads(content), {"parent": entry_identity(os.fstat(parent)),
+                                        "entry": identity, "digest": digest, "mode": stat.S_IMODE(before.st_mode)}
+    finally:
+        os.close(parent)
+
+def validate_gpt_original(data):
+    _, original = read_gpt_plist()
+    if original != data["gpt_sovits"]["original"]:
+        raise ValueError("original voice launch plist changed")
+
+def saved_gpt_endpoint(validate):
+    """Bounded read of endpoint/pin metadata; never inspect private model assets."""
+    try:
+        parent, name = open_parent(home / "Library/Application Support/Statelet/voice/dialogue-voice.json", home)
+        try:
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            with os.fdopen(descriptor, "rb") as handle:
+                before = os.fstat(handle.fileno())
+                if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                        or before.st_nlink != 1 or before.st_mode & 0o022
+                        or before.st_size > 16 * 1024 * 1024):
+                    return None
+                content = handle.read(16 * 1024 * 1024 + 1)
+                final = os.fstat(handle.fileno())
+            rebound = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+            if (len(content) > 16 * 1024 * 1024 or any(
+                    getattr(before, field) != getattr(final, field)
+                    or getattr(final, field) != getattr(rebound, field) for field in fields)):
+                return None
+            return validate(json.loads(content))
+        finally:
+            os.close(parent)
+    except (OSError, ValueError, UnicodeError):
+        return None
+
+def validate_gpt_publication(data):
+    voice = data["gpt_sovits"]
+    if not isinstance(voice, dict) or type(voice.get("reload")) is not bool:
+        raise ValueError("voice migration contract is invalid")
+    kind = "install" if voice["reload"] else "retain"
+    owners = [operation for operation in data["operations"]
+              if operation.get("target") == str(gpt_plist) and operation.get("kind") == kind]
+    if len(owners) != 1:
+        raise ValueError("voice launch plist ownership is invalid")
+    if voice["reload"]:
+        validate_live_install(owners[0])
+        backups = [operation for operation in data["operations"]
+                   if operation.get("target") == str(gpt_plist) and operation.get("kind") == "backup"]
+        original = voice["original"]
+        if (len(backups) != 1 or backups[0].get("digest") != original.get("digest")
+                or backups[0].get("source_entry") != original.get("entry")
+                or backups[0].get("target_parent") != original.get("parent")):
+            raise ValueError("voice launch plist backup changed")
+    else:
+        validate_retain(owners[0])
+        validate_gpt_original(data)
+    payload, _ = read_gpt_plist()
+    if (payload.get("Label") != gpt_label or payload.get("StateletManaged") != "statelet-v2"
+            or payload.get("RunAtLoad") is not False or payload.get("KeepAlive") is not False):
+        raise ValueError("voice launch plist is not on demand")
+
+def gpt_job_state():
+    result = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{gpt_label}"],
+                            capture_output=True, text=True, timeout=10)
+    if result.returncode == 113:
+        return False, False
+    if (result.returncode != 0
+            or not result.stdout.startswith(f"gui/{os.getuid()}/{gpt_label} = {{")
+            or not re.search(r"^\tpath = " + re.escape(str(gpt_plist)) + r"$", result.stdout, re.MULTILINE)
+            or not re.search(r"^\ttype = LaunchAgent$", result.stdout, re.MULTILINE)):
+        raise ValueError("loaded voice job ownership is ambiguous")
+    return True, bool(re.search(r"^\tpid = [1-9][0-9]*$", result.stdout, re.MULTILINE))
+
+def gpt_launch(action, *arguments):
+    return subprocess.run(["launchctl", action, *arguments], stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, timeout=10).returncode == 0
+
+def wait_gpt_state(loaded, running=None):
+    consecutive = 0
+    for _ in range(100):
+        current = gpt_job_state()
+        if current[0] == loaded and (running is None or current[1] == running):
+            consecutive += 1
+            if consecutive == 3:
+                return True
+        else:
+            consecutive = 0
+        time.sleep(0.05)
+    return False
+
+def reconcile_gpt_launch(data, forward):
+    voice = data.get("gpt_sovits")
+    if voice is None or voice.get("launch") is None:
+        return True  # --skip-launchctl and transactions before voice quiescence.
+    launch = voice["launch"]
+    if (set(launch) != {"loaded", "running", "pending", "changed"}
+            or not all(type(value) is bool for value in launch.values())
+            or (launch["running"] and not launch["loaded"])):
+        raise ValueError("voice launch state is invalid")
+    if not forward and not (launch["pending"] or launch["changed"]):
+        return True
+    if forward:
+        validate_gpt_publication(data)
+    else:
+        validate_gpt_original(data)
+    domain = f"gui/{os.getuid()}"
+    target = f"{domain}/{gpt_label}"
+    loaded, _ = gpt_job_state()
+    if not forward and loaded:
+        if not gpt_launch("bootout", target) or not wait_gpt_state(False):
+            return False
+        loaded = False
+    if (forward or launch["loaded"]) and not loaded:
+        if not gpt_launch("bootstrap", domain, str(gpt_plist)) or not wait_gpt_state(True):
+            return False
+    if forward:
+        validate_gpt_publication(data)
+        return True  # Bootstrap with both flags false; never kickstart on install.
+    if launch["loaded"]:
+        _, running = gpt_job_state()
+        if launch["running"] and not running:
+            if not gpt_launch("kickstart", target):
+                return False
+        elif not launch["running"] and running:
+            if not gpt_launch("kill", "SIGTERM", target):
+                return False
+        return wait_gpt_state(True, launch["running"])
+    return wait_gpt_state(False)
+
 def sync_directory(path):
     descriptor = os.open(path, os.O_RDONLY)
     try:
@@ -1527,6 +1688,64 @@ if command == "init":
     (root / "backup").mkdir(mode=0o700)
     write({"version": 3, "digest_algorithm": TREE_DIGEST_ALGORITHM,
            "home": str(home), "state": "active", "operations": []})
+elif command == "gpt-stage":
+    data = load()
+    if data["state"] != "active" or "gpt_sovits" in data:
+        raise ValueError("invalid voice migration state")
+    try:
+        payload, original = read_gpt_plist()
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        payload = None
+    helper = runpy.run_path(args[0])
+    migrate = helper["migrate_plist"]
+    migrated = migrate(payload, home)
+    if migrated is None:
+        print("absent")  # Unknown jobs are neither overwritten nor managed.
+    else:
+        if "StateletVoiceEndpoint" not in payload:
+            migrated = migrate(payload, home, saved_gpt_endpoint(helper["profile_endpoint"]))
+        reload = (payload.get("StateletManaged") != "statelet-v2"
+                  or payload.get("RunAtLoad") is not False or payload.get("KeepAlive") is not False
+                  or migrated.get("StateletVoiceEndpoint") != payload.get("StateletVoiceEndpoint"))
+        if reload:
+            stage = root / "stage" / (gpt_label + ".plist")
+            with stage.open("xb") as handle:
+                plistlib.dump(migrated, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(stage, original["mode"])
+        data["gpt_sovits"] = {"original": original, "reload": reload, "launch": None}
+        write(data)
+        print("reload" if reload else "retain")
+elif command == "gpt-quiesce":
+    data = load()
+    voice = data["gpt_sovits"]
+    if data["state"] != "active" or voice["launch"] is not None:
+        raise ValueError("invalid voice launch state")
+    validate_gpt_original(data)
+    loaded, running = gpt_job_state()
+    voice["launch"] = {"loaded": loaded, "running": running, "pending": False, "changed": False}
+    write(data)
+    if voice["reload"] and loaded:
+        voice["launch"]["pending"] = True
+        write(data)
+        if not gpt_launch("bootout", f"gui/{os.getuid()}/{gpt_label}"):
+            if gpt_job_state() == (loaded, running):
+                voice["launch"]["pending"] = False
+                write(data)
+                raise SystemExit(72)
+            raise SystemExit(71)
+        if not wait_gpt_state(False):
+            raise SystemExit(71)
+        voice["launch"].update(pending=False, changed=True)
+        write(data)
+elif command == "gpt-load":
+    data = load()
+    if data["state"] != "files-committed":
+        raise ValueError("file transaction is not committed")
+    validate_seal(data)
+    if not reconcile_gpt_launch(data, forward=True):
+        raise SystemExit(71)
 elif command == "record":
     kind, source, target, expected = args
     data = load()
@@ -1674,6 +1893,8 @@ elif command == "backup-move":
     private_directories = expected_attestation.get("private_directories", []) if expected_attestation else []
     private_directory_fds = open_attested_private_directories(private_directories) if private_directories else []
     try:
+        if target_path == gpt_plist and "gpt_sovits" in data:
+            validate_gpt_original(data)
         if expected_attestation is not None:
             current_digest, current_entry = attested_file_digest_and_entry(target_parent, target_name)
             if (
@@ -2092,6 +2313,9 @@ elif command == "recover":
         data["files_restored"] = True
         write(data)
     launch_failed = False
+    # Register the migrated voice job before relaunching an app that may request it.
+    if data["state"] == "files-committed" and not reconcile_gpt_launch(data, forward=True):
+        launch_failed = True
     launch = data.get("launch")
     if data["state"] == "files-committed" and not isinstance(launch, dict):
         raise ValueError("transaction launch state is invalid")
@@ -2169,6 +2393,9 @@ elif command == "recover":
                     launch_failed = True
             elif not should_load and subprocess.run(["launchctl", "print", f"{domain}/{label}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
                 launch_failed = True
+    if data["state"] == "active":
+        if not reconcile_gpt_launch(data, forward=False):
+            launch_failed = True
     if launch_failed:
         raise SystemExit(71)
     shutil.rmtree(root)
@@ -2187,7 +2414,7 @@ recover_transaction() {
     "$aggregator_plist" "$player_plist" "$legacy_aggregator_plist" "$legacy_player_plist" \
     "$hooks_file" "$grok_hooks_file" "$applications_dir" "$home_dir/Library" "$home_dir/Library/Application Support" \
     "$support_dir" "$launch_agents_dir" "$home_dir/.codex" "$home_dir/.grok" "$grok_hooks_dir" \
-    "$media_dir" "$runtime_dir" "$logs_dir" "$support_dir" 2>/dev/null
+    "$media_dir" "$runtime_dir" "$logs_dir" "$gpt_sovits_plist" "$support_dir" 2>/dev/null
 }
 
 if recover_transaction; then
@@ -2353,6 +2580,10 @@ stage_app="$stage_root/Statelet.app"
 stage_component="$stage_root/Statelet"
 stage_aggregator_plist="$stage_root/$aggregator_label.plist"
 stage_player_plist="$stage_root/$player_label.plist"
+gpt_sovits_plan="$(journal_command gpt-stage "$script_dir/gpt_sovits_launch_agent.py" 2>/dev/null)" || {
+  printf 'Statelet voice LaunchAgent could not be staged safely.\n' >&2
+  exit 75
+}
 "$python_bin" "$script_dir/merge_hooks.py" --safe-copy-source "$app_bundle" --safe-copy-destination "$stage_app" 2>/dev/null || {
   printf 'Statelet.app could not be snapshotted safely.\n' >&2
   exit 1
@@ -2475,6 +2706,12 @@ if [[ "$skip_launchctl" -eq 0 ]]; then
       if [[ "${STATELET_INSTALL_CRASH_AT:-}" == "after-first-bootout" ]]; then kill -KILL $$; fi
     fi
   done
+  if [[ "$gpt_sovits_plan" != "absent" ]]; then
+    journal_command gpt-quiesce 2>/dev/null || {
+      printf 'Statelet voice LaunchAgent could not be quiesced safely.\n' >&2
+      exit 72
+    }
+  fi
 else
   journal_command launch-skip
 fi
@@ -2632,6 +2869,9 @@ backup_target "$aggregator_plist" agents/aggregator
 backup_target "$player_plist" agents/player
 [[ ! -e "$legacy_aggregator_plist" ]] || backup_target "$legacy_aggregator_plist" agents/legacy-aggregator
 [[ ! -e "$legacy_player_plist" ]] || backup_target "$legacy_player_plist" agents/legacy-player
+if [[ "$gpt_sovits_plan" == "reload" ]]; then
+  backup_target "$gpt_sovits_plist" agents/gpt-sovits
+fi
 [[ ! -e "$hooks_file" ]] || backup_target "$hooks_file" hooks-quiesced.json
 install_target "$stage_app" "$app_dest" "" "$app_source_digest"
 if [[ "${STATELET_INSTALL_CRASH_AT:-}" == "after-app" ]]; then kill -KILL $$; fi
@@ -2648,6 +2888,11 @@ else
   install_target "$stage_component" "$component_dir"
 fi
 install_target "$stage_aggregator_plist" "$aggregator_plist"
+if [[ "$gpt_sovits_plan" == "reload" ]]; then
+  install_target "$stage_root/$gpt_sovits_label.plist" "$gpt_sovits_plist"
+elif [[ "$gpt_sovits_plan" == "retain" ]]; then
+  journal_command retain "$gpt_sovits_plist"
+fi
 if [[ "$install_player" -eq 1 ]]; then install_target "$stage_player_plist" "$player_plist"; fi
 install_target "$stage_hooks" "$hooks_file"
 
@@ -2740,7 +2985,7 @@ journal_command files-commit \
   "$support_dir/media" "$support_dir/voice" "$support_dir/characters" "$support_dir/sessions" \
   "$support_dir/sessions/activity-titles-v1.json" \
   "$support_dir/alpha-runtime" "$support_dir/runtime/current_state.json" "$support_dir/media/media-map.json" \
-  "$support_dir/.legacy-migration-v1.json" "$support_dir"
+  "$support_dir/.legacy-migration-v1.json" "$gpt_sovits_plist" "$support_dir"
 if [[ "${STATELET_INSTALL_CRASH_AT:-}" == "after-files-commit" ]]; then kill -KILL $$; fi
 
 if [[ "$skip_launchctl" -eq 0 ]]; then
@@ -2751,6 +2996,9 @@ if [[ "$skip_launchctl" -eq 0 ]]; then
   journal_command launch-validate "$aggregator_label" "$aggregator_plist"
   if [[ "${STATELET_INSTALL_CRASH_AT:-}" == "after-aggregator-rebootstrap" ]]; then kill -KILL $$; fi
   journal_command launch-phase 0 changed
+  if [[ "$gpt_sovits_plan" != "absent" ]]; then
+    journal_command gpt-load 2>/dev/null || { printf 'Statelet voice LaunchAgent did not load on demand.\n' >&2; exit 73; }
+  fi
   if [[ "$install_player" -eq 1 ]]; then
     journal_command launch-phase 1 pending
     journal_command launch-validate "$player_label" "$player_plist"
@@ -2771,7 +3019,7 @@ journal_command commit \
   "$support_dir/media" "$support_dir/voice" "$support_dir/characters" "$support_dir/sessions" \
   "$support_dir/sessions/activity-titles-v1.json" \
   "$support_dir/alpha-runtime" "$support_dir/runtime/current_state.json" "$support_dir/media/media-map.json" \
-  "$support_dir/.legacy-migration-v1.json" "$support_dir"
+  "$support_dir/.legacy-migration-v1.json" "$gpt_sovits_plist" "$support_dir"
 committed=1
 rm -rf "$transaction_root"
 trap - EXIT

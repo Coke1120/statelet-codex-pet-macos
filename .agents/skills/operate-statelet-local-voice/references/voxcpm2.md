@@ -34,8 +34,11 @@ the previous ready result remains until atomic replacement succeeds.
 
 Apple Silicon MPS follows the upstream float32 stability path and may be slow
 or memory-intensive on a MacBook Air. Saved-profile validation at app launch
-also loads the model; measure validation and generation helpers separately
-from the player, and verify they exit and release their allocations afterward.
+verifies the managed inputs without running the model-loading probe. Restored
+queues wait for **Generate**, **Retry**, or **Regenerate** on the selected line;
+adding or editing dialogue also requests generation. Existing ready audio does
+not need the model. Measure requested generation separately from the player,
+and verify its helper exits and releases its allocations afterward.
 A `Ready` profile or playable container
 does not prove natural or audible speech; use **Preview** and evaluate private
 audio locally.

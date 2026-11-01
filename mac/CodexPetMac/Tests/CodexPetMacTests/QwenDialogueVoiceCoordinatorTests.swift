@@ -5,6 +5,19 @@ import XCTest
 @testable import Statelet
 
 final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
+    private final class SavedAudioPlayer: DialogueAudioPlaying {
+        var isPlaying = false
+        var volume: Float = 1
+        var playedPaths: [String] = []
+
+        func play(relativePath: String, applicationSupportRoot: URL, onFinished: @escaping () -> Void) throws {
+            playedPaths.append(relativePath)
+            isPlaying = true
+        }
+
+        func stop() { isPlaying = false }
+    }
+
     private struct VoxProfileFixture {
         let profile: VoxCPM2VoiceProfile
         let sourceSnapshotURL: URL
@@ -177,6 +190,111 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
     override func setUp() {
         super.setUp()
         QwenUnexpectedGPTURLProtocol.counter.reset()
+    }
+
+    @MainActor
+    func testRestoredVoxQueueWaitsForSelectedLineDemandWithoutProbe() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try makeVoxProfile(root: root)
+        var library = try DialogueVoiceLibrary(voxcpm2Profile: fixture.profile, activeProviderKind: .voxcpm2)
+        let first = try library.addLine(text: "最初です。", language: "japanese")
+        let second = try library.addLine(text: "次です。", language: "japanese")
+        try save(library, root: root)
+        let probes = RequestCounter()
+        let generations = RequestCounter()
+        let coordinator = DialogueVoiceCoordinator(
+            applicationSupportRoot: root,
+            voxcpm2Client: makeVoxClient(root: root, probeCalls: probes, synthesisCalls: generations)
+        )
+        defer { coordinator.shutdown() }
+
+        coordinator.start()
+        try await waitUntil(timeout: 5) { coordinator.library.profileStatus == .ready }
+        XCTAssertEqual(probes.value, 0)
+        XCTAssertEqual(generations.value, 0)
+        XCTAssertTrue(coordinator.library.lines.allSatisfy { $0.status == .queued })
+
+        try coordinator.retryLine(id: first.id)
+        try await waitUntil(timeout: 5) { coordinator.library.lines.first?.status == .ready }
+        XCTAssertEqual(probes.value, 0)
+        XCTAssertEqual(generations.value, 1)
+        XCTAssertEqual(coordinator.library.lines.first(where: { $0.id == second.id })?.status, .queued)
+
+        coordinator.shutdown()
+        coordinator.start()
+        try await waitUntil(timeout: 5) { coordinator.library.profileStatus == .ready }
+        XCTAssertEqual(generations.value, 1)
+        XCTAssertEqual(coordinator.library.lines.first(where: { $0.id == second.id })?.status, .queued)
+    }
+
+    @MainActor
+    func testSavedVoxAudioPreviewAndProviderSelectionDoNotLoadModel() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try makeVoxProfile(root: root)
+        let gpt = try makeGPTProfile(root: root)
+        var library = try DialogueVoiceLibrary(
+            profile: gpt, voxcpm2Profile: fixture.profile, activeProviderKind: .voxcpm2
+        )
+        let line = try library.addLine(text: "保存済みです。", language: "japanese")
+        let ticket = try library.beginGeneration(for: line.id)
+        let path = "voice/generated/cached-vox.wav"
+        let output = root.appendingPathComponent(path)
+        try FileManager.default.createDirectory(at: output.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Self.voxWAV(frames: 480).write(to: output)
+        _ = try library.completeGeneration(ticket: ticket, outputPath: path)
+        try save(library, root: root)
+        let probes = RequestCounter()
+        let generations = RequestCounter()
+        let player = SavedAudioPlayer()
+        let coordinator = DialogueVoiceCoordinator(
+            applicationSupportRoot: root,
+            voxcpm2Client: makeVoxClient(root: root, probeCalls: probes, synthesisCalls: generations),
+            audioPlayer: player
+        )
+        defer { coordinator.shutdown() }
+
+        coordinator.start()
+        try await waitUntil(timeout: 5) { coordinator.library.profileStatus == .ready }
+        try coordinator.previewLine(id: line.id)
+        XCTAssertEqual(player.playedPaths, [path])
+        XCTAssertEqual(probes.value, 0)
+        XCTAssertEqual(generations.value, 0)
+
+        try coordinator.selectActiveProvider(.gptSovits)
+        try await waitUntil(timeout: 5) { coordinator.library.profileStatus == .ready }
+        try coordinator.selectActiveProvider(.voxcpm2)
+        try await waitUntil(timeout: 5) { coordinator.library.profileStatus == .ready }
+        XCTAssertEqual(probes.value, 0)
+        XCTAssertEqual(generations.value, 0)
+    }
+
+    @MainActor
+    func testRestoredGPTQueueDoesNotContactServiceUntilGenerate() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = try makeGPTProfile(root: root)
+        var library = try DialogueVoiceLibrary(profile: profile)
+        let line = try library.addLine(text: "Generate on demand", language: "en")
+        try save(library, root: root)
+        let requests = RequestCounter()
+        let client = GPTSoVITSAPIClient { request, _, _, _ in
+            requests.increment()
+            let data = request.url?.lastPathComponent == "tts"
+                ? Self.pcmWAV(sampleRate: 16_000, frames: 1_600) : Data("{}".utf8)
+            return (data, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
+        let coordinator = DialogueVoiceCoordinator(applicationSupportRoot: root, client: client)
+        defer { coordinator.shutdown() }
+
+        coordinator.start()
+        try await waitUntil(timeout: 5) { coordinator.library.profileStatus == .ready }
+        XCTAssertEqual(requests.value, 0)
+        XCTAssertEqual(coordinator.library.lines.first?.status, .queued)
+        try coordinator.retryLine(id: line.id)
+        try await waitUntil(timeout: 5) { coordinator.library.lines.first?.status == .ready }
+        XCTAssertEqual(requests.value, 3)
     }
 
     @MainActor
@@ -605,7 +723,7 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
         defer { coordinator.shutdown() }
         coordinator.start()
         try await waitUntil(timeout: 5) {
-            coordinator.library.profileStatus == .ready && probeCalls.value >= 1
+            coordinator.library.profileStatus == .ready
         }
 
         coordinator.configureQwenProfile(
@@ -648,6 +766,7 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
             if snapshot.library.lines.first?.status == .ready { ready.fulfill() }
         }
         coordinator.start()
+        try coordinator.retryLine(id: XCTUnwrap(coordinator.library.lines.first?.id))
         await fulfillment(of: [ready], timeout: 5)
         XCTAssertEqual(qwenCalls.value, 0)
         XCTAssertEqual(coordinator.library.activeProviderKind, .gptSovits)
@@ -678,6 +797,7 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
             coordinator.shutdown()
         }
         coordinator.start()
+        try coordinator.retryLine(id: XCTUnwrap(coordinator.library.lines.first?.id))
         await fulfillment(of: [finalizationStarted], timeout: 5)
 
         let generatedRoot = root.appendingPathComponent("voice/generated", isDirectory: true)
@@ -728,6 +848,7 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
             coordinator.shutdown()
         }
         coordinator.start()
+        try coordinator.retryLine(id: XCTUnwrap(coordinator.library.lines.first?.id))
         await fulfillment(of: [synthesisStarted], timeout: 5)
 
         try coordinator.removeProfile(provider: .qwen3TTS)
@@ -822,7 +943,7 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
         defer { coordinator.shutdown() }
         coordinator.start()
         try await waitUntil(timeout: 5) {
-            coordinator.library.profileStatus == .ready && probeCalls.value >= 1
+            coordinator.library.profileStatus == .ready
         }
 
         let newReferenceURL = root.deletingLastPathComponent()
@@ -836,6 +957,12 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
             pythonExecutableURL: try authenticatedPythonExecutable()
         )
 
+        try await waitUntil(timeout: 5) {
+            coordinator.library.voxcpm2Profile?.revision == 2
+                && coordinator.library.profileStatus == .ready
+        }
+        XCTAssertEqual(synthesisCalls.value, 0)
+        try coordinator.retryLine(id: line.id)
         try await waitUntil(timeout: 5) {
             coordinator.library.voxcpm2Profile?.revision == 2
                 && coordinator.library.profileStatus == .unavailable
@@ -866,7 +993,7 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent(profile.snapshotPath).path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: oldOutputURL.path))
         XCTAssertNotEqual(coordinator.library.lines.first?.outputRelativePath, oldOutputPath)
-        XCTAssertGreaterThanOrEqual(probeCalls.value, 2)
+        XCTAssertEqual(probeCalls.value, 0)
     }
 
     @MainActor
@@ -1466,12 +1593,15 @@ final class QwenDialogueVoiceCoordinatorTests: XCTestCase {
         )
         defer { coordinator.shutdown() }
         coordinator.start()
+        try await waitUntil(timeout: 5) { coordinator.library.profileStatus == .ready }
+        XCTAssertEqual(synthesisCalls.value, 0)
+        try coordinator.retryLine(id: line.id)
 
         try await waitUntil(timeout: 5) {
             guard let current = coordinator.library.lines.first else { return false }
             return current.status == .ready
                 && current.outputRelativePath != invalidOutputPath
-                && probeCalls.value >= 1
+                && probeCalls.value == 0
                 && synthesisCalls.value >= 1
         }
         let current = try XCTUnwrap(coordinator.library.lines.first)
