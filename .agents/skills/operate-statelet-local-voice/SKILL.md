@@ -38,7 +38,11 @@ in private local storage. Never commit, bundle, diagnose-upload, or log them.
    each required lifecycle state: Idle, Running, Waiting, and Review. Keep the
    text to one concise sentence for one contiguous utterance. Preserve an
    unsaved draft while switching Voice pages or importing assets.
-5. Wait for every line to reach `ready`. Automatic state speech must not
+5. Request generation for the required lines and wait for each to reach `ready`.
+   Restored GPT-SoVITS and VoxCPM2 queues wait for **Generate**; opening Statelet,
+   choosing a provider, and playing cached audio must not load those models.
+   Use a model-loading probe only for an explicit runtime diagnostic.
+   Automatic state speech must not
    interrupt active speech; only the latest pending state entry should play.
    Same-state heartbeats and clip rotation must not replay delivered speech.
 6. Read the provider reference before changing request fields, persistence,

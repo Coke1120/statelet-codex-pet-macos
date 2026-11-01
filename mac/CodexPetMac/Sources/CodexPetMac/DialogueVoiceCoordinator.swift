@@ -216,6 +216,9 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     private(set) var activityMessage: String?
 
     private var activeGenerationTask: Task<Void, Never>?
+    // Restoring a queue is not a request to load a voice model. Only explicit
+    // dialogue edits, Generate, Retry, or Regenerate may start inference.
+    private var requestedGenerationIDs: Set<UUID> = []
     private var automaticPlaybackTask: Task<Void, Never>?
     private var automaticPlaybackSession: AutomaticPlaybackSession?
     private var automaticPlaybackSequence: UInt64 = 0
@@ -231,7 +234,6 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     private var inFlightVoxImportPaths: Set<String> = []
     private var profileValidationTask: Task<Void, Never>?
     private var validatedProviderIdentity: ValidatedProviderIdentity?
-    private var voxcpm2ProbeSummary: String?
     private var profileValidationSequence: UInt64 = 0
     private var importSequence: UInt64 = 0
     private var persistenceBlocked = false
@@ -343,6 +345,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         assertMainThread()
         guard !started else { return }
         started = true
+        requestedGenerationIDs.removeAll()
         if FileManager.default.fileExists(atPath: store.fileURL.path) {
             do {
                 library = try store.load()
@@ -421,6 +424,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     func shutdown() {
         assertMainThread()
         started = false
+        requestedGenerationIDs.removeAll()
         activeImportTask?.cancel()
         importSequence &+= 1
         activeImportTask = nil
@@ -931,7 +935,6 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             profileValidationSequence &+= 1
             profileValidationTask = nil
             validatedProviderIdentity = nil
-            voxcpm2ProbeSummary = nil
             activeGenerationTask?.cancel()
             activeGenerationTask = nil
             activeTicket = nil
@@ -950,7 +953,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         let cleanup = retryPendingCleanup()
         activityMessage = cleanupAwareMessage(
             activatesVox
-                ? "VoxCPM2 profile saved. Revalidating its offline inputs and runtime…"
+                ? "VoxCPM2 profile saved. Verifying its local inputs without loading the model…"
                 : "VoxCPM2 profile saved. Use VoxCPM2 to switch providers.",
             outcome: cleanup
         )
@@ -1061,7 +1064,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         self.draft = draft
         let cleanup = retryPendingCleanup()
         activityMessage = cleanupAwareMessage(
-            "Voice profile saved. Validating its assets and the local GPT-SoVITS service…",
+            "Voice profile saved. Verifying its local inputs without starting the service…",
             outcome: cleanup
         )
         logger.info("event=profile_saved revision=\(profile.revision, privacy: .public)")
@@ -1275,6 +1278,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         assertMainThread()
         guard !persistenceBlocked else { throw DialogueVoiceError.storeFailure }
         guard library.activeProviderKind != provider else { return }
+        requestedGenerationIDs.removeAll()
         profileValidationTask?.cancel()
         profileValidationSequence &+= 1
         profileValidationTask = nil
@@ -1303,7 +1307,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     func addLine(text: String, language: String, state: PetState = .idle) throws {
         assertMainThread()
         guard !persistenceBlocked else { throw DialogueVoiceError.storeFailure }
-        _ = try commit { try $0.addLine(text: text, language: language, state: state) }
+        let line = try commit { try $0.addLine(text: text, language: language, state: state) }
+        requestedGenerationIDs.insert(line.id)
         activityMessage = library.profileStatus == .ready
             ? "Dialogue queued for voice generation."
             : library.activeProviderKind == nil
@@ -1328,6 +1333,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             ? "Dialogue updated and queued for fresh voice generation."
             : "Dialogue updated and saved as a draft until the voice profile is ready."
         activityMessage = cleanupAwareMessage(message, outcome: cleanup)
+        requestedGenerationIDs.insert(id)
         notify()
         processNextQueuedLine()
     }
@@ -1342,7 +1348,9 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                 _ = try Self.activateValidatedProfileRetainingVoxReplacementOutputs(&$0)
             }
             let line: DialogueLine
-            if selectedWasStale,
+            if let selected = $0.lines.first(where: { $0.id == id }), selected.status == .queued {
+                line = selected
+            } else if selectedWasStale,
                let activatedLine = $0.lines.first(where: { $0.id == id }),
                activatedLine.status == .queued {
                 line = activatedLine
@@ -1360,6 +1368,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             "Dialogue queued for retry.",
             outcome: cleanup
         )
+        requestedGenerationIDs.insert(id)
         notify()
         processNextQueuedLine()
     }
@@ -1378,6 +1387,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
             "Dialogue queued for fresh voice generation.",
             outcome: cleanup
         )
+        requestedGenerationIDs.insert(id)
         notify()
         processNextQueuedLine()
     }
@@ -1385,6 +1395,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
     func deleteLine(id: UUID) throws {
         assertMainThread()
         guard !persistenceBlocked else { throw DialogueVoiceError.storeFailure }
+        requestedGenerationIDs.remove(id)
         if activeTicket?.lineID == id { activeGenerationTask?.cancel() }
         _ = try commit {
             let removed = try $0.removeLine(id: id)
@@ -1710,22 +1721,11 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                     defaultTextLanguage: profile.defaultTextLanguage,
                     assetDigests: validatedAssets.digests
                 )
-                if fingerprint == profile.inputFingerprint {
-                    do {
-                        try await self.client.validateProfile(
-                            profile,
-                            applicationSupportRoot: root
-                        )
-                        result = .valid(.gptSovits(validatedAssets), invalidOutputs)
-                    } catch let error as DialogueVoiceRuntimeError
-                        where error == .inferenceUnavailable || error == .cancelled {
-                        result = .unavailable(.gptSovits(validatedAssets), invalidOutputs)
-                    } catch {
-                        result = .invalid
-                    }
-                } else {
-                    result = .invalid
-                }
+                // Asset and endpoint validation is local. Activating GPT weights
+                // would wake the service merely because Statelet was opened.
+                result = fingerprint == profile.inputFingerprint
+                    ? .valid(.gptSovits(validatedAssets), invalidOutputs)
+                    : .invalid
             } catch {
                 result = .invalid
             }
@@ -1823,7 +1823,6 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         profileValidationSequence &+= 1
         let sequence = profileValidationSequence
         let root = applicationSupportRoot
-        let client = voxcpm2Client
         let readyOutputs = library.lines.compactMap { line -> ReadyOutputValidationTicket? in
             guard line.status == .ready, let outputRelativePath = line.outputRelativePath else { return nil }
             return ReadyOutputValidationTicket(
@@ -1835,7 +1834,6 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         let activity = detachedActivities.begin()
         profileValidationTask = Task.detached(priority: .utility) {
             let result: ProfileValidationResult
-            var probeSummary: String?
             do {
                 let validated = try VoxCPM2ProfileValidator.validate(
                     profile: profile, applicationSupportRoot: root
@@ -1848,17 +1846,11 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                     ) else { return true }
                     return !VoxCPM2Client.isValidOutputWAV(data)
                 }
-                do {
-                    let probe = try await client.validateProfile(profile, applicationSupportRoot: root)
-                    probeSummary = probe.sanitizedSummary
-                    result = .valid(.voxcpm2(validated.identityTokens), invalidOutputs)
-                } catch let error as DialogueVoiceRuntimeError
-                    where error == .inferenceUnavailable || error == .cancelled {
-                    result = .unavailable(.voxcpm2(validated.identityTokens), invalidOutputs)
-                } catch { result = .invalid }
+                // The runtime probe loads the entire model. Synthesis performs
+                // its own runtime/output checks when a line is requested.
+                result = .valid(.voxcpm2(validated.identityTokens), invalidOutputs)
             } catch { result = .invalid }
             let validationResult = result
-            let validationSummary = probeSummary
             self.mainThreadFinalizations.enqueue {
                 defer { activity.finish() }
                 guard sequence == self.profileValidationSequence,
@@ -1866,7 +1858,6 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                       self.library.voxcpm2Profile?.id == profile.id,
                       self.library.voxcpm2Profile?.inputFingerprint == profile.inputFingerprint else { return }
                 self.profileValidationTask = nil
-                self.voxcpm2ProbeSummary = validationSummary
                 self.finishProfileValidation(provider: .voxcpm2, result: validationResult)
             }
         }
@@ -1899,8 +1890,8 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                 validatedProviderIdentity = identity
                 let cleanup = retryPendingCleanup()
                 let validationMessage: String
-                if provider == .voxcpm2, let probeSummary = voxcpm2ProbeSummary {
-                    validationMessage = "VoxCPM2 profile validated (\(probeSummary))."
+                if provider == .voxcpm2 || provider == .gptSovits {
+                    validationMessage = "Voice inputs verified. The model loads only when dialogue generation is requested."
                 } else {
                     validationMessage = "Voice profile validation completed."
                 }
@@ -1926,7 +1917,7 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                         ? "Voice assets are valid, but the pinned HTTPS GPT-SoVITS gateway is unavailable or this legacy profile has no TLS pin. Restore the gateway and save the profile again."
                         : provider == .qwen3TTS
                         ? "The Qwen voice package is valid, but its local Python runtime is unavailable. Restore the selected runtime and validate again."
-                        : "The VoxCPM2 inputs are pinned, but its offline probe could not validate the runtime. Verify the selected Python runtime and managed model package, then restart Statelet or switch providers and use VoxCPM2 again.",
+                        : "The VoxCPM2 inputs are pinned, but its offline runtime is unavailable. Verify the selected Python runtime and managed model package, then use Generate or Retry when speech is needed.",
                     outcome: cleanup
                 )
                 logger.error("event=profile_unavailable code=INFERENCE_UNAVAILABLE")
@@ -1937,7 +1928,6 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
                 library = updated
                 if let gptProfile { clearDigestsForActiveProfile(gptProfile) }
                 validatedProviderIdentity = nil
-                if provider == .voxcpm2 { voxcpm2ProbeSummary = nil }
                 activityMessage = "The saved voice assets changed, are missing, or are no longer valid. Re-import them before generating speech."
                 logger.error("event=profile_validation_failed code=INPUT_FINGERPRINT_MISMATCH")
             }
@@ -2032,13 +2022,17 @@ final class DialogueVoiceCoordinator: @unchecked Sendable {
         guard started, !persistenceBlocked, activeGenerationTask == nil,
               library.profileStatus == .ready,
               let provider = library.activeProviderKind,
-              let queued = library.lines.first(where: { $0.status == .queued }) else { return }
+              let queued = library.lines.first(where: {
+                  $0.status == .queued
+                      && (provider == .qwen3TTS || requestedGenerationIDs.contains($0.id))
+              }) else { return }
         if provider == .qwen3TTS, !isQwenCompatible(queued) {
             rejectQueuedQwenLine(queued)
             return
         }
         do {
             let ticket = try commit { try $0.beginGeneration(for: queued.id) }
+            requestedGenerationIDs.remove(queued.id)
             let line = try requireLine(ticket.lineID)
             activeTicket = ticket
             activityMessage = "Generating dialogue audio…"

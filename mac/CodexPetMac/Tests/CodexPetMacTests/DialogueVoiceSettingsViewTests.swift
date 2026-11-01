@@ -5,6 +5,41 @@ import XCTest
 
 final class DialogueVoiceSettingsViewTests: XCTestCase {
     @MainActor
+    func testQueuedLineOffersExplicitGenerateAction() throws {
+        let digest = String(repeating: "a", count: 64)
+        let profile = try GPTSoVITSVoiceProfile(
+            name: "On demand", apiBaseURL: URL(string: "https://127.0.0.1:9880")!,
+            tlsLeafCertificateSHA256: digest,
+            gptWeightRelativePath: "voice/assets/gpt/test.ckpt",
+            sovitsWeightRelativePath: "voice/assets/sovits/test.pth",
+            referenceAudioRelativePath: "voice/assets/reference/test.wav",
+            referenceText: "Reference", promptLanguage: "en", defaultTextLanguage: "en",
+            inputFingerprint: digest
+        )
+        var library = try DialogueVoiceLibrary(profile: profile)
+        let line = try library.addLine(text: "Wait for Generate", language: "en")
+        let view = DialogueVoiceSettingsView(frame: NSRect(x: 0, y: 0, width: 900, height: 700))
+        view.update(snapshot: DialogueVoiceCoordinatorSnapshot(
+            library: library,
+            draft: DialogueVoiceProfileDraft(
+                name: "", apiBaseURL: "https://127.0.0.1:9880", tlsLeafCertificateSHA256: digest,
+                promptLanguage: "en", defaultTextLanguage: "en", referenceText: ""
+            ),
+            importedAssets: DialogueVoiceImportedAssets(profile: profile), activityMessage: nil
+        ))
+        let table = try XCTUnwrap(Self.descendants(of: view).compactMap { $0 as? NSTableView }.first)
+        table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        let generate = try XCTUnwrap(Self.descendants(of: view).compactMap { $0 as? NSButton }
+            .first { $0.accessibilityLabel() == "Generate selected dialogue line" })
+        XCTAssertEqual(generate.title, "Generate")
+        XCTAssertTrue(generate.isEnabled)
+        var requested: UUID?
+        view.onRetryLine = { requested = $0.id }
+        generate.performClick(nil)
+        XCTAssertEqual(requested, line.id)
+    }
+
+    @MainActor
     func testVoiceSetupUsesAccessibleNativeProviderCards() throws {
         let view = DialogueVoiceSettingsView(frame: NSRect(x: 0, y: 0, width: 900, height: 700))
         let descendants = Self.descendants(of: view)

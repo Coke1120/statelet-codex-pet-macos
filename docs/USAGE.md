@@ -578,7 +578,7 @@ text and manage generated lines.
 If no profile has been saved yet, Dialogue & Voice opens on Voice Setup; otherwise it opens
 on Dialogue and remembers subsequent page changes while Settings remains open.
 
-1. Start GPT-SoVITS API v2 behind a locally managed TLS service or gateway on
+1. Configure GPT-SoVITS API v2 behind a locally managed TLS service or gateway on
    this Mac. The default profile endpoint is `https://127.0.0.1:9880`; a plain
    HTTP API must remain behind the authenticated gateway rather than being the
    Statelet endpoint.
@@ -598,18 +598,21 @@ on Dialogue and remembers subsequent page changes while Settings remains open.
    **Add**. The line is saved before background generation begins.
 
 Dialogue text can be saved as a draft before Voice Setup is ready. The page
-shows that generation will begin only after a valid profile and local service
-are available; switching between the two pages does not discard unsaved form
-or dialogue edits.
+shows when the profile is ready. Adding or editing a line requests generation;
+restored GPT-SoVITS and VoxCPM2 queues wait for **Generate** on the selected
+line. Opening Statelet or choosing another voice provider does not load these
+models. Switching between the two pages does not discard unsaved form or
+dialogue edits.
 
 The profile reports `Not configured`, `Validating`, `Ready`, `Invalid`, or
 `Local service unavailable`; Statelet fingerprints the model bytes, reference
 audio, transcript, endpoint, and language inputs and revalidates them after
 restart and before generation if file identity changes. Reference audio must be
-decodable by macOS, and the profile becomes `Ready` only after the local API
-accepts both weight files. The table reports `Draft`, `Queued`, `Generating`,
+decodable by macOS. For GPT-SoVITS and VoxCPM2, `Ready` means the saved local
+inputs passed verification; runtime availability is checked when generation
+is requested. The table reports `Draft`, `Queued`, `Generating`,
 `Ready`, `Failed`, or `Stale`. **Preview** is enabled only for validated `Ready`
-output. **Retry**
+output without starting a model. **Generate** requests a selected queued line. **Retry**
 reuses the same line after a failed request, while **Regenerate** invalidates
 the old result and queues a new revision. Editing a line or saving a changed
 profile also invalidates prior output. A late result cannot replace a newer
@@ -623,7 +626,11 @@ Same-state heartbeats and clip rotation do not replay the message. Legacy
 dialogue saved before state ownership existed is assigned to Idle.
 
 Statelet calls GPT-SoVITS API v2's local `/set_gpt_weights`,
-`/set_sovits_weights`, and `/tts` endpoints. It does not start, install, train,
+`/set_sovits_weights`, and `/tts` endpoints. An existing managed
+`com.coke1120.statelet.gpt-sovits` LaunchAgent can be started on demand for
+generation; Statelet releases a service it started after its owned requests
+finish, including failure and cancellation. A service already running before
+the request remains externally managed. Statelet does not install, train,
 download, or update GPT-SoVITS. Every request requires HTTPS on numeric IPv4 or
 IPv6 loopback and authenticates the exact saved SHA-256 of the leaf DER
 certificate, including for a deliberately self-signed local certificate.
@@ -659,24 +666,26 @@ or logged; the managed regular-file tree, selected runtime, reference identity,
 transcript, and synthesis settings are fingerprinted and rechecked before each
 use.
 
-Profile validation runs a bounded offline probe with `load_denoiser=False`,
-`optimize=False`, and `local_files_only=True`. The probe must load the model,
-report only `mps`, `cuda`, or `cpu`, and confirm a 48 kHz model output rate.
-The probe and generator execute below an OS network-denied child-process
-policy in addition to the helper's Hugging Face offline flags. A profile stays
-`Invalid` or `Local service unavailable` when the snapshot, runtime, probe, or
-reference changes; re-import the original complete folder and matching Python
-environment rather than editing the managed snapshot.
+Profile restoration and selection verify the managed inputs without running
+the model-loading probe. The generation helper uses `load_denoiser=False`,
+`optimize=False`, and `local_files_only=True`, and accepts only a 48 kHz mono
+PCM16 result. It executes below an OS network-denied child-process policy in
+addition to the helper's Hugging Face offline flags. Changed or missing inputs
+remain `Invalid`; runtime failures are reported after an explicit generation
+request. Re-import the original complete folder and matching Python environment
+rather than editing the managed snapshot.
 
 VoxCPM2 uses the same WAV/reference audio for `prompt_wav_path` and
 `reference_wav_path`, with the saved transcript as `prompt_text`. Generation is
 asynchronous, cancellable, and bounded; an old ready WAV remains until a new
 48 kHz mono PCM16 result passes structural validation and atomic publication.
 On Apple Silicon, MPS is deliberately promoted to float32 for stability and
-can be slow or memory-intensive. Saved-profile validation at app launch also
-loads the model. Each validation or generation helper exits when its job ends,
-releasing its model allocation. A `Ready` status proves software validation,
-not audible quality: use **Preview** and assess the private audio locally.
+can be slow or memory-intensive. Saved-profile validation at app launch does
+not load the model or resume saved generation queues. Each requested generation
+helper exits when its job ends, releasing its model allocation. Existing ready
+audio can be previewed or played automatically without loading the model. A
+`Ready` status does not prove audible quality: use **Preview** and assess the
+private audio locally.
 
 Removing VoxCPM2 removes its managed snapshot, reference, and generated speech
 while preserving the selected source folder, dialogue text, and other

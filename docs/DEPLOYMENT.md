@@ -61,6 +61,10 @@ checkout changes.
 
 ## Build the app
 
+Use a matching compiler and SDK. If `DEVELOPER_DIR` selects full Xcode while
+the shell pins `SDKROOT` to Command Line Tools, clear that override or select
+the matching Xcode SDK before building.
+
 Run from the repository root:
 
 ```bash
@@ -133,6 +137,15 @@ The installer:
 An unmanaged app or LaunchAgent at a managed destination causes installation to
 fail before replacement. See [Legacy identity migration](#legacy-identity-migration)
 for the ownership checks applied to older installations.
+
+An existing recognized `com.coke1120.statelet.gpt-sovits` voice service is
+migrated transactionally to on-demand startup. Its model, arguments and private
+configuration are preserved; installation loads the job with `RunAtLoad=false`
+and `KeepAlive=false`, without starting inference. Unknown jobs remain untouched
+and no voice service is created when one is absent. This migration runs through
+the source installer, so a binary-only app update does not change an existing
+voice LaunchAgent. See [local voice](USAGE.md#dialogue-and-local-voice) for generation
+and cached playback behavior.
 
 Restart Codex and any active Grok Build session after the first installation so
 they load the new hook configuration. Launch Statelet with:

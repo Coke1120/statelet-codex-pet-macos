@@ -247,10 +247,10 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         self.assertIn("previewButton.isEnabled = line?.status == .ready", self.voice_view)
         self.assertIn("profileStatus == .ready || profileStatus == .unavailable", self.voice_view)
 
-    def test_retry_accepts_failed_and_stale_lines_when_profile_allows_it(self) -> None:
+    def test_generate_and_retry_accept_queued_failed_and_stale_lines_when_profile_allows_it(self) -> None:
         enablement = method_body(self.voice_view, "    private func refreshButtonEnablement")
         self.assertIn(
-            "retryButton.isEnabled = (line?.status == .failed || line?.status == .stale)",
+            "retryButton.isEnabled = (line?.status == .queued || line?.status == .failed || line?.status == .stale)",
             enablement,
         )
         self.assertIn(
@@ -259,8 +259,10 @@ class MacDialogueVoiceSourceTests(unittest.TestCase):
         )
 
         retry_action = method_body(self.voice_view, "    @objc private func retryLine()")
+        self.assertIn("line.status == .queued", retry_action)
         self.assertIn("line.status == .failed || line.status == .stale", retry_action)
         self.assertIn("onRetryLine?(line)", retry_action)
+        self.assertIn('retryButton.title = line?.status == .queued ? "Generate" : "Retry"', enablement)
 
     def test_unavailable_stale_retry_uses_profile_activation_without_retrying_queued_state(self) -> None:
         retry = method_body(self.coordinator, "    func retryLine")

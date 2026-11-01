@@ -1211,7 +1211,13 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         deleteButton.isEnabled = line != nil
         previewButton.isEnabled = line?.status == .ready
             && (profileStatus == .ready || profileStatus == .unavailable)
-        retryButton.isEnabled = (line?.status == .failed || line?.status == .stale)
+        retryButton.title = line?.status == .queued ? "Generate" : "Retry"
+        retryButton.setAccessibilityLabel(line?.status == .queued
+            ? "Generate selected dialogue line" : "Retry selected dialogue line")
+        retryButton.toolTip = line?.status == .queued
+            ? "Load the selected voice model and generate this queued line."
+            : "Retry a failed or stale generation without creating another line."
+        retryButton.isEnabled = (line?.status == .queued || line?.status == .failed || line?.status == .stale)
             && (profileStatus == .ready || profileStatus == .unavailable)
         regenerateButton.isEnabled = profileStatus == .ready
             && line.map { $0.status != .queued && $0.status != .generating } == true
@@ -1416,7 +1422,8 @@ final class DialogueVoiceSettingsView: NSView, NSTableViewDataSource, NSTableVie
         onPreviewLine?(line)
     }
     @objc private func retryLine() {
-        guard let line = selectedLine(), line.status == .failed || line.status == .stale else { return }
+        guard let line = selectedLine(),
+              line.status == .queued || line.status == .failed || line.status == .stale else { return }
         onRetryLine?(line)
     }
     @objc private func regenerateLine() {

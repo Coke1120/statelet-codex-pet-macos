@@ -62,11 +62,12 @@ fixes into a verified release; ship urgent regressions as focused patches.
    the guide without coaching. Fix the largest observed blocker before adding
    a wizard, new preferences, or more provider choices. Compare task completion
    and interventions before/after; these are manual observations, not telemetry.
-5. **Reduce the cost of starting with saved voice audio.** Saved VoxCPM2 profile
-   validation currently loads the full model even when only cached speech will
-   play. Evaluate separating cached-audio validation from model loading while
-   retaining runtime authority, source fingerprints and output checks. Measure
-   startup memory and time before changing this trust boundary.
+5. **Qualify on-demand voice performance.** Saved GPT-SoVITS and VoxCPM2 profiles
+   now verify local inputs without loading a model, and restored queues wait
+   for an explicit generation request. Cached speech remains independent of
+   inference. Retain runtime authority, source fingerprints and output checks;
+   compare startup memory/time and requested cold-start generation on the same
+   installed profile before making measured performance claims.
 
 ## Deferred
 
